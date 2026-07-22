@@ -6,15 +6,18 @@ class RadarProcessing(Node):
 
     def __init__(self):
         super().__init__('radar_processing')
-        self.get_logger().info('📡 Radar Processing Node Started')
+        self.get_logger().info('📡 [Radar Processing] 악천후 보조 레이다 노드 시작')
 
-        # 1. PathPlanner로 보낼 레이다 기반 장애물 거리 발행
         self.pub_dist = self.create_publisher(
             Float64, '/perception/radar_dist', 10
         )
+        # 10Hz 주기로 실행
+        self.timer = self.create_timer(0.1, self.process_radar)
 
     def process_radar(self):
-        # 레이다 패킷을 수신해서 파싱하는 로직 작성
+        # ----------------------------------------------------
+        # 📌 비/눈 날씨 영향을 받지 않는 레이다 패킷 파싱 자리
+        # ----------------------------------------------------
         radar_distance = 999.0
 
         dist_msg = Float64()

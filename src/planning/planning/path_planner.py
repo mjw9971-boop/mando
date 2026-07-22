@@ -9,9 +9,9 @@ class PathPlanner(Node):
 
     def __init__(self):
         super().__init__('path_planner')
-        self.get_logger().info('🧠 Path Planner Node Started')
+        self.get_logger().info('🧠 [Path Planner] FSM 판단 및 경로 생성 노드 시작')
 
-        # 1. 기존 구독자 (차량 상태 및 전역 경로)
+        # 1. 구독자(Subscriber) 설정
         self.sub_ego = self.create_subscription(
             Odometry, '/vtd/ego_state', self.ego_callback, 10
         )
@@ -19,29 +19,35 @@ class PathPlanner(Node):
             Path, '/vtd/global_path', self.global_path_callback, 10
         )
 
-        # 2. 📸 🚨 퍼셉션 토픽 구독자 추가!
+        # 퍼셉션 데이터 구독자
         self.sub_traffic_light = self.create_subscription(
             String, '/perception/traffic_light', self.traffic_light_callback, 10
         )
         self.sub_lidar_dist = self.create_subscription(
             Float64, '/perception/lidar_dist', self.lidar_callback, 10
         )
+        self.sub_radar_dist = self.create_subscription(
+            Float64, '/perception/radar_dist', self.radar_callback, 10
+        )
 
-        # 3. 발행자 (제어 노드로 보낼 Local Path)
+        # 2. 발행자(Publisher) 설정
         self.pub_local_path = self.create_publisher(
             Path, '/planning/local_path', 10
         )
 
-        # 변수 초기화
+        # 내부 변수 초기화
         self.ego_pose = None
         self.global_path = None
-        self.local_path_len = 30
 
-        # 퍼셉션 상태 변수
-        self.traffic_light_state = "GREEN"  # 기본값: 진행
-        self.obstacle_distance = 999.0     # 기본값: 장애물 없음 (m)
+        # 퍼셉션 수신 변수 (기본값)
+        self.traffic_light_state = "GREEN"
+        self.lidar_dist = 999.0
+        self.radar_dist = 999.0
 
-        # 20Hz 실행
+        # FSM 상태 정보
+        self.state = "CRUISE"
+
+        # 20Hz 주기 실행 (0.05초마다 판단)
         self.timer = self.create_timer(0.05, self.plan_path)
 
     def ego_callback(self, msg):
@@ -50,37 +56,57 @@ class PathPlanner(Node):
     def global_path_callback(self, msg):
         self.global_path = msg.poses
 
-    # 📸 퍼셉션 콜백 함수들
     def traffic_light_callback(self, msg):
-        self.traffic_light_state = msg.data  # 예: "RED", "GREEN"
+        self.traffic_light_state = msg.data
 
     def lidar_callback(self, msg):
-        self.obstacle_distance = msg.data    # 전방 장애물 거리 (m)
+        self.lidar_dist = msg.data
+
+    def radar_callback(self, msg):
+        self.radar_dist = msg.data
 
     def plan_path(self):
+        # 필수 데이터 수신 전이면 대기
         if self.ego_pose is None or self.global_path is None or len(self.global_path) == 0:
             return
 
+        # ----------------------------------------------------
+        # 🧠 1. 센서 크로스체크 & FSM 상태 판단
+        # ----------------------------------------------------
+        # 라이다와 레이다 중 더 안전한(가까운) 장애물 거리 선택
+        min_obstacle_dist = min(self.lidar_dist, self.radar_dist)
+
+        # FSM 상태 결정
+        if self.traffic_light_state == "RED" or min_obstacle_dist < 5.0:
+            new_state = "STOP"
+        elif 5.0 <= min_obstacle_dist < 10.0:
+            new_state = "SLOWDOWN"
+        else:
+            new_state = "CRUISE"
+
+        # 상태 변경 시 로그 출력
+        if new_state != self.state:
+            self.get_logger().info(f'🔄 [State Change] {self.state} ➔ {new_state}')
+            self.state = new_state
+
+        # ----------------------------------------------------
+        # 🚗 2. FSM 상태별 Local Path 생성 및 행동 제어
+        # ----------------------------------------------------
         local_path_msg = Path()
         local_path_msg.header.frame_id = 'map'
         local_path_msg.header.stamp = self.get_clock().now().to_msg()
 
-        # ----------------------------------------------------
-        # 🧠 [판단 로직] 정지 조건 체크 (신호등 RED or 장애물 5m 이내)
-        # ----------------------------------------------------
-        if self.traffic_light_state == "RED" or self.obstacle_distance < 5.0:
-            self.get_logger().warn('🛑 [STOP] 장애물 또는 신호등 감지! 차량을 정지합니다.')
-            # 경로 비워 보내기 -> vehicle_control이 경로를 못 찾아 정지함 (또는 속도 0 명령)
+        # A. [STOP 상태] 경로를 빈 상태로 발행하여 정지 명령
+        if self.state == "STOP":
             local_path_msg.poses = []
             self.pub_local_path.publish(local_path_msg)
             return
 
-        # ----------------------------------------------------
-        # 🚗 [정상 주행] 내 위치 기반 Local Path 생성
-        # ----------------------------------------------------
+        # B. [CRUISE / SLOWDOWN 상태] 경로 추출
         ego_x = self.ego_pose.position.x
         ego_y = self.ego_pose.position.y
 
+        # 내 위치에서 가장 가까운 전역 경로 점(WayPoint) 찾아내기
         min_dist = float('inf')
         closest_idx = 0
 
@@ -92,9 +118,14 @@ class PathPlanner(Node):
                 min_dist = dist
                 closest_idx = i
 
-        end_idx = min(closest_idx + self.local_path_len, len(self.global_path))
+        # 상태별 가시 거리(Waypoint 개수) 조절
+        # SLOWDOWN일 때는 앞쪽을 짧게 잘라내어 제어기가 자연스럽게 감속하도록 유도
+        path_length = 12 if self.state == "SLOWDOWN" else 30
+
+        end_idx = min(closest_idx + path_length, len(self.global_path))
         local_path_msg.poses = self.global_path[closest_idx:end_idx]
 
+        # 3. 국소 경로 발행
         self.pub_local_path.publish(local_path_msg)
 
 
