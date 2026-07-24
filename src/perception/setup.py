@@ -17,7 +17,8 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'camera_processing = perception.camera_processing:main',
+            'lane_detection = perception.lane_detection:main',
+            'object_detection = perception.object_detection:main',
             'lidar_processing = perception.lidar_processing:main',
             'radar_processing = perception.radar_processing:main',
             'sensor_fusion = perception.sensor_fusion_node:main',
