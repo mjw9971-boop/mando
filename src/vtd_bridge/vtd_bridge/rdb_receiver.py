@@ -1,11 +1,13 @@
 import socket
 import struct
 import threading
+import time
+import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
-from std_msgs.msg import Header, Float64MultiArray
+from std_msgs.msg import Header, Float64MultiArray, Float64
 import sensor_msgs_py.point_cloud2 as pc2
 
 # ------------------------------------------------------------------------------
@@ -16,6 +18,8 @@ RDB_MSG_HDR_SIZE = 24       # RDB 메인 헤더 크기 (24 Bytes)
 RDB_ENTRY_HDR_SIZE = 16     # RDB 패키지 엔트리 헤더 크기 (16 Bytes)
 
 # VTD 패키지 ID
+# ⚠️ 아래 ID 및 parse_* 함수들의 byte offset은 실제 VTD SDK의 viRDBIcd.h와
+#    반드시 대조 확인이 필요합니다 (버전에 따라 구조체 크기가 다를 수 있음).
 RDB_PKG_ID_ROAD_POS = 5      # 차선/도로 위치 데이터 (Ground Truth)
 RDB_PKG_ID_OBJECT_STATE = 9  # 차량/장애물 상태 데이터
 RDB_PKG_ID_IMAGE = 14        # 카메라 데이터
@@ -43,9 +47,21 @@ class RDBReceiver(Node):
         self.camera_pub = self.create_publisher(Image, '/vtd/camera_image', 10)
         self.lane_pub = self.create_publisher(Float64MultiArray, '/vtd/lane_info', 10)
 
-        # 🟢 라이다 & 레이다 데이터를 PointCloud2 타입으로 변경 및 토픽명 매칭
+        # ✅ [수정] sensor_fusion_node.py가 구독하는 '/vtd/ego_speed' 토픽이
+        #    기존 코드에는 발행하는 곳이 없어 자차 속도가 항상 0으로 고정되던 문제 수정
+        self.speed_pub = self.create_publisher(Float64, '/vtd/ego_speed', 10)
+
+        # 라이다 & 레이다 데이터를 PointCloud2 타입으로 발행
         self.lidar_pub = self.create_publisher(PointCloud2, '/vtd/lidar_pointcloud', 10)
         self.radar_pub = self.create_publisher(PointCloud2, '/vtd/radar_pointcloud', 10)
+
+        # ✅ [수정] 자차 속도 계산을 위한 이전 위치/시간 저장용 변수
+        #    (RDB_OBJECT_STATE 페이로드 내 정확한 speed 필드 오프셋이 확인되지
+        #     않아, 위치값을 시간差 미분하는 방식으로 안전하게 속도를 추정합니다.
+        #     실제 RDB에 speed 필드가 별도 존재한다면 VTD SDK 문서 확인 후
+        #     직접 파싱하는 편이 더 정확합니다.)
+        self.prev_pos = None
+        self.prev_pos_time = None
 
         # ----------------------------------------------------
         # 3. 소켓 수신 백그라운드 스레드 생성
@@ -156,6 +172,20 @@ class RDBReceiver(Node):
             msg.data = [pos_x, pos_y, pos_z, heading, pitch, roll]
             self.state_pub.publish(msg)
 
+            # ✅ [수정] '/vtd/ego_speed' 발행: 위치값의 시간差 미분으로 자차 속도 추정
+            now = time.time()
+            if self.prev_pos is not None and self.prev_pos_time is not None:
+                dt = now - self.prev_pos_time
+                if dt > 1e-4:
+                    dx = pos_x - self.prev_pos[0]
+                    dy = pos_y - self.prev_pos[1]
+                    speed = math.hypot(dx, dy) / dt  # m/s
+                    speed_msg = Float64()
+                    speed_msg.data = float(speed)
+                    self.speed_pub.publish(speed_msg)
+            self.prev_pos = (pos_x, pos_y, pos_z)
+            self.prev_pos_time = now
+
     def parse_image(self, payload):
         if len(payload) < 24:
             return
@@ -173,26 +203,21 @@ class RDBReceiver(Node):
 
     def parse_sensor_data(self, payload):
         """
-        VTD 센서(라이다/레이다) 데이터를 앞서 만든 퍼셉션 노드가 처리할 수 있도록 
+        VTD 센서(라이다/레이다) 데이터를 퍼셉션 노드가 처리할 수 있도록
         PointCloud2 형식으로 변환하여 퍼블리시합니다.
-        (실제 RDB 바이너리 구조에 맞춰 파싱 부분은 조정될 수 있습니다)
+        (실제 RDB 바이너리 구조에 맞춰 파싱 부분은 조정될 수 있습니다 — 현재는 예시용 더미 데이터)
         """
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         header.frame_id = 'sensor_frame'
 
         # --- 임시 데이터 생성 예시 (실제 payload 해독 로직으로 대체 필요) ---
-        # 1. 라이다용 포인트 (X, Y, Z)
         dummy_lidar_points = np.array([[5.0, 0.0, 0.0], [10.0, 1.5, 0.5]], dtype=np.float32)
-        
-        # 2. 레이다용 포인트 (X, Y, Z, Velocity) - 앞서 만든 radar_processing.py 가 요구하는 형식
         dummy_radar_points = np.array([[15.0, 0.0, 0.0, -2.5]], dtype=np.float32)
 
-        # 🟢 라이다 PointCloud2 생성 및 퍼블리시
         lidar_msg = pc2.create_cloud_xyz32(header, dummy_lidar_points.tolist())
         self.lidar_pub.publish(lidar_msg)
 
-        # 🟢 레이다 PointCloud2 생성 및 퍼블리시 (속도 필드 추가)
         radar_fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -201,7 +226,6 @@ class RDBReceiver(Node):
         ]
         radar_msg = pc2.create_cloud(header, radar_fields, dummy_radar_points.tolist())
         self.radar_pub.publish(radar_msg)
-
 
     def destroy_node(self):
         self.is_running = False

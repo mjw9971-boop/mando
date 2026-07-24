@@ -6,6 +6,7 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import math
+import json
 import time
 from ultralytics import YOLO
 
@@ -197,8 +198,9 @@ class CameraProcessing(Node):
         return 0.0
 
     def process_yolo_detection(self, cv_image):
+        # ✅ [수정] bev_matrix가 아직 없으면 빈 JSON 배열 반환 ("NONE" 대신 → json.loads 안전)
         if self.bev_matrix is None:
-            return "NONE"
+            return "[]"
 
         h, w = cv_image.shape[:2]
         conf_thresh = self.get_parameter('conf_threshold').value
@@ -214,23 +216,34 @@ class CameraProcessing(Node):
                 cls_id = int(box.cls[0])
                 class_name = self.yolo_model.names[cls_id]
                 
-                # 📌 [핵심 반영 1] 바운딩 박스의 맨 밑 중앙 점(바닥점) 추출
+                # 바운딩 박스의 맨 밑 중앙 점(바닥점) 추출
                 bottom_x = (x1 + x2) / 2.0
                 bottom_y = y2
                 
-                # 📌 [핵심 반영 2] 바닥점 1개만 BEV 행렬로 좌표 변환
+                # 바닥점 1개만 BEV 행렬로 좌표 변환
                 pt = np.array([[[bottom_x, bottom_y]]], dtype=np.float32)
                 bev_pt = cv2.perspectiveTransform(pt, self.bev_matrix)[0][0]
                 
-                # 📌 [핵심 반영 3] BEV 좌표를 차량 기준 실제 거리(m)로 환산
-                # bev_pt[0]: BEV 상의 X 좌표, bev_pt[1]: BEV 상의 Y 좌표
+                # BEV 좌표를 차량 기준 실제 거리(m)로 환산
                 real_dist_x = (bev_pt[0] - (w / 2.0)) * m_per_pix  # 좌우 거리 (m, +:우, -:좌)
                 real_dist_y = (h - bev_pt[1]) * m_per_pix          # 전방 거리 (m)
-                
-                # 포맷: 이름:[좌우m, 전방m] (예: car:[0.50m, 12.30m])
-                detected_objects.append(f"{class_name}:[{real_dist_x:.2f}m,{real_dist_y:.2f}m]")
-                
-        return "|".join(detected_objects)
+
+                # ✅ [수정] sensor_fusion_node가 기대하는 스키마로 통일:
+                #    {"class": str, "distance": float, "lateral": float, "forward": float}
+                #    distance는 레이더의 target_dist(sqrt(x^2+y^2))와 동일 기준으로 계산해야
+                #    퓨전 노드의 5m 이내 거리비교 로직이 올바르게 동작함.
+                straight_dist = float(math.hypot(real_dist_x, real_dist_y))
+
+                detected_objects.append({
+                    "class": class_name,
+                    "distance": round(straight_dist, 2),
+                    "lateral": round(float(real_dist_x), 2),
+                    "forward": round(float(real_dist_y), 2),
+                })
+
+        # ✅ [수정] JSON 문자열로 직렬화 (기존: "car:[0.50m,12.30m]" pipe-문자열 → sensor_fusion_node의
+        #    json.loads()가 매번 예외를 던지고 조용히 무시되던 문제 수정)
+        return json.dumps(detected_objects)
 
     def image_callback(self, msg):
         try:
@@ -249,10 +262,10 @@ class CameraProcessing(Node):
         msg_offset.data = float(offset)
         self.pub_lane_offset.publish(msg_offset)
 
-        # [2] 객체 탐지 및 물리 거리(m) 퍼블리시
+        # [2] 객체 탐지 및 물리 거리(m) 퍼블리시 (JSON 포맷)
         objects_str = self.process_yolo_detection(cv_image)
         msg_objects = String()
-        msg_objects.data = objects_str if objects_str else "NONE"
+        msg_objects.data = objects_str
         self.pub_objects.publish(msg_objects)
 
 def main(args=None):
