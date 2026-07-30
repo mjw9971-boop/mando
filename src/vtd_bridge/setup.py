@@ -20,6 +20,7 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
+            'e2e_inference_node = vtd_bridge.e2e_inference_node:main',
             'rdb_receiver = vtd_bridge.rdb_receiver:main',
             'scp_sender = vtd_bridge.scp_sender:main',
         ],
