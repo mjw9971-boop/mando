@@ -35,3 +35,10 @@ dataset_out/
 
 # ===== 로그 =====
 *.log
+
+# --- HL FMA 컨트롤러 ---
+data/*.pkl
+logs/
+__pycache__/
+*.bin
+bags/

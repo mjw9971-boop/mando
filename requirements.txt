@@ -1,0 +1,10 @@
+# SPEC §4: 표준 라이브러리 + numpy/scipy 만. 딥러닝 프레임워크 금지.
+numpy>=1.24
+scipy>=1.10
+
+# config.yaml 파서. 표준 라이브러리에 YAML 이 없어 부득이하게 추가.
+# (딥러닝/무거운 의존성이 아니라 설정 로딩 전용)
+PyYAML>=6.0
+
+# tools 전용 (런타임에는 import 하지 않는다)
+matplotlib>=3.7 ; python_version >= "3.10"

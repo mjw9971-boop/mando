@@ -1,0 +1,103 @@
+# HL FMA 2026 컨트롤러 파라미터 (모든 튜닝 값의 단일 출처)
+# 단위: m, m/s, m/s^2, rad. km/h 는 이 파일과 로그 출력에서만.
+# 노드가 모두 같은 값을 봐야 하므로 와일드카드로 한 번에 준다.
+#
+# 이 파일은 nodes/params.py 의 DEFAULTS 로부터 생성한다:
+#   python3 -c "import sys;sys.path.insert(0,'src/hlfma');from hlfma.nodes.params import render_yaml;print(render_yaml())" \
+#     > src/hlfma/config/params.yaml
+/**:
+  ros__parameters:
+    graph_path: data/lane_graph.pkl
+    route_path: data/route.pkl
+
+    # ── comm ──
+    comm.host: "127.0.0.1"
+    comm.port: 9910
+    comm.send_hz: 20
+    comm.watchdog_s: 1.0
+    # 실측 확정 (2026-08-19, VTD 2025.2): +1.0.
+    # -1.0 이면 직선 구간에서 발산하며 courseRespawn 리셋이 발생한다.
+    # corr(steering, yaw_rate) = -0.93 으로 확인 (logs/run_20260819_185936.jsonl).
+    # 뒤집히면 control 의 SteerSignMonitor 가 주행 5초 안에 경고를 띄운다.
+    comm.steer_sign: 1.0
+    comm.connect_retry_s: 1.0
+    comm.recv_bufsize: 65536
+    # ── vehicle ──
+    vehicle.wheelbase: 2.944
+    vehicle.max_steer: 0.48
+    vehicle.length: 4.848
+    vehicle.width: 1.886
+    vehicle.height: 1.507
+    # ── speed ──
+    speed.margin_kph: 3.0
+    speed.a_comf: 1.5
+    speed.a_max: 2.0
+    speed.a_min: -6.0
+    speed.a_emergency: -8.0
+    speed.jerk_max: 2.0
+    speed.a_lat_max: 2.0
+    speed.stop_gap_m: 1.0
+    speed.a_hold: -1.0
+    # ── caps_kph ──
+    caps_kph.school_zone: 28.0
+    caps_kph.crosswalk: 25.0
+    caps_kph.junction: 30.0
+    caps_kph.blind: 25.0
+    # ── signal ──
+    signal.yellow_s: 3.0
+    signal.lead_s: 3.0
+    signal.margin_s: 1.0
+    signal.flash_mode: "yield"
+    # ── lead ──
+    lead.time_headway_s: 2.0
+    lead.min_gap_m: 5.0
+    # ── ttc ──
+    ttc.warn_s: 4.0
+    ttc.brake_s: 2.5
+    ttc.emergency_s: 1.5
+    # ── lane_change ──
+    lane_change.back_m: 30.0
+    lane_change.front_m: 50.0
+    lane_change.min_window_m: 20.0
+    lane_change.transition_s: 3.0
+    lane_change.transition_min_m: 20.0
+    lane_change.done_t_off_m: 0.3
+    lane_change.done_heading_deg: 5.0
+    # ── cross ──
+    cross.margin_s: 2.0
+    # ── percep ──
+    percep.horizon_m: 200.0
+    percep.coast_s: 1.5
+    # courseRespawn 리셋 감지 문턱. 실제 리셋 이동량이 3.3 m 남짓이라 그보다 낮아야 한다.
+    percep.jump_m: 2.0
+    percep.speed_lpf: 0.3
+    percep.reset_route_s_drop_m: 5.0
+    percep.stall_dt_s: 0.2
+    percep.reset_speed_factor: 3.0
+    percep.reset_abs_speed: 30.0
+    percep.ped_extrapolate_s: 2.0
+    # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개.
+    percep.gt_range_m: 80.0
+    percep.range_margin_m: 5.0
+    # ── control ──
+    control.kp: 0.8
+    control.ki: 0.15
+    control.k_ld: 0.8
+    control.ld_min: 5.0
+    control.ld_max: 20.0
+    control.steer_rate_max: 1.0
+    # ── shield ──
+    shield.edge_margin_m: 0.3
+    shield.lane_side_m: 1.0
+    # ── log ──
+    log.enabled: true
+    log.dir: "logs"
+    log.path: ""
+    log.flush_every: 20
+    # ── debug ──
+    debug.const_speed_kph: 20.0
+    debug.path_dist_m: 40.0
+    debug.path_step_m: 0.5
+    debug.print_hz: 1.0
+    # ── default_speed_kph ──
+    default_speed_kph: 50.0
