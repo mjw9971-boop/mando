@@ -5,6 +5,7 @@
 돌아 /cmd 가 나오는지 본다. 타이머 없이 콜백만으로 한 틱이 완결되는지 확인하는 게
 목적이다 (요구사항 1).
 """
+import json
 import math
 import pathlib
 import threading
@@ -126,8 +127,12 @@ def test_speed_estimated_from_successive_packets(harness):
     assert harness.worlds[-1].ego_speed > 1.0
 
 
-def test_decision_is_const_speed_and_follow(harness):
-    """현재 단계의 planner 는 상수 속도 + FOLLOW 고정."""
+def test_decision_is_follow_with_candidate_speed(harness):
+    """기본 경로는 상수속도가 아니라 _speed_candidates 중재 결과를 쓴다.
+
+    debug.enabled 가 꺼져 있으면 debug_const 후보가 아예 생기지 않아야 하고,
+    v_target 은 유한한 양수이면서 법정 제한속도를 넘지 않아야 한다.
+    """
     harness.decisions.clear()
     harness.tick(*START[:2], START[3], 400.0)
     deadline = time.time() + 3.0
@@ -136,7 +141,12 @@ def test_decision_is_const_speed_and_follow(harness):
     assert harness.decisions
     d = harness.decisions[-1]
     assert d.state == 'FOLLOW'
-    assert d.v_target == pytest.approx(20.0 / 3.6, rel=1e-3)
+    reasons = json.loads(d.reasons_json) if d.reasons_json else {}
+    assert 'debug_const' not in reasons
+    assert 'const_cap' not in reasons.get('shield', {})
+    assert 0.0 < d.v_target < math.inf
+    assert d.v_target <= float(reasons['limit']) + 1e-6
+    assert reasons.get('winner') not in (None, 'none')
     assert len(d.path_x) == len(d.path_y) > 0
 
 

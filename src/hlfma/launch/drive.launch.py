@@ -19,6 +19,7 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, GroupAction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 NODES = [('vtd_bridge', 'vtd_bridge'), ('perception', 'perception'),
          ('planner', 'planner'), ('control', 'control'), ('logger', 'logger')]
@@ -38,8 +39,16 @@ def generate_launch_description():
     bag_path = LaunchConfiguration('bag_path')
 
     # 파라미터 파일 위에 launch 인자를 덮어쓴다
-    overrides = {'graph_path': graph, 'route_path': route,
-                 'comm.host': host, 'comm.port': port}
+    debug_speed = LaunchConfiguration('debug_speed')
+    overrides = {
+        'graph_path': graph, 'route_path': route,
+        'comm.host': host, 'comm.port': port,
+        # debug_speed > 0 이면 상수속도 모드. 기본 0 = 끔.
+        # (기본 주행은 제한속도·곡률·정지선만으로 속도를 정한다)
+        'debug.const_speed_kph': ParameterValue(debug_speed, value_type=float),
+        'debug.enabled': ParameterValue(
+            PythonExpression(['float("', debug_speed, '") > 0']), value_type=bool),
+    }
     common = [params, overrides]
 
     return LaunchDescription([
@@ -53,6 +62,9 @@ def generate_launch_description():
         DeclareLaunchArgument('record', default_value='false',
                               description='true 면 전 토픽 rosbag 녹화'),
         DeclareLaunchArgument('bag_path', default_value='bags/drive'),
+        DeclareLaunchArgument('debug_speed', default_value='0.0',
+                              description='[km/h] >0 이면 상수속도 모드(연동 확인용). '
+                                          '0 = 제한속도·곡률·정지선으로만 주행'),
 
         # 단일 프로세스 (기본)
         # name= 을 주면 __node 리맵이 걸려 프로세스 안 4개 노드가 모두 같은 이름이

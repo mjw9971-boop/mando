@@ -29,8 +29,10 @@
     vehicle.width: 1.886
     vehicle.height: 1.507
     # ── speed ──
-    speed.margin_kph: 3.0
+    speed.margin_kph: 5.0
     speed.a_comf: 1.5
+    speed.a_plan_factor: 0.7
+    speed.stop_latch_v: 1.5
     speed.a_max: 2.0
     speed.a_min: -6.0
     speed.a_emergency: -8.0
@@ -85,6 +87,9 @@
     control.k_ld: 0.8
     control.ld_min: 5.0
     control.ld_max: 20.0
+    control.ki_band_mps: 1.0
+    control.k_curv: 12.0
+    control.ld_curve_min: 3.0
     control.steer_rate_max: 1.0
     # ── shield ──
     shield.edge_margin_m: 0.3
@@ -95,6 +100,7 @@
     log.path: ""
     log.flush_every: 20
     # ── debug ──
+    debug.enabled: false
     debug.const_speed_kph: 20.0
     debug.path_dist_m: 40.0
     debug.path_step_m: 0.5

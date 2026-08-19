@@ -86,12 +86,16 @@ class Perception:
         idx = self._route_index(m.lane, flags)
         route_s = (float(self.route['cum_s'][idx]) + m.s) if (self.route and idx is not None) else m.s
 
-        # route_s 가 크게 뒤로 가는 것도 리셋 신호다 (위치 점프가 작아도 잡힌다)
+        # route_s 가 크게 뒤로 가는 것도 리셋 신호다 (위치 점프가 작아도 잡힌다).
+        # 단 **경로 위에 있을 때만** 의미가 있다. 경로를 벗어났거나 완주한 뒤에는
+        # route_s 가 다른 구간에 다시 붙으면서 크게 요동쳐 오탐이 된다
+        # (실측: 완주 직후 10건이 전부 이 경우였다).
         drop_thr = float(self.cfg['percep']['reset_route_s_drop_m'])
-        if (self._prev_route_s is not None and not flags.get('reset')
+        on_route = not flags.get('off_route')
+        if (on_route and self._prev_route_s is not None and not flags.get('reset')
                 and self._prev_route_s - route_s > drop_thr):
             self._mark_reset(flags, route_s_drop=self._prev_route_s - route_s)
-        self._prev_route_s = route_s
+        self._prev_route_s = route_s if on_route else None
 
         ego = EgoState(x=x, y=y, z=z, yaw=yaw, pitch=pitch, roll=roll,
                        speed=speed, accel=accel, lane=m.lane, s=m.s,

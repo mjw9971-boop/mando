@@ -178,14 +178,26 @@ def test_path_transition_is_smooth_and_progresses(lg, route, lc_event):
 
 
 def test_speed_is_not_reduced_during_lane_change(lg, route, lc_event):
-    """전이 중 감속하지 않는다 (녹색신호 통과 감점 방지)."""
+    """
+    전이 중 차선변경을 이유로 감속하지 않는다 (녹색신호 통과 감점 방지).
+
+    v_target 은 제한속도·곡률·정지선이 정한다. 차선변경이 그 값을 더 깎지 않아야 한다.
+    """
     pl = Planner(lg, route, CFG)
     v = 5.56
     for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 10]:
         pl.plan(make_world(lg, route, s, speed=v))
-    d = pl.plan(make_world(lg, route, lc_event['window_s0'] + 1.0, speed=v))
-    assert d.state == LANE_CHANGE
-    assert d.v_target == pytest.approx(CFG['debug']['const_speed_kph'] / 3.6)
+
+    w_in = make_world(lg, route, lc_event['window_s0'] + 1.0, speed=v)
+    d_in = pl.plan(w_in)
+    assert d_in.state == LANE_CHANGE
+
+    # 같은 지점을 차선변경 없이 (새 planner) 계산한 값과 비교
+    pl2 = Planner(lg, route, CFG)
+    d_ref = pl2.plan(make_world(lg, route, lc_event['window_s0'] + 1.0, speed=v))
+    assert d_in.v_target >= d_ref.v_target - 1e-6, \
+        f'차선변경이 속도를 깎았다: {d_ref.v_target:.2f} → {d_in.v_target:.2f}'
+    assert 'debug_const' not in d_in.reasons, '기본 경로에 상수속도가 남아 있다'
 
 
 # ── shield ────────────────────────────────────────────────────────────────

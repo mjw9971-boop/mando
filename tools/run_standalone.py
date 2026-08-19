@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help='jsonl 로그를 Comm 대신 소스로 사용 (VTD 불필요)')
     ap.add_argument('--log', default=None, help='틱 로그를 쓸 jsonl 경로')
     ap.add_argument('--max-ticks', type=int, default=0, help='0 = 무제한 (디버깅용)')
+    ap.add_argument('--debug-speed', type=float, default=0.0,
+                    help='[km/h] >0 이면 상수속도 모드. 0 = 제한속도 기반 주행')
     return ap
 
 
@@ -70,6 +72,9 @@ class Runner:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.cfg = load_config(args.config)
+        if getattr(args, 'debug_speed', 0.0) > 0:
+            self.cfg['debug']['enabled'] = True
+            self.cfg['debug']['const_speed_kph'] = args.debug_speed
         self.args = args
 
         self.lg = LaneGraph(args.graph)

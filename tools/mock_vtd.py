@@ -71,6 +71,13 @@ def _light_at(a: argparse.Namespace, t: float) -> tuple[int, int]:
     """
     if not a.lights:
         return (0, 0)
+    if a.light_state is not None:
+        # 고정 상태. 정지 위치 정확도를 재려면 적색이 계속 유지돼야 한다
+        # (순환 주기로는 완전 정지 전에 녹색으로 바뀐다).
+        lid = a.light_id
+        if a.light_switch_s > 0:
+            lid += int(t // a.light_switch_s)
+        return (lid, a.light_state)
     phase = t % CYCLE_LEN
     state = LIGHT_CYCLE[-1][0]
     acc = 0.0
@@ -160,6 +167,8 @@ def main(argv=None) -> int:
     ap.add_argument('--light-id', type=int, default=3, help='시작 신호등 id')
     ap.add_argument('--light-switch-s', type=float, default=0.0,
                     help='[s] 이 주기마다 신호등 id 를 바꾼다 (0 = 고정)')
+    ap.add_argument('--light-state', type=int, default=None,
+                    help='신호 상태를 고정한다 (1=적 2=황 3=녹 ...). 정지 위치 측정용')
     return serve(ap.parse_args(argv))
 
 

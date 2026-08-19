@@ -108,6 +108,10 @@ class Control:
         self.ld_min = float(c['ld_min'])
         self.ld_max = float(c['ld_max'])
         self.steer_rate_max = float(c['steer_rate_max'])
+        self.ki_band = float(c.get('ki_band_mps', 1e9))
+        self.k_curv = float(c.get('k_curv', 0.0))
+        self.ld_curve_min = float(c.get('ld_curve_min', 3.0))
+        self.last_curv = 0.0
         self.a_min = float(s['a_min'])
         self.a_max = float(s['a_max'])
         self.jerk_max = float(s['jerk_max'])
@@ -165,6 +169,15 @@ class Control:
         ego = world.ego
         v = max(0.0, ego.speed)
         ld = _clamp(self.k_ld * v, self.ld_min, self.ld_max)
+
+        # 곡률이 크면 lookahead 를 줄인다.
+        # 47 km/h 면 L_d 가 10 m 인데 교차로 연결로 반경이 13 m 라, 그대로 두면
+        # 목표점이 코너 안쪽에 놓여 경로를 잘라 먹는다.
+        #   L_d = clamp(k_ld*v, ld_min, ld_max) / (1 + k_curv*|curv|)
+        curv = self._path_curvature(path, ld)
+        self.last_curv = curv
+        if self.k_curv > 0.0 and curv > 0.0:
+            ld = max(self.ld_curve_min, ld / (1.0 + self.k_curv * curv))
         self.last_ld = ld
 
         target = self._find_target(path, ego.x, ego.y, ld)
@@ -186,6 +199,38 @@ class Control:
         alpha = math.atan2(ly, lx)
         delta = math.atan2(2.0 * self.wheelbase * math.sin(alpha), max(dist, 1e-3))
         return self._rate_limit(_clamp(delta, -self.max_steer, self.max_steer), dt)
+
+    @staticmethod
+    def _path_curvature(path: list[tuple[float, float]], span_m: float) -> float:
+        """
+        경로 앞쪽 span_m 구간의 최대 |곡률| [1/m].
+
+        LaneGraph 를 참조하지 않고 **따라갈 경로 자체**에서 낸다. 실제로 추종해야
+        하는 곡률이 그것이고, core 가 지도에 의존하지 않아도 된다.
+        연속 세 점의 외접원 반지름(Menger 곡률)을 쓴다.
+        """
+        if len(path) < 3:
+            return 0.0
+        acc = 0.0
+        worst = 0.0
+        for i in range(1, len(path) - 1):
+            ax, ay = path[i - 1]
+            bx, by = path[i]
+            cx, cy = path[i + 1]
+            acc += math.hypot(bx - ax, by - ay)
+            if acc > max(span_m, 1.0):
+                break
+            d1 = math.hypot(bx - ax, by - ay)
+            d2 = math.hypot(cx - bx, cy - by)
+            d3 = math.hypot(cx - ax, cy - ay)
+            if d1 < 1e-6 or d2 < 1e-6 or d3 < 1e-6:
+                continue
+            # 삼각형 넓이 * 2
+            cross = abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+            k = 2.0 * cross / (d1 * d2 * d3)
+            if k > worst:
+                worst = k
+        return worst
 
     @staticmethod
     def _find_target(path: list[tuple[float, float]], x: float, y: float,
@@ -227,7 +272,14 @@ class Control:
             return self.a_hold
 
         err = v_t - v
-        self._i_term += err * dt
+        # 적분은 목표 근처에서만 쌓는다.
+        # 정지→목표속도처럼 오차가 큰 구간에서 계속 적분하면, 목표에 도달한 뒤에도
+        # 적분항이 가속을 밀어 제한속도를 넘긴다 (실측: 27 목표에 28.4 까지 오버슛).
+        # 출력 포화 시 되돌리는 기존 방어만으로는 포화 전 구간을 못 막는다.
+        if abs(err) <= self.ki_band:
+            self._i_term += err * dt
+        else:
+            self._i_term *= 0.9          # 대역 밖에서는 서서히 흘려보낸다
         raw = self.kp * err + self.ki * self._i_term
 
         accel = _clamp(raw, self.a_min, self.a_max)

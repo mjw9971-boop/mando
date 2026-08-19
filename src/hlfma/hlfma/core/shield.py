@@ -29,11 +29,16 @@ class Shield:
         """
         fired: dict = {}
 
-        v_cap = float(self.cfg['debug']['const_speed_kph']) / 3.6
-        v_new = max(0.0, min(decision.v_target, v_cap))
-        if v_new != decision.v_target:
-            fired['const_cap'] = [decision.v_target, v_new]
-            decision.v_target = v_new
+        # 디버그 상수속도 캡: debug.enabled 이고 값이 양수일 때만.
+        # (기본 주행에서는 planner 의 _speed_candidates 가 v_target 을 정한다.
+        #  이 캡이 무조건 걸리면 const_speed_kph=0 일 때 v_target 이 0 으로 눌린다.)
+        dbg = self.cfg['debug']
+        if dbg.get('enabled') and float(dbg['const_speed_kph']) > 0.0:
+            v_cap = float(dbg['const_speed_kph']) / 3.6
+            v_new = max(0.0, min(decision.v_target, v_cap))
+            if v_new != decision.v_target:
+                fired['const_cap'] = [decision.v_target, v_new]
+                decision.v_target = v_new
 
         self._forbid_illegal_lane_change(world, decision, fired)
         self._abort_lane_change_on_ttc(world, decision, fired)

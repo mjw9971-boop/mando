@@ -37,6 +37,7 @@ class Planner:
         self._lc = None            # 진행/대기 중인 이벤트 dict
         self._lc_signal_on = False
         self._lc_warned = set()    # 창을 놓칠 뻔한 경고를 이벤트당 한 번만
+        self._stop_latch = False   # 정지 확정. 정지선이 시야를 벗어나도 유지한다
         self.lc_done = 0           # 완료 횟수 (품질 지표)
         self.lc_aborted = 0
         # TODO: AVOID 진입 시점 등
@@ -48,9 +49,16 @@ class Planner:
         제한속도/정지선/신호/객체 중재는 아직 TODO (_speed_candidates).
         차선변경만 경로 이벤트를 근거로 실행한다.
         """
-        v_const = float(self.cfg['debug']['const_speed_kph']) / 3.6
-        v_target = 0.0 if not world.valid else v_const
-        reasons: dict = {'const': v_const}
+        # 기본 주행은 _speed_candidates 만으로 속도를 정한다.
+        # debug.enabled 일 때만 상수속도 상한을 얹는다 (초기 연동 확인용).
+        dbg = self.cfg['debug']
+        reasons: dict = {}
+        if dbg.get('enabled') and float(dbg['const_speed_kph']) > 0:
+            v_const = float(dbg['const_speed_kph']) / 3.6
+            reasons['debug_const'] = v_const
+            v_target = 0.0 if not world.valid else v_const
+        else:
+            v_target = 0.0 if not world.valid else math.inf
         turn_signal = TURN_OFF
 
         if not world.valid or world.ego.lane is None:
@@ -84,10 +92,16 @@ class Planner:
         # ── 종방향: 후보들의 min() 중재 ──────────────────────────────────
         cand = self._speed_candidates(world)
         reasons.update(cand)
-        v_target = min([v_target] + list(cand.values()))
+        pool = dict(cand)
+        if 'debug_const' in reasons:
+            pool['debug_const'] = reasons['debug_const']
+        v_target = min([v_target] + list(pool.values()))
+        if not math.isfinite(v_target):
+            v_target = 0.0                      # 후보가 하나도 없다 = 근거 없음 → 정지
+            reasons['no_candidate'] = 0.0
         reasons['v_target'] = round(v_target, 3)
-        winner = min(cand, key=cand.get) if cand else None
-        reasons['winner'] = winner if (winner and cand[winner] <= v_target + 1e-6) else 'const'
+        winner = min(pool, key=pool.get) if pool else None
+        reasons['winner'] = winner if winner else 'none'
 
         # 정지선 때문에 서는 중이면 FSM 상태로 드러낸다 (차선변경이 우선)
         if self.state != LANE_CHANGE and winner == 'stop_line' and v_target < 0.5:
@@ -106,7 +120,10 @@ class Planner:
         v^2 = v_at^2 + 2*a*d  (등감속). 이걸 후보로 쓰면 제한이 걸리는 지점에
         **도달했을 때 이미 그 속도**가 되어 있다.
         """
-        a = float(self.cfg['speed']['a_comf'])
+        sp = self.cfg['speed']
+        # 계획 감속도는 a_comf 에 여유를 둔다. 제어기가 프로파일을 즉시 따라오지
+        # 못해서(램프 추종 지연) a_comf 를 그대로 쓰면 정지선을 넘어간다.
+        a = float(sp['a_comf']) * float(sp.get('a_plan_factor', 1.0))
         return math.sqrt(max(0.0, v_at * v_at + 2.0 * a * max(0.0, dist)))
 
     def _speed_candidates(self, world: WorldState) -> dict:
@@ -219,15 +236,6 @@ class Planner:
           (일시정지 규정 확인 전까지 — SPEC §7 미확인 항목)
         """
         summ = world.summ or {}
-        d = summ.get('dist_stop_line')
-        if d is None:
-            return None
-        if not (summ.get('stop_signal_ids') or []):
-            return None                      # 비신호 정지선 — 아직 다루지 않는다
-        if world.light is None:
-            return None
-
-        state = int(world.light[1])
         sp = self.cfg['speed']
         gap = float(sp['stop_gap_m'])
         yellow_s = float(self.cfg['signal']['yellow_s'])
@@ -235,8 +243,27 @@ class Planner:
 
         GREEN, GREEN_LEFT, LEFT, YELLOW, RED, FLASH = 3, 5, 4, 2, 1, 6
 
+        if world.light is None:
+            self._stop_latch = False
+            return None
+        state = int(world.light[1])
+
+        # 녹색이면 래치를 풀고 통과 (**녹색신호 통과도 채점 항목**)
         if state in (GREEN, GREEN_LEFT):
-            return None                      # 통과
+            self._stop_latch = False
+            return None
+
+        # 정지 확정 상태면 정지선이 시야를 벗어나도 계속 선다.
+        # 이게 없으면 정지선이 lookahead 를 벗어나는 순간 브레이크를 놓아
+        # 적신호에 그대로 넘어간다 (실측: 정지선 0.13 m 통과).
+        if self._stop_latch:
+            return 0.0
+
+        d = summ.get('dist_stop_line')
+        if d is None:
+            return None
+        if not (summ.get('stop_signal_ids') or []):
+            return None                      # 비신호 정지선 — 아직 다루지 않는다
         if state == LEFT:
             nxt = summ.get('next_turn')
             return None if nxt == 'turn_left' else self._stop_at(d, gap)
@@ -255,8 +282,15 @@ class Planner:
         return None                          # 0 = 미할당
 
     def _stop_at(self, dist: float, gap: float) -> float:
-        """정지선 dist 앞, gap 여유를 두고 정지하기 위한 현재 허용 속도."""
-        return self._approach(0.0, dist - gap)
+        """
+        정지선 dist 앞, gap 여유를 두고 정지하기 위한 현재 허용 속도.
+        충분히 느려지면 정지를 확정(래치)해 정지선을 지나쳐도 유지한다.
+        """
+        v = self._approach(0.0, dist - gap)
+        if v < float(self.cfg['speed'].get('stop_latch_v', 1.5)):
+            self._stop_latch = True
+            return 0.0
+        return v
 
     # ══════════════════════════════════════════════════════════════════════
     # 차선변경

@@ -19,7 +19,13 @@ DEFAULTS: dict[str, Any] = {
              'steer_sign': 1.0, 'connect_retry_s': 1.0, 'recv_bufsize': 65536},
     'vehicle': {'wheelbase': 2.944, 'max_steer': 0.48, 'length': 4.848,
                 'width': 1.886, 'height': 1.507},
-    'speed': {'margin_kph': 3.0, 'a_comf': 1.5, 'a_max': 2.0, 'a_min': -6.0,
+    # margin_kph: 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
+    'speed': {'margin_kph': 5.0, 'a_comf': 1.5,
+              # 계획용 감속도는 a_comf 보다 낮게 잡는다. a_comf 를 그대로 쓰면
+              # 제어 지연분 여유가 없어 정지선을 넘어간다(실측 -1.1 m).
+              'a_plan_factor': 0.7,
+              # 이 속도 아래로 내려가면 정지 확정(래치). 정지선이 시야를 벗어나도 유지
+              'stop_latch_v': 1.5, 'a_max': 2.0, 'a_min': -6.0,
               'a_emergency': -8.0, 'jerk_max': 2.0, 'a_lat_max': 2.0,
               'stop_gap_m': 1.0, 'a_hold': -1.0},
     'caps_kph': {'school_zone': 28.0, 'crosswalk': 25.0, 'junction': 30.0, 'blind': 25.0},
@@ -45,13 +51,21 @@ DEFAULTS: dict[str, Any] = {
                # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개
                'gt_range_m': 80.0, 'range_margin_m': 5.0},
     'control': {'kp': 0.8, 'ki': 0.15, 'k_ld': 0.8, 'ld_min': 5.0, 'ld_max': 20.0,
+                # 적분은 목표 근처에서만 쌓는다. 큰 오차 구간에서 쌓으면
+                # 목표에 닿은 뒤에도 가속이 남아 제한속도를 넘는다(와인드업).
+                'ki_band_mps': 1.0,
+                # 곡률이 크면 lookahead 를 줄인다 (코너 컷 방지):
+                #   L_d = clamp(k_ld*v, ld_min, ld_max) / (1 + k_curv*|curv|)
+                'k_curv': 12.0, 'ld_curve_min': 3.0,
                 'steer_rate_max': 1.0},
     # lane_side_m: path 가 이만큼 옆으로 벗어나면 차선변경 시도로 본다
     'shield': {'edge_margin_m': 0.3, 'lane_side_m': 1.0},
     # path 가 비어 있으면 dir/run_<타임스탬프>.jsonl 로 자동 생성한다.
     'log': {'enabled': True, 'dir': 'logs', 'path': '', 'flush_every': 20},
-    'debug': {'const_speed_kph': 20.0, 'path_dist_m': 40.0, 'path_step_m': 0.5,
-              'print_hz': 1.0},
+    # enabled=true 일 때만 const_speed_kph 가 속도 상한으로 걸린다.
+    # 기본 주행은 제한속도·곡률·정지선만으로 속도를 정한다.
+    'debug': {'enabled': False, 'const_speed_kph': 20.0,
+              'path_dist_m': 40.0, 'path_step_m': 0.5, 'print_hz': 1.0},
     'default_speed_kph': 50.0,
 }
 

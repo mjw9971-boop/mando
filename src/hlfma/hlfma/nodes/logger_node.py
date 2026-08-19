@@ -28,6 +28,7 @@ from hlfma_msgs.msg import Cmd, Decision, GtState, WorldState
 
 from hlfma.convert import msg_to_command, msg_to_decision, msg_to_packet, msg_to_world
 from hlfma.core.logger import Logger
+from hlfma.core.scoring import SpeedMonitor
 from hlfma.core.timing import Stage, Timer
 from hlfma.nodes.params import collect_core_config
 
@@ -66,6 +67,11 @@ class LoggerNode(Node):
         self._written = 0
         self._orphan = 0
         self._dropped = 0
+
+        # 주행 요약(제한속도 준수는 채점 항목이라 매 주행 찍는다)
+        self.speed_mon = SpeedMonitor(
+            margin_kph=float(cfg['speed']['margin_kph']),
+            school_cap_kph=float(cfg['caps_kph']['school_zone']))
 
         self.st_cb = Stage('logger 콜백')
         self.st_write = Stage('  파일 쓰기(백그라운드)')
@@ -125,6 +131,9 @@ class LoggerNode(Node):
             except Exception as e:                                # noqa: BLE001
                 self.get_logger().error(f'로그 변환 실패: {e}', throttle_duration_sec=5.0)
                 return
+            w = item[1]
+            self.speed_mon.feed(w.ego.speed, w.speed_limit, w.school_zone,
+                                w.ego.route_s, w.t)
             try:
                 self._q.put_nowait(item)
             except queue.Full:
@@ -151,6 +160,8 @@ class LoggerNode(Node):
     def destroy_node(self) -> None:
         self._stop.set()
         self._writer.join(timeout=3.0)
+        for line in self.speed_mon.lines():
+            self.get_logger().info(line)
         if self.enabled:
             self.get_logger().info(
                 f'틱 로그 {self._written}줄 기록 '
