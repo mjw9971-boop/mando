@@ -66,25 +66,48 @@ class Shield:
         decision.path = [(float(x), float(y)) for x, y in pts]
         return True
 
-    @staticmethod
-    def _path_side(world: WorldState, decision: Decision, ahead_m: float = 15.0):
+    def _path_side(self, world: WorldState, decision: Decision, ahead_m: float = 15.0):
         """
-        path 가 현재 위치 기준 어느 쪽으로 벗어나 있는지 [m] (좌 +).
+        path 가 **현재 차로 중심선** 기준 어느 쪽으로 벗어나 있는지 [m] (좌 +).
         차선변경 판정용이라 자차 바로 앞이 아니라 조금 앞을 본다.
+
+        자차 헤딩 프레임으로 재면 안 된다 — 우측 차선변경 중에는 차체가 우로
+        틀어져 전방 경로가 "왼쪽"으로 보이고(실측 2026-08-21 t=11993.7: 우측
+        LC1 전이 중 +1.12 m "좌측 실선 침범" 오판 → LC 강제 중단/재시작 →
+        경계 1.2 s 정체 + 조향 요동), 곡선로에서는 경로가 차로를 그대로
+        따라가도 이탈 -10 m 로 보인다(1702 우회전 연결로에서 수십 틱 연속
+        오발화). 중심선(successor 로 이어붙인 폴리라인)에 투영해서 잰다.
         """
-        if not decision.path:
+        if not decision.path or world.ego.lane is None:
             return 0.0
         e = world.ego
+        # ahead_m 앞의 경로 점
         acc = 0.0
         prev = (e.x, e.y)
-        for px, py in decision.path:
-            acc += math.hypot(px - prev[0], py - prev[1])
-            prev = (px, py)
+        px, py = decision.path[-1]
+        for qx, qy in decision.path:
+            acc += math.hypot(qx - prev[0], qy - prev[1])
+            prev = (qx, qy)
             if acc >= ahead_m:
-                dx, dy = px - e.x, py - e.y
-                return -dx * math.sin(e.yaw) + dy * math.cos(e.yaw)
-        dx, dy = decision.path[-1][0] - e.x, decision.path[-1][1] - e.y
-        return -dx * math.sin(e.yaw) + dy * math.cos(e.yaw)
+                px, py = qx, qy
+                break
+        # 현재 차로 중심선 (섹션이 짧으므로 successor 로 이어붙인다)
+        cl = self.lg.points_ahead(e.lane, e.s, dist=ahead_m + 10.0, step=1.0)
+        if len(cl) < 2:
+            return 0.0
+        best = None
+        for (ax, ay), (bx, by) in zip(cl[:-1], cl[1:]):
+            vx, vy = bx - ax, by - ay
+            L2 = vx * vx + vy * vy
+            if L2 < 1e-12:
+                continue
+            u = min(1.0, max(0.0, ((px - ax) * vx + (py - ay) * vy) / L2))
+            cx, cy = ax + u * vx, ay + u * vy
+            dd = math.hypot(px - cx, py - cy)
+            if best is None or dd < best[0]:
+                cross = vx * (py - ay) - vy * (px - ax)   # >0 이면 왼쪽
+                best = (dd, math.copysign(dd, cross))
+        return best[1] if best else 0.0
 
     # 1 ────────────────────────────────────────────────────────────────────
     def _clamp_speed_limit(self, world: WorldState, d: Decision) -> None:

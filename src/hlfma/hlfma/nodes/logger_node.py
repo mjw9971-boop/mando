@@ -96,7 +96,8 @@ class LoggerNode(Node):
 
     @staticmethod
     def _put(store: OrderedDict, stamp, value) -> None:
-        store[_key(stamp)] = value
+        # 도착 시각(monotonic)을 같이 저장 — 노드 간 지연을 틱 로그에서 재구성한다
+        store[_key(stamp)] = (value, time.monotonic())
         while len(store) > MAX_PENDING:
             store.popitem(last=False)
 
@@ -114,6 +115,7 @@ class LoggerNode(Node):
         if not self.enabled:
             return
         k = _key(msg.header.stamp)
+        t_cmd = time.monotonic()
         gt, ws, dc = self._gt.pop(k, None), self._ws.pop(k, None), self._dc.pop(k, None)
         if gt is None or ws is None or dc is None:
             # 앞단 메시지를 못 받았다 (QoS 유실 등). 이 틱은 건너뛴다.
@@ -125,9 +127,14 @@ class LoggerNode(Node):
                     throttle_duration_sec=5.0)
             return
         with Timer(self.st_cb):
+            (gt, t_gt), (ws, t_ws), (dc, t_dc) = gt, ws, dc
             try:
+                # 각 토픽의 로거 도착 시각(monotonic). gt→ws 사이가 perception,
+                # ws→dc 사이가 planner+shield, dc→cmd 사이가 control 콜백 구간이다.
+                timing = {'arr': {'gt': round(t_gt, 4), 'ws': round(t_ws, 4),
+                                  'dc': round(t_dc, 4), 'cmd': round(t_cmd, 4)}}
                 item = (msg_to_packet(gt), msg_to_world(ws),
-                        msg_to_decision(dc), msg_to_command(msg))
+                        msg_to_decision(dc), msg_to_command(msg), timing)
             except Exception as e:                                # noqa: BLE001
                 self.get_logger().error(f'로그 변환 실패: {e}', throttle_duration_sec=5.0)
                 return

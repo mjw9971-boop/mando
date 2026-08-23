@@ -91,7 +91,20 @@ class LaneGraph:
         return float(x), float(y), float(z), wrap(float(h))
 
     def points_ahead(self, key: LaneKey, s: float, dist: float, step: float = 0.5, route=None, idx=None):
-        """현재 s 에서 dist 만큼 앞의 중심선 점들 (경로가 있으면 다음 차로로 이어서) → (N,2) array"""
+        """
+        현재 s 에서 dist 만큼 앞의 중심선 점들 (경로가 있으면 다음 차로로 이어서) → (N,2) array
+
+        **경로의 차선변경 이음매를 뒤로 점프시키지 않는다.** route['lanes'] 는 차선변경을
+        "평행한 이웃 차로를 연달아 적는" 식으로 표현한다(successor 가 아니다). 이걸
+        successor 처럼 s=0 부터 이어붙이면 경로가 차로 길이만큼 **뒤로** 튀고
+        (실측 6.75 / 12.4 / 30.3 m), Pure Pursuit 목표점이 차 뒤로 넘어가 조향이
+        풀락으로 나간다 — 2026-08-20 주행에서 차선변경 두 곳 모두 도로이탈 +
+        courseRespawn 으로 끝났다(logs/run_20260820_200930.jsonl).
+        그래서 이음매에서는 route 를 따라가지 않고 **자기 successor** 로 잇는다.
+        경로가 기하학적으로 끊기지 않는 것이 우선이고, 목표 차로로의 가로 이동은
+        planner._blend_path 가 맡는다. 이어붙인 차로가 다시 route 위에 있으면
+        그 지점부터 route 추종을 재개한다.
+        """
         out = []
         acc = 0.0
         cur = key
@@ -100,22 +113,42 @@ class LaneGraph:
         while acc < dist and cur is not None:
             r = self.lanes[cur]
             L = r['length']
-            ss = np.arange(s0, L + 1e-9, step)
-            if len(ss) == 0:
-                ss = np.array([L])
-            xs = np.interp(ss, r['s'], r['pts'][:, 0])
-            ys = np.interp(ss, r['s'], r['pts'][:, 1])
-            for x, y in zip(xs, ys):
-                out.append((x, y))
-            acc += L - s0
-            s0 = 0.0
-            if route is not None and i is not None and i + 1 < len(route['lanes']):
-                i += 1
-                cur = route['lanes'][i]
+            if s0 < L - 1e-9:
+                ss = np.arange(s0, L + 1e-9, step)
+            elif not out:
+                ss = np.array([min(s0, L)])       # 경로 끝에서도 최소 한 점은 낸다
             else:
+                ss = None
+            if ss is not None:
+                xs = np.interp(ss, r['s'], r['pts'][:, 0])
+                ys = np.interp(ss, r['s'], r['pts'][:, 1])
+                for x, y in zip(xs, ys):
+                    out.append((x, y))
+            acc += max(0.0, L - s0)
+            nxt = None
+            if route is not None and i is not None and i + 1 < len(route['lanes']):
+                nxt = route['lanes'][i + 1]
+                if nxt in r['next']:
+                    i += 1
+                else:
+                    nxt = None                    # 차선변경 이음매 — 아래로 떨어뜨린다
+            if nxt is None:
                 nx = r['next']
-                cur = nx[0] if nx else None
+                nxt = nx[0] if nx else None
+                i = self._route_pos(route, nxt)
+            cur = nxt
+            s0 = 0.0
         return np.array(out) if out else np.zeros((0, 2))
+
+    @staticmethod
+    def _route_pos(route, lane) -> Optional[int]:
+        """route['lanes'] 안에서의 위치. 없으면 None (이후로는 successor 만 따라간다)."""
+        if route is None or lane is None:
+            return None
+        try:
+            return route['lanes'].index(tuple(lane))
+        except ValueError:
+            return None
 
     def mark_at(self, key: LaneKey, s: float, side: str):
         segs = self.lanes[key]['left_mark' if side == 'left' else 'right_mark']
@@ -270,23 +303,47 @@ class LaneGraph:
             for ev in events_by_lane.get(key, []):
                 if ev['s_in_lane'] >= s0 - 1e-6:
                     items.append(Ahead(base + ev['s_in_lane'], ev['kind'], key, ev['s_in_lane'], dict(ev)))
-            # 막다른 차로
-            if not r['next'] and i + 1 >= len(lanes):
+            # 경로 끝 / 막다른 차로.
+            # route_end 는 "경로 차로열이 여기서 끝난다"다 — successor 유무와
+            # 무관하다. 예전엔 successor 없는 차로에서만 방출해서, 마지막 경로
+            # 차로에 successor 가 있으면(1602/-3 → 1615/1631) 완주 후에도 그대로
+            # 달렸다 (2026-08-21: 완주 후 6.94 m/s 로 93 m 초과 주행).
+            if i + 1 >= len(lanes):
                 items.append(Ahead(base + L, 'route_end', key, L, {}))
             elif not r['next']:
                 items.append(Ahead(base + L, 'dead_end', key, L, {}))
-            acc += L - s0
-            s0 = 0.0
+            # 다음 차로로 전진. **차선변경 이음매(평행 이웃)는 진행거리가 늘지
+            # 않는다** — 같은 물리 구간을 옆 차로에서 이어 보는 것이므로 acc 를
+            # 그대로 두고 s 위치도 유지한다. 이걸 successor 처럼 L-s0 를 더하면
+            # 전방 정지선/횡단보도/회전까지의 거리가 이음매마다 차로 길이만큼
+            # (2026-08-21 경로 실측 12/30/6 m) 과대 보고되고, route['cum_s']
+            # (build_route.advance 가 hop 을 0 으로 계상)와도 어긋난다.
+            if i + 1 < len(lanes) and lanes[i + 1] not in r['next'] \
+                    and lanes[i + 1] in (r['left_nb'], r['right_nb']):
+                s0 = min(s0, self.lanes[lanes[i + 1]]['length'])
+            else:
+                acc += L - s0
+                s0 = 0.0
             i += 1
         items = [it for it in items if it.dist <= horizon + 1e-6]
         items.sort(key=lambda it: it.dist)
-        return items
+        # 평행 차로를 같은 s 에서 두 번 훑으므로 같은 물리 지점(정지선/횡단보도
+        # 등)이 양쪽 차로에서 한 번씩 나온다. 종류별로 0.5 m 안에 겹치면 중복이다.
+        out: List[Ahead] = []
+        last_at: Dict[str, float] = {}
+        for it in items:
+            prev = last_at.get(it.kind)
+            if prev is not None and it.dist - prev < 0.5:
+                continue
+            last_at[it.kind] = it.dist
+            out.append(it)
+        return out
 
     def summarize(self, ahead: List[Ahead]) -> Dict[str, Any]:
         """lookahead 결과를 판단 노드가 바로 쓰는 요약치로"""
         out = {'dist_stop_line': None, 'stop_signal_ids': [], 'dist_crosswalk': None,
                'dist_next_turn': None, 'next_turn': None, 'dist_lane_change': None, 'lane_change_dir': None,
-               'dist_junction': None, 'dist_dead_end': None, 'speed_changes': []}
+               'dist_junction': None, 'dist_dead_end': None, 'dist_route_end': None, 'speed_changes': []}
         for it in ahead:
             if it.kind == 'stop_line' and out['dist_stop_line'] is None:
                 out['dist_stop_line'] = it.dist
@@ -303,6 +360,8 @@ class LaneGraph:
                 out['dist_junction'] = it.dist
             elif it.kind == 'dead_end' and out['dist_dead_end'] is None:
                 out['dist_dead_end'] = it.dist
+            elif it.kind == 'route_end' and out['dist_route_end'] is None:
+                out['dist_route_end'] = it.dist
             elif it.kind == 'speed':
                 out['speed_changes'].append((it.dist, it.data['limit'], it.data['school_zone']))
         return out

@@ -41,7 +41,7 @@ TL_UNASSIGNED, TL_RED, TL_YELLOW, TL_GREEN, TL_LEFT, TL_GREEN_LEFT, TL_FLASH = r
 TURN_OFF, TURN_LEFT, TURN_RIGHT = 0, 1, 2
 
 
-def parse(frame: bytes, t_recv: float | None = None) -> RawPacket:
+def parse(frame: bytes, t_recv: float | None = None, frames_total: int = 0) -> RawPacket:
     """1109 B 한 프레임 → RawPacket. id == 0 인 슬롯은 버린다."""
     if len(frame) < FRAME_SIZE:
         raise ValueError(f'프레임이 짧다: {len(frame)} < {FRAME_SIZE}')
@@ -64,7 +64,7 @@ def parse(frame: bytes, t_recv: float | None = None) -> RawPacket:
 
     return RawPacket(
         t_recv=time.monotonic() if t_recv is None else t_recv,
-        ego=ego, objects=objects, lights=lights,
+        ego=ego, objects=objects, lights=lights, frames_total=frames_total,
     )
 
 
@@ -197,7 +197,8 @@ class Comm:
 
         self.frames_seen += 1
         self.last_rx = time.monotonic()
-        return parse(last, t_recv=self.last_rx)
+        return parse(last, t_recv=self.last_rx,
+                     frames_total=self.frames_seen + self.frames_dropped)
 
     # ── 송신 ──────────────────────────────────────────────────────────────
     def send(self, cmd: Command) -> bool:

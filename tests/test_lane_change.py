@@ -22,7 +22,9 @@ from hlfma.nodes.params import load_params_yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE = ROOT / 'data' / 'route_example.pkl'
+ROUTE = ROOT / 'data' / 'route.pkl'
+if not ROUTE.exists():
+    ROUTE = ROOT / 'data' / 'route_example.pkl'
 CFG = load_params_yaml(PARAMS_YAML)
 
 pytestmark = pytest.mark.skipif(not (GRAPH.exists() and ROUTE.exists()),
@@ -41,15 +43,25 @@ def route():
 
 @pytest.fixture(scope='module')
 def lc_event(route):
-    evs = [e for e in route['events'] if e['kind'].startswith('lane_change')]
-    assert evs, '경로에 차선변경 이벤트가 없다'
+    """바로 앞에 교차로 회전이 없는 첫 LC 이벤트.
+
+    회전 직후의 LC(예: 회전1 연결로 끝 = LC1 창 시작)는 회전 중 반대 방향
+    지시등이 우선해 lead 가 짧아지는 별도 케이스다 (tests/test_lc_lead.py)."""
+    turns = [e['s'] for e in route['events'] if e['kind'].startswith('turn_')]
+    evs = [e for e in route['events'] if e['kind'].startswith('lane_change')
+           and not any(e['window_s0'] - 80.0 <= t <= e['window_s0'] for t in turns)]
+    assert evs, '경로에 (회전과 겹치지 않는) 차선변경 이벤트가 없다'
     return evs[0]
 
 
 def make_world(lg, route, route_s, lane=None, speed=5.56, objects=()):
     """경로상 route_s 지점의 자차 상태를 만든다."""
     cum = route['cum_s']
-    idx = max(i for i in range(len(cum)) if cum[i] <= route_s)
+    # 차선변경 이음매는 from/to 차로의 cum_s 가 같다(평행). 동률이면 **앞쪽(from)**
+    # 차로를 고른다 — 뒤쪽(to)을 고르면 t_off=0 인 자차가 목표 차로에 이미 안착한
+    # 것으로 판정돼 전이가 시작 즉시 끝난다.
+    best = max(cum[i] for i in range(len(cum)) if cum[i] <= route_s)
+    idx = min(i for i in range(len(cum)) if cum[i] == best)
     k = route['lanes'][idx]
     s_in = route_s - cum[idx]
     s_in = max(0.0, min(s_in, lg.length(k)))
@@ -57,7 +69,9 @@ def make_world(lg, route, route_s, lane=None, speed=5.56, objects=()):
     ego = EgoState(x=x, y=y, z=0.0, yaw=h, pitch=0.0, roll=0.0,
                    speed=speed, accel=0.0, lane=lane or k, s=s_in,
                    route_s=route_s, t_off=0.0, heading_err=0.0)
-    return WorldState(t=0.0, ego=ego, objects=list(objects), light=None, ahead=[], summ={},
+    # t 는 route_s / speed — 등속 주행 가정. 틱 시퀀스 테스트에서 지시등 연속
+    # 점등 시간(sig_lead_s) 이 실제처럼 흐르게 한다.
+    return WorldState(t=route_s / max(speed, 0.1), ego=ego, objects=list(objects), light=None, ahead=[], summ={},
                       speed_limit=13.9, school_zone=False, left_solid=False,
                       right_solid=False, left_is_center=False, valid=True, flags={})
 
@@ -71,19 +85,25 @@ def blocker(lane, s_rel):
 
 
 # ── 지시등 ────────────────────────────────────────────────────────────────
-def test_signal_on_before_window(lg, route, lc_event):
+def test_signal_on_before_window(lg, route):
     """창 시작 (lead_s + margin_s) 초 전부터 켜져야 한다."""
     pl = Planner(lg, route, CFG)
     sig = CFG['signal']
     v = 5.56
     lead_m = v * (sig['lead_s'] + sig['margin_s'])
+    # 바로 앞에 교차로 회전이 붙은 LC(예: 회전1 연결로 → LC1)는 회전 지시등이
+    # 우선해 LC 방향이 가려진다(tests/test_turn_signal.py 가 그 규칙을 검사한다).
+    # 여기서는 회전과 겹치지 않는 LC 이벤트로 LC 자체의 lead 를 본다.
+    turns = [e['s'] for e in route['events'] if e['kind'].startswith('turn_')]
+    lc_event = next(e for e in route['events'] if e['kind'].startswith('lane_change')
+                    and not any(e['window_s0'] - 80.0 <= t <= e['window_s0'] for t in turns))
     w0 = lc_event['window_s0']
+    expect = 1 if lc_event['kind'].endswith('left') else 2
 
     far = pl.plan(make_world(lg, route, w0 - lead_m - 15.0, speed=v))
     assert far.turn_signal == 0, '너무 일찍 켜졌다'
 
     near = pl.plan(make_world(lg, route, w0 - lead_m + 2.0, speed=v))
-    expect = 1 if lc_event['kind'].endswith('left') else 2
     assert near.turn_signal == expect
 
 
@@ -114,8 +134,8 @@ def test_no_lane_change_outside_window(lg, route, lc_event):
 def test_lane_change_starts_inside_window(lg, route, lc_event):
     pl = Planner(lg, route, CFG)
     v = 5.56
-    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 10,
-              lc_event['window_s0'] + 1.0]:
+    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 20,
+              lc_event['window_s0'] - 10, lc_event['window_s0'] + 1.0]:
         d = pl.plan(make_world(lg, route, s, speed=v))
     assert d.state == LANE_CHANGE
     assert d.turn_signal != 0
@@ -126,7 +146,7 @@ def test_blocked_target_lane_waits(lg, route, lc_event):
     pl = Planner(lg, route, CFG)
     v = 5.56
     tgt = tuple(lc_event['to_lane'])
-    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 10]:
+    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 20, lc_event['window_s0'] - 10]:
         pl.plan(make_world(lg, route, s, speed=v))
     d = pl.plan(make_world(lg, route, lc_event['window_s0'] + 1.0, speed=v,
                            objects=[blocker(tgt, 10.0)]))
@@ -139,7 +159,7 @@ def test_object_behind_beyond_back_m_does_not_block(lg, route, lc_event):
     v = 5.56
     tgt = tuple(lc_event['to_lane'])
     far_back = -(CFG['lane_change']['back_m'] + 20.0)
-    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 10]:
+    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 20, lc_event['window_s0'] - 10]:
         pl.plan(make_world(lg, route, s, speed=v))
     d = pl.plan(make_world(lg, route, lc_event['window_s0'] + 1.0, speed=v,
                            objects=[blocker(tgt, far_back)]))
@@ -155,7 +175,7 @@ def test_path_transition_is_smooth_and_progresses(lg, route, lc_event):
     pl = Planner(lg, route, CFG)
     v = 5.56
     w0 = lc_event['window_s0']
-    for s in [w0 - 30, w0 - 10]:
+    for s in [w0 - 30, w0 - 20, w0 - 10]:
         pl.plan(make_world(lg, route, s, speed=v))
 
     w = make_world(lg, route, w0 + 1.0, speed=v)
@@ -185,7 +205,7 @@ def test_speed_is_not_reduced_during_lane_change(lg, route, lc_event):
     """
     pl = Planner(lg, route, CFG)
     v = 5.56
-    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 10]:
+    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 20, lc_event['window_s0'] - 10]:
         pl.plan(make_world(lg, route, s, speed=v))
 
     w_in = make_world(lg, route, lc_event['window_s0'] + 1.0, speed=v)
@@ -205,7 +225,7 @@ def test_shield_aborts_lane_change_on_ttc(lg, route, lc_event):
     pl = Planner(lg, route, CFG)
     sh = Shield(lg, CFG, planner=pl)
     v = 5.56
-    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 10]:
+    for s in [lc_event['window_s0'] - 30, lc_event['window_s0'] - 20, lc_event['window_s0'] - 10]:
         pl.plan(make_world(lg, route, s, speed=v))
 
     # 목표 차로에 두면 planner 가 애초에 시작하지 않는다(간격 확인에서 걸림).

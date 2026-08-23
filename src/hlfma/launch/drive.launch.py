@@ -7,7 +7,7 @@
   graph, route         지도/경로 pkl 경로
   host, port           VTD 주소
   params               파라미터 파일 (기본: 패키지의 config/params.yaml)
-  use_single_process   true(기본)= 한 프로세스에 4노드 / false = 노드별 프로세스
+  use_single_process   false(기본)= 노드별 프로세스 / true = 한 프로세스에 4노드
   record               true 면 전 토픽 rosbag 녹화
   bag_path             녹화 경로
 """
@@ -54,11 +54,14 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('graph', default_value='data/lane_graph.pkl'),
         DeclareLaunchArgument('route', default_value='data/route.pkl'),
-        DeclareLaunchArgument('host', default_value='127.0.0.1'),
+        DeclareLaunchArgument('host', default_value='192.168.10.1'),
         DeclareLaunchArgument('port', default_value='9910'),
         DeclareLaunchArgument('params', default_value=default_params),
-        DeclareLaunchArgument('use_single_process', default_value='true',
-                              description='true = 4노드를 한 프로세스에'),
+        # 기본 분리 실행 (2026-08-21 A/B): 단일 프로세스는 GIL 경합으로 프레임
+        # 드롭 17%/gt→cmd p50 43 ms, 분리하면 드롭 0%/p50 2.9 ms. 되돌리려면
+        # use_single_process:=true.
+        DeclareLaunchArgument('use_single_process', default_value='false',
+                              description='true = 4노드를 한 프로세스에 (기본: 분리)'),
         DeclareLaunchArgument('record', default_value='false',
                               description='true 면 전 토픽 rosbag 녹화'),
         DeclareLaunchArgument('bag_path', default_value='bags/drive'),
@@ -66,7 +69,7 @@ def generate_launch_description():
                               description='[km/h] >0 이면 상수속도 모드(연동 확인용). '
                                           '0 = 제한속도·곡률·정지선으로만 주행'),
 
-        # 단일 프로세스 (기본)
+        # 단일 프로세스 (use_single_process:=true 일 때)
         # name= 을 주면 __node 리맵이 걸려 프로세스 안 4개 노드가 모두 같은 이름이
         # 된다(rosout 경고 + 노드별 파라미터 불가). 각자 이름을 쓰게 둔다.
         Node(package='hlfma', executable='drive',

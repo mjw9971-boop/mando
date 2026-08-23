@@ -15,9 +15,15 @@ from typing import Any
 
 # 근거는 AGENT_SPEC §5.
 DEFAULTS: dict[str, Any] = {
-    'comm': {'host': '127.0.0.1', 'port': 9910, 'send_hz': 20, 'watchdog_s': 1.0,
-             'steer_sign': 1.0, 'connect_retry_s': 1.0, 'recv_bufsize': 65536},
+    'comm': {'host': '192.168.10.1', 'port': 9910, 'send_hz': 20, 'watchdog_s': 1.0,
+             'steer_sign': 1.0, 'connect_retry_s': 1.0, 'recv_bufsize': 65536,
+             # /cmd 가 이 시간 이상 끊기면 vtd_bridge 가 조향을 0 으로 감쇠 재송신
+             # (가속은 유지). 2026-08-21: 풀락 조향이 0.32 s 유지돼 도로이탈.
+             'hold_decay_s': 0.15},
     'vehicle': {'wheelbase': 2.944, 'max_steer': 0.48, 'length': 4.848,
+                # 뒷바퀴축 → 앞범퍼. Ioniq 6 제원: 전장 4855 / 축거 2950 / 앞 오버행 855 /
+                # 뒤 오버행 1050 mm (여기 length 4.848 − wheelbase 2.944 = 1.904 와 일치).
+                'front_overhang_m': 0.855,
                 'width': 1.886, 'height': 1.507},
     # margin_kph: 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
     'speed': {'margin_kph': 5.0, 'a_comf': 1.5,
@@ -27,9 +33,22 @@ DEFAULTS: dict[str, Any] = {
               # 이 속도 아래로 내려가면 정지 확정(래치). 정지선이 시야를 벗어나도 유지
               'stop_latch_v': 1.5, 'a_max': 2.0, 'a_min': -6.0,
               'a_emergency': -8.0, 'jerk_max': 2.0, 'a_lat_max': 2.0,
+              # 정지 목표 선행 보상 [s]: P 제어가 내려가는 목표를 a_plan/kp ≈ 1.3 m/s 늦게
+              # 따라가 정지점을 ~2 m 넘긴다. 목표를 v·stop_lag_s 만큼 앞당긴다 (폐루프
+              # 시뮬: 0.6 이면 앞범퍼가 정지선 −1.0~−1.2 m, 완주 시간 손실 0).
+              'stop_lag_s': 0.6,
+              # 래치 뒤 0 스냅 대신 연속 프로파일 — 시뮬에서 이득 없어 기본 끔
+              'stop_continuous': False,
               'stop_gap_m': 1.0, 'a_hold': -1.0},
-    'caps_kph': {'school_zone': 28.0, 'crosswalk': 25.0, 'junction': 30.0, 'blind': 25.0},
-    'signal': {'yellow_s': 3.0, 'lead_s': 3.0, 'margin_s': 1.0, 'flash_mode': 'yield'},
+    # crosswalk 캡은 없다: 채점표의 속도 항목은 S1.1.01 제한속도 / S1.1.02 스쿨존
+    # 뿐이고 S6.3.03 은 "횡단보도 정차 금지"(멈추지 말라)다. 25 km/h 캡이
+    # 2026-08-21 주행 평균을 19 km/h 로 눌렀다 (완주 필요 평균 36 km/h).
+    'caps_kph': {'school_zone': 28.0, 'junction': 30.0, 'blind': 25.0},
+    'signal': {'yellow_s': 3.0, 'lead_s': 3.0, 'margin_s': 1.0, 'flash_mode': 'yield',
+               # 계획 차선변경은 해당 방향 지시등이 이 시간 이상 연속 점등된 뒤에만 실행
+               'lc_lead_min_s': 3.0,
+               # RTOR(적신호 우회전): 완전 정지 유지 시간, 서행 통과 속도, 스위치(조직위 답변에 따라)
+               'stop_dwell_s': 1.0, 'rtor_speed_kph': 20.0, 'rtor_enabled': True},
     'lead': {'time_headway_s': 2.0, 'min_gap_m': 5.0},
     'ttc': {'warn_s': 4.0, 'brake_s': 2.5, 'emergency_s': 1.5},
     'lane_change': {'back_m': 30.0, 'front_m': 50.0, 'min_window_m': 20.0,
@@ -39,15 +58,27 @@ DEFAULTS: dict[str, Any] = {
                     'done_t_off_m': 0.3, 'done_heading_deg': 5.0},
     'cross': {'margin_s': 2.0},
     'percep': {'horizon_m': 200.0, 'coast_s': 1.5, 'jump_m': 2.0, 'speed_lpf': 0.3,
+               # 속도 추정 슬라이딩 창 [s] (Σ변위/Σ벽시계 dt). 9910 송신 간격이
+               # 40/80 ms 로 불규칙해 틱 단위 d/dt 는 못 쓴다 (2026-08-23 실측).
+               'speed_win_s': 0.4,
                # VTD 대회 브릿지의 courseRespawn 감지.
                # respawnPoseToleranceM=1.5 라 실제 리셋 이동량은 3 m 남짓이다.
                'reset_route_s_drop_m': 5.0,
                # 리셋 판정은 거리 단독으로 하지 않는다. 파이프라인이 멈췄다가
                # 재개되면 차는 정상 속도로 크게 움직이는데 그건 리스폰이 아니다.
                'stall_dt_s': 0.2,          # 이보다 긴 틱 간격은 '스톨'로 분류
+               # 스톨(긴 dt)이라도 이동량이 이보다 크면 텔레포트 = 리셋으로 처리
+               # (2026-08-21: 25 s 갭 + 590 m 이동이 스톨로 분류돼 속도 오염)
+               'stall_teleport_m': 50.0,
                'reset_speed_factor': 3.0,  # 점프속도가 실제속도의 이 배를 넘어야
                'reset_abs_speed': 30.0,    # 그리고 이 절대상한도 넘어야 리스폰
+               # 같은 차로에서 t_off 가 한 틱에 이만큼 뛰면 리스폰 (고속 리스폰은
+               # 환산속도 문턱을 통과한다 — 실측 33 m/s vs 문턱 33.4)
+               'reset_toff_jump_m': 2.0,
                'ped_extrapolate_s': 2.0,
+               # 횡단보도 폴리곤 근사 (s_rel/lat_off 기준). RTOR 안전 확인과
+               # 횡단보도 보행자 정지가 같은 판정을 쓴다.
+               'crosswalk_half_w_m': 8.0, 'crosswalk_back_m': 3.0, 'crosswalk_fwd_m': 7.0,
                # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개
                'gt_range_m': 80.0, 'range_margin_m': 5.0},
     'control': {'kp': 0.8, 'ki': 0.15, 'k_ld': 0.8, 'ld_min': 5.0, 'ld_max': 20.0,
@@ -83,6 +114,11 @@ NOTES: dict[str, list[str]] = {
     ],
     'percep.gt_range_m': [
         '공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개.',
+    ],
+    'comm.hold_decay_s': [
+        '/cmd 가 이 시간 이상 안 오면 vtd_bridge 가 조향만 0 으로 감쇠해 재송신.',
+        '(2026-08-21 주행: 풀락 조향 -0.480 이 0.32 s 유지된 채 3.5 m → 도로이탈)',
+        '가속은 유지 — 적신호 대기와 구분 불가. 완전 단절은 watchdog_s 의 SAFE_STOP.',
     ],
 }
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import math
 import pathlib
+import queue
+import threading
 import time
 
 from .types import Command, Decision, RawPacket, WorldState
@@ -29,20 +31,67 @@ def _num(v):
 
 
 class Logger:
+    """
+    jsonl 틱 로그.
+
+    파일 쓰기는 **전용 스레드**에서 한다. write() 는 직렬화까지만 하고 큐에
+    넣는다 — 틱 콜백에서 동기 파일 I/O(플러시 수십 ms)를 하면 20 Hz 루프가
+    그대로 밀린다. (ROS 경로의 logger_node 도 자체 큐를 한 겹 더 두는데,
+    이중 버퍼일 뿐 해롭지 않다. standalone 경로는 이 큐가 유일한 방벽이다.)
+    큐가 차면 버린다 — 기록보다 주행이 우선이다.
+    """
+
     def __init__(self, path: str | None, cfg: dict) -> None:
         self.path = path
         self.cfg = cfg
         self.flush_every = int(cfg.get('log', {}).get('flush_every', 20))
         self._f = None
         self._n = 0
+        self.dropped = 0
+        # sim_dt 환산용 프레임 주기 (9910 은 프레임당 sim 1/send_hz 진행)
+        self._frame_s = 1.0 / float(cfg.get('comm', {}).get('send_hz', 20))
+        self._prev_wall: float | None = None
+        self._prev_frames: int | None = None
+        self._q: queue.Queue | None = None
+        self._stop = threading.Event()
+        self._writer: threading.Thread | None = None
         if path:
             pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._f = open(path, 'w', encoding='utf-8')
+            self._q = queue.Queue(maxsize=2000)
+            self._writer = threading.Thread(target=self._writer_loop, daemon=True)
+            self._writer.start()
+
+    def _writer_loop(self) -> None:
+        while not self._stop.is_set() or not self._q.empty():
+            try:
+                line = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._f.write(line)
+                self._n += 1
+                if self._n % self.flush_every == 0:
+                    self._f.flush()
+            except OSError:
+                pass
+
+    def _put(self, line: str) -> None:
+        if self._q is None:
+            return
+        try:
+            self._q.put_nowait(line)
+        except queue.Full:
+            self.dropped += 1
 
     # ── 틱 기록 ───────────────────────────────────────────────────────────
     def write(self, pkt: RawPacket, world: WorldState, decision: Decision,
-              cmd: Command) -> None:
-        """한 틱을 jsonl 한 줄로. replay 가 재구성할 수 있을 만큼 전부 담는다."""
+              cmd: Command, timing: dict | None = None) -> None:
+        """한 틱을 jsonl 한 줄로. replay 가 재구성할 수 있을 만큼 전부 담는다.
+
+        timing: 호출자(노드)가 잰 도착 시각 등 부가 계측. 아래의 wall/sim 차분과
+        합쳐 'timing' 필드로 남는다.
+        """
         if self._f is None:
             return
         e = world.ego
@@ -96,10 +145,23 @@ class Logger:
                 'turn_signal': int(cmd.turn_signal),
             },
         }
-        self._f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-        self._n += 1
-        if self._n % self.flush_every == 0:
-            self._f.flush()
+        # ── 시간 계측: RTF(sim/wall) 판별용 ──────────────────────────────
+        # t(=t_recv) 는 소켓 수신 시각 time.monotonic() = **벽시계**다.
+        # 9910 프레임에는 sim 타임스탬프 필드가 없어(§1.1) sim 경과시간은
+        # 프레임 카운터 차분 x 프레임주기(50 ms)로 계산한다.
+        tm = dict(timing or {})
+        wall = float(pkt.t_recv)
+        frames = int(getattr(pkt, 'frames_total', 0) or 0)
+        if self._prev_wall is not None:
+            tm['wall_dt'] = round(wall - self._prev_wall, 4)
+        if frames > 0:
+            tm['frames_total'] = frames
+            if self._prev_frames:
+                tm['sim_dt'] = round((frames - self._prev_frames) * self._frame_s, 4)
+        self._prev_wall = wall
+        self._prev_frames = frames if frames > 0 else self._prev_frames
+        rec['timing'] = tm
+        self._put(json.dumps(rec, ensure_ascii=False) + '\n')
 
     # ── 부가 로그 ─────────────────────────────────────────────────────────
     def error(self, tick: int, exc: BaseException, streak: int) -> None:
@@ -119,14 +181,20 @@ class Logger:
     def _event(self, kind: str, **kw) -> None:
         if self._f is None:
             return
-        self._f.write(json.dumps({'t': time.monotonic(), 'event': kind, **kw},
-                                 ensure_ascii=False) + '\n')
+        self._put(json.dumps({'t': time.monotonic(), 'event': kind, **kw},
+                             ensure_ascii=False) + '\n')
 
     def close(self) -> None:
+        if self._writer is not None:
+            self._stop.set()
+            self._writer.join(timeout=3.0)
+            self._writer = None
         if self._f is not None:
             self._f.flush()
             self._f.close()
             self._f = None
+        if self.dropped:
+            print(f'[logger] 큐 포화로 {self.dropped}줄 버림', flush=True)
 
 
 def _jsonable(d):

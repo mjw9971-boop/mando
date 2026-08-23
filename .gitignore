@@ -1,11 +1,4 @@
-build/
-install/
-log/
-__pycache__/
-*.pyc
-.vscode/
-
-# ===== ROS2 build artifacts =====
+# ===== ROS2 build =====
 build/
 install/
 log/
@@ -17,28 +10,13 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# ===== PyTorch 학습 산출물 =====
-checkpoints/
-*.pth
-*.pt
-runs/
-wandb/
-
-# ===== 데이터셋 (용량 크므로 git 관리 X) =====
-dataset_out/
-*.npz
-
 # ===== IDE / OS =====
 .vscode/
 .idea/
 .DS_Store
 
-# ===== 로그 =====
-*.log
-
-# --- HL FMA 컨트롤러 ---
-data/*.pkl
+# ===== HL FMA 컨트롤러 =====
 logs/
-__pycache__/
-*.bin
 bags/
+*.bin
+*.log

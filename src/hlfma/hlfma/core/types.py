@@ -23,6 +23,11 @@ class RawPacket:
     objects: list[tuple]                   # id != 0 인 것만
     #                                        (id, x, y, z, heading, speed, length, width, height)
     lights: list[tuple[int, int]]          # (id, state), id == 0 이면 제외
+    # 접속 후 지금까지 소켓에 도착한 9910 프레임 수 (버린 백로그 포함).
+    # 프레임 하나 = 시뮬레이션 1/send_hz(50 ms) 이므로 이 카운터의 차분이
+    # 시뮬레이션 경과시간이다 — 프레임에 sim 타임스탬프 필드가 없어서(§1.1)
+    # RTF(sim/wall) 판별은 이 값으로만 가능하다. 0 = 카운터 없음(리플레이 등).
+    frames_total: int = 0
 
 
 @dataclass

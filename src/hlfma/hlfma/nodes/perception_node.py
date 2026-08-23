@@ -92,9 +92,13 @@ class PerceptionNode(Node):
             self.st_gap.record(msg.t_recv - self._prev_rx, at)
         self._prev_rx = msg.t_recv
 
+        cb_t0 = time.monotonic()
         with Timer(self.st_all, at):
             with Timer(self.st_core, at):
                 ws = self.core.update(msg_to_packet(msg))
+            # 콜백 시작/끝 벽시계(monotonic) — 스톨이 어느 구간(수신/계산/전달)에서
+            # 나는지 틱 로그에서 재구성하기 위한 계측 (flags 는 그대로 로그에 남는다)
+            ws.flags['cb_perc'] = [cb_t0, time.monotonic()]
             with Timer(self.st_pub, at):
                 self.pub.publish(world_to_msg(ws, msg.header.stamp))
         self._report_reset(ws)

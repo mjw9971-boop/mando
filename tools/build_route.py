@@ -16,6 +16,7 @@ build_route.py ─ 대회 공식 경유점 CSV → route.pkl   (대회날 경로
 route.pkl:
     lanes        : [lane_key ...]        차로 순서
     cum_s        : [float ...]           각 차로 시작점의 경로 누적거리
+                   차선변경 hop 은 평행 차로라 증가분 0 (실주행거리와 일치시킨다)
     lengths      : [float ...]
     total_length : float
     waypoints    : [(x,y) ...]
@@ -23,6 +24,7 @@ route.pkl:
     events       : [{kind, s, lane, s_in_lane, ...}]
                    kind = turn_left / turn_right / lane_change_left / lane_change_right
                    lane_change 는 window_s0/window_s1 (경로 누적거리, 점선 구간) 포함
+                   창 시작점은 laneSection 경계를 넘어 최대한 앞으로 당긴다
 탐색 규칙: 차로 길이 = 비용, 차선변경 = +25m 비용 (점선 구간이 있을 때만 허용), 막다른 차로 자동 회피
 """
 import argparse, heapq, math, pickle, sys
@@ -63,6 +65,108 @@ def has_broken(lg, key, side):
     if lg.neighbor(key, side) is None:
         return False
     return any(ok for _, _, _, _, ok in lg.lanes[key]['left_mark' if side == 'left' else 'right_mark'])
+
+
+def is_lane_change_hop(lg, k, k2) -> bool:
+    """route['lanes'] 의 k -> k2 가 차선변경(평행 이웃)인가. successor 면 False."""
+    if k2 in lg.successors(k):
+        return False
+    return k2 in (lg.neighbor(k, 'left'), lg.neighbor(k, 'right'))
+
+
+def advance(lg, k, k2, length_k) -> float:
+    """
+    k 를 떠나 k2 로 갈 때 **경로 누적거리** 증가분 [m].
+
+    차선변경은 평행한 이웃 차로로 옮겨 타는 것이라 진행거리가 늘지 않는다.
+    successor 처럼 차로 길이를 더하면 route_s 가 통째로 과대계상된다
+    (2026-08-21 주행: 실주행 221.3 m 인데 route_s 는 273.8 m -- 52.5 m 초과).
+    route_s 는 차선변경 창 판정과 `_blend_path` 의 전이 진행도 기준이라
+    이게 틀리면 창이 엉뚱한 물리적 위치에 놓인다.
+
+    평행 차로는 같은 laneSection 안에서 주행방향 s 가 정렬돼 있으므로
+    (곡률 차이로 길이가 몇 cm 다른 정도) 증가분 0 으로 두면 된다.
+    """
+    return 0.0 if is_lane_change_hop(lg, k, k2) else length_k
+
+
+# 차선변경 창이 이보다 짧으면 리포트에서 경고한다.
+# planner 의 전이거리 = max(lane_change.transition_s * v, lane_change.transition_min_m)
+# 이고 transition_min_m 이 20 m 다 (params.yaml). 창이 그보다 짧으면 전이를
+# 끝낼 수 없다 — 2026-08-21 주행에서 창 6.1 m 짜리 차선변경이 실패해
+# 헤딩오차 46°, 조향 풀락 포화, 도로이탈 + courseRespawn 으로 끝났다.
+MIN_LC_WINDOW_M = 20.0
+
+# 점선 구간 두 개가 이만큼 안쪽으로 붙어 있으면 하나로 잇는다 (샘플 경계 오차)
+MARK_JOIN_M = 1e-6
+# 점선 구간이 차로 끝까지 닿았다고 볼 허용오차 [m]
+MARK_EDGE_M = 0.5
+
+
+def dashed_runs(lg, key, side):
+    """side 방향 **연속 점선** 구간 [(s0, s1) ...]. 실선/none 에서 끊긴다."""
+    segs = sorted((a, b) for a, b, typ, col, ok in
+                  lg.lanes[key]['left_mark' if side == 'left' else 'right_mark'] if ok)
+    out = []
+    for a, b in segs:
+        if out and a - out[-1][1] <= MARK_JOIN_M:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def lane_change_window(lg, lanes, cum, seq, i, side, target):
+    """
+    차선변경 창 -> (window_s0, window_s1, lane_idx, s_in_lane)
+
+    **끝점은 기존 그대로** — 지금 차로 lanes[i] 의 마지막 점선 구간 끝이다.
+    **시작점만 최대한 앞으로 당긴다**: 거기서 뒤로 거슬러 올라가며 "차선변경
+    가능" 이 끊기지 않는 가장 이른 지점을 찾는다.
+
+    laneSection 은 OpenDRIVE 의 차로구성 변경 단위라 차선변경에 필요한 거리와
+    아무 상관이 없다 (도로 128 은 12 m, 도로 1648 은 6 m). 그래서 같은 차로가
+    successor 로 끊김 없이 이어지는 동안은 section 경계를 넘어 병합한다.
+
+    뒤로 못 가는 조건 (여기서 멈춘다):
+      · 앞 차로가 route 상 successor 가 아니다 (차선변경으로 들어온 차로)
+      · 앞 차로가 교차로 연결로다 (junction != -1)
+      · 앞 차로에 side 이웃이 없거나, 그 이웃이 target 으로 이어지지 않는다
+        (= 목표 차로가 거기엔 아직 없다)
+      · 앞 차로의 그 방향이 실선이다 (roadMark type != broken)
+      · 그 차로에 route 가 진입한 지점 (그 앞은 우리가 지나온 길이 아니다)
+    """
+    k = lanes[i]
+    runs = dashed_runs(lg, k, side)
+    if not runs:
+        # 점선이 아예 없다 = 원래 넘을 수 없는 자리. 탐색이 has_broken 으로
+        # 걸러 주므로 여기 오면 안 되지만, 오면 기존 폴백을 그대로 쓴다.
+        s_en = seq[i][1]
+        return cum[i] + s_en, cum[i] + lg.length(k), i, s_en
+
+    w1 = runs[-1][1]
+    j, s0 = i, runs[-1][0]
+    while True:
+        entry = seq[j][1]
+        if s0 > entry + 1e-6:
+            break                       # 이 차로 안에서 시작한다 — 더는 못 당긴다
+        s0 = entry
+        if j == 0:
+            break
+        p = lanes[j - 1]
+        if lanes[j] not in lg.successors(p):
+            break                       # 차선변경으로 들어온 차로
+        if lg.lanes[p]['junction'] != -1:
+            break                       # 교차로 연결로에서는 차선변경 금지
+        nb_p, nb_j = lg.neighbor(p, side), lg.neighbor(lanes[j], side)
+        if nb_p is None or nb_j is None or nb_j not in lg.successors(nb_p):
+            break                       # 목표 차로가 거기까지 이어지지 않는다
+        runs_p = dashed_runs(lg, p, side)
+        if not runs_p or runs_p[-1][1] < lg.length(p) - MARK_EDGE_M:
+            break                       # 앞 차로 끝이 실선 — 창이 거기서 끊긴다
+        j -= 1
+        s0 = runs_p[-1][0]
+    return cum[j] + s0, cum[i] + w1, j, s0
 
 
 def dijkstra(lg, starts, targets, allow_lane_change=True):
@@ -287,7 +391,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
     s_first = seq[0][1]
     cum = [-s_first]
     for i in range(1, len(lanes)):
-        cum.append(cum[i - 1] + lengths[i - 1])
+        cum.append(cum[i - 1] + advance(lg, lanes[i - 1], lanes[i], lengths[i - 1]))
     total = cum[-1] + lengths[-1]
     # 경유점 누적거리: 경로 차로들에 투영해서 가장 가까운 것
     wp_dist = [0.0]
@@ -309,12 +413,11 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             if k2 not in r['next']:
                 side = 'left' if r['left_nb'] == k2 else ('right' if r['right_nb'] == k2 else None)
                 if side:
-                    segs = [(a, b) for a, b, typ, col, ok in r['left_mark' if side == 'left' else 'right_mark'] if ok]
-                    s_en = seq[i][1] if i == 0 else 0.0
-                    w0, w1 = (segs[0][0], segs[-1][1]) if segs else (s_en, r['length'])
-                    w0 = max(w0, s_en)
-                    events.append({'kind': f'lane_change_{side}', 's': cum[i] + w0, 'lane': k, 's_in_lane': w0,
-                                   'window_s0': cum[i] + w0, 'window_s1': cum[i] + w1, 'to_lane': k2})
+                    w_s0, w_s1, j0, s_in = lane_change_window(lg, lanes, cum, seq, i, side, k2)
+                    events.append({'kind': f'lane_change_{side}', 's': w_s0,
+                                   'lane': lanes[j0], 's_in_lane': s_in,
+                                   'window_s0': w_s0, 'window_s1': w_s1, 'to_lane': k2,
+                                   'from_lane': k})
         # 회전: 교차로 연결도로에서 헤딩 변화
         if r['junction'] != -1 and (i == 0 or lg.lanes[lanes[i - 1]]['junction'] == -1):
             h = np.unwrap(r['hdg'].astype(float))
@@ -484,7 +587,12 @@ def report(lg, rt, radius, warn_dev=None):
     for e in ev:
         extra = ''
         if 'window_s0' in e:
-            extra = f"  window {e['window_s0']:.0f}-{e['window_s1']:.0f} m"
+            w = e['window_s1'] - e['window_s0']
+            extra = f"  window {e['window_s0']:.1f}-{e['window_s1']:.1f} m  ({w:.1f} m)"
+            if w < MIN_LC_WINDOW_M:
+                extra += (f'   <= [경고] 창이 {MIN_LC_WINDOW_M:.0f} m 미만 — '
+                          f'전이거리(max(transition_s*v, transition_min_m))를 못 채운다')
+                warns += 1
         if 'delta_heading_deg' in e:
             extra = (f"  Δ{e['delta_heading_deg']:+.1f}°  junction={e.get('junction')}"
                      + ('  [짝 기준 보정]' if e.get('source') == 'pair' else ''))

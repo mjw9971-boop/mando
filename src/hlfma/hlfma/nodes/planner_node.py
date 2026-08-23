@@ -8,6 +8,7 @@ Shield 를 건너뛴 Decision 이 존재할 수 있게 된다.
 from __future__ import annotations
 
 import pickle
+import time
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -54,6 +55,7 @@ class PlannerNode(Node):
         self.st_pub = Stage('  decision→msg+publish')
 
     def _on_world(self, msg: WorldState) -> None:
+        cb_t0 = time.monotonic()
         with Timer(self.st_all, msg.t):
             with Timer(self.st_conv, msg.t):
                 ws = msg_to_world(msg)
@@ -61,6 +63,8 @@ class PlannerNode(Node):
                 d = self.planner.plan(ws)
             with Timer(self.st_shield, msg.t):
                 d = self.shield.apply(ws, d)
+            # 콜백 시작/끝 벽시계(monotonic) — 틱 로그의 timing 재구성용
+            d.reasons['cb_plan'] = [cb_t0, time.monotonic()]
             with Timer(self.st_pub, msg.t):
                 self.pub.publish(decision_to_msg(d, msg.header.stamp))
 

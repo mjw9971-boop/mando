@@ -28,8 +28,13 @@ class Perception:
         self._prev_t: float | None = None
         self._speed = 0.0
         self._accel = 0.0
+        # 속도 추정 창: (진행방향 변위 [m], 벽시계 dt [s]) 의 최근 항목들.
+        # Σ변위/Σdt 가 속도다 (아래 _estimate_motion 참고).
+        self._win: list[tuple[float, float]] = []
         self._route_idx = 0          # 경로 진행 인덱스 (단조 증가 힌트)
         self._prev_route_s: float | None = None
+        self._prev_lane: LaneKey | None = None   # t_off 불연속 검사용 (같은 차로끼리만 비교)
+        self._prev_toff: float | None = None
         self.reset_count = 0         # VTD 리셋(리스폰) 누적 = 실제 이탈 횟수
         self.stall_count = 0         # 파이프라인 멈춤 누적 (리셋과 섞지 않는다)
         self.reset_log: list = []    # (t, dt, 점프거리, 사유)
@@ -75,6 +80,7 @@ class Perception:
         valid = m is not None
         if not valid:
             flags['locate_failed'] = True
+            self._prev_lane = self._prev_toff = None   # 복귀 틱에서 낡은 t_off 와 비교 금지
             ego = EgoState(x=x, y=y, z=z, yaw=yaw, pitch=pitch, roll=roll,
                            speed=speed, accel=accel, lane=None, s=0.0,
                            route_s=0.0, t_off=0.0, heading_err=0.0)
@@ -96,6 +102,24 @@ class Perception:
                 and self._prev_route_s - route_s > drop_thr):
             self._mark_reset(flags, route_s_drop=self._prev_route_s - route_s)
         self._prev_route_s = route_s if on_route else None
+
+        # 횡 오프셋 불연속도 리셋 신호다. 고속 리스폰은 환산속도 문턱
+        # max(v*factor, abs)를 빠져나간다 — 실측 t=6590.6: 점프 4.9 m/0.15 s
+        # = 33 m/s 인데 문턱이 33.4 (v=11.1 * 3) 라 0.4 차이로 미검출.
+        # 조건은 세 개 전부다:
+        #   1) 같은 차로에서 t_off 가 한 틱에 reset_toff_jump_m 이상 뛰었다
+        #   2) 점프 **후** 차로 중심 근처다 (|t_off| < 0.7)
+        #   3) 점프 후 차로와 정렬돼 있다 (|heading_err| < 0.15)
+        # 2·3 이 리스폰의 시그니처다 — respawn 은 차를 중심선에 정렬해 놓는다
+        # (실측 두 건 모두 t_off 0.00 / heading_err 0.00). 1만 보면 헤딩오차가
+        # 큰 미끄러짐(횡속도 = v·sin(herr) ≈ 10 m/s)을 리스폰으로 오탐한다.
+        toff_thr = float(self.cfg['percep']['reset_toff_jump_m'])
+        if (not flags.get('reset') and self._prev_lane == m.lane
+                and self._prev_toff is not None
+                and abs(m.t - self._prev_toff) > toff_thr
+                and abs(m.t) < 0.7 and abs(m.heading_err) < 0.15):
+            self._mark_reset(flags, toff_jump=abs(m.t - self._prev_toff))
+        self._prev_lane, self._prev_toff = m.lane, m.t
 
         ego = EgoState(x=x, y=y, z=z, yaw=yaw, pitch=pitch, roll=roll,
                        speed=speed, accel=accel, lane=m.lane, s=m.s,
@@ -156,6 +180,12 @@ class Perception:
             return
 
         if dt > float(p['stall_dt_s']):
+            # 긴 dt 라도 이동량이 물리적으로 불가능하면 스톨이 아니라 텔레포트다.
+            # (2026-08-21: 25 s 갭 + 590 m 순간이동이 스톨로 분류돼 속도가 -1.34 로
+            #  오염되고 트랙/적분항이 리셋되지 않았다.)
+            if d > float(p['stall_teleport_m']):
+                self._mark_reset(flags, jump_m=d, dt=dt, v_implied=d / dt)
+                return
             # 우리 쪽이 멈춘 것. 위치 차분은 여전히 유효하므로 속도추정을 건드리지 않는다.
             self.stall_count += 1
             self.stall_log.append((t, dt, d))
@@ -176,7 +206,7 @@ class Perception:
 
     def _mark_reset(self, flags: dict, jump_m: float = None,
                     route_s_drop: float = None, dt: float = None,
-                    v_implied: float = None) -> None:
+                    v_implied: float = None, toff_jump: float = None) -> None:
         """리셋 처리: 카운트 + 플래그 + 추정 상태 초기화."""
         self.reset_count += 1
         flags['reset'] = True                 # control 이 이 값을 보고 적분항을 턴다
@@ -189,17 +219,21 @@ class Perception:
             flags['reset_implied_mps'] = round(v_implied, 1)
         if route_s_drop is not None:
             flags['reset_route_s_drop'] = round(route_s_drop, 2)
+        if toff_jump is not None:
+            flags['reset_toff_jump'] = round(toff_jump, 2)
         self.reset_log.append((dt, jump_m, route_s_drop, v_implied))
 
         # 속도/가속도 추정 초기화 — 순간이동을 주행으로 세면 안 된다
         self._speed = 0.0
         self._accel = 0.0
+        self._win.clear()
         self._prev_xy = None
         self._prev_t = None
         # 리셋 후에는 경로상 위치가 뒤로 갈 수 있다. 직전 인덱스 근처만 보면
         # 엉뚱한 데 붙으므로 처음부터 다시 찾게 한다.
         self._route_idx = 0
         self._prev_route_s = None
+        self._prev_lane = self._prev_toff = None
         # 객체 트랙도 무의미해진다 (자차가 순간이동했으므로 상대량이 전부 어긋남)
         self._tracks.clear()
 
@@ -226,20 +260,35 @@ class Perception:
     def _estimate_motion(self, x: float, y: float, yaw: float, t: float,
                          flags: dict) -> tuple[float, float]:
         """
-        위치 미분 + 저역통과로 (speed, accel) 추정.
+        **슬라이딩 창** 속도 추정: 최근 `percep.speed_win_s`(0.4 s) 동안의
+        Σ(진행방향 변위) / Σ(벽시계 dt).
 
-        SPEC §1.1: 패킷에 ego 속도 필드가 없다. dt 는 t_recv 차분,
-        LPF 계수는 config `percep.speed_lpf`.
-        변위를 헤딩에 투영해 전진/후진 부호를 살린다.
-        좌표 점프(> `percep.jump_m`)는 리스폰으로 보고 추정치를 리셋한다.
+        SPEC §1.1: 패킷에 ego 속도 필드가 없다. dt 는 t_recv(벽시계) 차분이다.
+
+        왜 창인가 — 9910 송신 간격은 40/80 ms 로 불규칙하고(평균 50 ms) 변위는
+        **벽시계에 정확히 비례**한다 (2026-08-23 실측: 40 ms 틱 0.591 m, 80 ms 틱
+        1.181 m, 둘 다 53 km/h). 예전 코드는 dt 하한을 공칭 50 ms 로 잡아 40 ms
+        틱(68 %)에서 속도를 20 % 낮게 냈고 LPF 결과가 −15 % 편향됐다 →
+        v_target 45 km/h 에 실속도 53 km/h 로 제한속도(S1.1.01)를 186틱 넘겼다.
+        프레임 카운터 × 50 ms 로 sim 시간을 재는 것도 같은 이유로 틀리다.
+
+        창은 틱 하나의 dt 오차(스톨 직후 10 ms 간격으로 몰려 오는 프레임 등)를
+        희석한다. 창은 **항상 speed_win_s 이상**을 유지한다 — 가장 오래된 항목을
+        빼도 창이 speed_win_s 이상 남을 때만 뺀다. 그래야 2 s 스톨 항목 뒤에
+        10 ms 틱 하나가 와도 스톨 항목이 남아 Σd/Σdt 가 실제 평균속도가 된다.
+
+        변위를 헤딩에 투영해 전진/후진 부호를 살린다. 리셋(순간이동)은
+        _detect_reset/_mark_reset 이 창을 비운다; 스톨은 실제 주행 변위이므로
+        그대로 창에 넣는다.
         """
         p = self.cfg['percep']
-        alpha = float(p['speed_lpf'])
+        alpha = float(p['speed_lpf'])          # 가속도(속도 미분)에만 쓴다
         jump_m = float(p['jump_m'])
+        win_s = float(p.get('speed_win_s', 0.4))
 
         if self._prev_xy is None or self._prev_t is None:
             self._prev_xy, self._prev_t = (x, y), t
-            return 0.0, 0.0
+            return self._speed, self._accel
 
         dt = t - self._prev_t
         dx, dy = x - self._prev_xy[0], y - self._prev_xy[1]
@@ -248,16 +297,30 @@ class Perception:
         if dt <= 1e-4:
             flags['bad_dt'] = dt
             return self._speed, self._accel
-        if dist > jump_m:
+
+        # 리스폰 판정과 같은 척도: 이 dt 동안 현재 속도의 reset_speed_factor 배로
+        # 가야 나오는 거리보다 멀어야 점프다. dt 가 길면 허용치도 늘어난다.
+        allow = max(jump_m, abs(self._speed) * dt * float(p['reset_speed_factor']))
+        # _detect_reset 이 이 틱을 '스톨'(우리 쪽 지연)로 분류했으면 위치 차분은
+        # 여전히 유효한 주행 변위다 — 점프 리셋을 걸지 않는다.
+        if dist > allow and not flags.get('stall'):
             # _detect_reset 이 이미 처리했어야 하는 경우 (방어적)
             flags.setdefault('jump_m', round(dist, 2))
             self._prev_xy, self._prev_t = (x, y), t
             self._speed, self._accel = 0.0, 0.0
+            self._win.clear()
             return 0.0, 0.0
 
-        v_raw = (dx * math.cos(yaw) + dy * math.sin(yaw)) / dt
-        v = alpha * v_raw + (1.0 - alpha) * self._speed
-        self._accel = (v - self._speed) / dt
+        d_fwd = dx * math.cos(yaw) + dy * math.sin(yaw)
+        self._win.append((d_fwd, dt))
+        tot = sum(w[1] for w in self._win)
+        while len(self._win) > 1 and tot - self._win[0][1] >= win_s:
+            tot -= self._win[0][1]
+            self._win.pop(0)
+        v = sum(w[0] for w in self._win) / tot
+
+        a_raw = (v - self._speed) / dt
+        self._accel = alpha * a_raw + (1.0 - alpha) * self._accel
         self._speed = v
         self._prev_xy, self._prev_t = (x, y), t
         return self._speed, self._accel

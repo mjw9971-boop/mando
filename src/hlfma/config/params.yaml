@@ -11,7 +11,7 @@
     route_path: data/route.pkl
 
     # ── comm ──
-    comm.host: "127.0.0.1"
+    comm.host: "192.168.10.1"
     comm.port: 9910
     comm.send_hz: 20
     comm.watchdog_s: 1.0
@@ -22,10 +22,16 @@
     comm.steer_sign: 1.0
     comm.connect_retry_s: 1.0
     comm.recv_bufsize: 65536
+    # /cmd 가 이 시간 이상 안 오면 vtd_bridge 가 조향만 0 으로 감쇠해 재송신.
+    # (2026-08-21 주행: 풀락 조향 -0.480 이 0.32 s 유지된 채 3.5 m → 도로이탈)
+    # 가속은 유지 — 적신호 대기와 구분 불가. 완전 단절은 watchdog_s 의 SAFE_STOP.
+    comm.hold_decay_s: 0.15
     # ── vehicle ──
     vehicle.wheelbase: 2.944
     vehicle.max_steer: 0.48
     vehicle.length: 4.848
+    # 뒷바퀴축 → 앞범퍼 (Ioniq 6: 앞 오버행 855 mm). 정지 목표 = 앞범퍼가 정지선 − stop_gap.
+    vehicle.front_overhang_m: 0.855
     vehicle.width: 1.886
     vehicle.height: 1.507
     # ── speed ──
@@ -37,12 +43,16 @@
     speed.a_min: -6.0
     speed.a_emergency: -8.0
     speed.jerk_max: 2.0
+    # 정지 목표 선행 보상 [s]: P 제어 추종 지연(≈a_plan/kp) 만큼 목표를 v·lag 앞당긴다.
+    # 폐루프 시뮬: 0.6 → 앞범퍼 정지선 −1.0~−1.2 m, 시간 손실 0 (0 이면 +1.1 m 침범)
+    speed.stop_lag_s: 0.6
+    # 래치 뒤 0 스냅 대신 연속 프로파일 — 시뮬에서 이득 없어 끔
+    speed.stop_continuous: false
     speed.a_lat_max: 2.0
     speed.stop_gap_m: 1.0
     speed.a_hold: -1.0
     # ── caps_kph ──
     caps_kph.school_zone: 28.0
-    caps_kph.crosswalk: 25.0
     caps_kph.junction: 30.0
     caps_kph.blind: 25.0
     # ── signal ──
@@ -50,6 +60,12 @@
     signal.lead_s: 3.0
     signal.margin_s: 1.0
     signal.flash_mode: "yield"
+    # 계획 차선변경은 해당 방향 지시등이 이 시간 이상 연속 점등된 뒤에만 실행
+    signal.lc_lead_min_s: 3.0
+    # RTOR(적신호 우회전): 완전 정지 유지 시간, 서행 통과 속도, 스위치(조직위 답변에 따라 끌 것)
+    signal.stop_dwell_s: 1.0
+    signal.rtor_speed_kph: 20.0
+    signal.rtor_enabled: true
     # ── lead ──
     lead.time_headway_s: 2.0
     lead.min_gap_m: 5.0
@@ -73,11 +89,19 @@
     # courseRespawn 리셋 감지 문턱. 실제 리셋 이동량이 3.3 m 남짓이라 그보다 낮아야 한다.
     percep.jump_m: 2.0
     percep.speed_lpf: 0.3
+    # 속도 추정 슬라이딩 창 [s] (Σ변위/Σ벽시계 dt). 송신 간격 40/80 ms 불규칙 대응.
+    percep.speed_win_s: 0.4
     percep.reset_route_s_drop_m: 5.0
     percep.stall_dt_s: 0.2
+    percep.stall_teleport_m: 50.0
     percep.reset_speed_factor: 3.0
     percep.reset_abs_speed: 30.0
+    percep.reset_toff_jump_m: 2.0
     percep.ped_extrapolate_s: 2.0
+    # 횡단보도 폴리곤 근사 (RTOR 안전 확인 + 횡단보도 보행자 정지 공용)
+    percep.crosswalk_half_w_m: 8.0
+    percep.crosswalk_back_m: 3.0
+    percep.crosswalk_fwd_m: 7.0
     # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개.
     percep.gt_range_m: 80.0
     percep.range_margin_m: 5.0
@@ -107,3 +131,4 @@
     debug.print_hz: 1.0
     # ── default_speed_kph ──
     default_speed_kph: 50.0
+

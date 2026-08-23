@@ -82,6 +82,7 @@ def packet_to_msg(pkt: RawPacket, stamp) -> GtState:
     m.header.stamp = stamp
     m.header.frame_id = 'map'
     m.t_recv = float(pkt.t_recv)
+    m.frames_total = int(pkt.frames_total)
     (m.ego_x, m.ego_y, m.ego_z, m.ego_heading, m.ego_pitch, m.ego_roll) = \
         [float(v) for v in pkt.ego]
 
@@ -106,6 +107,7 @@ def msg_to_packet(m: GtState) -> RawPacket:
         objects=[(o.id, o.x, o.y, o.z, o.heading, o.speed, o.length, o.width, o.height)
                  for o in m.objects],
         lights=[(int(l.id), int(l.state)) for l in m.lights],
+        frames_total=int(m.frames_total),
     )
 
 
