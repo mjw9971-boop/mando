@@ -22,9 +22,9 @@ from hlfma.nodes.params import load_params_yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE = ROOT / 'data' / 'route.pkl'
-if not ROUTE.exists():
-    ROUTE = ROOT / 'data' / 'route_example.pkl'
+# 고정 테스트 경로. data/route.pkl 은 시나리오마다 다시 빌드되므로 쓰지 않는다
+# (2026-08-23: 경로 재생성 때마다 하드코딩된 정지선·이벤트 위치가 어긋나 29건 실패).
+ROUTE = ROOT / 'data' / 'route_example.pkl'
 CFG = load_params_yaml(PARAMS_YAML)
 
 pytestmark = pytest.mark.skipif(not (GRAPH.exists() and ROUTE.exists()),
@@ -235,7 +235,9 @@ def test_shield_aborts_lane_change_on_ttc(lg, route, lc_event):
     assert d0.state == LANE_CHANGE, '전이가 시작되지 않아 중단을 시험할 수 없다'
 
     danger = blocker(w0.ego.lane, 8.0)          # 현재 차로의 선행차
-    danger.ttc = 1.0
+    # ttc.emergency_s(1.5) 와 ttc.warn_s(4.0) 사이 — 차선변경 중단만 보고
+    # 비상제동(E_STOP)은 건드리지 않는다 (그건 tests/test_emergency_brake.py)
+    danger.ttc = 2.0
     w = make_world(lg, route, lc_event['window_s0'] + 3.0, speed=v, objects=[danger])
     d = sh.apply(w, pl.plan(w))
     assert 'lc_abort_ttc' in d.reasons['shield']

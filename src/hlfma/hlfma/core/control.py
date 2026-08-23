@@ -113,6 +113,7 @@ class Control:
         self.ld_curve_min = float(c.get('ld_curve_min', 3.0))
         self.last_curv = 0.0
         self.a_min = float(s['a_min'])
+        self.a_emergency = float(s['a_emergency'])
         self.a_max = float(s['a_max'])
         self.jerk_max = float(s['jerk_max'])
         self.a_hold = float(s.get('a_hold', -1.0))
@@ -271,6 +272,14 @@ class Control:
             self._prev_accel = self.a_hold
             return self.a_hold
 
+        # 비상정지(shield._emergency_brake) — PI 를 거치지 않고 speed.a_emergency 를
+        # 그대로 낸다. a_min(-6.0) 클램프도 저크 제한도 적용하지 않는다: 충돌이
+        # 임박한 상황에서 편안함은 고려 대상이 아니다.
+        if decision.state == 'E_STOP':
+            self._i_term = 0.0
+            self._prev_accel = self.a_emergency
+            return self.a_emergency
+
         err = v_t - v
         # 적분은 목표 근처에서만 쌓는다.
         # 정지→목표속도처럼 오차가 큰 구간에서 계속 적분하면, 목표에 도달한 뒤에도
@@ -286,7 +295,7 @@ class Control:
         if accel != raw:                       # 와인드업 방지
             self._i_term -= err * dt
 
-        if decision.state != 'E_STOP':         # 비상정지는 저크 제한 해제
+        if decision.state != 'E_STOP':         # 비상정지는 위에서 이미 반환됐다
             max_djerk = self.jerk_max * dt
             accel = _clamp(accel, self._prev_accel - max_djerk, self._prev_accel + max_djerk)
 

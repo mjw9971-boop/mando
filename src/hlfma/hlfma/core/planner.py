@@ -25,6 +25,11 @@ E_STOP = 'E_STOP'
 
 TURN_OFF, TURN_LEFT, TURN_RIGHT = 0, 1, 2
 
+# IDM 자유주행 지수. 무차원 형상 파라미터라 튜닝값이 아니다(표준 4).
+IDM_DELTA = 4.0
+# lead 후보 탐색 범위 [m]. GT 가 80 m 안쪽만 주므로(percep.gt_range_m) 그 이상은 의미 없다.
+LEAD_MAX_S = 80.0
+
 
 def crosswalk_blockers(objects, d_cw, cfg) -> list:
     """
@@ -97,6 +102,14 @@ class Planner:
         self._v_now = 0.0
         self._cw_ped_latch = False   # 횡단보도 보행자 정지 확정 (보행자가 비면 풀린다)
         self._cw_note = ''
+        self._lead = None                   # 이번 틱 추종 대상 (TrackedObject)
+        # 정차 차량 추월(blocked): 판정 지속 시각, 판정 결과, 진행 중인 추월 상태
+        self._blocked_since: float | None = None
+        self._blocked = False
+        self._blocked_why = ''
+        self._obj_moved_t: dict = {}         # 객체 id → 마지막으로 '달리던' 시각
+        self._overtake: dict | None = None   # {'blocker_id', 'orig_lane', 'returning'}
+        self.lead_id: int | None = None     # 그 id (shield 회피·횡단보도 판정 제외용)
         self._route_end_latch = False   # 경로 끝 정지 확정 (끝을 지나쳐도 유지)
         self.lc_done = 0           # 완료 횟수 (품질 지표)
         self.lc_aborted = 0
@@ -180,6 +193,11 @@ class Planner:
             reasons['rtor'] = self._rtor_note
         if self._cw_note:
             reasons['crosswalk'] = self._cw_note
+        reasons['blocked'] = self._blocked
+        if self._blocked_why:
+            reasons['blocked_why'] = self._blocked_why
+        if self._overtake is not None:
+            reasons['overtake'] = ('return' if self._overtake.get('returning') else 'out')
         pool = dict(cand)
         if 'debug_const' in reasons:
             pool['debug_const'] = reasons['debug_const']
@@ -224,6 +242,13 @@ class Planner:
         caps = self.cfg['caps_kph']
         margin = float(sp['margin_kph']) / 3.6
         out: dict = {}
+
+        # 추종 대상 선행차를 **먼저** 정한다. 횡단보도 정지(4c)와 IDM(6)이 같은
+        # 판정을 쓰게 하려는 것이다 — 선행차는 서서 기다릴 대상이 아니라 따라갈
+        # 대상이라 횡단보도 차단 객체에서 빼야 한다 (폐루프 시뮬: 선행차가 횡단보도
+        # 위를 지날 때 crosswalk_ped 가 winner 가 되어 이중 제동).
+        self._lead = self._select_lead(world)
+        self.lead_id = self._lead.id if self._lead is not None else None
 
         # ── 1) 제한속도 + 스쿨존 ─────────────────────────────────────────
         out['limit'] = max(0.0, world.speed_limit - margin)
@@ -293,6 +318,18 @@ class Planner:
         # ── 5) 가시거리 (GT 80 m 밖은 안 보이는 것과 같다) ───────────────
         out['visibility'] = self.visibility_limit()
 
+        # ── 5b) 정차 차량에 갇혔는가 (추월 판정) ─────────────────────────
+        self._update_blocked(world, out)
+
+        # ── 6) 선행차 추종 (IDM) — **맨 마지막** ─────────────────────────
+        # 자유주행 목표 v0 는 여기까지의 후보 min 이다. 제한속도·곡률·정지선이
+        # 이미 깎아 놓은 상한을 IDM 이 되올리지 않게 한다.
+        finite = [v for v in out.values() if math.isfinite(v)]
+        v0 = min(finite) if finite else world.speed_limit
+        v_lead = self._idm(world, v0)
+        if v_lead is not None:
+            out['lead'] = v_lead
+
         return {k: float(v) for k, v in out.items() if math.isfinite(v)}
 
     def _curvature_speed(self, world: WorldState) -> float | None:
@@ -312,6 +349,12 @@ class Planner:
             return None
         lanes = self.route['lanes']
 
+        # 지도 곡률 이상치 방어. 빌드 단계(build_lane_graph.smooth_curvature)에서
+        # 스파이크를 걸러내지만, 낡은 lane_graph.pkl 로 돌 수도 있고 걸러지지 않은
+        # 것이 남을 수도 있다. **이웃 중앙값의 ratio 배를 넘는 고립 값은 건너뛴다.**
+        # (2026-08-23: 직선 도로에 반경 6.5 m 가 한 점 찍혀 45 → 16 km/h 로 감속)
+        ratio = float(self.cfg['speed'].get('curv_outlier_ratio', 5.0))
+
         best = None
         acc = 0.0
         s0 = world.ego.s
@@ -319,7 +362,8 @@ class Planner:
         while acc < horizon and i < len(lanes):
             r = self.lg.lanes[lanes[i]]
             ss, cv = r['s'], r['curv']
-            for j in range(len(ss)):
+            n_pt = len(ss)
+            for j in range(n_pt):
                 if ss[j] < s0:
                     continue
                 d = acc + (ss[j] - s0)
@@ -328,6 +372,14 @@ class Planner:
                 k = abs(float(cv[j]))
                 if k < 1e-4:                     # 반경 1 km 이상 = 직선
                     continue
+                if ratio > 0.0 and n_pt >= 5:
+                    # 창은 ±3, 중앙값은 **아래쪽**을 고른다. 스파이크가 두 점
+                    # 연속으로 찍히는 경우가 흔한데(섹션 끝 cv[-2], cv[-1]),
+                    # 위쪽 중앙값을 쓰면 두 점이 서로를 가려 걸러지지 않는다.
+                    lo, hi = max(0, j - 3), min(n_pt, j + 4)
+                    nb = sorted(abs(float(cv[m])) for m in range(lo, hi) if m != j)
+                    if nb and k > ratio * max(nb[(len(nb) - 1) // 2], 1e-4):
+                        continue                 # 이웃 대비 고립 스파이크 — 무시
                 v_here = math.sqrt(a_lat / k)
                 v_now = self._approach(v_here, d)
                 if best is None or v_now < best:
@@ -362,6 +414,15 @@ class Planner:
 
         UNASSIGNED, GREEN, GREEN_LEFT, LEFT, YELLOW, RED, FLASH = 0, 3, 5, 4, 2, 1, 6
 
+        # ── 래치 무결성: 대상 정지선을 명백히 지났으면 **무조건** 해제한다 ──────
+        # light 소멸 분기 안에만 있던 검사를 여기로 올렸다. 신호가 계속 오는 동안
+        # 지나쳐 버린 경우에도 풀려야 하고, 무엇보다 _stop_line_s 가 래치 중에
+        # 갱신되지 않아야(아래) 이 비교가 의미를 갖는다.
+        if (self._stop_latch and self._stop_line_s is not None
+                and s_now - self._stop_line_s > 5.0):
+            self._stop_latch = False
+            self._rtor_reset()
+
         if world.light is None:
             # 9910 light 필드는 ego 가 정지선 도로를 벗어나 연결로에 들어서는 순간
             # 통째로 사라진다. 예전엔 여기서 무조건 래치를 풀어, 감속 중 소멸과
@@ -369,9 +430,7 @@ class Planner:
             # light 소멸은 해제 사유가 아니다.** 해제는 녹색류 수신 / RTOR go /
             # 명백한 통과(정지선을 5 m 이상 지남) 뿐이다.
             if self._stop_latch:
-                passed = (self._stop_line_s is not None
-                          and s_now - self._stop_line_s > 5.0)
-                if self._rtor_dwell_done or passed:
+                if self._rtor_dwell_done:      # 통과 해제는 위에서 이미 처리했다
                     self._stop_latch = False
                     self._rtor_reset()
                     return None
@@ -398,8 +457,23 @@ class Planner:
             return None
 
         d = summ.get('dist_stop_line')
-        if d is not None:
-            self._stop_line_s = s_now + d         # 통과 판정용 (래치 전후 계속 갱신)
+        # 래치 대상 정지선의 경로거리는 **래치 시점 값으로 고정(freeze)** 한다.
+        # 매 틱 갱신하면 정지선을 지나는 순간 lookahead 가 **다음 교차로** 정지선을
+        # 가리키면서 _stop_line_s 가 그쪽으로 덮어써지고, 해제 조건
+        # (route_s > _stop_line_s + 5) 을 영영 만족하지 못해 그 자리에 영구 정지한다
+        # (2026-08-23 17:49 런: 378 m 에서 23.8 s 정지, 기준이 494 m 로 밀림).
+        # 차선변경이 blend base 를 시작 시점 차로로 고정하는 것과 같은 이유다 —
+        # **판단의 기준점은 확정 시점에 얼어붙어야 한다.**
+        if d is not None and not self._stop_latch:
+            self._stop_line_s = s_now + d
+
+        # ── 통과한 정지선으로는 새로 세우지 않는다 ─────────────────────────
+        # 앞범퍼가 이미 정지선을 지났으면 그 교차로 신호로 감속할 이유가 없다.
+        # 황색으로 딜레마존 통과 직후 적색으로 바뀌면 dist_stop_line 이 아직
+        # 양수(뒷바퀴축 기준)라 정지 후보가 생겨 교차로 한복판에서 급정거했다
+        # (같은 런: 앞범퍼 +1.0 m 통과 시점에 발동, -3.94 m/s²).
+        # 이미 래치된 정지(멀리서부터 정상 감속 중)는 건드리지 않는다.
+        passed_front = d is not None and d <= self._front_m()
         if d is not None and not (summ.get('stop_signal_ids') or []):
             # 정지선에 신호 id 가 안 붙어 있다. 두 경우다:
             #  · 진짜 비신호 정지선(일시정지/양보) — 아직 다루지 않는다
@@ -417,7 +491,8 @@ class Planner:
                 self._signal_fallback = True
 
         # ── RTOR: 적색 + 다음 회전이 우회전 — 완전 정지 → dwell → 안전 확인 → 서행 ──
-        if state == RED and nxt == 'turn_right' and (d is not None or self._stop_latch):
+        if state == RED and nxt == 'turn_right' and (
+                (d is not None and not passed_front) or self._stop_latch):
             r = self._rtor(world, d)
             if r is not None:
                 return r
@@ -426,11 +501,11 @@ class Planner:
         # 이게 없으면 정지선이 lookahead 를 벗어나는 순간 브레이크를 놓아
         # 적신호에 그대로 넘어간다 (실측: 정지선 0.13 m 통과).
         if self._stop_latch:
-            if d is None or not bool(sp.get('stop_continuous', False)):
+            if d is None or not bool(sp.get('stop_continuous', True)):
                 return 0.0
             lag = float(sp.get('stop_lag_s', 0.0)) * v
             return self._approach(0.0, d - gap - lag)   # 연속 프로파일 (0 에서 자연히 0)
-        if d is None:
+        if d is None or passed_front:
             return None
         if state == LEFT:
             return None if nxt == 'turn_left' else self._stop_at(d, gap)
@@ -505,7 +580,9 @@ class Planner:
         """
         summ = world.summ or {}
         d_cw = summ.get('dist_crosswalk')
-        blockers = crosswalk_blockers(world.objects, d_cw, self.cfg)
+        # 추종 중인 선행차는 제외한다 (회피·대기 대상이 아니라 따라가는 대상).
+        objs = [o for o in world.objects if o.id != self.lead_id]
+        blockers = crosswalk_blockers(objs, d_cw, self.cfg)
         if not blockers:
             self._cw_ped_latch = False
             return None
@@ -574,15 +651,18 @@ class Planner:
         v = self._approach(0.0, dist - gap - lag)
         if v < float(sp.get('stop_latch_v', 1.5)):
             self._stop_latch = True
-            if not bool(sp.get('stop_continuous', False)):
+            if not bool(sp.get('stop_continuous', True)):
                 return 0.0
-        return v if (self._stop_latch and bool(sp.get('stop_continuous', False))) else v
+        return v if (self._stop_latch and bool(sp.get('stop_continuous', True))) else v
 
     # ══════════════════════════════════════════════════════════════════════
     # 차선변경
     # ══════════════════════════════════════════════════════════════════════
     def _pending_lane_change(self, world: WorldState) -> dict | None:
-        """아직 안 끝난 가장 가까운 lane_change 이벤트."""
+        """아직 안 끝난 가장 가까운 lane_change 이벤트 (추월 합성 이벤트 우선)."""
+        ov = self._overtake_event(world)
+        if ov is not None:
+            return ov
         if not self.route:
             return None
         # 경로를 벗어났으면 route_s 가 의미 없다 — 차로가 바뀔 때마다 0 부근으로
@@ -659,6 +739,18 @@ class Planner:
             self._finish_lane_change(ev, ok=True)
             return None
 
+        # ── 최소 속도 게이트 ────────────────────────────────────────────
+        # 블렌드 진행도가 **주행거리**(route_s − s_start)에 비례하므로, 너무 느리면
+        # 전이가 진행되지 않는데 조향 목표만 목표 차로 쪽으로 고착돼 차가 그대로
+        # 옆으로 밀려 나간다 (2026-08-23 19:56 런: v=0.84 m/s 에서 시작 → 도로
+        # 이탈, 차로 id -3 → +5 로 반대편 차선 진입, shield 발동 0회).
+        v_min = float(lc.get('v_min_mps', 2.0))
+        if self._lc is not None and world.ego.speed < v_min:
+            self._finish_lane_change(
+                ev, ok=False, why='속도 %.2f < v_min %.1f m/s — 전이 중단' % (world.ego.speed, v_min))
+            reasons['lc_slow_abort'] = round(world.ego.speed, 2)
+            return None
+
         dist_to_window = ev['window_s0'] - s_now
         # 지시등: 창 시작 (lead_s + margin_s) 초 전부터
         lead_m = v * (float(sig['lead_s']) + float(sig['margin_s']))
@@ -685,6 +777,8 @@ class Planner:
         clear, why = self._target_lane_clear(world, target, side)
         reasons['lc_dist_to_window'] = round(dist_to_window, 1)
         reasons['lc_clear'] = clear
+        if clear and world.ego.speed < v_min:
+            reasons['lc_too_slow'] = round(world.ego.speed, 2)
 
         # ── 대기로 창이 모자라는 경우 ──────────────────────────────────────
         # 남은 창 < 전이거리면 (1) 창 확장 시도 → (2) 불가하면 대기 중단, 즉시 실행
@@ -706,16 +800,20 @@ class Planner:
         if self._lc is not None:
             # 이미 전이 중 — 점선인 동안에는 끝까지 간다
             active = True
-        elif in_window and clear and signaled_long_enough:
+        elif in_window and clear and signaled_long_enough and world.ego.speed >= v_min:
             self._lc = dict(ev)               # 실행 시작
             # 전이 진행도의 기준점. 자차 위치에 매 틱 다시 고정하면
             # 목표의 일부 지점만 계속 쫓게 되어 차선을 끝까지 못 넘는다.
             self._lc['s_start'] = s_now
+            self._lc['t_start'] = world.t
             # 블렌드 base 의 기준 차로. 매칭 차로를 그대로 쓰면 차선을 넘는
             # 순간 base 가 원차로 → 목표차로 중심선으로 불연속 교체되어
             # 경계에서 정체 + 조향 요동이 난다 (2026-08-21 실측: 1.2 s 정체,
             # 조향 +0.36 → -0.24 요동, 순간 최대 0.359 rad).
             self._lc['src_lane'] = tuple(world.ego.lane)
+            if ev.get('overtake') and self._overtake is None and self._lead is not None:
+                self._overtake = {'blocker_id': self._lead.id, 'side': side,
+                                  'returning': False}
             active = True
         left = w1 - s_now
         if in_window and left < float(lc['min_window_m']) and ev['window_s0'] not in self._lc_warned:
@@ -807,7 +905,8 @@ class Planner:
     def _finish_lane_change(self, ev: dict, ok: bool, why: str = '') -> None:
         if ok:
             self.lc_done += 1
-            self._lc_finished.add(ev['window_s0'])
+            if not ev.get('overtake'):
+                self._lc_finished.add(ev['window_s0'])
         elif self._lc is not None:
             self.lc_aborted += 1
         self._win_ext.pop(ev['window_s0'], None)
@@ -880,8 +979,17 @@ class Planner:
         # 진행도는 **경로상 고정 시작점** 기준이다.
         # 매 틱 자차 위치를 0 으로 두면 전방 점의 가중치가 늘 같은 값에 머물러
         # 차가 목표 차로의 일부 지점(≈0.5 m)만 쫓다가 넘어가지 못한다.
+        # 진행도는 **거리와 시간 중 더 많이 진척된 쪽**을 쓴다.
+        # 거리 단독이면 저속에서 전이가 멈춘 채 조향만 고착된다. 시간 항은
+        # v_min 으로 달렸다면 갔을 거리로 환산해, 속도가 떨어져도 전이가 끝까지
+        # 진행되어 차가 어느 한쪽 차로에는 반드시 안착하게 한다.
         s_start = self._lc.get('s_start', world.ego.route_s) if self._lc else world.ego.route_s
         prog = max(0.0, world.ego.route_s - s_start)
+        if self._lc is not None:
+            t_start = self._lc.get('t_start')
+            if t_start is not None:
+                v_min = float(cfg.get('v_min_mps', 2.0))
+                prog = max(prog, v_min * max(0.0, world.t - t_start))
 
         out = []
         for i in range(n):
@@ -930,10 +1038,239 @@ class Planner:
         # TODO: 구현
         raise NotImplementedError('planner._v_safe')
 
-    def _idm(self, world: WorldState) -> float:
-        """선행차 추종 속도 상한 (config `lead.time_headway_s`, `lead.min_gap_m`)."""
-        # TODO: 구현
-        raise NotImplementedError('planner._idm')
+    def _update_blocked(self, world: WorldState, out: dict) -> None:
+        """
+        선행차가 **서 있고, 신호 때문이 아니면** 'blocked' 로 판정한다 → 추월 대상.
+
+        전부 만족해야 한다 (하나라도 아니면 즉시 해제):
+          1) 선행차가 있고 속도 < 0.5 m/s
+          2) **최근에 달리던 차가 아니다** — `lead.blocked_recent_move_v`(2.0 m/s)를
+             넘겨 달린 이력이 `lead.blocked_recent_move_s`(20 s) 안에 있으면 "잠깐
+             선 것"으로 보고 기다린다. 앞차 급제동은 정지 자체가 연속이라
+             dwell 로는 절대 구분되지 않는다 (2026-08-23 19:56 런: v=0.000 이
+             10.9 s 연속 → dwell 2 s 만에 추월 발동, 그 차는 15 s 뒤 재출발 예정이었다)
+          3) 전방에 **활성 신호 정지 후보가 없다** (적/황으로 서는 중이면 추월 금지)
+          4) 교차로 내부가 아니다
+          5) 앞범퍼 기준 전방 정지선이 `lead.blocked_ignore_stopline_m` 보다 멀거나 없다
+             — 가까우면 신호 대기 행렬일 수 있다
+          6) 1~5 가 `lead.blocked_dwell_s` 이상 **연속** 유지 (센서 노이즈 방지)
+
+        신호 대기 중 추월은 즉시 실격이므로 3·5 가, 급제동 오판 방지는 2 가 핵심이다.
+        """
+        ld = self.cfg['lead']
+        summ = world.summ or {}
+        lead = self._lead
+
+        # 관측된 모든 객체의 '마지막으로 달리던 시각' 갱신 (사라진 것은 정리)
+        mv = float(ld['blocked_recent_move_v'])
+        alive = set()
+        for o in world.objects:
+            alive.add(o.id)
+            if o.speed > mv:
+                self._obj_moved_t[o.id] = world.t
+        for oid in [k for k in self._obj_moved_t if k not in alive]:
+            if world.t - self._obj_moved_t[oid] > 60.0:
+                del self._obj_moved_t[oid]
+
+        why = ''
+        if lead is None:
+            why = 'lead 없음'
+        elif lead.speed >= 0.5:
+            why = 'lead 주행 중(%.1f m/s)' % lead.speed
+        elif (self._obj_moved_t.get(lead.id) is not None
+              and world.t - self._obj_moved_t[lead.id] < float(ld['blocked_recent_move_s'])):
+            why = '최근 주행 이력 %.1fs 전' % (world.t - self._obj_moved_t[lead.id])
+        elif 'stop_line' in out:
+            why = '신호 정지 후보 활성'
+        elif summ.get('in_junction'):
+            why = '교차로 내부'
+        else:
+            d = summ.get('dist_stop_line')
+            if d is not None and (d - self._front_m()) <= float(ld['blocked_ignore_stopline_m']):
+                why = '정지선 %.0f m (신호 대기 가능)' % (d - self._front_m())
+
+        if why:
+            self._blocked_since = None
+            self._blocked = False
+            self._blocked_why = why
+            return
+        if self._blocked_since is None:
+            self._blocked_since = world.t
+        held = world.t - self._blocked_since
+        self._blocked = held >= float(ld['blocked_dwell_s'])
+        self._blocked_why = 'blocked %.1fs' % held if self._blocked else 'dwell %.1fs' % held
+
+    def _overtake_event(self, world: WorldState) -> dict | None:
+        """
+        정차 차량 추월용 **합성 차선변경 이벤트**. 경로 이벤트와 같은 형식이라
+        기존 판정(_target_lane_clear / 지시등 lead / _blend_path)을 그대로 탄다.
+
+        나갈 때: blocked 이면 좌측 우선(추월 관례), 없으면 우측 이웃으로.
+        돌아올 때: 막고 있던 차를 지나쳤으면 원 차로로 되돌아간다.
+        창은 지금부터 전이거리+여유까지다 (경로 이벤트처럼 미리 정해진 구간이 없다).
+        """
+        ego = world.ego
+        if ego.lane is None:
+            return None
+        lc = self.cfg['lane_change']
+        v = max(ego.speed, 1.0)
+        span = max(float(lc['transition_s']) * v, float(lc['transition_min_m'])) + 10.0
+        s_now = ego.route_s
+
+        def mk(target, side):
+            return {'kind': 'lane_change_%s' % side, 's': s_now,
+                    'lane': tuple(ego.lane), 's_in_lane': ego.s,
+                    'window_s0': s_now - 1.0, 'window_s1': s_now + span,
+                    'to_lane': tuple(target), 'from_lane': tuple(ego.lane),
+                    'overtake': True}
+
+        # 경로 차로 집합. 원 차로 **키**를 기억하면 안 된다 — 키에 섹션 인덱스가
+        # 들어 있어 전진만 해도 (2003,2,-2) → (2003,3,-1) 처럼 달라지고, 이웃 비교가
+        # 전부 빗나가 복귀에 실패한다. "경로 위 차로인가" 와 "어느 쪽으로 나갔나"
+        # 두 가지만 들고 간다.
+        route_lanes = set(self.route['lanes']) if self.route else set()
+        on_route_lane = tuple(ego.lane) in route_lanes
+        OPP = {'left': 'right', 'right': 'left'}
+
+        if self._overtake is not None:
+            side = self._overtake['side']
+            if self._overtake['returning']:
+                if on_route_lane:
+                    self._overtake = None        # 복귀 완료
+                    return None
+                back = self.lg.neighbor(ego.lane, OPP[side])
+                if back is not None and tuple(back) in route_lanes:
+                    return mk(back, OPP[side])   # 복귀 이벤트 재발행
+                self._overtake = None            # 되돌아갈 경로 차로가 없다 — 포기
+                return None
+
+            if on_route_lane:
+                # 아직 경로 차로다 = 전이 진행 중이거나 시작 전. **여기서 상태를
+                # 지우면 안 된다** — 예전엔 '복귀 완료'로 오판해 매 틱 초기화되며
+                # 차선변경이 시작·취소를 반복했다.
+                nb = self.lg.neighbor(ego.lane, side)
+                if nb is not None:
+                    return mk(nb, side)
+                self._overtake = None
+                return None
+
+            # 옆 차로에 나왔다 — 막던 차를 충분히 지나쳤으면 복귀
+            blocker = next((o for o in world.objects
+                            if o.id == self._overtake['blocker_id']), None)
+            passed = blocker is None or blocker.s_rel < -float(self.cfg['vehicle']['length'])
+            if not passed:
+                return None                      # 아직 옆을 지나는 중 — 그대로 간다
+            back = self.lg.neighbor(ego.lane, OPP[side])
+            if back is not None and tuple(back) in route_lanes:
+                self._overtake['returning'] = True
+                return mk(back, OPP[side])
+            self._overtake = None
+            return None
+
+        if not self._blocked or self._lead is None:
+            return None
+        for side in ('left', 'right'):
+            nb = self.lg.neighbor(ego.lane, side)
+            if nb is None:
+                continue
+            rec = self.lg.lanes.get(nb)
+            if rec is None or rec['type'] != 'driving':
+                continue
+            return mk(nb, side)
+        return None
+
+    def _select_lead(self, world: WorldState):
+        """
+        추종할 선행차 하나. on_route ∧ 내 차로 폭 안 ∧ 앞 0~80 m 중 **최근접**.
+
+        `lat_off` 는 내 경로 중심선 기준이므로(perception) 옆 차로 차는 폭 밖으로
+        걸러진다. 범위 상한은 GT 가 주는 80 m 와 같다.
+        """
+        half_w = 1.75
+        if world.ego.lane is not None:
+            try:
+                half_w = 0.5 * float(self.lg.width_at(world.ego.lane, world.ego.s))
+            except Exception:                          # noqa: BLE001
+                pass
+        margin = float(self.cfg['shield'].get('lane_side_m', 1.0)) * 0.5
+        # 추월 전이 중에는 **막고 있던 차를 추종 대상에서 뺀다**. 안 빼면 IDM 이
+        # 계속 0 을 명령해 차가 서고, 전이 진행도(prog = route_s − s_start)가 늘지
+        # 않아 차선변경이 영영 끝나지 않는다 (폐루프 시뮬: t_off 0.81 에서 멈춤).
+        # 목표 차로는 _target_lane_clear 로 이미 비었음을 확인했고, 만일의 접근은
+        # shield 의 TTC 비상제동이 최후 방어로 남는다.
+        # 추월 기동 동안(나가기~복귀)은 그 대상을 추종 후보에서 뺀다 — shield 의
+        # TTC 면제와 같은 범위다.
+        skip = self._overtake['blocker_id'] if self._overtake is not None else None
+        best = None
+        for o in world.objects:
+            if o.id == skip:
+                continue
+            if not o.on_route or not (0.0 < o.s_rel <= LEAD_MAX_S):
+                continue
+            if abs(o.lat_off) > half_w + margin:
+                continue
+            if best is None or o.s_rel < best.s_rel:
+                best = o
+        return best
+
+    def _idm(self, world: WorldState, v0: float) -> float | None:
+        """
+        선행차 추종 속도 상한 [m/s]. 선행차가 없으면 None.
+
+            s* = s0 + max(0, v·T + v·Δv / (2√(a_max·b)))
+            a  = a_max · [ 1 − (v/v0)^δ − (s*/gap)² ]
+
+        s0 = `lead.min_gap_m`, T = `lead.time_headway_s`, a_max = `speed.a_max`,
+        b = `speed.a_comf`(쾌적 감속), δ = IDM_DELTA. **전부 기존 키 재사용**이다.
+        (PDM-Lite §3.2.1 계수 확보 시 이 값들을 교체할 것.)
+
+        gap 은 범퍼 간격이다(자차 앞부분 + 객체 반길이 차감) — perception 의 ttc 와
+        같은 기준을 쓴다. 가속도는 **지평 τ** 를 곱해 목표속도 v + a·τ 로 바꿔 다른
+        후보와 같은 단위(m/s)로 min() 중재에 넣는다. τ = 1 / `control.kp` 다:
+        제어기가 accel = kp·(v_target − v) 를 내므로 τ = 1/kp 여야 IDM 이 지시한
+        가속도가 **그대로** 재현된다. 한 틱 dt(0.05 s)를 쓰면 kp·a·dt = 0.04·a 로
+        IDM 감속의 4 % 만 전달되어(실측) gap 7.8 m 에서도 12.0 m/s 를 유지했다.
+
+        선행차가 서 있으면(v_lead < 0.5) 정지선과 같은 감속 프로파일로 s_rel − s0
+        지점에 세우는 후보를 함께 내고 둘 중 낮은 값을 쓴다.
+        """
+        lead = self._lead
+        if lead is None:
+            return None
+
+        ld = self.cfg['lead']
+        sp = self.cfg['speed']
+        vh = self.cfg['vehicle']
+        # 추월 대상 뒤에서는 조향 여유를 두고 더 멀리 선다.
+        s0 = float(ld['blocked_gap_m'] if self._blocked else ld['min_gap_m'])
+        T = float(ld['time_headway_s'])
+        a_max = float(sp['a_max'])
+        b = float(sp['a_comf'])
+
+        v = max(world.ego.speed, 0.0)
+        front = float(vh['wheelbase']) + float(vh.get('front_overhang_m', 0.855))
+        gap = max(lead.s_rel - front - 0.5 * float(lead.length), 0.1)
+        dv = lead.v_rel                                 # + = 접근
+
+        s_star = s0 + max(0.0, v * T + v * dv / (2.0 * math.sqrt(a_max * b)))
+        # 자유주행 항은 **1 에서 자른다**. v > v0 일 때 원식은 추가 제동을 거는데,
+        # 그 상한은 이미 다른 후보(limit/junction/curvature)가 min() 으로 걸고 있어
+        # 이중 제동이 된다 — 목표가 v0 아래로 내려갔다가 되올라오며 진동했다
+        # (폐루프 시뮬: ego 6.4~11.0 m/s 요동, 추종 gap 35 m). 자른 뒤에는
+        # v >= v0 에서 상호작용(제동) 항만 남는다.
+        free = min(1.0, (v / v0) ** IDM_DELTA) if v0 > 1e-6 else 1.0
+        a = a_max * (1.0 - free - (s_star / gap) ** 2)
+        a = max(float(sp['a_min']), min(a_max, a))
+
+        tau = 1.0 / max(1e-6, float(self.cfg['control']['kp']))
+        v_next = max(0.0, min(v0, v + a * tau))
+
+        # 서 있는 선행차: 정지선과 같은 프로파일로 s_rel − s0 앞에 정지
+        if lead.speed < 0.5:
+            lag = float(sp.get('stop_lag_s', 0.0)) * v
+            v_stop = self._approach(0.0, gap - s0 - lag)
+            v_next = min(v_next, v_stop)
+        return v_next
 
     # ── 횡방향 ────────────────────────────────────────────────────────────
     def _lateral_path(self, world: WorldState) -> list[tuple[float, float]]:
@@ -941,9 +1278,10 @@ class Planner:
         추종 목표 점열 (월드 좌표). 기본은 경로 차로 중심선 = `lg.points_ahead`.
 
         AVOID 진입 조건 (**전부** 만족해야 함):
-          - 내 차로에 정지 장애물. **횡단보도 위 보행자는 제외** — 피해 가는 게
-            아니라 서서 기다리는 대상이다 (`crosswalk_blockers` 로 걸러낸다).
-            그 정지는 `_crosswalk_ped_speed` 가 정지선 앞에서 처리한다.
+          - 내 차로에 정지 장애물. **아래 둘은 제외** — 피해 가는 게 아니라
+            서서 기다리거나 따라가는 대상이다:
+              · 횡단보도 위 보행자 (`crosswalk_blockers`) → `_crosswalk_ped_speed`
+              · 추종 중인 선행차 (`self.lead_id`) → `_idm` (`_select_lead`)
           - 해당 방향 `lg.lane_change_ok` 가 True (실선이면 불가)
           - 옆차로 뒤 `lane_change.back_m` / 앞 `lane_change.front_m` 비었음
           - 지시등을 `signal.lead_s` 만큼 미리 켜둔 상태

@@ -1,21 +1,28 @@
-# HL FMA 2026 자율주행 컨트롤러 — 리포 스캐폴딩 지시서
+# HL FMA 2026 자율주행 컨트롤러 — 규격 및 설계 근거
 
-이 문서를 CLI 코딩 에이전트에 그대로 먹인다. 아래 "작업 지시" 절이 실제 요청이고,
-그 위의 "확정 사실"은 추측하지 말고 그대로 따를 것.
+이 문서는 CLI 코딩 에이전트와 팀원이 공유하는 **단일 사실 소스**다.
+"확정 사실"은 실측·공식 답변으로 검증된 것이니 추측으로 바꾸지 말 것.
+초기 스캐폴딩 지시(구 §3)는 완료되어 삭제했다 — 현재 구조는 README 참조.
 
 ---
 
 ## 0. 배경 (한 줄)
 
 VTD 2025.2 시뮬레이터가 9910 TCP 로 GT(ego/객체/신호등)를 주고, 우리는 조향·가속도·지시등을 되돌려준다.
-도로교통법 10개 항목 + 동적 이벤트 5개로 자동 채점된다. **순수 룰베이스**로 간다. 신경망 없음.
+도로교통법 10개 항목 + 동적 이벤트 5개로 자동 채점된다. **순수 룰베이스**. 신경망 없음.
 
 ---
 
-## 1. 확정 사실 (실측 완료 — 바꾸지 말 것)
+## 1. 확정 사실 (실측·공식 확인 완료 — 바꾸지 말 것)
 
 ### 1.1 9910 TCP 수신 프레임
-- **1109 바이트 고정, 헤더 없음, little-endian, 20 Hz**
+
+- **1109 바이트 고정, 헤더 없음, little-endian, 20 Hz** (주기는 조직위 공식 답변 + RTF 1.000 실측 일치)
+- timestamp·frame ID **없음** (공식 답변) → sim 시간은 프레임 카운트로만 유도 가능
+- **도착 간격은 40/80 ms 교대** (TCP 전달 지터, 유실 아님 — 2000틱 프레임 증분 전부 1 확인).
+  평균은 정확히 50 ms. **고정 dt 가정 금지** — 실사고: `dt_eff = max(dt, 1/send_hz)` 하한이
+  −15 % 속도 편향을 만들어 53 km/h 과속 186틱이 로그에 은폐됐다. 속도는 벽시계
+  슬라이딩 창(Σ변위/Σwall_dt, `percep.speed_win_s`)으로 추정한다.
 - 구조 (연속, 패딩 없음):
 
 | 구간 | 크기 | 포맷 | 내용 |
@@ -24,300 +31,179 @@ VTD 2025.2 시뮬레이터가 9910 TCP 로 GT(ego/객체/신호등)를 주고, �
 | objects[30] | 36 B × 30 = 1080 B | `<I8f` × 30 | id(uint32), x, y, z, heading, speed, length, width, height |
 | trafficLights[1] | 5 B | `<iB` | id(int32), state(uint8) |
 
-- **빈 객체 슬롯은 전 필드 0** → `id == 0` 이면 스킵
-- **trafficLights 는 1칸 고정.** 없으면 `(0, 0)` 이 온다. VTD 가 "지금 봐야 할 신호등" 하나를 골라서 준다.
-- state: `0=미할당 1=적 2=황 3=녹 4=좌회전 5=녹+좌회전 6=점멸`
-- **ego 에 속도 필드가 없다.** 위치 미분 + 저역통과로 직접 추정할 것.
-- ego x, y 는 **xodr 월드 좌표와 동일** (검증 완료: 시나리오 초기위치 508.80 / -168.29 가 lane_graph 의 road 465 lane -1, 중심선 오차 0.05 m — VTD ModuleManager 의 `Road ID=465 Lane ID=-1 Off=0.052` 와 일치).
-- 객체 타입 필드는 **없다.** 크기로 분류할 것:
-  - 보행자: width 0.5–0.8, height 1.5–2.0, length < 1.0
-  - 차량: length > 3.0
-  - 그 외 + speed≈0: 정적 장애물
-- 객체 id 는 작은 고정 정수(시나리오 플레이어 번호). 프레임 간 동일 id 유지 → 트래킹 용이.
-- 객체는 가시성(occlusion) 필터 없이 온다 (60–70 m 밖 객체도 수신 확인). 단 **미확인**: 정확한 거리 컷오프. 77 m 객체가 목록에서 빠진 사례 있음 → 런타임에 관찰 로그 남길 것.
+- **빈 객체 슬롯은 전 필드 0** → `id == 0` 스킵. 선택 규칙(공식): 수평거리 80 m 이내,
+  가까운 순, 최대 30개. 시야각·occlusion 필터 없음(후방 포함).
+- **trafficLights 는 1칸 고정.** 없으면 `(0, 0)`.
+- **id 는 xodr signal id 가 아니라 SignalController id 다** (관측 id 3/5/11/19/30/38/80/90 이
+  signal 테이블에 부재, controller 계층과 일치). VTD 는 **자차 접근로 기준** controller 를
+  골라 준다 — 행동 상관 3건(적색 대기→녹색 통과 등)으로 검증. 자차가 도로를 옮기면
+  id 가 다음 교차로 접근로 단위로 바뀌고, 교차로 연결로·비신호 구간에서는 `(0,0)` 또는
+  **필드 소멸**이 온다. **소멸 ≠ 통과 허가** — 정지 래치는 소멸로 풀지 않는다(실사고 §6).
+- state: `0=비알람 1=적 2=황 3=녹 4=좌회전 5=녹+좌회전 6=점멸`
+  - 5(녹+좌)는 녹색 포함 → 직진·우회전 통과가 정상 (실주행 3곳 검증)
+  - 0은 제약 없음으로 처리하되 **래치 해제 조건에는 포함하지 않음**
+- **ego 속도 필드 없음** (공식 답변: 직접 계산). 위치 차분 + 창 추정.
+- ego x, y 는 **xodr 월드 좌표와 동일**, 원점은 **뒷바퀴 축 중심** — 정지·통과 판정에는
+  **전장 보정 필수**: 앞범퍼 = 뒷축 + wheelbase(2.944) + front_overhang(0.855).
+- 객체 타입 필드 없음 → 크기 분류: 보행자 width 0.5–0.8·height 1.5–2.0·length<1.0,
+  차량 length>3.0, 그 외+speed≈0 = 정적 장애물. id 는 프레임 간 유지(트래킹 용이).
 
 ### 1.2 9910 TCP 송신 (제어)
-- **9 바이트, 헤더 없음**: `struct.pack('<ffB', steering, targetAccel, turnSignal)`
-- steering [rad] (좌 +), targetAccel [m/s²] (음수 = 감속), turnSignal `0=OFF 1=LEFT 2=RIGHT`
-- 20 Hz 로 계속 보낼 것. 끊기면 VTD 가 멈출 수 있음.
-- **부호 주의**: 주최 제공 예제(`tcp_manual_controller.py`)는 내부 steer 를 `steer_out = -steer` 로 뒤집어 보낸다. 실차 검증 전까지 조향 부호는 파라미터로 빼둘 것 (`STEER_SIGN = -1.0`).
+
+- **9 바이트**: `struct.pack('<ffB', steering, targetAccel, turnSignal)`
+- steering [rad] (좌 +), targetAccel [m/s²], turnSignal `0=OFF 1=LEFT 2=RIGHT`
+- 20 Hz 지속 송신. **`comm.steer_sign = +1.0` 실측 확정** (2026-08-19,
+  corr(steering, yaw_rate) = −0.93 사고로 규명; SteerSignMonitor 가 주행 5초 내 자동 검증).
+- VTD 는 targetAccel 을 **폐루프로 실현**한다 — 6.4 % 오르막에서 명령 0.0 에 속도 유지
+  실측. 중력 보상은 VTD 내부가 하므로 **pitch feed-forward 를 넣지 말 것**
+  (넣으면 오르막 +2.9 km/h 과속).
 
 ### 1.3 차량 제원 (Ioniq 6)
-- wheelbase 2.944 m, 전장 4.848, 전폭 1.886, 전고 1.507
-- 최대 조향 0.48 rad, 회전반경(지름) 12.53 m
-- **좌표 원점은 뒷바퀴 축 중심(지면)** — Pure Pursuit 에 그대로 쓰면 됨
-- 센서(사용 안 함): LiDAR Velodyne HDL-32E 80 m @ (1.0, 0, 2.4), 카메라 FOV 80°×50.6° @ (1.5, 0, 1.6)
 
-### 1.4 채점 항목
-법규 10개: 제한속도, 스쿨존 속도, 차로 유지, 중앙선 침범·우측통행, 보도 침범, 실선 차선변경 금지,
-적색신호 정지, 녹색신호 통과, 도로 파손·장애물 대응, 횡단보도 정차 금지.
-동적 이벤트 5개: 보행자 출현(거리·감속·TTC·정지), 차량 출현/급정거(안전거리), 장애물(감속·정지·회피),
-방향지시등(회전·차선변경 n초 전 점등), 충돌(감점).
-경로 3 km 이내 / 약 5분.
+- wheelbase 2.944 / 전장 4.848 / 전폭 1.886 / 전고 1.507 / **front_overhang 0.855**
+- 최대 조향 0.48 rad → 최소회전반경 ≈ 5.65 m. **R < 5.65 m 호는 추종 불가**
+  (속도 무관 — 예시 경로 LC4 6.09 m 창, 회전1 연결로 R=4.5 m 가 해당)
+- 좌표 원점 뒷바퀴 축 중심 — Pure Pursuit 는 무보정, **정지 판정은 보정**(§1.1)
 
-### 1.5 이미 있는 자산 (재작성 금지, import 해서 쓸 것)
-- `lane_graph/build_lane_graph.py` — xodr → `lane_graph.pkl` (오프라인 1회)
-- `lane_graph/lanegraph.py` — 런타임 헬퍼. **이 API 를 그대로 사용**:
-  - `LaneGraph(path)` / `.locate(x, y, yaw, prefer=route['lanes']) -> LaneMatch(lane, s, t, heading_err, dist, idx)`
-  - `.lookahead(route, idx, s_in_lane, horizon) -> [Ahead(dist, kind, lane, s_in_lane, data)]`
-    - kind: `stop_line`(data.signal_ids) / `crosswalk`(data.kind=pelican|inferred) / `crosswalk_warn` / `yield` /
-      `speed`(data.limit, data.school_zone) / `mark_left`·`mark_right`(data.type, data.lane_change_ok, data.is_center) /
-      `junction_in`·`junction_out` / `turn_left`·`turn_right` / `lane_change_left`·`lane_change_right`(window_s0/s1) /
-      `dead_end` / `route_end`
-  - `.summarize(ahead) -> dict`
-  - `.points_ahead(lane, s, dist, step, route, idx) -> (N,2)` ← Pure Pursuit 목표점용
-  - `.mark_at(lane, s, side)`, `.lane_change_ok(lane, s, side)`, `.speed_limit_at(lane)`, `.width_at(lane, s)`,
-    `.point_at(lane, s)`, `.neighbor(lane, side)`, `.successors/.predecessors(lane)`
-  - lane key = `(road_id, section_idx, lane_id)`. lane 레코드에 `left_is_center`(중앙선 여부), `dir`, `curv` 등 포함.
-- `lane_graph/build_route.py` — 경유점 csv → `route.pkl`
-  (`lanes`, `cum_s`, `lengths`, `total_length`, `start_s_in_lane`, `waypoints`, `waypoint_s`, `events`)
-  경로 누적거리 = `cum_s[i] + s_in_lane`
-- `lane_graph/plot_lane_graph.py` — 시각화
-- `probe_9910.py` — 9910 덤프/디코드 도구 (참고용, `decode()` 재사용 가능)
-- 맵 파싱 결과: 도로 651 / 주행차로 2480 / 신호등 646 / 정지선 277(방향별 클러스터) / 제한속도는
-  **표준 `<speed>` 필드 없음** → 노면표시 객체(RM_517_50=50, roadmark_speed_30=30, RM_518=스쿨존 30)로 도로·방향 단위 부여,
-  표시 없는 도로는 `None` → 런타임에서 직전 값 유지(carry).
+### 1.4 채점 항목 (공지 캡처 확보)
 
----
+법규 10: S1.1.01 제한속도 / S1.1.02 스쿨존 속도 / S2.1.01 차로 유지 / S2.1.02 중앙선·우측통행 /
+S2.1.03 보도 침범 / S2.2.05 실선 차선변경 금지 / S5.1.01 적색 정지 / S5.1.03 녹색 통과 /
+S6.1.01 파손·장애물 대응 / **S6.3.03 횡단보도 "정차 금지"** (속도 캡 아님 — crosswalk 25 캡은
+근거 없어 제거됨).
+동적 5: 보행자 출현(거리·감속·TTC·정지) / 차량 출현·급정거 / 장애물 / 방향지시등 n초 전 /
+충돌. 차로유지·중앙선·보도·실선·우측통행은 **상시 측정**.
+경로 ~3 km / 5분 (→ 평균 36 km/h 필요. 현 평균 ~26–31, §7-6).
 
-## 2. 아키텍처 (한 틱 = 한 패킷, 순차 실행)
+### 1.5 지도·경로 자산
 
-```
-9910 → Comm.recv → Perception → Planner → Shield → Control → Comm.send → 9910
-                          ↘________ Logger (매 틱 전부 기록) ________↙
-```
-
-- **단일 프로세스, 단일 스레드 루프.** ROS 안 씀. 노드 간 지연/시간동기화 문제 제거.
-- 각 단계는 앞 단계 출력(dataclass)만 받는다. 역방향 참조 금지.
-- Perception 은 판단하지 않는다. Control 은 교통법을 모른다. Shield 는 Planner 를 신뢰하지 않는다.
+- xodr: 도로 651 / 주행차로 2480 / 교차로 94 / 신호 646(controller 214) /
+  정지선 클러스터 277(비신호 156) / 횡단보도 400+
+- 제한속도는 표준 `<speed>` **0건** — 노면표시 객체로만: `RM_517_50`=50(도로 16),
+  `RM_518`=스쿨존(도로 23, 차로 230; 30 해석은 §7-5 미검증), `roadmark_speed_30`=30.
+  **50 초과 마킹 없음** → 맵 최고 제한 50. 무표시 도로는 `default_speed_kph 50`
+  (한국 5030 정책과 부합, 채점도 동일 xodr 기준일 것).
+- 경사: 5 % 초과 180곳, 최대 39.6 % — 언덕 지형 (속도 저하는 §1.2 로 VTD 가 처리)
+- 신호 좌표(x/y)는 xodr 에 없음 — 신호 검증은 controller↔정지선 매핑으로 한다.
+  **빌드 매핑 규칙(같은 도로 20 m)은 한국식 배치(신호가 건너편 25 m)를 놓친다** →
+  런타임 폴백 ②(§3.4)로 보완. 스쿨존 비신호 정지선 46곳에서 폴백 오정지 위험(§7-4).
+- 대회 경유점 CSV 형식 (공식): 첫 점=출발, 끝 점=도착, 중간은 **교차로 진입·진출 짝**,
+  짝 사이 = 교차로 내부. 경로 이탈 감점.
+- lane key = `(road_id, section_idx, lane_id)`. **좌측 차로는 id 순서가 반전**된다
+  (실사고: 좌우 역추론 → 차선변경 10.5 m 지연).
+- route_s = cum_s + s_in_lane. **차선변경 hop 은 길이 0** — 평행 차로 중복 가산이
+  route_s 52 m / lookahead 12–55 m 과대를 만든 실사고 2건. lookahead 도 동일 규칙.
+- 차선변경 창은 **같은 lane 연속 section 병합 + 시작점 최대 전진**으로 산정.
+  창 < 전이거리 max(3·v, 20 m) 인 경로는 물리적 실패 — 빌드 리포트가 20 m 미만 경고.
 
 ---
 
-## 3. 작업 지시
-
-아래 구조로 리포를 스캐폴딩하고, 각 파일에 **타입 시그니처와 docstring, TODO 주석**까지 작성한다.
-로직 본문은 `# TODO:` 로 남기되, **Comm 파싱/송신과 dataclass 정의와 main loop 는 완전히 구현**한다.
+## 2. 아키텍처
 
 ```
-hlfma/
-├── README.md                  # 실행법, 대회날 체크리스트
-├── requirements.txt           # numpy, scipy  (matplotlib 은 tools 전용)
-├── run.sh                     # 환경변수 + main 실행 (대회날 이것만 실행)
-├── config.yaml                # 모든 튜닝 파라미터 (아래 5절)
-├── src/
-│   ├── main.py                # 틱 루프. argparse(--host --port --route --graph --replay --log)
-│   ├── types.py               # dataclass: RawPacket, EgoState, TrackedObject, WorldState, Decision, Command
-│   ├── comm.py                # Comm: connect/recv/parse/send/watchdog/reconnect
-│   ├── perception.py          # Perception: RawPacket + LaneGraph + route → WorldState
-│   ├── planner.py             # Planner: WorldState → Decision (FSM + min() 속도중재)
-│   ├── shield.py              # Shield: Decision clamp (법규 하드 가드)
-│   ├── control.py             # Control: Decision → Command (Pure Pursuit + 종방향 PI)
-│   ├── logger.py              # 매 틱 jsonl 기록 + 리플레이 소스
-│   └── lanegraph.py           # (기존 파일 복사, 수정 금지)
-├── tools/
-│   ├── build_lane_graph.py    # (기존)
-│   ├── build_route.py         # (기존)
-│   ├── plot_lane_graph.py     # (기존)
-│   ├── probe_9910.py          # (기존)
-│   ├── replay.py              # 로그 jsonl → Comm 대체 소스로 재생 (VTD 없이 P/P/S/C 재실행)
-│   └── score.py               # 로그 → 채점 (법규 10항목 자동 판정)  ※ 뼈대만
-├── data/
-│   ├── lane_graph.pkl
-│   └── route.pkl
-└── tests/
-    ├── test_comm_parse.py     # 합성 1109B 프레임 → 파싱 왕복 검증
-    ├── test_perception.py     # 시나리오 초기위치가 (465,2,-1), t≈0.05 로 매칭되는지
-    └── test_shield.py         # 과속/실선 차선변경/TTC 입력 시 clamp 되는지
+9910 ─recv─> vtd_bridge ─/gt_state─> perception ─/world_state─> planner(+shield)
+                  ↑                                                    │
+                  └────────────── /cmd ────────── control <──/decision─┘
+                          Logger (매 틱 raw+판단 전부 jsonl)
 ```
 
-### 3.1 `types.py` — 이대로 정의할 것
+- **ROS 2, 노드별 프로세스 분리가 기본.** 단일 프로세스는 GIL 경합으로 8.8 Hz
+  (드롭 67 %, 지연 169 ms) — 분리로 20 Hz / 0.1 % / 4.4 ms (실차 실측).
+- 한 패킷 = 한 틱, 타이머 없이 콜백 체인. QoS depth=1 최신 우선.
+- core/ 는 ROS 를 모른다 — pytest·replay·mock 이 같은 코드를 돈다.
+- Perception 은 판단하지 않고, Control 은 교통법을 모르며, Shield 는 Planner 를 신뢰하지 않는다.
 
-```python
-@dataclass
-class RawPacket:
-    t_recv: float                    # time.monotonic()
-    ego: tuple[float, ...]           # x, y, z, heading, pitch, roll
-    objects: list[tuple]             # id≠0 인 것만, (id, x, y, z, heading, speed, length, width, height)
-    lights: list[tuple[int, int]]    # (id, state), id==0 이면 제외
+## 3. 모듈 규격 (구현 완료분의 계약)
 
-@dataclass
-class EgoState:
-    x: float; y: float; z: float; yaw: float; pitch: float; roll: float
-    speed: float                     # 위치 미분 + LPF 로 추정
-    accel: float                     # speed 미분
-    lane: tuple[int, int, int] | None
-    s: float                         # 차로 내 s
-    route_s: float                   # 경로 누적거리
-    t_off: float                     # 중심선 횡오프셋 (좌 +)
-    heading_err: float
+### 3.1 Comm
+스트림 재조립 후 **최신 프레임만** 사용. watchdog 은 수신 유무로만(적신호 대기 13–18 s
+동안 속도 0 은 정상). `/cmd` 가 `hold_decay_s`(0.15) 이상 끊기면 vtd_bridge 가 조향만
+0 으로 감쇠(가속 유지 — 실사고: 풀락 0.48 이 0.32 s 유지된 채 3.5 m → 이탈).
 
-@dataclass
-class TrackedObject:
-    id: int
-    x: float; y: float; heading: float; speed: float
-    length: float; width: float; height: float
-    cls: str                         # 'vehicle' | 'pedestrian' | 'obstacle' | 'unknown'
-    lane: tuple[int, int, int] | None
-    on_route: bool                   # 경로 차로 위인지
-    s_rel: float                     # 경로 기준 종방향 상대거리 (+ = 앞)
-    lat_off: float                   # 내 경로 중심선 기준 횡거리
-    v_rel: float                     # 접근 속도 (+ = 접근)
-    ttc: float                       # inf 가능
-    will_enter_lane: bool            # 1~2 s 등속 외삽 시 내 차로 진입
-    age: float                       # 마지막 수신 후 경과 (coasting 용)
-    coasting: bool                   # 이번 틱 수신 없어 외삽 중
+### 3.2 Perception
+- 속도: 벽시계 슬라이딩 창(§1.1). 창 pop 은 "빼도 ≥ win_s 남을 때만"(스톨 후 버스트 방어).
+- 리셋 감지: 점프 `max(jump_m, v·dt·f)` / 환산속도 / t_off 점프 / **차로중심 스냅**
+  (리스폰은 중심 0.00 복귀 — 이 조건 추가로 미검출 5건 소급 검출). 스톨(dt>0.2 s)이라도
+  이동 > `stall_teleport_m`(50) 이면 리셋 처리. 리셋 틱은 속도 창·적분항·조향 이력 전부 초기화.
+- 객체: 분류(§1.1) → lane 매칭 → on_route/s_rel/ttc/will_enter_lane(등속 외삽 2 s) /
+  coasting(1.5 s).
 
-@dataclass
-class WorldState:
-    t: float
-    ego: EgoState
-    objects: list[TrackedObject]
-    light: tuple[int, int] | None    # (id, state)
-    ahead: list                      # lanegraph.Ahead 리스트
-    summ: dict                       # lanegraph.summarize 결과
-    speed_limit: float               # 현재 유효 제한속도 [m/s] (carry 반영)
-    school_zone: bool
-    left_solid: bool; right_solid: bool; left_is_center: bool
-    valid: bool                      # 패킷 신선도/좌표 점프 없음
-    flags: dict
-
-@dataclass
-class Decision:
-    v_target: float                  # [m/s]
-    path: list[tuple[float, float]]  # 추종 목표 점열 (월드 좌표)
-    turn_signal: int
-    state: str                       # FSM 상태명
-    reasons: dict                    # 각 속도 후보값 (로그/디버깅용)
-
-@dataclass
-class Command:
-    steering: float
-    accel: float
-    turn_signal: int
+### 3.3 Planner — 종방향은 후보 min()
 ```
-
-### 3.2 `comm.py` — 완전 구현
-
-- `connect()` 재시도 루프, `TCP_NODELAY`
-- **스트림 재조립**: `recv` 가 1109 배수로 오지 않을 수 있으므로 버퍼에 쌓고 1109 씩 잘라 **가장 최신 프레임만** 사용 (밀린 프레임은 버림 — 지연 누적 방지)
-- `parse(frame) -> RawPacket` (§1.1 그대로, id==0 스킵)
-- `send(Command)` (§1.2)
-- watchdog: `WATCHDOG_S` 동안 수신 없으면 `valid=False` + 안전정지 명령 송신 + 재접속.
-  **주의: 적신호 대기가 13–18 s 이므로 "속도 0" 을 이유로 재시작하면 안 된다.** 오직 패킷 수신 여부로 판단.
-
-### 3.3 `perception.py`
-
-1. ego 속도/가속도 추정 (dt 는 `t_recv` 차분, LPF 계수 config)
-2. `lg.locate(x, y, yaw, prefer=route['lanes'])` → lane/s/t/heading_err, `route_s = cum_s[idx] + s`
-3. `lg.lookahead(route, idx, s, horizon)` + `summarize`
-4. 제한속도 carry (표시 없는 도로는 직전 값 유지), 스쿨존 플래그
-5. 객체 분류(§1.1 크기 규칙) → `lg.locate(obj.x, obj.y, obj.heading)` 로 lane 매칭 → `on_route`, `s_rel`, `lat_off`
-6. `v_rel`, `ttc`, 보행자 1–2 s 등속 외삽 → `will_enter_lane`
-7. 직전 틱에 있었으나 이번에 없는 id 는 `COAST_S` 동안 마지막 상태로 유지 (`coasting=True`)
-8. 유효성: dt 이상, 좌표 점프(> `JUMP_M`), lane 매칭 실패 → `flags`
-
-### 3.4 `planner.py`
-
-FSM: `FOLLOW / STOP_LINE / FOLLOW_LEAD / YIELD_PED / AVOID / RETURN / E_STOP`
-
-종방향은 **후보들의 min()**:
+v_target = min( limit − margin, school/junction/blind 캡, sqrt(a_lat_max/|curv|),
+                limit_ahead 선행감속, IDM(선행차), 정지 후보들, route_end )
 ```
-v_target = min(
-  speed_limit - SPEED_MARGIN,
-  school/crosswalk/junction/blind 구간 캡,
-  곡률 속도  sqrt(A_LAT_MAX / |curv|),
-  IDM(선행차),
-  v_safe(정지점),                       # sqrt(2*A_COMF*(d - STOP_GAP))
-  v_safe(장애물), v_safe(보행자)
-)
-```
-신호 판단(정지선까지 d, 현재 v, 황색 잔여 t_y=3 s 가정):
-- 적/황이고 `d > v*t_y` → 정지점 = 정지선 - `STOP_GAP`
-- 황이고 `d <= v*t_y` → 통과
-- 녹/녹+좌 → 통과 (**녹색신호 통과도 채점 항목. 불필요한 정지 금지**)
-- 좌회전 신호(4/5)는 경로가 좌회전일 때만 진행 근거로 사용
-- 점멸(6)은 config 플래그로 동작 선택 (기본: 서행 + 교차 차량 양보)
+- **정지 프로파일**: 목표 = 앞범퍼가 (정지점 − stop_gap). 유효거리에서 전장 보정(§1.1)
+  차감 + **속도 비례 선행 보상 `stop_lag_s`(0.6)** — P 추종 지연(err≈a_plan/kp≈1.3 m/s)
+  상쇄. route_end 에도 동일 lag 적용. 실측: 앞범퍼가 정지선 1.10 m 앞 v=0 (오차 0.10 m).
+- **신호**: 적/황(딜레마존 밖) → 정지 래치. **해제는 ① 녹색류(3/5, 4+좌회전경로)
+  ② RTOR go ③ 명백 통과(정지선 +5 m) 뿐** — light 소멸·state 0 으로 풀지 않음.
+- **폴백 ②**: 전방 정지선의 signal_ids 가 비어도 9910 light 유효 시 그 state 적용
+  (`light_ctrl_match is False` 확인 시에만 차단). 빌드 매핑 누락(도로 30) 보완.
+- **RTOR**: 적색+`next_turn==turn_right` → 완전정지(v<0.2) → dwell 1.0 s → 통과경로·
+  횡단보도·좌측 TTC 안전 확인 → `rtor_speed_kph`(20) 서행. `rtor_enabled` 스위치
+  (규정 미확정 §7-3). hold 사유는 reasons 에 기록.
+- **차선변경**: 창 진입 + `lc_clear` + **지시등 연속 점등 ≥ `lc_lead_min_s`(3.0)**.
+  미달 시 점등 유지하며 원차로 직진; 남은 창 < 전이거리면 창 연장 시도 후 즉시 실행
+  (`lead_short` 플래그). shield 긴급 회피는 면제. 완료 이벤트는 창 s1 통과까지
+  재선택 금지(재선택 깜빡임 23회 실사고). blend base 는 **LC 시작 시점 원차로로 고정**
+  — 매칭 전환 시 base 교체가 경계 요동(1.2 s, ±0.36) 실사고.
+- **지시등**: 회전 = lookahead turn 이벤트 lead 4 s 전 점등, 연결로 끝(end_s)까지 유지.
+  LC 와 겹치면 **거리 짧은 쪽 우선, 동률 회전 우선**. `sig_src`/`sig_lead_s` 로그.
 
-횡방향:
-- 기본 = 현재 경로 차로 중심선 (`lg.points_ahead`)
-- `AVOID` 진입 조건: 내 차로 정지 장애물 && 해당 방향 `lane_change_ok` && 옆차로 뒤 `LC_BACK_M`/앞 `LC_FRONT_M` 비었음 && 지시등 `SIGNAL_LEAD_S` 선행 점등 완료
-- **위 조건 하나라도 불만족 → 회피하지 않고 정지** (실선 차선변경·중앙선 침범이 감점이므로 정지가 항상 이득)
-- 장애물 통과 후 조건 만족 시 `RETURN`
+### 3.4 Shield
+corridor·실선·중앙선 가드, TTC 비상제동(1.5 s, 저크 해제). §7-7: 횡단보도 보행자는
+회피(AVOIDING) 대상이 아니라 **정지선 대기 대상** — 우선순위 정리 구현 중.
 
-교차로 진입 게이트 (신호 위반 차량 대비):
-- 교차 방향 접근 객체의 `t_them = d/v`, 내 통과시간 `t_me` 비교 → 여유 `CROSS_MARGIN_S` 미만이면 진입 보류
-- 감속 안 하는 접근 차량은 신호와 무관하게 양보
+### 3.5 Control
+- 횡: Pure Pursuit, `L_d = clamp(0.8·v, 5, 20) / (1 + k_curv·|curv|)` (곡률 축소 —
+  코너 안쪽 잘라먹기 방지, `ld_curve_min` 3). 조향 변화율 1.0 rad/s.
+- 종: PI + 저크 제한. **적분은 |err| ≤ `ki_band`(1 m/s) 에서만** (오버슛 28.4 실사고),
+  포화 시 와인드업 되돌림, 정지 유지 `a_hold`(−1.0). E_STOP 은 저크 해제.
+- 리셋 플래그 수신 시 전 이력 초기화.
 
-지시등: `route['events']` 의 `turn_*`, `lane_change_*` 지점까지 남은 거리를 현재 속도로 나눈 시간이
-`SIGNAL_LEAD_S + SIGNAL_MARGIN_S` 이하가 되면 점등.
+## 4. 코딩 규칙 (불변)
 
-### 3.5 `shield.py` — Planner 를 신뢰하지 않는 하드 가드
+- Python 3.10+, numpy/scipy. 딥러닝 금지.
+- **모든 튜닝 상수는 params.py DEFAULTS → params.yaml 생성, 단일 출처.**
+  두 파일 수동 이원화 금지(steer_sign 회귀 실사고). yaml 수정 후 colcon build 필수.
+- 내부 단위 m·m/s·m/s²·rad. km/h 는 입출력·로그만.
+- 틱 내부 예외는 잡아서 로깅 + 직전 Command 유지.
+- 로그(logger.py)는 raw 포함 전 필드 유지 — replay·summarize 의 계약. 필드 삭제 금지.
+- 검증 사다리: pytest → tools/replay.py(개루프) → mock/폐루프 시뮬 → 실차.
+  수치 주장은 실측 로그 근거를 함께 남길 것.
 
-```
-1. v_target = min(v_target, speed_limit - SPEED_MARGIN)          # 절대 초과 금지
-2. 현재 s 에서 해당 방향 mark.lane_change_ok == False 인데 path 가 옆차로면 → 현재 차로 path 로 교체
-3. left_is_center 인데 path 가 좌측 이탈 → 교체
-4. min TTC < TTC_EMERGENCY → v_target = 0, accel = A_EMERGENCY (저크 제한 해제)
-5. 횡단보도 구간 내 정차 금지: 정지점이 crosswalk 구간 안이면 구간 앞으로 당김
-6. |t_off| > lane_width/2 - EDGE_MARGIN → 복귀 우선
-```
-각 clamp 발동을 `Decision.reasons['shield']` 에 기록.
+## 5. 파라미터
 
-### 3.6 `control.py`
+`src/hlfma/config/params.yaml` 이 유일한 값 목록이다 (이 문서에 사본을 두지 않는다 —
+이원화 방지). 근거가 있는 값에는 yaml 주석으로 실측 날짜·사고 번호를 남긴다.
 
-- 횡: Pure Pursuit. `L_d = clamp(K_LD * v, LD_MIN, LD_MAX)`, `delta = atan2(2*WHEELBASE*sin(alpha), L_d)`,
-  `steering = STEER_SIGN * clamp(delta, -MAX_STEER, MAX_STEER)`, 조향 변화율 제한
-- 종: `accel = KP*(v_target - v) + KI*∫ + FF`, `clamp(A_MIN, A_MAX)`, 저크 제한 `JERK_MAX`
-  (단 `state == 'E_STOP'` 이면 저크 제한 해제)
-- 정지 유지: `v_target == 0 && v < 0.2` → `accel = A_HOLD` (음수 유지)
+## 6. 실사고 대장 (같은 실수 반복 금지)
 
-### 3.7 `logger.py` / `tools/replay.py`
+| # | 사고 | 교훈 |
+|---|---|---|
+| 1 | steer_sign 반전 → 직선 발산·리스폰 | 부호는 실측+자동 감시(SteerSignMonitor) |
+| 2 | 단일 프로세스 8.8 Hz | GIL — 분리가 기본 |
+| 3 | route_s/lookahead 평행차로 중복 가산 | LC hop = 0, 두 곳 모두 |
+| 4 | dt 하한 → 속도 −15 % 편향, 과속 은폐 | 벽시계 창 추정, 고정 주기 가정 금지 |
+| 5 | 좌측 차로 id 역순 미인지 | lane id 부호·순서 규칙 명시(§1.5) |
+| 6 | light 소멸 시 무조건 언래치 → 감속 중 재가속 3/3 | 소멸 ≠ 허가 |
+| 7 | 뒷축 기준 + 보정 없음 → 앞범퍼 3–5 m 침범 | 정지 판정은 전장 보정 |
+| 8 | P 추종 지연 → 스냅 시점 3.3 m/s 잔속 | stop_lag_s 선행 보상 |
+| 9 | LC 완료 미기억 → 지시등 깜빡임 23회·88 % 점등 | 완료 집합 + 래치 리셋 |
+| 10 | blend base 매칭 전환 → 경계 요동 | base 를 원차로 고정 |
+| 11 | 횡단보도 보행자를 장애물 회피 → 도로 중앙 급정지 | §7-7 수정 중 |
 
-- 매 틱 1줄 jsonl: `t`, raw ego/objects/lights, WorldState 요약, Decision(reasons 포함), Command
-- `replay.py` 는 이 jsonl 을 읽어 `Comm.recv` 를 대체 → **VTD 없이** Perception/Planner/Shield/Control 재실행.
-  판단 로직 수정 후 회귀 테스트의 기반.
+## 7. 미확인·미해결 (가정은 전부 params 로)
 
----
-
-## 4. 코딩 규칙
-
-- Python 3.10+, 표준 라이브러리 + numpy/scipy 만. 딥러닝 프레임워크 금지.
-- 모든 튜닝 상수는 `config.yaml` 에서만. 코드에 매직넘버 금지.
-- 단위 명시: 내부는 **m, m/s, m/s², rad** 통일. km/h 는 입출력에서만 변환.
-- 각 모듈은 부작용 없는 순수 함수 형태 선호 (입력 dataclass → 출력 dataclass).
-- 예외로 루프가 죽지 않게: 틱 내부 예외는 잡아서 로깅 + 직전 Command 유지 + `E_STOP` 카운터.
-- 타입힌트 필수, docstring 은 한국어.
-
-## 5. `config.yaml` 초기값 (근거 있는 값만; 나머지는 TODO 로 표시)
-
-```yaml
-comm: {host: 127.0.0.1, port: 9910, send_hz: 20, watchdog_s: 1.0, steer_sign: -1.0}
-vehicle: {wheelbase: 2.944, max_steer: 0.48, length: 4.848, width: 1.886}
-speed:   {margin_kph: 3.0, a_comf: 1.5, a_max: 2.0, a_min: -6.0, a_emergency: -8.0,
-          jerk_max: 2.0, a_lat_max: 2.0, stop_gap_m: 1.0}
-caps_kph: {school_zone: 28, crosswalk: 25, junction: 30, blind: 25}   # TODO: 튜닝
-signal:  {yellow_s: 3.0, lead_s: 3.0, margin_s: 1.0, flash_mode: yield}
-lead:    {time_headway_s: 2.0, min_gap_m: 5.0}
-ttc:     {warn_s: 4.0, brake_s: 2.5, emergency_s: 1.5}
-lane_change: {back_m: 30, front_m: 50, min_window_m: 20}
-cross:   {margin_s: 2.0}
-percep:  {horizon_m: 200, coast_s: 1.5, jump_m: 5.0, speed_lpf: 0.3,
-          ped_extrapolate_s: 2.0}
-control: {kp: 0.8, ki: 0.15, k_ld: 0.8, ld_min: 5.0, ld_max: 20.0}   # TODO: 튜닝
-```
-
-## 6. 산출물 확인 기준
-
-- `python3 -m pytest tests/` 통과
-- `python3 src/main.py --replay logs/sample.jsonl` 가 VTD 없이 끝까지 돈다
-- `python3 src/main.py --host 127.0.0.1 --graph data/lane_graph.pkl --route data/route.pkl` 가
-  연결 후 20 Hz 로 Command 를 보내고 매 틱 로그를 남긴다
-
-## 7. 아직 미확인 (코드에 TODO 로 남기고 가정은 config 로 뺄 것)
-
-1. 신호등이 교차로마다 id 가 바뀌는지, state 전이가 실제로 오는지 (관측 중)
-2. GT 객체 거리 컷오프 (77 m 사례) — 런타임 관찰 로그 남길 것
-3. 대회 경유점 파일 형식 (좌표 개수/판정 반경) → `build_route.py --radius`
-4. 표시 없는 도로의 기본 제한속도 (주최 문의 중) → `config: default_speed_kph`
-5. `RM_518` 이 어린이보호구역 30 이 맞는지 (텍스처 확인 필요)
-6. 점멸 신호(state 6) 의 대회 규정 해석
+| # | 내용 | 관련 |
+|---|---|---|
+| 1 | 점멸(state 6) 황/적 구분 | `signal.flash_mode` — 조직위 문의 |
+| 2 | 지시등 선행 "n초" 규정값 | `signal.lc_lead_min_s` 3.0 (2.0 이면 회전1 감속으로 충족 가능) |
+| 3 | RTOR 허용 여부 | `signal.rtor_enabled` |
+| 4 | 스쿨존 비신호 횡단보도 일시정지 채점 여부 | 폴백 오정지 위험 46곳과 상충 — 규정 후 결정 |
+| 5 | RM_518 = 스쿨존 30 | 텍스처 미검증 |
+| 6 | 5분 초과 처리 | margin_kph 전략 직결 (현 평균 26–31 km/h) |
+| 7 | 횡단보도 보행자 → 정지선 정지 + shield 우선순위 | 구현 중 |
+| 8 | 라우터: 연속 LC 이격 / waypoint 짝으로 진출차로 특정 | 임의 경로 강건화 |
+| 9 | junction 6 신호가 대회날 켜지는지 | 연습 환경 state=0 고정 — 당일 첫 수 초 확인 |

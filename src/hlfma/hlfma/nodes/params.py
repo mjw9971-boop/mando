@@ -36,9 +36,13 @@ DEFAULTS: dict[str, Any] = {
               # 정지 목표 선행 보상 [s]: P 제어가 내려가는 목표를 a_plan/kp ≈ 1.3 m/s 늦게
               # 따라가 정지점을 ~2 m 넘긴다. 목표를 v·stop_lag_s 만큼 앞당긴다 (폐루프
               # 시뮬: 0.6 이면 앞범퍼가 정지선 −1.0~−1.2 m, 완주 시간 손실 0).
+              # 지도 곡률 이상치 방어: 이웃 중앙값의 이 배수를 넘는 고립 곡률은 무시.
+              # 0 이면 방어 끔. (빌드 단계 필터가 1차 방어, 이건 2차 방어)
+              'curv_outlier_ratio': 5.0,
               'stop_lag_s': 0.6,
-              # 래치 뒤 0 스냅 대신 연속 프로파일 — 시뮬에서 이득 없어 기본 끔
-              'stop_continuous': False,
+              # 래치 뒤 0 스냅 대신 _approach 곡선을 v=0 까지 연속으로 (스냅은
+              # 마지막에 감속도가 튄다 — 2026-08-23 15:48 런에서 -1.29 -> -1.87)
+              'stop_continuous': True,
               'stop_gap_m': 1.0, 'a_hold': -1.0},
     # crosswalk 캡은 없다: 채점표의 속도 항목은 S1.1.01 제한속도 / S1.1.02 스쿨존
     # 뿐이고 S6.3.03 은 "횡단보도 정차 금지"(멈추지 말라)다. 25 km/h 캡이
@@ -49,13 +53,34 @@ DEFAULTS: dict[str, Any] = {
                'lc_lead_min_s': 3.0,
                # RTOR(적신호 우회전): 완전 정지 유지 시간, 서행 통과 속도, 스위치(조직위 답변에 따라)
                'stop_dwell_s': 1.0, 'rtor_speed_kph': 20.0, 'rtor_enabled': True},
-    'lead': {'time_headway_s': 2.0, 'min_gap_m': 5.0},
+    'lead': {'time_headway_s': 2.0, 'min_gap_m': 5.0,
+             # ── 정차 차량 추월 (blocked) ──
+             # 정차 판정을 이 시간 이상 연속 만족해야 추월에 들어간다(센서 노이즈 방지).
+             'blocked_dwell_s': 2.0,
+             # 전방 정지선이 이보다 가까우면 신호 대기 행렬일 수 있으므로 추월하지 않는다.
+             'blocked_ignore_stopline_m': 30.0,
+             # 추월 대상 뒤에서는 조향 여유를 두고 더 멀리 선다.
+             'blocked_gap_m': 8.0,
+             # **최근에 달리던 차는 추월하지 않는다.** 이 속도를 넘겨 달린 이력이
+             # blocked_recent_move_s 안에 있으면 "잠깐 선 것"으로 보고 기다린다.
+             # 2_lead_brake(앞차가 15 s 뒤 재출발)에서 정차 2 s 만에 추월이
+             # 발동했다 — 앞차는 10.9 s 동안 v=0.000 이라 dwell 은 정상이었고,
+             # 구분 근거는 "직전에 달리고 있었는가" 뿐이다.
+             # 값은 예상되는 일시정차 시간보다 길어야 한다.
+             'blocked_recent_move_v': 2.0, 'blocked_recent_move_s': 20.0},
     'ttc': {'warn_s': 4.0, 'brake_s': 2.5, 'emergency_s': 1.5},
     'lane_change': {'back_m': 30.0, 'front_m': 50.0, 'min_window_m': 20.0,
                     # 횡방향 전이 거리 = max(transition_s * v, transition_min_m)
                     'transition_s': 3.0, 'transition_min_m': 20.0,
                     # 완료 판정
-                    'done_t_off_m': 0.3, 'done_heading_deg': 5.0},
+                    'done_t_off_m': 0.3, 'done_heading_deg': 5.0,
+                    # 차선변경 최소 속도 [m/s]. 이보다 느리면 시작하지 않고,
+                    # 전이 중 이 아래로 떨어지면 중단하고 원 차로로 되돌린다.
+                    # 블렌드 진행도가 주행거리에 비례하므로 저속에서는 전이가
+                    # 진행되지 않는데 조향만 한쪽으로 고착돼 차가 옆으로 밀린다
+                    # (2026-08-23 19:56 런: v=0.84 m/s 에서 시작 → 도로 이탈,
+                    #  차로 id -3 → +5 로 반대편 차선 진입).
+                    'v_min_mps': 2.0},
     'cross': {'margin_s': 2.0},
     'percep': {'horizon_m': 200.0, 'coast_s': 1.5, 'jump_m': 2.0, 'speed_lpf': 0.3,
                # 속도 추정 슬라이딩 창 [s] (Σ변위/Σ벽시계 dt). 9910 송신 간격이

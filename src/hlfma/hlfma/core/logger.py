@@ -17,6 +17,13 @@ import time
 from .types import Command, Decision, RawPacket, WorldState
 
 
+# v_target 을 정하는 속도 후보 이름 (planner._speed_candidates). 이번 틱에 나오지
+# 않은 후보는 **null 로 명시**한다 — "키가 없다" 와 "후보가 미구현이다" 를 로그에서
+# 구분할 수 없어 선행차 무반응 원인 규명이 늦어졌다 (2026-08-23 16:31 런).
+SPEED_CANDIDATES = ('limit', 'limit_ahead', 'school_zone', 'curvature', 'junction',
+                    'stop_line', 'crosswalk_ped', 'route_end', 'visibility', 'lead')
+
+
 def _num(v):
     """numpy 스칼라/NaN/inf 를 json 이 먹을 수 있는 형태로."""
     try:
@@ -62,6 +69,15 @@ class Logger:
             self._writer = threading.Thread(target=self._writer_loop, daemon=True)
             self._writer.start()
 
+    def _front_gap(self, world: WorldState) -> float | None:
+        """앞범퍼 위치 − 정지선 위치 [m]. 음수 = 못 미침(정상), 양수 = 침범."""
+        d = (world.summ or {}).get('dist_stop_line')
+        if d is None:
+            return None
+        vh = self.cfg.get('vehicle', {})
+        front = float(vh.get('wheelbase', 2.944)) + float(vh.get('front_overhang_m', 0.855))
+        return front - float(d)
+
     def _writer_loop(self) -> None:
         while not self._stop.is_set() or not self._q.empty():
             try:
@@ -99,6 +115,9 @@ class Logger:
             't': _num(pkt.t_recv),
             # raw — replay 가 RawPacket 을 그대로 복원할 수 있어야 한다
             'raw': {
+                # ego:     [x, y, z, heading, pitch, roll]            (m, rad)
+                # objects: [id, x, y, z, heading, speed, length, width, height]
+                # lights:  [[id, state], ...]   state 0=미할당 1=적 2=황 3=녹 4=좌 5=녹+좌 6=점멸
                 'ego': [_num(v) for v in pkt.ego],
                 'objects': [[_num(v) for v in o] for o in pkt.objects],
                 'lights': [[int(i), int(s)] for i, s in pkt.lights],
@@ -125,11 +144,23 @@ class Logger:
                 'ahead': [{'kind': a.kind, 'dist': _num(a.dist)} for a in world.ahead[:20]],
                 'summ': _jsonable({k: v for k, v in world.summ.items()
                                    if k != 'speed_changes'}),
+                # 정지 위치 실측용: 앞범퍼 위치 − 정지선 위치.
+                # **음수 = 앞범퍼가 정지선에 못 미침(정상), 양수 = 침범.**
+                # ego 좌표가 뒷바퀴축이라 dist_stop_line 만 보면 전장만큼 착시가 난다.
+                'stop_line_front_m': _num(self._front_gap(world)),
             },
+            # 객체: perception 이 계산한 **경로 기준 상대량**까지 남긴다. 예전에는
+            # x/y/speed/ttc 만 있어서 "선행차가 내 차선 몇 m 앞인지" 를 로그만으로
+            # 알 수 없었다 (리플레이로 복원해야 했다).
             'objects': [
                 {'id': int(o.id), 'cls': o.cls,
                  'x': _num(o.x), 'y': _num(o.y), 'speed': _num(o.speed),
-                 'ttc': _num(o.ttc)}
+                 'lane': list(o.lane) if o.lane else None,
+                 'on_route': bool(o.on_route),
+                 's_rel': _num(o.s_rel), 'lat_off': _num(o.lat_off),
+                 'v_rel': _num(o.v_rel), 'ttc': _num(o.ttc),
+                 'will_enter_lane': bool(o.will_enter_lane),
+                 'age': _num(o.age), 'coasting': bool(o.coasting)}
                 for o in world.objects
             ],
             'decision': {
@@ -137,7 +168,9 @@ class Logger:
                 'v_target': _num(decision.v_target),
                 'turn_signal': int(decision.turn_signal),
                 'n_path': len(decision.path),
-                'reasons': _jsonable(decision.reasons),
+                # 이번 틱에 없던 후보는 null 로 남긴다 (위 SPEC_CANDIDATES 주석 참고)
+                'reasons': {**{k: None for k in SPEED_CANDIDATES},
+                            **_jsonable(decision.reasons)},
             },
             'cmd': {
                 'steering': _num(cmd.steering),

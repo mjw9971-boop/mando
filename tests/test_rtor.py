@@ -19,11 +19,17 @@ from test_turn_signal import make_world
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE = ROOT / 'data' / 'route.pkl'
+ROUTE = ROOT / 'data' / 'route_example.pkl'   # 고정 테스트 경로 (data/route.pkl 은 시나리오마다 바뀐다)
 CFG = load_params_yaml(PARAMS_YAML)
 RED, GREEN = 1, 3
 RTOR_V = CFG['signal']['rtor_speed_kph'] / 3.6
 DWELL = CFG['signal']['stop_dwell_s']
+STOP_S = 50.03                       # 도로 30 정지선 (route_example 경로거리)
+FRONT = CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m']
+# 정지 목표 위치(뒷바퀴축): 앞범퍼가 정지선 − stop_gap 에 오는 지점.
+# 예전에는 49.0 을 썼는데 그건 **앞범퍼가 정지선을 2.8 m 지난** 자리라,
+# "통과한 정지선으로는 세우지 않는다" 게이트가 생기면서 후보가 사라진다.
+AT_LINE_S = STOP_S - CFG['speed']['stop_gap_m'] - FRONT
 
 pytestmark = pytest.mark.skipif(not (GRAPH.exists() and ROUTE.exists()),
                                 reason='lane_graph.pkl / route.pkl 없음')
@@ -48,7 +54,7 @@ def obj(oid, s_rel, lat_off=0.0, on_route=True, ttc=float('inf'), enter=False):
 
 def at_line(lg, route, t, speed=0.0, objects=(), light=(3, RED)):
     """도로 30 정지선(50.03 m) stop_gap 앞에 선 자차. 정지선 signal_ids 는 비어 있다(폴백 경로)."""
-    w = make_world(lg, route, 49.0, speed=speed, t=t, light=light, objects=objects)
+    w = make_world(lg, route, AT_LINE_S, speed=speed, t=t, light=light, objects=objects)
     assert w.summ['next_turn'] == 'turn_right' and not w.summ['stop_signal_ids']
     return w
 

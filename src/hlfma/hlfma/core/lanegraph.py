@@ -343,7 +343,8 @@ class LaneGraph:
         """lookahead 결과를 판단 노드가 바로 쓰는 요약치로"""
         out = {'dist_stop_line': None, 'stop_signal_ids': [], 'dist_crosswalk': None,
                'dist_next_turn': None, 'next_turn': None, 'dist_lane_change': None, 'lane_change_dir': None,
-               'dist_junction': None, 'dist_dead_end': None, 'dist_route_end': None, 'speed_changes': []}
+               'dist_junction': None, 'dist_dead_end': None, 'dist_route_end': None,
+               'dist_junction_out': None, 'in_junction': False, 'speed_changes': []}
         for it in ahead:
             if it.kind == 'stop_line' and out['dist_stop_line'] is None:
                 out['dist_stop_line'] = it.dist
@@ -358,12 +359,19 @@ class LaneGraph:
                 out['lane_change_dir'] = it.kind
             elif it.kind == 'junction_in' and out['dist_junction'] is None:
                 out['dist_junction'] = it.dist
+            elif it.kind == 'junction_out' and out['dist_junction_out'] is None:
+                out['dist_junction_out'] = it.dist
             elif it.kind == 'dead_end' and out['dist_dead_end'] is None:
                 out['dist_dead_end'] = it.dist
             elif it.kind == 'route_end' and out['dist_route_end'] is None:
                 out['dist_route_end'] = it.dist
             elif it.kind == 'speed':
                 out['speed_changes'].append((it.dist, it.data['limit'], it.data['school_zone']))
+        # 교차로 안인가: 진출(junction_out)이 앞에 있는데 진입(junction_in)이 없거나
+        # 더 멀면, 이미 연결로 위다. junction 캡·회전 판정의 근거를 로그에서 구분하려고 남긴다.
+        if out['dist_junction_out'] is not None:
+            out['in_junction'] = (out['dist_junction'] is None
+                                  or out['dist_junction'] > out['dist_junction_out'])
         return out
 
 

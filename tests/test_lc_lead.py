@@ -25,7 +25,7 @@ from test_turn_signal import lcs, make_world, sig_of
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE = ROOT / 'data' / 'route.pkl'
+ROUTE = ROOT / 'data' / 'route_example.pkl'   # 고정 테스트 경로 (data/route.pkl 은 시나리오마다 바뀐다)
 CFG = load_params_yaml(PARAMS_YAML)
 LEAD_MIN = float(CFG['signal']['lc_lead_min_s'])
 
@@ -120,3 +120,61 @@ def test_red_light_with_unlinked_stop_line_stops(lg, route):
     w.light = None                                         # light 없음 → 비신호 정지선
     d = Planner(lg, route, CFG).plan(w)
     assert 'stop_line' not in d.reasons
+
+
+# ── 저속 차선변경 방지 (2026-08-23 19:56 런: v=0.84 m/s 에서 발산) ──────────
+def test_lane_change_blocked_below_v_min(lg, route):
+    """lane_change.v_min_mps 미만이면 시작하지 않는다."""
+    v_min = CFG['lane_change']['v_min_mps']
+    ev = lcs(route)[-1]
+    pl = Planner(lg, route, CFG)
+    # 지시등 lead 를 충분히 채운 뒤 창 안에서 저속으로 진입
+    s = ev['window_s0'] - 40.0
+    while s < ev['window_s0']:
+        pl.plan(make_world(lg, route, s, speed=6.0, t=s / 6.0))
+        s += 0.5
+    slow = v_min * 0.4
+    d = pl.plan(make_world(lg, route, ev['window_s0'] + 1.0, speed=slow,
+                           t=(ev['window_s0'] + 1.0) / 6.0))
+    assert d.state != LANE_CHANGE, '저속인데 차선변경이 시작됐다'
+    assert d.reasons.get('lc_too_slow') == pytest.approx(slow, abs=0.01)
+
+
+def test_lane_change_aborts_when_speed_drops(lg, route):
+    """전이 중 v_min 아래로 떨어지면 중단하고 원 차로로 돌아간다."""
+    v_min = CFG['lane_change']['v_min_mps']
+    ev = lcs(route)[-1]
+    pl = Planner(lg, route, CFG)
+    s = ev['window_s0'] - 40.0
+    while s < ev['window_s0'] + 2.0:
+        d = pl.plan(make_world(lg, route, s, speed=6.0, t=s / 6.0))
+        if d.state == LANE_CHANGE:
+            break
+        s += 0.5
+    assert d.state == LANE_CHANGE, '전제: 정상 속도에서는 시작된다'
+    d2 = pl.plan(make_world(lg, route, s + 0.5, speed=v_min * 0.3,
+                            t=(s + 0.5) / 6.0))
+    assert d2.state != LANE_CHANGE
+    assert d2.reasons.get('lc_slow_abort') is not None
+    assert pl._lc is None
+
+
+def test_blend_progress_uses_time_as_well(lg, route):
+    """진행도가 거리 단독이 아니라 시간과 병용이라, 저속에서도 전이가 진척된다."""
+    ev = lcs(route)[-1]
+    pl = Planner(lg, route, CFG)
+    s = ev['window_s0'] - 40.0
+    while s < ev['window_s0'] + 2.0:
+        d = pl.plan(make_world(lg, route, s, speed=6.0, t=s / 6.0))
+        if d.state == LANE_CHANGE:
+            break
+        s += 0.5
+    assert d.state == LANE_CHANGE
+    t_now = s / 6.0
+    ego = d.path[0]
+    # 같은 위치에서 **시간만** 흐르면 목표 경로가 목표 차로 쪽으로 더 이동해야 한다
+    d_later = pl.plan(make_world(lg, route, s + 0.1, speed=6.0, t=t_now + 3.0))
+    assert d_later.state == LANE_CHANGE
+    far0 = d.path[min(30, len(d.path) - 1)]
+    far1 = d_later.path[min(30, len(d_later.path) - 1)]
+    assert far0 != far1, '시간이 흘러도 전이가 전혀 진척되지 않았다'

@@ -45,11 +45,16 @@
     speed.jerk_max: 2.0
     # 정지 목표 선행 보상 [s]: P 제어 추종 지연(≈a_plan/kp) 만큼 목표를 v·lag 앞당긴다.
     # 폐루프 시뮬: 0.6 → 앞범퍼 정지선 −1.0~−1.2 m, 시간 손실 0 (0 이면 +1.1 m 침범)
+    # 지도 곡률 이상치 방어: 이웃 중앙값의 이 배수를 넘는 고립 곡률은 무시 (0=끔)
+    speed.curv_outlier_ratio: 5.0
     speed.stop_lag_s: 0.6
-    # 래치 뒤 0 스냅 대신 연속 프로파일 — 시뮬에서 이득 없어 끔
-    speed.stop_continuous: false
+    # 래치 뒤 0 으로 스냅하지 않고 _approach 곡선을 v=0 까지 연속으로 낸다.
+    # 스냅은 목표를 한 틱에 6 km/h -> 0 으로 떨어뜨려(30 m/s^2) 마지막에 감속도가
+    # -1.29 -> -1.87 로 튄다("킥"). 연속이면 -1.56 까지만 올라가고 목표 낙차는
+    # 5.3 m/s^2 로 줄어든다 (2026-08-23 15:48 런 + 폐루프 시뮬).
+    speed.stop_continuous: true
     speed.a_lat_max: 2.0
-    speed.stop_gap_m: 1.0
+    speed.stop_gap_m: 4.0
     speed.a_hold: -1.0
     # ── caps_kph ──
     caps_kph.school_zone: 28.0
@@ -69,6 +74,14 @@
     # ── lead ──
     lead.time_headway_s: 2.0
     lead.min_gap_m: 5.0
+    # ── 정차 차량 추월 (blocked) ──
+    lead.blocked_dwell_s: 2.0
+    lead.blocked_ignore_stopline_m: 30.0
+    lead.blocked_gap_m: 8.0
+    # 최근 이 속도를 넘겨 달린 이력이 blocked_recent_move_s 안에 있으면 추월 금지
+    # (2_lead_brake: 앞차가 15 s 뒤 재출발 — 잠깐 선 차를 추월하면 안 된다)
+    lead.blocked_recent_move_v: 2.0
+    lead.blocked_recent_move_s: 20.0
     # ── ttc ──
     ttc.warn_s: 4.0
     ttc.brake_s: 2.5
@@ -81,6 +94,8 @@
     lane_change.transition_min_m: 20.0
     lane_change.done_t_off_m: 0.3
     lane_change.done_heading_deg: 5.0
+    # 차선변경 최소 속도 [m/s] — 저속에서는 블렌드가 진행되지 않아 조향이 고착된다
+    lane_change.v_min_mps: 2.0
     # ── cross ──
     cross.margin_s: 2.0
     # ── percep ──

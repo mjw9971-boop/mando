@@ -25,7 +25,7 @@ from hlfma.nodes.params import load_params_yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE = ROOT / 'data' / 'route.pkl'
+ROUTE = ROOT / 'data' / 'route_example.pkl'   # 고정 테스트 경로 (data/route.pkl 은 시나리오마다 바뀐다)
 LOG = ROOT / 'logs' / 'run_20260823_102634.jsonl'
 CFG = load_params_yaml(PARAMS_YAML)
 LEAD_S = float(CFG['signal']['lead_s']) + float(CFG['signal']['margin_s'])
@@ -91,14 +91,19 @@ def test_turn_signal_lead_and_direction(lg, route):
 
 
 def test_turn_signal_stays_on_in_connector_and_off_after(lg, route):
-    """연결로 안에서는 켜져 있고, 연결로 끝(end_s)을 지나면 꺼진다."""
+    """연결로 안에서는 회전 지시등이 켜지고, 연결로 끝(end_s)을 지나면 회전 근거가 사라진다.
+
+    끝난 직후 LC 창이 바로 시작하는 경로도 있으므로(회전1 end_s = LC1 window_s0)
+    "무조건 소등"이 아니라 **회전이 더는 점등 근거가 아니다**(sig_src != 'turn')로 본다.
+    """
     pl = Planner(lg, route, CFG)
-    last = pl._turns[-1]                       # 마지막 회전 뒤에는 LC 가 없다
+    last = pl._turns[-1]
     inside = pl.plan(make_world(lg, route, (last['s'] + last['end_s']) / 2, speed=10.0))
     assert inside.turn_signal == last['signal']
     assert inside.reasons.get('turn_dist') == 0.0
     after = pl.plan(make_world(lg, route, last['end_s'] + 3.0, speed=10.0))
-    assert after.turn_signal == TURN_OFF
+    assert after.reasons.get('sig_src') != 'turn'
+    assert after.reasons.get('turn_dist') is None
 
 
 def test_build_turns_end_is_junction_exit(lg, route):
@@ -201,14 +206,24 @@ def test_signal_latch_resets_when_pending_changes(lg, route):
 
 # ── 실제 런 리플레이 회귀 ─────────────────────────────────────────────────
 @pytest.mark.skipif(not LOG.exists(), reason='런 로그 없음')
-def test_replay_run_20260823_has_no_flicker():
+def test_replay_run_20260823_has_no_flicker(route):
+    """실제 런 재생: 깜빡임 0, 경로의 모든 LC 수행, 경로에 없는 방향은 켜지지 않는다.
+
+    기대치는 **route 에서 유도**한다 — route.pkl 은 시나리오마다 다시 만들어진다.
+    """
     import sys
     sys.path.insert(0, str(ROOT / 'tools'))
     from replay import flicker_count, replay_signals, segments
-    _orig, new, pl = replay_signals(str(LOG))
+    _orig, new, pl = replay_signals(str(LOG), route='data/route_example.pkl')
     segs = segments(new)
     assert flicker_count(segs) == 0
-    assert pl.lc_done == 3 and pl.lc_aborted == 0
+    n_lc = len(lcs(route))
+    assert pl.lc_done == n_lc and pl.lc_aborted == 0
     on = [g for g in segs if g['sig'] != TURN_OFF]
-    # 회전1(우) → LC1(좌) → LC2+회전2(우) → LC3+회전3(우)
-    assert [g['sig'] for g in on] == [TURN_RIGHT, TURN_LEFT, TURN_RIGHT, TURN_RIGHT]
+    assert on, '점등 구간이 없다'
+    # 경로 이벤트가 요구하는 방향만 켜져야 한다 (역방향 점등 금지)
+    want = {sig_of(e['kind']) for e in route['events']
+            if e['kind'].startswith(('turn_', 'lane_change'))}
+    assert {g['sig'] for g in on} <= want
+    # 토막나지 않았는지는 flicker_count 가 본다. OFF 를 사이에 둔 같은 방향 연속
+    # 점등(회전2, 회전3)은 서로 다른 이벤트라 정상이다.

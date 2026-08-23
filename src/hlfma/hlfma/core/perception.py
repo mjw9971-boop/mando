@@ -248,6 +248,19 @@ class Perception:
         lanes = self.route['lanes']
         hits = [i for i, k in enumerate(lanes) if k == lane]
         if not hits:
+            # 정차 차량 추월로 **경로 차로 바로 옆**에 있을 수 있다. 좌/우 이웃이
+            # 경로 차로면 그 인덱스를 그대로 쓴다 — 나란한 차로는 s 매개화가 같아
+            # route_s 가 이어진다. 이게 없으면 추월하는 순간 off_route 가 되어
+            # route_s 가 낡은 인덱스에 묶이고 정지선·이벤트 거리가 전부 어긋난다.
+            for side in ('left', 'right'):
+                nb = self.lg.neighbor(lane, side)
+                if nb is None:
+                    continue
+                nb_hits = [i for i, k in enumerate(lanes) if k == nb]
+                if nb_hits:
+                    self._route_idx = min(nb_hits, key=lambda i: abs(i - self._route_idx))
+                    flags['beside_route'] = True
+                    return self._route_idx
             flags['off_route'] = True
             return self._route_idx
         self._route_idx = min(hits, key=lambda i: abs(i - self._route_idx))
@@ -444,10 +457,10 @@ class Perception:
                 length=olen, width=owid, height=ohei,
                 cls=self.classify(olen, owid, ohei, ospeed),
                 **self._locate_object(ox, oy, ohead, ego),
-                # TODO: v_rel / ttc / will_enter_lane (SPEC §3.3 6단계)
                 v_rel=0.0, ttc=float('inf'), will_enter_lane=False,
                 age=0.0, coasting=False,
             )
+            self._relative_motion(obj, ego, ospeed, ohead)
             out.append(obj)
             self._tracks[oid] = (obj, t, dist)
 
@@ -497,6 +510,57 @@ class Perception:
             flags['obj_lost'] = dropped_lost
         return out
 
+    def _relative_motion(self, obj, ego: EgoState, ospeed: float, ohead: float) -> None:
+        """
+        SPEC §3.3 6단계: `v_rel`(+ = 접근), `ttc`, `will_enter_lane` 을 채운다.
+
+        기준축은 **자차 경로의 접선방향** t̂ = (cos yaw, sin yaw) 다. 객체 속도를
+        여기에 투영해 자차 속도와 빼면 접근 속도가 된다.
+            v_rel = v_ego - (v_obj · t̂)
+        같은 방향으로 더 느리게 가는 선행차는 양수(접근), 더 빠르면 음수(멀어짐),
+        마주 오는 차는 두 속도의 합이 되어 크게 양수다.
+
+        ttc 는 **범퍼 간 간격** 기준이다. s_rel 은 자차 뒷바퀴축 ↔ 객체 기준점
+        거리이므로 자차 앞부분(wheelbase + front_overhang)과 객체 반길이를 뺀다.
+        v_rel <= 0 (멀어짐) 이면 충돌하지 않으므로 inf.
+
+        will_enter_lane 은 횡속도 외삽이다. 객체 속도의 법선성분 n̂ = (-sin, cos)
+        으로 `percep.ped_extrapolate_s` 초 뒤 횡위치를 예측해, 지금은 차로 밖인데
+        그때 차로 폭 안으로 들어오면 True. 이미 차로 안인 객체는 on_route/lat_off
+        가 잡으므로 여기서는 **진입하는 것만** 표시한다 (횡단보도 판정과 같은 규약).
+        """
+        p = self.cfg['percep']
+        vh = self.cfg['vehicle']
+        c, sn = math.cos(ego.yaw), math.sin(ego.yaw)
+        vx, vy = ospeed * math.cos(ohead), ospeed * math.sin(ohead)
+
+        obj.v_rel = float(ego.speed - (vx * c + vy * sn))
+
+        front = float(vh['wheelbase']) + float(vh.get('front_overhang_m', 0.855))
+        gap = obj.s_rel - front - 0.5 * float(obj.length)
+        if obj.v_rel > 1e-3 and gap > 0.0:
+            obj.ttc = float(gap / obj.v_rel)
+        elif obj.v_rel > 1e-3 and obj.s_rel > -float(vh['length']):
+            obj.ttc = 0.0                      # 이미 겹쳤는데 접근 중
+        else:
+            # 멀어지거나(v_rel<=0) **뒤에 있는** 객체는 충돌 대상이 아니다.
+            # s_rel 조건이 없으면 지나쳐 보낸 정지 차량이 v_rel>0 (자차가 앞으로
+            # 가니까) + gap<0 으로 ttc=0 이 되어 비상제동이 걸린다
+            # (폐루프 시뮬: 추월 후 82 m 뒤 차 때문에 E_STOP).
+            obj.ttc = float('inf')
+
+        v_lat = -vx * sn + vy * c
+        half_w = 1.75
+        if ego.lane is not None:
+            try:
+                half_w = 0.5 * float(self.lg.width_at(ego.lane, ego.s))
+            except Exception:                  # noqa: BLE001
+                pass
+        lat_future = obj.lat_off + v_lat * float(p['ped_extrapolate_s'])
+        obj.will_enter_lane = bool(
+            abs(obj.lat_off) >= half_w and abs(lat_future) < half_w
+            and obj.s_rel > -float(vh['length']))
+
     def _locate_object(self, ox: float, oy: float, ohead: float,
                        ego: EgoState) -> dict:
         """
@@ -524,7 +588,17 @@ class Perception:
             dx, dy = ox - ego.x, oy - ego.y
             s_rel = dx * math.cos(ego.yaw) + dy * math.sin(ego.yaw)
             on_route = False
-        return {'lane': m.lane, 'on_route': on_route, 's_rel': s_rel, 'lat_off': m.t}
+        # lat_off 는 **내 경로 중심선 기준** 횡거리다 (types.py 정의).
+        #  · 경로 차로 위 객체: m.t 가 곧 그 값이다 (그 차로 중심선 = 내 경로)
+        #  · 경로 밖 차로 객체: m.t 는 **그 객체 자기 차로** 안에서의 오프셋이라
+        #    옆 차로 차도 0 에 가깝게 나온다 — 그대로 쓰면 "내 경로에서 몇 m 벗어나
+        #    있나" 를 전혀 구분하지 못한다. 자차 진행방향 기준 수직거리로 대신한다.
+        if not on_route:
+            dx, dy = ox - ego.x, oy - ego.y
+            lat = -dx * math.sin(ego.yaw) + dy * math.cos(ego.yaw)
+        else:
+            lat = m.t
+        return {'lane': m.lane, 'on_route': on_route, 's_rel': s_rel, 'lat_off': lat}
 
     # ── 8) 유효성 ─────────────────────────────────────────────────────────
     def _validate(self, pkt: RawPacket, ego: EgoState) -> tuple[bool, dict]:

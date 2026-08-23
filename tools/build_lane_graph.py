@@ -163,6 +163,60 @@ def ref_line(geoms, s_arr):
 # ────────────────────────────────────────────────────────────────────────────
 # 2. 도로 파싱
 # ────────────────────────────────────────────────────────────────────────────
+# 곡률 dh/dst 를 신뢰할 수 있는 최소 세그먼트 길이 [m].
+# 섹션 끝에는 직전 점과 1 mm 떨어진 중복점이 흔한데, 그 dst 로 나누면 값이 폭발한다
+# (실측: 도로 2011 섹션 경계 Δs=0.001 m → 곡률 0.1546 = 반경 6.5 m, 실제는 직선).
+CURV_MIN_DS = 0.05
+
+
+def _fill_nan(c):
+    """NaN 을 가장 가까운 유효값으로 채운다 (앞→뒤, 뒤→앞)."""
+    n = len(c)
+    ok = np.isfinite(c)
+    if not ok.any():
+        return np.zeros(n)
+    idx = np.where(ok, np.arange(n), -1)
+    np.maximum.accumulate(idx, out=idx)
+    fwd = np.where(idx >= 0, c[np.maximum(idx, 0)], np.nan)
+    idx2 = np.where(ok, np.arange(n), n)
+    idx2 = np.minimum.accumulate(idx2[::-1])[::-1]
+    bwd = np.where(idx2 < n, c[np.minimum(idx2, n - 1)], np.nan)
+    return np.where(np.isfinite(fwd), fwd, bwd)
+
+
+def smooth_curvature(cv, k=5):
+    """
+    곡률 점열의 **스파이크 제거**. 끝점 대체 + 중앙값 필터.
+
+    끝점 곡률을 믿을 수 없는 이유가 둘이다:
+      1) 내부 점은 앞뒤 세그먼트 헤딩의 **벡터평균**을 쓰는데 끝점만 마지막
+         세그먼트 헤딩을 그대로 쓴다 → 마지막 두 점 사이 dh 가 과대해진다.
+      2) 섹션 끝의 중복점(Δs ≈ 1 mm)에서 dh/dst 가 폭발한다. 그 값은
+         **cv[-2] 와 cv[-1] 둘 다**에 들어가므로 한 점만 고쳐서는 안 된다.
+    실측(2026-08-23): 직선 도로 2011 의 섹션 경계에서 곡률 0.1546(반경 6.5 m)이
+    찍혀, 플래너가 헤어핀으로 오인하고 45 → 16 km/h 로 감속했다.
+
+    진짜 커브는 여러 점에 걸쳐 있어(연결로 반경 4.5 m 호 ≈ 10 점) 중앙값 필터가
+    그대로 보존한다. 고립된 스파이크만 사라진다.
+    """
+    n = len(cv)
+    if n < 4:
+        return np.zeros(n, dtype=np.float32) if n else cv
+    c = _fill_nan(np.asarray(cv, dtype=float).copy())
+    # 구성상 오염되는 자리: 앞 1점(hd[0] 이 원시 헤딩), 뒤 2점(마지막 세그먼트)
+    c[0] = c[1]
+    c[-1] = c[-2] = c[-3]
+    if n < k:
+        return c.astype(np.float32)
+    pad = k // 2
+    ext = np.concatenate([np.repeat(c[0], pad), c, np.repeat(c[-1], pad)])
+    try:
+        out = np.median(np.lib.stride_tricks.sliding_window_view(ext, k), axis=-1)
+    except AttributeError:                       # numpy < 1.20
+        out = np.array([np.median(ext[i:i + k]) for i in range(n)])
+    return out.astype(np.float32)
+
+
 def parse_pieces(el, tag, keys=('a', 'b', 'c', 'd'), skey='sOffset'):
     out = []
     for e in el.findall(tag):
@@ -453,9 +507,12 @@ def build_lanes(road, ds, warnings):
                 dst = np.diff(st)
                 cv = np.zeros_like(st)
                 with np.errstate(divide='ignore', invalid='ignore'):
-                    c_mid = np.where(dst > 1e-6, dh / dst, 0.0)
+                    # 너무 짧은 세그먼트(중복점)는 무효로 두고 이웃 값으로 채운다.
+                    # 예전 문턱 1e-6 은 Δs=1 mm 도 통과시켜 곡률을 폭발시켰다.
+                    c_mid = np.where(dst > CURV_MIN_DS, dh / dst, np.nan)
                 cv[:-1] = c_mid
                 cv[-1] = c_mid[-1] if len(c_mid) else 0.0
+                cv = smooth_curvature(cv)         # 섹션 경계 스파이크 제거
             else:
                 hd = np.array([wrap(h[order][0] + (0.0 if d == 1 else math.pi))])
                 cv = np.zeros(1)
