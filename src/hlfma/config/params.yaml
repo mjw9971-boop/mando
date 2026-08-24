@@ -77,7 +77,8 @@
     # ── 정차 차량 추월 (blocked) ──
     lead.blocked_dwell_s: 2.0
     lead.blocked_ignore_stopline_m: 30.0
-    lead.blocked_gap_m: 8.0
+    # 추월 대상 뒤 정지 간격 — 12 m 미만이면 횡이동이 끝나기 전에 그 차에 도달한다(폐루프 실측)
+    lead.blocked_gap_m: 12.0
     # 최근 이 속도를 넘겨 달린 이력이 blocked_recent_move_s 안에 있으면 추월 금지
     # (2_lead_brake: 앞차가 15 s 뒤 재출발 — 잠깐 선 차를 추월하면 안 된다)
     lead.blocked_recent_move_v: 2.0
@@ -96,6 +97,9 @@
     lane_change.done_heading_deg: 5.0
     # 차선변경 최소 속도 [m/s] — 저속에서는 블렌드가 진행되지 않아 조향이 고착된다
     lane_change.v_min_mps: 2.0
+    # blocked 추월(정지 출발) 전용 크립 속도 / 전이 정체 중단 시간
+    lane_change.creep_kph: 8.0
+    lane_change.stall_abort_s: 3.0
     # ── cross ──
     cross.margin_s: 2.0
     # ── percep ──

@@ -107,6 +107,8 @@ class Planner:
         self._blocked_since: float | None = None
         self._blocked = False
         self._blocked_why = ''
+        self._lead_creep = False             # 이번 틱 크립 발동 (로그용)
+        self._last_prog = None               # 블렌드 진행도 (로그용)
         self._obj_moved_t: dict = {}         # 객체 id → 마지막으로 '달리던' 시각
         self._overtake: dict | None = None   # {'blocker_id', 'orig_lane', 'returning'}
         self.lead_id: int | None = None     # 그 id (shield 회피·횡단보도 판정 제외용)
@@ -148,6 +150,7 @@ class Planner:
         path = [(float(x), float(y)) for x, y in base]
 
         # ── 차선변경 ─────────────────────────────────────────────────────
+        self._last_prog = None               # 이번 틱 블렌드가 다시 채운다 (로그용)
         lc = self._update_lane_change(world, reasons)
         # ── 지시등: 차선변경 vs 교차로 회전 — **더 가까운 이벤트가 이긴다** ──
         # 둘 다 후보를 (방향, 남은거리) 로 내고 거리가 짧은 쪽을 켠다. 실행 중
@@ -185,6 +188,7 @@ class Planner:
         self._signal_fallback = False
         self._rtor_note = ''
         self._cw_note = ''
+        self._lead_creep = False
         cand = self._speed_candidates(world)
         reasons.update(cand)
         if self._signal_fallback:
@@ -196,6 +200,10 @@ class Planner:
         reasons['blocked'] = self._blocked
         if self._blocked_why:
             reasons['blocked_why'] = self._blocked_why
+        if self._lead_creep:
+            reasons['lead_creep'] = True
+        if self._last_prog is not None:
+            reasons['lc_prog'] = round(self._last_prog, 2)
         if self._overtake is not None:
             reasons['overtake'] = ('return' if self._overtake.get('returning') else 'out')
         pool = dict(cand)
@@ -745,11 +753,30 @@ class Planner:
         # 옆으로 밀려 나간다 (2026-08-23 19:56 런: v=0.84 m/s 에서 시작 → 도로
         # 이탈, 차로 id -3 → +5 로 반대편 차선 진입, shield 발동 0회).
         v_min = float(lc.get('v_min_mps', 2.0))
-        if self._lc is not None and world.ego.speed < v_min:
+        # blocked 추월은 **정지 출발**이 정상이므로 면제한다 — IDM 이 blocked_gap 앞
+        # 정지를 만들어 지시등 3 s 를 채울 때쯤 반드시 v≈0 이 되고, 게이트를 그대로
+        # 두면 시작이 영구 거부된다 (2026-08-24 13:10 런: 교착 확정). 조향 고착은
+        # 블렌드의 시간 항이, 새 교착은 아래 정체 워치독이 막는다.
+        vmin_exempt = bool(ev.get('overtake'))
+        if vmin_exempt:
+            reasons['lc_vmin_exempt'] = 'overtake'
+        if self._lc is not None and not vmin_exempt and world.ego.speed < v_min:
             self._finish_lane_change(
                 ev, ok=False, why='속도 %.2f < v_min %.1f m/s — 전이 중단' % (world.ego.speed, v_min))
             reasons['lc_slow_abort'] = round(world.ego.speed, 2)
             return None
+
+        # ── [작업 3] 전이 정체 워치독: v≈0 인 채 진행이 없으면 중단·복귀 ────
+        if self._lc is not None:
+            if world.ego.speed < 0.2:
+                t0 = self._lc.setdefault('stall_t', world.t)
+                if world.t - t0 > float(lc.get('stall_abort_s', 3.0)):
+                    self._finish_lane_change(
+                        ev, ok=False, why='전이 정체 %.1fs — 중단' % (world.t - t0))
+                    reasons['lc_stall_abort'] = round(world.t - t0, 1)
+                    return None
+            else:
+                self._lc.pop('stall_t', None)
 
         dist_to_window = ev['window_s0'] - s_now
         # 지시등: 창 시작 (lead_s + margin_s) 초 전부터
@@ -777,7 +804,7 @@ class Planner:
         clear, why = self._target_lane_clear(world, target, side)
         reasons['lc_dist_to_window'] = round(dist_to_window, 1)
         reasons['lc_clear'] = clear
-        if clear and world.ego.speed < v_min:
+        if clear and not vmin_exempt and world.ego.speed < v_min:
             reasons['lc_too_slow'] = round(world.ego.speed, 2)
 
         # ── 대기로 창이 모자라는 경우 ──────────────────────────────────────
@@ -800,7 +827,8 @@ class Planner:
         if self._lc is not None:
             # 이미 전이 중 — 점선인 동안에는 끝까지 간다
             active = True
-        elif in_window and clear and signaled_long_enough and world.ego.speed >= v_min:
+        elif in_window and clear and signaled_long_enough and (
+                vmin_exempt or world.ego.speed >= v_min):
             self._lc = dict(ev)               # 실행 시작
             # 전이 진행도의 기준점. 자차 위치에 매 틱 다시 고정하면
             # 목표의 일부 지점만 계속 쫓게 되어 차선을 끝까지 못 넘는다.
@@ -814,6 +842,10 @@ class Planner:
             if ev.get('overtake') and self._overtake is None and self._lead is not None:
                 self._overtake = {'blocker_id': self._lead.id, 'side': side,
                                   'returning': False}
+                # 블렌드 전이거리 상한: 그 차 **뒷범퍼**까지의 거리 (위 _blend_path 참고)
+                self._lc['ov_gap'] = max(
+                    0.0, self._lead.s_rel - self._front_m()
+                    - 0.5 * float(self._lead.length))
             active = True
         left = w1 - s_now
         if in_window and left < float(lc['min_window_m']) and ev['window_s0'] not in self._lc_warned:
@@ -975,6 +1007,13 @@ class Planner:
         n = min(len(base), len(tgt))
         L = max(float(cfg['transition_s']) * max(world.ego.speed, 1.0),
                 float(cfg['transition_min_m']))
+        # 정차 차량 추월은 **그 차 뒷범퍼에 도달하기 전에 횡이동이 끝나야** 한다.
+        # 일반 전이거리(최소 20 m)를 그대로 쓰면 절반 지점(횡이동 최대 기울기)이
+        # 그 차 **뒤**에 놓여 스치고 지나간다 (폐루프: 최소 접근 1.91 m 충돌).
+        # 시작 시 저장한 뒷범퍼까지 거리로 상한을 걸되, 최소 회전 기하(S 커브
+        # ≈ 10 m) 아래로는 줄이지 않는다 — 그보다 짧으면 물리적으로 못 넘는다.
+        if self._lc.get('overtake') and self._lc.get('ov_gap') is not None:
+            L = max(10.0, min(L, float(self._lc['ov_gap'])))
 
         # 진행도는 **경로상 고정 시작점** 기준이다.
         # 매 틱 자차 위치를 0 으로 두면 전방 점의 가중치가 늘 같은 값에 머물러
@@ -990,6 +1029,7 @@ class Planner:
             if t_start is not None:
                 v_min = float(cfg.get('v_min_mps', 2.0))
                 prog = max(prog, v_min * max(0.0, world.t - t_start))
+        self._last_prog = prog
 
         out = []
         for i in range(n):
@@ -1080,14 +1120,24 @@ class Planner:
         elif (self._obj_moved_t.get(lead.id) is not None
               and world.t - self._obj_moved_t[lead.id] < float(ld['blocked_recent_move_s'])):
             why = '최근 주행 이력 %.1fs 전' % (world.t - self._obj_moved_t[lead.id])
-        elif 'stop_line' in out:
-            why = '신호 정지 후보 활성'
         elif summ.get('in_junction'):
             why = '교차로 내부'
         else:
+            # 신호 정지 판정 — **실제로 구속 중일 때만** 추월을 막는다.
+            # 예전 조건("stop_line 후보 존재")은 114 m 앞 다음 교차로가 황색으로
+            # 바뀌기만 해도(후보 53.9 km/h, winner 는 여전히 lead) 추월 의사를
+            # 영구 소멸시켰다 (2026-08-24 13:10 런). 기준은 두 가지로 통합한다:
+            #   · 후보가 현재 min() 을 실제로 결정하고 있다 (binding)
+            #   · 또는 정지선이 blocked_ignore_stopline_m 이내다 (신호 대기 행렬 가능)
+            sl = out.get('stop_line')
+            binding = sl is not None and out and sl <= min(out.values()) + 1e-9
             d = summ.get('dist_stop_line')
-            if d is not None and (d - self._front_m()) <= float(ld['blocked_ignore_stopline_m']):
-                why = '정지선 %.0f m (신호 대기 가능)' % (d - self._front_m())
+            d_front = (d - self._front_m()) if d is not None else None
+            near = d_front is not None and d_front <= float(ld['blocked_ignore_stopline_m'])
+            if binding:
+                why = '신호 정지 구속 중(%.1f m/s)' % sl
+            elif near:
+                why = '정지선 %.0f m (신호 대기 가능)' % d_front
 
         if why:
             self._blocked_since = None
@@ -1270,6 +1320,14 @@ class Planner:
             lag = float(sp.get('stop_lag_s', 0.0)) * v
             v_stop = self._approach(0.0, gap - s0 - lag)
             v_next = min(v_next, v_stop)
+            # blocked 추월 확정이면 정지 목표를 풀고 크립으로 나간다 — 지시등을
+            # 채우는 동안 완전 정지하면 v_min 교착이 된다 (2026-08-24 13:10 런).
+            # 단 간격이 min_gap_m 아래로 좁아지면 크립도 멈춘다 (충돌 여유).
+            if self._blocked and gap > float(ld['min_gap_m']):
+                creep = float(self.cfg['lane_change'].get('creep_kph', 8.0)) / 3.6
+                if v_next < creep:
+                    v_next = creep
+                    self._lead_creep = True
         return v_next
 
     # ── 횡방향 ────────────────────────────────────────────────────────────

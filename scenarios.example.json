@@ -1,0 +1,10 @@
+[
+  {"name": "2_lead_brake",
+   "vtd_xml_path": "/home/vtd/VIRES/VTD/Data/Projects/HL_FMA/Scenarios/2_lead_brake.xml",
+   "route_csv": "waypoints.csv",
+   "timeout_s": 180},
+  {"name": "3_blocked",
+   "vtd_xml_path": "/home/vtd/VIRES/VTD/Data/Projects/HL_FMA/Scenarios/3_blocked.xml",
+   "route_csv": "waypoints.csv",
+   "timeout_s": 240}
+]
