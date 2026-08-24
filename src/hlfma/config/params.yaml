@@ -32,6 +32,9 @@
     vehicle.length: 4.848
     # 뒷바퀴축 → 앞범퍼 (Ioniq 6: 앞 오버행 855 mm). 정지 목표 = 앞범퍼가 정지선 − stop_gap.
     vehicle.front_overhang_m: 0.855
+    # 연결로 통행 금지 임계계수: R_min < 최소회전반경 x 이 값이면 경로에서 배제.
+    # 실증: R 4.52 m 통과(t_off 0.85), R 2.55 m 탈선 → 0.7(임계 3.96 m)이 경계를 가른다
+    vehicle.min_turn_margin: 0.7
     vehicle.width: 1.886
     vehicle.height: 1.507
     # ── speed ──

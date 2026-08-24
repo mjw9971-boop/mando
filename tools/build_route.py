@@ -169,10 +169,54 @@ def lane_change_window(lg, lanes, cum, seq, i, side, target):
     return cum[j] + s0, cum[i] + w1, j, s0
 
 
-def dijkstra(lg, starts, targets, allow_lane_change=True):
+def min_turn_radius_m():
+    """차량 최소회전반경 [m] = 축거 / tan(최대조향). params.yaml 을 읽는다."""
+    try:
+        from hlfma.nodes.params import load_params_yaml
+        cfg = load_params_yaml(str(_pathlib.Path(__file__).resolve().parent.parent
+                                    / 'src' / 'hlfma' / 'config' / 'params.yaml'))
+        vh = cfg['vehicle']
+        return (float(vh['wheelbase']) / math.tan(float(vh['max_steer'])),
+                float(vh.get('min_turn_margin', 1.2)))
+    except Exception:                                    # noqa: BLE001 — 독립 실행 폴백
+        return 2.944 / math.tan(0.48), 1.2
+
+
+def lane_r_min(lg, key):
+    """차로의 최소 곡률반경 [m]. 곡률 0 이면 inf."""
+    cv = np.abs(lg.lanes[key]['curv'])
+    m = float(cv.max()) if len(cv) else 0.0
+    return (1.0 / m) if m > 1e-6 else float('inf')
+
+
+def infeasible_connectors(lg):
+    """
+    물리적으로 돌 수 없는 교차로 연결로 집합.
+
+    junction 연결로의 R_min 이 (최소회전반경 × vehicle.min_turn_margin) 미만이면
+    풀락으로도 호를 못 따라간다 — 9_school_route 실측(2026-08-24): junction 25 의
+    (1576,0,-1) R_min 2.55 m 를 최단이라고 골랐다가 조향 포화 1.8 s 끝에 호를
+    이탈해 off_route 정지. 같은 교차로에 R 56.6 m 대안(1573)이 있었다.
+    곡률 스파이크는 빌드 단계에서 이미 걸렀으므로(중앙값 필터) 남은 값은 진짜
+    기하다 — 그대로 평가한다.
+    """
+    r_min, margin = min_turn_radius_m()
+    thr = r_min * margin
+    out = {}
+    for key, rec in lg.lanes.items():
+        if rec['junction'] == -1:
+            continue
+        r = lane_r_min(lg, key)
+        if r < thr:
+            out[key] = r
+    return out, thr
+
+
+def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
     """starts: [(lane, s_start)]  targets: {lane: s_target} → (cost, [ (lane, s_enter) ... ])
 
-    allow_lane_change=False 면 successor 링크만 따라간다 (교차로 내부 구간용)."""
+    allow_lane_change=False 면 successor 링크만 따라간다 (교차로 내부 구간용).
+    banned: 통행 금지 차로 (회전 불가 연결로 — 비용 무한 대신 아예 확장하지 않는다)."""
     tgt = dict(targets)
     best = {}
     heap = []
@@ -195,6 +239,8 @@ def dijkstra(lg, starts, targets, allow_lane_change=True):
         # key 끝에 도달한 상태 (cost = 끝까지). 다음 후보들
         r = lg.lanes[key]
         for k2 in r['next']:
+            if k2 in banned:
+                continue                     # 물리적으로 돌 수 없는 연결로
             if (k2, False) in best and (k2, True) in best:
                 continue
             L2 = lg.length(k2)
@@ -299,6 +345,9 @@ def junction_segments(n_points):
 
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
                 seqs=None):
+    # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
+    banned, turn_thr = infeasible_connectors(lg)
+    forced_infeasible: list = []   # 대안이 없어 불가피하게 포함시킨 연결로
     seq = []   # [(lane, s_enter)]
     wp_s = []
     total = 0.0
@@ -349,12 +398,19 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             for k, s, d in tg:
                 if d > tier:
                     continue
-                res = dijkstra(lg, starts, {k: s}, allow_lane_change=allow_lc)
+                res = dijkstra(lg, starts, {k: s}, allow_lane_change=allow_lc,
+                               banned=banned)
+                used_banned = []
                 if res is None:
-                    continue
+                    # 금지를 풀면 연결되는가 — 대안이 없어 **불가피**한 경우만 허용하되
+                    # 조용히 넘기지 않고 기록한다 (리포트에 ⚠).
+                    res = dijkstra(lg, starts, {k: s}, allow_lane_change=allow_lc)
+                    if res is None:
+                        continue
+                    used_banned = [kk for kk, _ in res[1] if kk in banned]
                 score = res[0] + TARGET_DIST_W * d
                 if best is None or score < best[0]:
-                    best = (score, res[1], k, s)
+                    best = (score, res[1], k, s, used_banned)
             if best is not None:
                 break
         if best is None:
@@ -371,7 +427,9 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             raise RouteError(
                 f'{label(wi)} ({x0:.2f},{y0:.2f}) -> {label(wi + 1)} ({x1:.2f},{y1:.2f}): '
                 f'경로 없음\n       출발 차로 {starts[0][0]}   후보 {near}{extra}')
-        _score, path, k_end, s_end = best
+        _score, path, k_end, s_end, used_banned = best
+        for kk in used_banned:
+            forced_infeasible.append((wi, kk, banned[kk]))
         if wi == 0:
             wp_s.append(0.0)
         # path 를 seq 에 이어붙임 (첫 원소는 prev_end 와 같은 차로면 중복 제거)
@@ -460,6 +518,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
 
     events.sort(key=lambda e: e['s'])
     return {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
+            'infeasible_forced': forced_infeasible, 'turn_radius_thr_m': turn_thr,
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
             'waypoint_seq': list(seqs) if seqs else list(range(1, len(waypoints) + 1)),
             'junction_segments': sorted(junction_segs), 'segment_span': seg_span}
@@ -597,6 +656,37 @@ def report(lg, rt, radius, warn_dev=None):
             extra = (f"  Δ{e['delta_heading_deg']:+.1f}°  junction={e.get('junction')}"
                      + ('  [짝 기준 보정]' if e.get('source') == 'pair' else ''))
         print(f"  {e['s']:8.1f} m  {e['kind']:<20}{extra}")
+
+    # ── [5] 회전 가능성 — 회전 이벤트가 지나는 연결로들의 최소 곡률반경 ──────
+    # R_min < 최소회전반경 × vehicle.min_turn_margin 이면 풀락으로도 못 돈다
+    # (9_school_route 실측: R 2.55 m 연결로 선택 → 호 이탈 → off_route 정지).
+    r_need, margin = min_turn_radius_m()
+    thr = rt.get('turn_radius_thr_m', r_need * margin)
+    print(f"\n[5] 회전 가능성  (금지 임계 R < {thr:.2f} m = 최소회전반경 {r_need:.2f} × {margin:g};"
+          f"  {thr:.2f}~{r_need:.2f} m 는 '빠듯' — 포화·차로폭 여유로 통과)")
+    lanes_list = rt['lanes']
+    cum = rt['cum_s']
+    for e in ev:
+        if not e['kind'].startswith('turn'):
+            continue
+        junc = e.get('junction')
+        conns = [(i, k) for i, k in enumerate(lanes_list)
+                 if lg.lanes[k]['junction'] == junc and junc is not None
+                 and abs(cum[i] - e['s']) < 60.0]
+        for i, k in conns:
+            r = lane_r_min(lg, k)
+            bad = r < thr
+            tight = (not bad) and r < r_need
+            note = '   <= ⚠ 회전 불가 기하' if bad else ('   (빠듯 — 조향 포화 예상)' if tight else '')
+            print(f"  {e['s']:8.1f} m  {e['kind']:<11} 연결로 {str(k):<16} "
+                  f"R_min {r:8.2f} m{note}")
+            if bad:
+                warns += 1
+    forced = rt.get('infeasible_forced', [])
+    for wi, k, r in forced:
+        print(f"  ⚠ 구간 {wi}: 대안 경로가 없어 회전 불가 연결로 {k} (R_min {r:.2f} m) 를 "
+              f"**불가피하게 포함** — 실주행에서 이탈 가능성 높음")
+        warns += 1
 
     print(f"\n{'=' * 72}")
     print('경고 없음' if warns == 0 else f'[경고] {warns}건 — 위 표시된 항목을 확인할 것')
