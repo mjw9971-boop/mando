@@ -1,0 +1,62 @@
+[
+ {
+  "name": "급정거집중_01_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_01_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_01_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_02_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_02_기본.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_02_기본.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_03_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_03_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_03_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_04_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_04_기본.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_04_기본.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_05_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_05_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_05_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_06_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_06_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_06_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_07_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_07_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_07_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_08_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_08_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_08_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_09_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_09_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_09_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_10_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_10_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_10_직진.csv",
+  "timeout_s": 266
+ }
+]

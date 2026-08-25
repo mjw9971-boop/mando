@@ -1,0 +1,59 @@
+# tools/gen_scenarios.py --from-yaml <이 파일> 로 단건 재생성
+name: 교차로집중_08_직진신호
+theme: 교차로집중
+seed_key: 0:교차로집중:교차로집중_08_직진신호
+route:
+  name: 직진신호
+  rows:
+  - - 1
+    - 1393.630533
+    - -589.757624
+  - - 2
+    - 1175.964051
+    - -765.582549
+  - - 3
+    - 1132.383721
+    - -800.456526
+  - - 4
+    - 1058.049251
+    - -860.252525
+  length_m: 439.3
+  start:
+    road: 2076
+    lane:
+    - 2076
+    - 7
+    - -3
+    x: 1393.631
+    y: -589.758
+  roads:
+  - 2076
+  - 2086
+  - 1927
+  junctions:
+  - 46
+  turns:
+    left: 0
+    right: 0
+axes:
+  신호: 짧은녹색
+  route:
+  - 직진신호
+  - 1
+  - ''
+  event:
+  - signal
+events:
+- kind: signal
+  timing: 짧은녹색
+  approaches:
+  - junction: 46
+    controllers:
+    - 91
+    stop_s: 280.66
+    phases:
+    - 5.0
+    - 3.0
+    - 25.0
+est_s: 118.6
+timeout_s: 195

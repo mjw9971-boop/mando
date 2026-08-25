@@ -44,8 +44,8 @@ def route():
     return pickle.load(open(ROUTE, 'rb'))
 
 
-def ped(oid, s_rel, lat_off=0.0, enter=False, ttc=float('inf')):
-    return TrackedObject(id=oid, x=0.0, y=0.0, heading=0.0, speed=1.2, length=0.6, width=0.6,
+def ped(oid, s_rel, lat_off=0.0, enter=False, ttc=float('inf'), speed=1.2):
+    return TrackedObject(id=oid, x=0.0, y=0.0, heading=0.0, speed=speed, length=0.6, width=0.6,
                          height=1.7, cls='pedestrian', lane=None, on_route=False, s_rel=s_rel,
                          lat_off=lat_off, v_rel=0.0, ttc=ttc, will_enter_lane=enter, age=0.0,
                          coasting=False)
@@ -123,6 +123,63 @@ def test_will_enter_lane_also_stops(lg, route):
     d = pl.plan(approach(lg, route, 20.0, speed=8.0,
                          objects=[ped(9, s_rel=d_cw, lat_off=9.0, enter=True)]))
     assert 'crosswalk_ped' in d.reasons
+
+
+# ── 인도 위 정지 보행자 해제 회귀 (2026-08-25 정지 고착·완주 실패) ─────────
+def test_blocker_excludes_still_ped_on_sidewalk():
+    """차도 밖(가장자리+margin 너머)에 정지해 있고 진입 예측도 없으면 blocker 제외.
+
+    run_20260825_001951: 횡단을 마친 보행자가 lat +5.45 m 인도에 서 있는데
+    반폭 8 m 폴리곤에 남아 crosswalk_ped=0.0 이 172 s 유지 → 재출발 불가.
+    """
+    d = 20.0
+    edges = (5.0, 4.0)                                   # 좌/우 차도 가장자리
+    still_out = ped(1, s_rel=d, lat_off=6.5, speed=0.0)  # 인도 위 정지 → 제외
+    assert crosswalk_blockers([still_out], d, CFG, edges) == []
+    # 같은 위치라도 움직이면 세운다 (횡단 재개 가능)
+    moving_out = ped(2, s_rel=d, lat_off=6.5, speed=1.0)
+    assert crosswalk_blockers([moving_out], d, CFG, edges) == [moving_out]
+    # 차도 안이면 정지해 있어도 세운다
+    still_in = ped(3, s_rel=d, lat_off=0.0, speed=0.0)
+    assert crosswalk_blockers([still_in], d, CFG, edges) == [still_in]
+    # 진입 예측이면 어디서든 세운다
+    enter_out = ped(4, s_rel=d, lat_off=6.5, speed=0.0, enter=True)
+    assert crosswalk_blockers([enter_out], d, CFG, edges) == [enter_out]
+    # 가장자리를 모르면(road_edges None) 제외하지 않는다 (보수적)
+    assert crosswalk_blockers([still_out], d, CFG, None) == [still_out]
+    # 우측(음수 lat)도 같은 규칙
+    still_right = ped(5, s_rel=d, lat_off=-5.5, speed=0.0)
+    assert crosswalk_blockers([still_right], d, CFG, edges) == []
+
+
+def test_releases_after_ped_finishes_crossing(lg, route):
+    """횡단을 마치고 인도에 선 보행자는 래치를 풀어 재출발한다 (사고 재현)."""
+    pl = Planner(lg, route, CFG)
+    s, v = 20.0, 8.0
+    while s < 55.0:                                      # 횡단 중 보행자 → 정지 래치
+        w = approach(lg, route, s, speed=v)
+        d_cw = w.summ['dist_crosswalk']
+        d = pl.plan(approach(lg, route, s, speed=v,
+                             objects=[ped(7, s_rel=d_cw, lat_off=1.0)]))
+        if pl._cw_ped_latch:
+            break
+        s += 0.5
+    assert pl._cw_ped_latch, '보행자가 있는데 정지 래치가 안 걸렸다'
+    w = approach(lg, route, s, speed=0.0)
+    d_cw = w.summ['dist_crosswalk']
+    edges = pl._cw_road_edges(w, d_cw)
+    assert edges is not None
+    # 보행자가 횡단을 마치고 좌측 인도(가장자리 밖)에 정지
+    done = ped(7, s_rel=d_cw + 1.0, lat_off=edges[0] + 1.0, speed=0.0)
+    d = pl.plan(approach(lg, route, s, speed=0.0, objects=[done]))
+    assert not pl._cw_ped_latch and 'crosswalk_ped' not in d.reasons
+    assert d.v_target > 0.0, '보행자 해소 후에도 재출발하지 못한다'
+    # 대조: 같은 보행자가 아직 차도 안에 있으면 계속 선다
+    pl2 = Planner(lg, route, CFG)
+    pl2._cw_ped_latch = True
+    on_road = ped(8, s_rel=d_cw, lat_off=0.5, speed=0.0)
+    d2 = pl2.plan(approach(lg, route, s, speed=0.0, objects=[on_road]))
+    assert d2.reasons.get('crosswalk_ped') == 0.0
 
 
 def test_no_stop_inside_crosswalk(lg, route):

@@ -171,6 +171,77 @@ class LaneGraph:
         r = self.lanes[key]
         return float(np.interp(s, r['s'], r['width']))
 
+    def lanes_of_road(self, road_id: int) -> List[LaneKey]:
+        return list(self.roads[road_id]['lanes'])
+
+    def road_s_at(self, key: LaneKey, s: float) -> float:
+        """차로 s(주행 방향) → 도로 s. dir=-1 차로는 road_s 가 감소 방향이다."""
+        r = self.lanes[key]
+        rs = r['road_s']
+        # np.interp 는 x 가 증가해야 한다 — 차로 s 축은 항상 증가하므로 그대로 쓴다
+        return float(np.interp(np.clip(s, 0.0, r['length']), r['s'], rs))
+
+    def opposite_of(self, key: LaneKey) -> Optional[LaneKey]:
+        """같은 도로에서 통행방향이 반대인 driving 차로 중 가장 가까운(중앙선 쪽) 것.
+        같은 road_s 구간을 덮는 섹션이어야 한다 (섹션 인덱스는 방향별로 다를 수 있다)."""
+        road, _sec, lid = key
+        me = self.lanes[key]
+        rs_mid = self.road_s_at(key, 0.5 * me['length'])
+        best = None
+        for k in self.roads[road]['lanes']:
+            o = self.lanes[k]
+            if o['dir'] == me['dir'] or o['type'] != 'driving':
+                continue
+            lo, hi = sorted((float(o['road_s'][0]), float(o['road_s'][-1])))
+            if not (lo - 1e-6 <= rs_mid <= hi + 1e-6):
+                continue
+            if best is None or abs(k[2] - lid) < abs(best[2] - lid):
+                best = k
+        return best
+
+    def roadway_edges(self, key: LaneKey, s: float) -> Tuple[float, float]:
+        """이 차로 중심선에서 차도 가장자리까지 (left, right) 거리 [m].
+
+        같은 방향 이웃(driving)을 좌우로 합산하고, **반대 통행방향 차로 폭을
+        왼쪽에 더한다** — left_nb 는 중앙선을 넘지 않는다(실측: (30,0,-1) 이웃
+        None). 2026-08-25 정지 고착: 생성기가 반대차로를 빼고 횡단 폭을 계산해
+        보행자가 반대 차선 위에 멈췄고, 컨트롤러는 차도 위 보행자로 보고 영원히
+        대기했다. 횡단보도 보행자 판정(planner)과 시나리오 생성(gen_scenarios)이
+        같은 값을 쓰도록 여기 한 곳에 둔다.
+        """
+        def _extent(side: str) -> float:
+            ext = 0.5 * self.width_at(key, s)
+            cur = key
+            for _ in range(6):
+                nb = self.neighbor(cur, side)
+                if nb is None or self.lanes[nb]['type'] != 'driving':
+                    break
+                ext += self.width_at(nb, min(s, self.length(nb)))
+                cur = nb
+            return ext
+
+        left, right = _extent('left'), _extent('right')
+        me = self.lanes[key]
+        rs = self.road_s_at(key, s)
+        for kk in self.roads[key[0]]['lanes']:
+            o = self.lanes[kk]
+            if o['dir'] == me['dir'] or o['type'] != 'driving':
+                continue
+            lo, hi = sorted((float(o['road_s'][0]), float(o['road_s'][-1])))
+            if lo - 1e-6 <= rs <= hi + 1e-6:
+                left += self.width_at(kk, 0.5 * o['length'])
+        return left, right
+
+    def junction_ahead(self, key: LaneKey) -> Optional[int]:
+        """이 차로가 흘러드는 교차로 id (successor 가 교차로 차로일 때). 없으면 None."""
+        if self.lanes[key]['junction'] != -1:
+            return self.lanes[key]['junction']
+        for nk in self.lanes[key]['next']:
+            j = self.lanes[nk]['junction']
+            if j != -1:
+                return j
+        return None
+
     # ── 위치 매칭 ───────────────────────────────────────────────────────
     def project(self, key: LaneKey, x: float, y: float, idx_hint: Optional[int] = None):
         """점 (x,y) 를 차로 key 폴리라인에 투영 → (s, t, dist, idx)"""

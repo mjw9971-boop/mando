@@ -1,0 +1,65 @@
+# tools/gen_scenarios.py --from-yaml <이 파일> 로 단건 재생성
+name: 급정거집중_02_기본
+theme: 급정거집중
+seed_key: 0:급정거집중:급정거집중_02_기본
+route:
+  name: 기본
+  rows:
+  - - 1
+    - 1042.608
+    - 301.513
+  - - 2
+    - 940.427
+    - 224.376
+  - - 3
+    - 866.362
+    - 160.42
+  - - 4
+    - 657.363
+    - -95.466
+  - - 5
+    - 607.101
+    - -111.936
+  - - 6
+    - 570.803
+    - -128.374
+  length_m: 736.4
+  start:
+    road: 1222
+    lane:
+    - 1222
+    - 0
+    - 1
+    x: 1042.608
+    y: 301.513
+  roads:
+  - 1222
+  - 1241
+  - 173
+  - 766
+  - 174
+  junctions:
+  - 8
+  - 9
+  turns:
+    left: 0
+    right: 2
+axes:
+  감속강도: 3.0
+  발동거리: 0.75
+  재출발: 있음
+  route:
+  - 기본
+  - 1
+  - ''
+  event:
+  - lead_brake
+events:
+- kind: lead_brake
+  lead: LeadCar01
+  trigger_s: 496.45
+  decel: 3.0
+  resume: true
+  gap0: 80.0
+est_s: 158.2
+timeout_s: 266

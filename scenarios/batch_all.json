@@ -1,0 +1,122 @@
+[
+ {
+  "name": "급정거집중_01_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_01_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_01_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_02_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_02_기본.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_02_기본.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_03_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_03_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_03_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_04_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_04_기본.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_04_기본.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_05_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_05_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_05_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_06_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_06_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_06_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_07_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_07_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_07_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_08_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_08_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_08_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_09_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_09_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_09_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "급정거집중_10_직진",
+  "vtd_xml_path": "/home/mjw/scenarios/급정거집중/급정거집중_10_직진.xml",
+  "route_csv": "scenarios/급정거집중/급정거집중_10_직진.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "교차로집중_01_우회전신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_01_우회전신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_01_우회전신호.csv",
+  "timeout_s": 180
+ },
+ {
+  "name": "교차로집중_02_우회전신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_02_우회전신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_02_우회전신호.csv",
+  "timeout_s": 180
+ },
+ {
+  "name": "교차로집중_03_좌회전신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_03_좌회전신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_03_좌회전신호.csv",
+  "timeout_s": 180
+ },
+ {
+  "name": "교차로집중_04_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_04_기본.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_04_기본.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "교차로집중_05_직진신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_05_직진신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_05_직진신호.csv",
+  "timeout_s": 195
+ },
+ {
+  "name": "교차로집중_06_직진신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_06_직진신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_06_직진신호.csv",
+  "timeout_s": 195
+ },
+ {
+  "name": "교차로집중_07_우회전신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_07_우회전신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_07_우회전신호.csv",
+  "timeout_s": 180
+ },
+ {
+  "name": "교차로집중_08_직진신호",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_08_직진신호.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_08_직진신호.csv",
+  "timeout_s": 195
+ },
+ {
+  "name": "교차로집중_09_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_09_기본.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_09_기본.csv",
+  "timeout_s": 266
+ },
+ {
+  "name": "교차로집중_10_기본",
+  "vtd_xml_path": "/home/mjw/scenarios/교차로집중/교차로집중_10_기본.xml",
+  "route_csv": "scenarios/교차로집중/교차로집중_10_기본.csv",
+  "timeout_s": 266
+ }
+]

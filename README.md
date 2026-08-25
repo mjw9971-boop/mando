@@ -18,8 +18,10 @@ src/hlfma/launch/   drive.launch.py  replay.launch.py
 src/hlfma/config/   params.yaml      ← 모든 튜닝 파라미터의 단일 출처
 tools/              build_lane_graph build_route plot_lane_graph make_test_route
                     probe_9910 mock_vtd run_standalone replay score summarize_run
-                    scp_client set_ego_start
+                    scp_client set_ego_start gen_scenarios batch_run
 data/               lane_graph.pkl route.pkl xodr   (레포에 포함 — 클론 즉시 사용 가능)
+configs/            themes.yaml      ← 시나리오 생성 프리셋 (주제·경로 풀·변형 축)
+templates/          9_clean_drive.xml 등 검증된 VTD 시나리오 원본 (블록 추출용)
 ```
 
 한 패킷 = /gt_state 하나 = 한 틱. **타이머 없이 콜백 체인으로만** 흐른다:
@@ -80,6 +82,18 @@ ros2 launch hlfma drive.launch.py               # 터미널 2
 
 # 9910 프레임 눈으로 확인
 python3 tools/probe_9910.py --host <VTD_IP>
+
+# 그날치 테스트 시나리오 자동 생성 (주제는 configs/themes.yaml, --list 로 목록)
+python3 tools/gen_scenarios.py 보행자집중 급정거집중 --count 3 --seed 1
+python3 tools/gen_scenarios.py 교차로집중 --hours 2        # 시간 예산으로 개수 환산
+#  → scenarios/<주제>/<이름>.{xml,csv,yaml} + batch_<주제>.json + batch_all.json(통합)
+#    모든 경로는 생성 시점에 build_route 로 검증 — 경고(회전 불가 연결로 등) 있으면
+#    다른 시작점으로 재시도, 소진 시 사유와 함께 목록에서 제외
+#  → scenarios/ 를 VTD PC 의 /home/mjw/scenarios 로 복사(scp) 후:
+#    python3 tools/batch_run.py scenarios/batch_all.json
+#    (실행 전에 첫 시나리오 경로를 ssh ls 로 실존 확인 — 없으면 즉시 중단)
+#    (batch_run 은 목록 여러 개·glob 도 받아 합쳐 실행한다 — 단 batch_all 과 주제별을
+#     같이 주면 이름 중복으로 막힌다. 중복 검사는 통합 후 기준)
 
 python3 -m pytest tests/
 ```

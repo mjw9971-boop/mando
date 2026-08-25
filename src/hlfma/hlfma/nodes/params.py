@@ -121,6 +121,11 @@ DEFAULTS: dict[str, Any] = {
                # 횡단보도 폴리곤 근사 (s_rel/lat_off 기준). RTOR 안전 확인과
                # 횡단보도 보행자 정지가 같은 판정을 쓴다.
                'crosswalk_half_w_m': 8.0, 'crosswalk_back_m': 3.0, 'crosswalk_fwd_m': 7.0,
+               # 차도 밖(인도)에 정지해 있고 진입 예측도 없는 객체는 blocker 에서 제외.
+               # 2026-08-25 실사고: 횡단을 마치고 인도(lat 5.45 m)에 선 보행자가 반폭
+               # 8 m 폴리곤에 영원히 남아 172 s 정지 고착 → 완주 실패. 차도 가장자리는
+               # lane_graph 차로폭으로 계산하고, 못 구하면 제외하지 않는다(보수적).
+               'crosswalk_still_v': 0.3, 'crosswalk_edge_margin_m': 0.5,
                # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개
                'gt_range_m': 80.0, 'range_margin_m': 5.0},
     'control': {'kp': 0.8, 'ki': 0.15, 'k_ld': 0.8, 'ld_min': 5.0, 'ld_max': 20.0,
@@ -133,6 +138,13 @@ DEFAULTS: dict[str, Any] = {
                 'steer_rate_max': 1.0},
     # lane_side_m: path 가 이만큼 옆으로 벗어나면 차선변경 시도로 본다
     'shield': {'edge_margin_m': 0.3, 'lane_side_m': 1.0},
+    # 배치 회귀(batch_run/summarize_run)의 종료 판정 — 컨트롤러 정지 정책과
+    # 같은 params 를 쓰게 해 튜닝이 판정과 어긋나지 않게 한다.
+    'batch': {'end_slack_m': 1.0,
+              # 정지(v<0.1)인데 계획은 진행(v_target≥0.5)이 이 시간 지속 → stall 종료
+              'stall_end_s': 20.0,
+              # route_s 무전진이 이 시간 지속 → no_progress 종료 (적60 대기 60 s 보다 길게)
+              'no_progress_end_s': 120.0},
     # path 가 비어 있으면 dir/run_<타임스탬프>.jsonl 로 자동 생성한다.
     'log': {'enabled': True, 'dir': 'logs', 'path': '', 'flush_every': 20},
     # enabled=true 일 때만 const_speed_kph 가 속도 상한으로 걸린다.
@@ -156,6 +168,12 @@ NOTES: dict[str, list[str]] = {
     ],
     'percep.gt_range_m': [
         '공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개.',
+    ],
+    'batch.end_slack_m': [
+        '완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).',
+        'route_s 는 뒷축 기준이고 계획 정지점이 total − stop_gap − 앞범퍼 이므로',
+        '임계가 stop_gap 튜닝을 자동으로 따라간다 (2026-08-25: stop_gap 1→4 후',
+        '고정 임계 5 m 에 7.9 m 못 미쳐 정상 완주가 timeout 처리된 사고).',
     ],
     'comm.hold_decay_s': [
         '/cmd 가 이 시간 이상 안 오면 vtd_bridge 가 조향만 0 으로 감쇠해 재송신.',

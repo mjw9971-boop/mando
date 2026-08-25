@@ -31,7 +31,7 @@ IDM_DELTA = 4.0
 LEAD_MAX_S = 80.0
 
 
-def crosswalk_blockers(objects, d_cw, cfg) -> list:
+def crosswalk_blockers(objects, d_cw, cfg, road_edges=None) -> list:
     """
     전방 횡단보도 폴리곤(근사) 안에 있거나 차로 진입이 예측되는 객체들.
 
@@ -39,6 +39,13 @@ def crosswalk_blockers(objects, d_cw, cfg) -> list:
     없어 크기로만 분류하므로(SPEC §1.1) 오분류 시 치는 쪽이 더 위험하다.
     폴리곤은 s_rel/lat_off 근사: 종방향 [d_cw - back, d_cw + fwd], 횡방향 |lat_off| < half_w.
     RTOR 안전 확인과 횡단보도 정지가 **같은 판정**을 쓰도록 여기 한 곳에 둔다.
+
+    road_edges=(left_m, right_m): 경로 중심선에서 차도 가장자리까지 거리.
+    주어지면 **차도 밖(인도)에 정지해 있고 진입 예측도 없는** 객체를 제외한다 —
+    2026-08-25 실사고: 횡단을 마치고 인도(lat +5.45 m)에 선 보행자가 반폭 8 m
+    폴리곤에 영원히 남아 172 s 정지 고착 → 완주 실패 (run_20260825_001951).
+    반폭 8 m 는 차도 폭을 넘어 인도를 덮으므로, 폴리곤 이탈만으로는 해제가
+    영원히 오지 않는다. 움직이는 객체·진입 예측 객체는 종전대로 전부 세운다.
     """
     if d_cw is None:
         return []
@@ -46,14 +53,21 @@ def crosswalk_blockers(objects, d_cw, cfg) -> list:
     half_w = float(p.get('crosswalk_half_w_m', 8.0))
     back = float(p.get('crosswalk_back_m', 3.0))
     fwd = float(p.get('crosswalk_fwd_m', 7.0))
+    still_v = float(p.get('crosswalk_still_v', 0.3))
+    margin = float(p.get('crosswalk_edge_margin_m', 0.5))
     out = []
     for o in objects:
         in_poly = abs(o.lat_off) < half_w and d_cw - back <= o.s_rel <= d_cw + fwd
         # 진입 예측(will_enter_lane)은 횡단보도 근처의 것만 — 멀리서 차로로 들어오는
         # 차량까지 여기서 세우면 안 된다(그건 선행차/TTC 담당).
         near = abs(o.lat_off) < half_w * 2 and d_cw - back <= o.s_rel <= d_cw + fwd
-        if in_poly or (o.will_enter_lane and near):
-            out.append(o)
+        if not (in_poly or (o.will_enter_lane and near)):
+            continue
+        if road_edges is not None and not o.will_enter_lane and o.speed < still_v:
+            edge = road_edges[0] if o.lat_off >= 0.0 else road_edges[1]
+            if abs(o.lat_off) > edge + margin:
+                continue               # 인도 위 정지 객체 — 횡단 종료/시작 전 대기
+        out.append(o)
     return out
 
 
@@ -590,7 +604,8 @@ class Planner:
         d_cw = summ.get('dist_crosswalk')
         # 추종 중인 선행차는 제외한다 (회피·대기 대상이 아니라 따라가는 대상).
         objs = [o for o in world.objects if o.id != self.lead_id]
-        blockers = crosswalk_blockers(objs, d_cw, self.cfg)
+        blockers = crosswalk_blockers(objs, d_cw, self.cfg,
+                                      self._cw_road_edges(world, d_cw))
         if not blockers:
             self._cw_ped_latch = False
             return None
@@ -633,9 +648,34 @@ class Planner:
                 return f'id={o.id} 진입 예측'
             if o.on_route and -2.0 <= o.s_rel <= d_end + 5.0:
                 return f'id={o.id} 통과 경로 {o.s_rel:+.0f} m'
-        for o in crosswalk_blockers(world.objects, d_cw, self.cfg):
+        for o in crosswalk_blockers(world.objects, d_cw, self.cfg,
+                                    self._cw_road_edges(world, d_cw)):
             return f'id={o.id} 횡단보도 {o.s_rel:+.0f} m'
         return ''
+
+    def _cw_road_edges(self, world: WorldState, d_cw) -> tuple | None:
+        """횡단보도 위치에서 경로 중심선 → 차도 가장자리 좌/우 거리 (left, right) [m].
+
+        crosswalk_blockers 의 "차도 밖 정지 객체 제외"에 쓴다. 실제 계산은
+        lanegraph.roadway_edges (시나리오 생성기와 공용 — 어긋나면 2026-08-25
+        정지 고착이 재발한다). 차로를 못 찾으면 None → 제외 없이 보수적 판정.
+        """
+        if d_cw is None:
+            return None
+        k = sl = None
+        if self.route is not None:
+            s_t = world.ego.route_s + d_cw
+            lanes, cum, lens = (self.route['lanes'], self.route['cum_s'],
+                                self.route['lengths'])
+            for i, kk in enumerate(lanes):
+                if cum[i] - 1e-6 <= s_t <= cum[i] + lens[i] + 1e-6:
+                    k, sl = kk, min(max(s_t - cum[i], 0.0), lens[i])
+                    break
+        if k is None:
+            k, sl = world.ego.lane, world.ego.s
+        if k is None:
+            return None
+        return self.lg.roadway_edges(k, sl)
 
     def _front_m(self) -> float:
         """뒷바퀴축 → 앞범퍼 거리 = wheelbase + front_overhang."""

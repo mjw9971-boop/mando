@@ -1,0 +1,60 @@
+# tools/gen_scenarios.py --from-yaml <이 파일> 로 단건 재생성
+name: 교차로집중_02_우회전신호
+theme: 교차로집중
+seed_key: 0:교차로집중:교차로집중_02_우회전신호
+route:
+  name: 우회전신호
+  rows:
+  - - 1
+    - 1044.793039
+    - 696.466398
+  - - 2
+    - 1229.265892
+    - 805.124788
+  - - 3
+    - 1256.493835
+    - 797.625009
+  - - 4
+    - 1291.960501
+    - 691.094499
+  length_m: 372.8
+  start:
+    road: 2815
+    lane:
+    - 2815
+    - 1
+    - -2
+    x: 1044.793
+    y: 696.466
+  roads:
+  - 2815
+  - 3060
+  - 2816
+  junctions:
+  - 89
+  turns:
+    left: 0
+    right: 1
+axes:
+  신호: 짧은녹색
+  route:
+  - 우회전신호
+  - 1
+  - ''
+  event:
+  - signal
+events:
+- kind: signal
+  timing: 짧은녹색
+  approaches:
+  - junction: 89
+    controllers:
+    - 155
+    - 156
+    stop_s: 215.0
+    phases:
+    - 5.0
+    - 3.0
+    - 25.0
+est_s: 109.7
+timeout_s: 180

@@ -58,6 +58,30 @@ def load_map():
         return None, None
 
 
+def load_cfg() -> dict:
+    """params.yaml (없으면 DEFAULTS) — 완주 임계가 컨트롤러 정지 정책과 같은 값을 보게."""
+    from hlfma.nodes.params import DEFAULTS, load_params_yaml
+    yaml_path = _ROOT / 'src' / 'hlfma' / 'config' / 'params.yaml'
+    try:
+        return load_params_yaml(str(yaml_path))
+    except Exception:                                   # noqa: BLE001
+        return DEFAULTS
+
+
+def end_margin_m(cfg: dict) -> float:
+    """완주 임계 [m]: route_s(뒷축) ≥ total − 이 값이면 완주.
+
+    계획 정지점이 total − stop_gap − (wheelbase + front_overhang) 이므로
+    임계 = stop_gap + 앞범퍼거리 + 여유(end_slack). stop_gap 튜닝을 자동으로
+    따라간다 — 2026-08-25: stop_gap 1→4 후 고정 임계 5 m 로 완주가 timeout 처리.
+    batch_run 과 여기(완주 표기)가 같은 함수를 쓴다.
+    """
+    sp, vh = cfg['speed'], cfg['vehicle']
+    return (float(sp['stop_gap_m']) + float(vh['wheelbase'])
+            + float(vh.get('front_overhang_m', 0.855))
+            + float(cfg.get('batch', {}).get('end_slack_m', 1.0)))
+
+
 def segments(vals):
     """연속 같은 값 구간 → [(start_idx, end_idx, value)]."""
     out, s0 = [], 0
@@ -100,7 +124,8 @@ def summarize(path: str, lg=None, route=None) -> dict:
     dist = s[peak_i] - s[0]
     dur = ticks[peak_i]['t'] - t0
     end_stopped = v[-1] < 2.0
-    done = (total is not None and s[peak_i] >= total - 5.0)
+    margin = end_margin_m(load_cfg())
+    done = (total is not None and s[peak_i] >= total - margin)
     out['finish'] = {'done': done, 'peak_route_s': round(s[peak_i], 1), 'route_total': total,
                      'dist_m': round(dist, 1), 'time_s': round(dur, 1),
                      'avg_kph': round(dist / dur * 3.6, 1) if dur > 0 else None,

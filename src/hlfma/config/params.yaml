@@ -124,6 +124,11 @@
     percep.crosswalk_half_w_m: 8.0
     percep.crosswalk_back_m: 3.0
     percep.crosswalk_fwd_m: 7.0
+    # 차도 밖(인도) 정지 + 진입 예측 없음 객체는 blocker 제외 (2026-08-25 실사고:
+    # 횡단 완료 후 인도에 선 보행자가 폴리곤에 남아 172 s 정지 고착 → 완주 실패).
+    # 차도 가장자리는 lane_graph 차로폭 합, 못 구하면 제외 안 함(보수적).
+    percep.crosswalk_still_v: 0.3
+    percep.crosswalk_edge_margin_m: 0.5
     # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개.
     percep.gt_range_m: 80.0
     percep.range_margin_m: 5.0
@@ -140,6 +145,15 @@
     # ── shield ──
     shield.edge_margin_m: 0.3
     shield.lane_side_m: 1.0
+    # ── batch ── (배치 회귀 종료 판정 — 컨트롤러 정지 정책과 같은 params 사용)
+    # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + end_slack).
+    # 2026-08-25: stop_gap 1→4 튜닝 후 고정 임계 5 m 에 7.9 m 못 미쳐
+    # 정상 완주(계획 정지점 도달)가 timeout 처리 — 임계를 stop_gap 연동으로 변경.
+    batch.end_slack_m: 1.0
+    # 정지(v<0.1)인데 계획은 진행(v_target≥0.5)이 지속되면 stall 종료
+    batch.stall_end_s: 20.0
+    # route_s 무전진 지속 시 no_progress 종료 (적60 대기 60 s 보다 길게 둘 것)
+    batch.no_progress_end_s: 120.0
     # ── log ──
     log.enabled: true
     log.dir: "logs"

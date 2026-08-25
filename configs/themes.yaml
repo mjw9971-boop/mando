@@ -1,0 +1,168 @@
+# 시나리오 자동 생성 프리셋 — tools/gen_scenarios.py 가 읽는다.
+#
+#   python3 tools/gen_scenarios.py 보행자집중 급정거집중 --count 3 --seed 1
+#
+# [routes]  경로 풀. 이름 → 정의.
+#   csv:  검증된 대회형식 CSV 재사용 (시작 + 교차로 진입/진출 짝 + 종료)
+#   walk: lane_graph 를 걸어 대회형식 CSV 를 합성한다
+#         turns: 교차로마다 고를 방향 [straight|right|left|any]
+#         require: school_zone | speed_change  (경로가 반드시 포함해야 하는 성질)
+#         max_gap_m: 교차로 사이 최대 간격 (연속교차로용)
+#         tail_m: 마지막 교차로 뒤 여유 주행 거리
+#
+# [themes]  주제 프리셋.
+#   event:  이벤트 종류 나열 — pedestrian jaywalk ped_blind lead_brake slow_lead
+#           static_vehicle cut_in oncoming signal obstacle_chain narrow none
+#   routes: 위 경로 풀 이름들
+#   vary:   흔들 축. 축별 값 풀은 같은 이름의 키로 재정의할 수 있다 (없으면 코드 기본값)
+#   combine: N  → 한 시나리오에 이벤트 N개 동시 배치 (다중이벤트)
+#   rotate: true → 시나리오마다 event 목록을 순환하며 하나씩 (전체회귀)
+#   random_axes: true → 축 값을 전수조합 대신 시드 난수로 뽑는다 (랜덤카오스)
+#   start: 고정|자유 → walk 경로의 시작점 모드. 고정(기본)이면 같은 경로 풀
+#          이름은 실행 내에서 주제가 달라도 같은 경로를 공유하고, 자유면 주제·
+#          경로변형마다 맵 전체 후보 풀에서 다른 시작점을 뽑는다 (맵 커버리지용).
+#          csv 경로는 시작점이 파일에 고정이라 영향 없음.
+#
+# 로직이 아직 대응 못 하는 주제(대향차·컷인 등)도 생성은 된다 — 실패 목록이
+# 곧 미구현 우선순위 자료다.
+
+routes:
+  기본:
+    csv: waypoints.csv        # 검증된 연습 경로 (교차로 짝 1)
+  직진:
+    walk: {turns: [straight, straight], tail_m: 120}
+  우회전:
+    walk: {turns: [right], tail_m: 100}
+  좌회전:
+    walk: {turns: [left], tail_m: 100}
+  스쿨존:
+    walk: {turns: [any], require: school_zone, tail_m: 80}
+  연속교차로:
+    walk: {turns: [any, any, any, any, any, any], max_gap_m: 150, tail_m: 80}
+  속도전환:
+    walk: {turns: [any, any], require: speed_change, tail_m: 100}
+  직진신호:
+    walk: {turns: [straight], require: signalized, tail_m: 100}
+  우회전신호:
+    walk: {turns: [right], require: signalized, tail_m: 100}
+  좌회전신호:
+    walk: {turns: [left], require: signalized, tail_m: 100}
+  
+
+
+themes:
+  보행자집중:
+    event: [pedestrian]
+    routes: [기본, 직진]
+    vary: [위치, 보행속도, 신호, 트리거거리]
+    start: 자유
+    보행속도: [1.0, 1.5, 2.0]
+    트리거거리: [15, 25, 35]
+
+  무단횡단집중:
+    event: [jaywalk]
+    routes: [직진]
+    vary: [위치, 보행속도, 트리거거리, 지점]
+    start: 자유
+    지점: [횡단보도, 도로중간]      # 신호 무시 + 횡단보도 밖 지점 포함
+
+  보행자사각:
+    event: [ped_blind]
+    routes: [기본, 직진]
+    vary: [위치, 보행속도, 트리거거리, 차폐물]
+    start: 자유
+    차폐물: [버스, 승용차]
+
+  추월집중:
+    event: [static_vehicle]
+    routes: [기본, 직진]
+    vary: [위치, 차선, 대향차]
+    start: 자유
+
+  급정거집중:
+    event: [lead_brake]
+    routes: [기본, 직진]
+    vary: [감속강도, 발동거리, 재출발]
+    감속강도: [3.0, 5.0, 7.0]
+    start: 자유
+
+  저속선행차:
+    event: [slow_lead]
+    routes: [기본, 직진, 우회전]
+    vary: [간격]
+    간격: [30, 50, 80]
+    속도_kph: 15
+    start: 자유
+
+  대향차직진:
+    event: [oncoming]
+    routes: [기본, 직진]
+    vary: [위치, 개수, 속도]
+    개수: [2, 4, 6]
+    속도: [30, 50]
+    start: 자유
+
+  교차로집중:
+    event: [signal]
+    routes: [기본, 직진신호, 우회전신호, 좌회전신호]
+    vary: [신호]
+    신호: [적60, 딜레마, 짧은녹색]
+    start: 자유
+
+  연속교차로:
+    event: [none]
+    routes: [연속교차로]
+    vary: [경로변형]
+    경로변형: [1, 2, 3, 4, 5, 6]          # walk 시드만 다른 경로 변형
+    start: 자유
+
+  속도구간집중:
+    event: [none]
+    routes: [속도전환, 스쿨존]
+    vary: [경로변형]
+    경로변형: [1, 2, 3]
+    start: 자유
+
+  연쇄장애물:
+    event: [obstacle_chain]
+    routes: [기본, 직진]
+    vary: [위치, 개수]
+    개수: [3, 4, 6]
+    start: 자유
+
+  차로폭협착:
+    event: [narrow]
+    routes: [기본, 직진]
+    vary: [위치, 침범폭]
+    침범폭: [0.4, 0.7, 1.0]         # 양측 정차 차량이 차로 안으로 무는 폭 [m]
+    start: 자유
+
+  다중이벤트:
+    event: [pedestrian, lead_brake, static_vehicle, obstacle_chain]
+    combine: 2
+    routes: [직진, 우회전]        # 기본 경로는 교차로 클러스터가 대부분이라 2개가 안 들어간다
+    vary: [위치]
+    start: 자유
+
+  완주속도:
+    event: [none]
+    start: 자유
+    routes: [기본, 직진, 우회전, 좌회전, 연속교차로, 속도전환]
+    vary: [경로변형]
+    경로변형: [1, 2, 3]
+
+  전체회귀:
+    event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
+            static_vehicle, oncoming, signal, obstacle_chain, none]
+    rotate: true
+    start: 자유
+    routes: [기본, 직진]
+    vary: [위치]
+
+  랜덤카오스:
+    event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
+            static_vehicle, cut_in, oncoming, signal, obstacle_chain, narrow]
+    random_axes: true
+    start: 자유
+    routes: [기본, 직진, 우회전, 좌회전, 연속교차로]
+    vary: [위치, 보행속도, 트리거거리, 감속강도, 발동거리, 개수, 속도, 차선, 신호]
