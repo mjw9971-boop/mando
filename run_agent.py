@@ -3,12 +3,12 @@
 
 한 패킷 = 한 틱, 단일 프로세스 / 단일 스레드:
 
-    9910 → Comm.recv → EgoTracker → [판단: phase3 에서 PDM-Lite] → Comm.send → 9910
-                              ↘________ Logger (매 틱 전부 기록) ________↙
+    9910 → Comm.recv → EgoTracker/VtdWorld → PDM-Lite autopilot.run_step
+         → command_from_control → Comm.send → 9910
+                    ↘________ Logger (매 틱 전부 기록) ________↙
 
-phase1 현재: 판단 자리는 **정속 주행 stub** (v_target = speed_limit, steering = 0)
-이다 — comm→log 루프와 로그 스키마가 도는지 확인하는 골격. phase3 에서
-team_code/autopilot.py (PDM-Lite) 로 교체된다.
+판단은 team_code/autopilot.py (PDM-Lite, Beißwenger 2024) 원문이 한다.
+어댑터(vtd_adapter)가 CARLA 표면을 흉내내고, 여기서는 조립·로깅만 한다.
 
 실행:
     python3 run_agent.py --route data/route.pkl
@@ -18,6 +18,7 @@ team_code/autopilot.py (PDM-Lite) 로 교체된다.
 from __future__ import annotations
 
 import argparse
+import math
 import pathlib
 import pickle
 import subprocess
@@ -26,13 +27,23 @@ import time
 
 _ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / 'team_code'))    # PDM-Lite 는 평면 import 를 쓴다
 
+from vtd_adapter import frame                              # noqa: E402
 from vtd_adapter.comm import SAFE_STOP, Comm               # noqa: E402
 from vtd_adapter.config import load_params_yaml            # noqa: E402
+from vtd_adapter.control import (VtdLongitudinalController,  # noqa: E402
+                                 command_from_control)
 from vtd_adapter.ego import EgoTracker                     # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph                # noqa: E402
 from vtd_adapter.logger import Logger                      # noqa: E402
-from vtd_adapter.types import Command, Decision            # noqa: E402
+from vtd_adapter.map import VtdMap                         # noqa: E402
+from vtd_adapter.route import VtdRoutePlanner              # noqa: E402
+from vtd_adapter.types import Command, Decision, TrackedObject  # noqa: E402
+from vtd_adapter.world import VtdWorld                     # noqa: E402
+
+from autopilot import AutoPilot                            # noqa: E402  (team_code)
+from config import GlobalConfig                            # noqa: E402  (team_code)
 
 
 def load_route(path: str) -> dict:
@@ -71,29 +82,45 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-class StubAgent:
-    """phase1 임시 판단: 정속 주행 (v_target = speed_limit, steering = 0).
+class LoggingAutoPilot(AutoPilot):
+    """autopilot 원문은 무수정(diff 0) 유지하고, 원인별 목표속도를 로그로 뽑기
+    위해 개별 원인 함수의 **반환값만** 가로챈다 — 판단에는 관여하지 않는다.
 
-    phase3 에서 team_code/autopilot.py 로 교체된다. Decision/Command 는
-    로그 스키마 확인용으로만 채운다.
+    candidates: leading / vehicle / bicycle / pedestrian / red_light [m/s]
+    final: (brake, target_speed, speed_reduced_by_obj), initial: 중재 전 목표.
     """
 
-    def __init__(self, cfg: dict) -> None:
-        s, c = cfg['speed'], cfg['control']
-        self.kp = float(c['kp'])
-        self.a_min = float(s['a_min'])
-        self.a_max = float(s['a_max'])
-        self.a_hold = float(s['a_hold'])
+    def get_brake_and_target_speed(self, plant, route_points, dist_tl, next_tl,
+                                   dist_ss, next_ss, vehicle_list, actor_list,
+                                   initial_target_speed, speed_reduced_by_obj):
+        self.candidates = {}
+        self.initial_target = float(initial_target_speed)
+        out = super().get_brake_and_target_speed(
+            plant, route_points, dist_tl, next_tl, dist_ss, next_ss,
+            vehicle_list, actor_list, initial_target_speed, speed_reduced_by_obj)
+        self.final = out
+        return out
 
-    def step(self, world) -> tuple[Decision, Command]:
-        v_t = float(world.speed_limit)
-        decision = Decision(v_target=v_t, path=[], turn_signal=0,
-                            state='STUB', reasons={'limit': v_t})
-        if v_t <= 1e-6 and world.ego.speed < 0.2:
-            accel = self.a_hold
-        else:
-            accel = min(self.a_max, max(self.a_min, self.kp * (v_t - world.ego.speed)))
-        return decision, Command(steering=0.0, accel=accel, turn_signal=0)
+    def compute_target_speed_wrt_leading_vehicle(self, *a, **kw):
+        ts, obj = super().compute_target_speed_wrt_leading_vehicle(*a, **kw)
+        self.candidates['leading'] = float(ts)
+        return ts, obj
+
+    def compute_target_speeds_wrt_all_actors(self, *a, **kw):
+        bike, ped, veh, obj = super().compute_target_speeds_wrt_all_actors(*a, **kw)
+        self.candidates.update(bicycle=float(bike), pedestrian=float(ped),
+                               vehicle=float(veh))
+        return bike, ped, veh, obj
+
+    def ego_agent_affected_by_red_light(self, *a, **kw):
+        ts = super().ego_agent_affected_by_red_light(*a, **kw)
+        self.candidates['red_light'] = float(ts)
+        return ts
+
+
+# decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등 판단(kr_rules)은 phase4.
+_HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
+                'vehicle': 'vehicle', 'bicycle': 'bicycle'}
 
 
 class Runner:
@@ -114,8 +141,20 @@ class Runner:
         if self.route is None:
             raise SystemExit(f'route 파일 없음: {route_path}')
 
+        # ── 어댑터 + PDM-Lite 조립 ────────────────────────────────────────
+        self.pdm_config = GlobalConfig()
         self.tracker = EgoTracker(self.lg, self.route, self.cfg)
-        self.agent = StubAgent(self.cfg)          # phase3: PDM-Lite autopilot 으로 교체
+        self.world = VtdWorld(self.cfg)
+        self.vmap = VtdMap(self.lg)
+        self.planner = VtdRoutePlanner(self.lg, self.route, self.cfg,
+                                       config=self.pdm_config)
+        self.longc = VtdLongitudinalController(self.cfg)
+        self.max_steer = float(self.cfg['vehicle']['max_steer'])
+
+        self.agent = LoggingAutoPilot()
+        self.agent.setup(self.world, self.vmap, self.planner, self.longc,
+                         self.world.ego, config=self.pdm_config)
+
         log_path = args.log
         if log_path is None and bool(self.cfg['log'].get('enabled', True)):
             ts = time.strftime('%Y%m%d_%H%M%S')
@@ -152,11 +191,71 @@ class Runner:
     # ── 한 틱 ─────────────────────────────────────────────────────────────
     def tick(self, pkt) -> Command:
         """RawPacket → Command. 예외는 호출자가 잡는다."""
-        world = self.tracker.update(pkt)
-        decision, cmd = self.agent.step(world)
-        self.logger.write(pkt, world, decision, cmd)
-        self._maybe_print(world, decision, cmd)
+        world_state = self.tracker.update(pkt)
+
+        # courseRespawn: 순간이동 전의 상태(트랙·경로 인덱스·제어 이력)는 전부 무효
+        if world_state.flags.get('reset'):
+            self.world.clear()
+            cx, cy = frame.to_carla_xy(world_state.ego.x, world_state.ego.y)
+            self.planner.reset_index([cx, cy])
+            self.agent._turn_controller.error_history = []
+            self.longc._prev_accel = 0.0
+
+        self.world.update(pkt, world_state.ego)
+        self.planner.update_lights(pkt.lights)
+
+        control = self.agent.run_step(world_state, pkt.t_recv)
+        cmd = command_from_control(control, self.max_steer, turn_signal=0)
+
+        decision = self._build_decision()
+        world_state.objects = self._log_objects()
+        self.logger.write(pkt, world_state, decision, cmd)
+        self._maybe_print(world_state, decision, cmd)
         return cmd
+
+    def _build_decision(self) -> Decision:
+        """autopilot 부수 상태 → 로그 스키마의 decision.
+
+        state = 이긴 hazard 명 (walker/light/lead/vehicle/bicycle/none),
+        reasons = 원인별 목표속도 + winner + 최저 원인 객체. turn_signal 은 0
+        고정 (phase4 kr_rules 몫).
+        """
+        a = self.agent
+        cand = dict(getattr(a, 'candidates', {}))
+        initial = getattr(a, 'initial_target', None)
+        brake, target, reduced = getattr(a, 'final', (False, 0.0, None))
+
+        winner = 'none'
+        if cand:
+            low = min(cand, key=cand.get)
+            if initial is None or cand[low] < initial - 1e-6:
+                winner = _HAZARD_NAME[low]
+
+        reasons = {'initial': initial, 'winner': winner, **cand}
+        if reduced is not None and reduced[1] is not None:
+            reasons['speed_reduced_by'] = {
+                'type': reduced[1], 'id': reduced[2],
+                'dist': None if reduced[3] is None else round(float(reduced[3]), 1)}
+        return Decision(v_target=float(target), path=[], turn_signal=0,
+                        state=winner, reasons=reasons)
+
+    def _log_objects(self) -> list:
+        """VtdWorld 액터 → 로그 objects[] (스키마 유지 — 좌표는 VTD 원 프레임).
+
+        s_rel/lat_off/v_rel/ttc/will_enter_lane 은 옛 perception 의 판단 산물이라
+        이제 없다 → None (지시 3-2). PDM 의 충돌 판단은 OBB forecast 가 한다.
+        """
+        out = []
+        for actor in self.world.get_actors():
+            vx, vy = frame.from_carla_xy(actor.x, actor.y)
+            out.append(TrackedObject(
+                id=actor.id, x=vx, y=vy,
+                heading=frame.from_carla_yaw_deg(actor.yaw_deg),
+                speed=actor.speed, length=actor.length, width=actor.width,
+                height=actor.height, cls=actor.cls, lane=None, on_route=False,
+                s_rel=None, lat_off=None, v_rel=None, ttc=None,
+                will_enter_lane=False, age=actor.age, coasting=actor.coasting))
+        return out
 
     def _maybe_print(self, world, decision, cmd) -> None:
         """1초에 한 줄. 차가 어디서 뭘 하고 있는지 한눈에."""
@@ -210,6 +309,8 @@ class Runner:
                     self.source.send(self.last_cmd)
 
                 self.ticks += 1
+                if self.args.replay:
+                    continue                                  # 재생은 페이싱 없이 최대 속도로
                 next_send += self.send_dt
                 sleep = next_send - time.monotonic()
                 if sleep > 0:

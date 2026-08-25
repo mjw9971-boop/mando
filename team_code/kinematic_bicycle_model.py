@@ -105,38 +105,14 @@ class KinematicBicycleModel:
             heading + speed / self.rear_wheel_base * np.sin(slip_angle) * self.time_step
         )
 
-        # We use different polynomial models for estimating the speed if whether the ego vehicle brakes or not.
-        if brake:
-            speed_kph = speed * 3.6
-            features = speed_kph ** np.arange(1, 8)
-            next_speed_kph = features @ self.brake_values
-            next_speed = next_speed_kph / 3.6
-        else:
-            throttle = np.clip(throttle, 0.0, 1.0)
-
-            # For a throttle value < 0.3 the car doesn't really accelerate and the polynomial model below
-            # doesn't hold anymore.
-            if throttle < self.throttle_threshold_during_forecasting:
-                next_speed = speed
-            else:
-                speed_kph = (speed * 3.6).item()
-                features = np.array(
-                    [
-                        speed_kph,
-                        speed_kph**2,
-                        throttle,
-                        throttle**2,
-                        speed_kph * throttle,
-                        speed_kph * throttle**2,
-                        speed_kph**2 * throttle,
-                        speed_kph**2 * throttle**2,
-                    ]
-                ).T
-
-                next_speed_kph = features @ self.throttle_values
-                next_speed = next_speed_kph / 3.6
-
-        next_speed = np.maximum(0.0, next_speed)
+        # VTD: 원문은 CARLA Lincoln 에 캘리브레이션한 throttle/brake 다항식으로
+        # 속도를 예측했다. 우리 종방향은 VtdLongitudinalController 가 accel
+        # [m/s²] 를 직접 내므로(phase0 §0-4 (b)) throttle 자리가 accel 이다 —
+        # 등가속 적분으로 대체. brake 분기는 ego forecast 에서 항상 0 이라
+        # (forecast_ego_agent 가 action=[steer, accel, 0.0]) 같은 식으로 합친다.
+        # 원 다항식은 git 이력(phase3 원본 커밋) / DriveLM 원본 저장소 참조.
+        accel = self.brake_acceleration if brake else throttle
+        next_speed = np.maximum(0.0, speed + accel * self.time_step)
         next_location = np.array([next_x[0], next_y[0], location[2]])
 
         return next_location, next_heading, next_speed

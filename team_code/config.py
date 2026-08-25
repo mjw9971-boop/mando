@@ -2,7 +2,6 @@
 Config class that contains all the hyperparameters needed to build any model.
 """
 
-import carla
 import numpy as np
 
 
@@ -11,15 +10,16 @@ class GlobalConfig:
     Config class that contains all the hyperparameters needed to build any model.
     """
 
-    # Colors used for drawing during debugging
-    future_route_color = carla.Color(0, 1, 0)
-    other_vehicles_forecasted_bbs_color = carla.Color(0, 0, 1, 1)
-    leading_vehicle_color = carla.Color(1, 0, 0, 0)
-    trailing_vehicle_color = carla.Color(1, 1, 1, 0)
-    ego_vehicle_bb_color = carla.Color(0, 0, 0, 1)
-    pedestrian_forecasted_bbs_color = carla.Color(0, 0, 1, 1)
-    ego_vehicle_forecasted_bbs_hazard_color = carla.Color(1, 0, 0, 0)
-    ego_vehicle_forecasted_bbs_normal_color = carla.Color(0, 1, 0, 0)
+    # VTD: import carla 제거. debug 색상(carla.Color 8종)은 visualize=0 경로라
+    # None 으로 대체 — world.debug 가 no-op 이라 값은 쓰이지 않는다.
+    future_route_color = None
+    other_vehicles_forecasted_bbs_color = None
+    leading_vehicle_color = None
+    trailing_vehicle_color = None
+    ego_vehicle_bb_color = None
+    pedestrian_forecasted_bbs_color = None
+    ego_vehicle_forecasted_bbs_hazard_color = None
+    ego_vehicle_forecasted_bbs_normal_color = None
 
     def __init__(self):
         """base architecture configurations"""
@@ -28,7 +28,7 @@ class GlobalConfig:
         # -----------------------------------------------------------------------------
         # Frame rate used for the bicycle models in the autopilot
         self.bicycle_frame_rate = 20
-        self.steer_noise = 1e-3  # Noise added to expert steering angle
+        self.steer_noise = 0.0  # VTD: 원값 1e-3 — 데이터 수집용 노이즈, 실주행엔 불필요
         # Distance of obstacles (in meters) in which we will check for collisions
         self.detection_radius = 50.0
         self.num_route_points_saved = (
@@ -40,10 +40,16 @@ class GlobalConfig:
         self.bb_save_radius = 64.0
         # Ratio between the the speed limit / curvature dependent speed limit and the target speed.
         # By default the other vehicles drive with 70 % of the speed limit. To avoid collisions we have to be a bit faster.
-        self.ratio_target_speed_limit = 0.72
+        # VTD: 원값 0.72 (CARLA 는 NPC 가 제한의 70 %로 달려 그보다 빨라야 했다).
+        # 우리는 감점 회피용 margin(speed.margin_kph 5)을 VtdRoutePlanner 가
+        # speed_limits 배열에 이미 반영하므로 1.0.
+        self.ratio_target_speed_limit = 1.0
         # Maximum number of ticks the agent doesn't take any action. The maximum is 179 and it's speed must be >0.1.
         # After taking 180 ticks no action the route ends with an AgentBlockTest infraction.
-        self.max_blocked_ticks = 170
+        # VTD: 원값 170 (CARLA AgentBlockedTest 대응 = 정지 8.5 초 후 throttle=1
+        # 강제). 적신호 대기 13~18 s 와 정면 충돌 → 신호위반 폭주라 사실상
+        # 비활성으로 둔다. 정지 고착 감시는 batch(stall)·kr_rules(phase4) 몫.
+        self.max_blocked_ticks = 10 ** 9
         # Minimum walker speed
         self.min_walker_speed = 0.5
         # Time in seconds to draw the things during debugging.
@@ -128,7 +134,8 @@ class GlobalConfig:
         # Minimum speed in m/s to prevent rolling back, when braking no throttle is applied
         self.minimum_speed_to_prevent_rolling_back = 0.5
         # Maximum seed in junctions in m/s
-        self.max_speed_in_junction = 64 / 3.6
+        # VTD: 원값 64/3.6. caps_kph.junction 30 이 이 코스 검증값이다.
+        self.max_speed_in_junction = 30 / 3.6
         # Lookahead distance to check, whether the ego is close to a junction
         self.max_lookahead_to_check_for_junction = 30 * self.points_per_meter
         # Distance of the first checkpoint for TF++
@@ -280,12 +287,14 @@ class GlobalConfig:
         #  Time step for the model (20 frames per second).
         self.time_step = 1.0 / 20.0
         # Kinematic bicycle model parameters tuned from World on Rails.
-        # Distance from the rear axle to the front axle of the vehicle.
-        self.front_wheel_base = -0.090769015
+        # VTD: 원값 front=-0.090769015 / rear=1.4178275 / gain=0.36848336
+        # (CARLA Lincoln 캘리브레이션). Ioniq6 축거 2.944 균등 분할 + 조향
+        # 정규화 [-1,1]→rad 스케일 = max_steer 0.48 로 교체 (forecast 전용 근사).
+        self.front_wheel_base = 1.472
         # Distance from the rear axle to the center of the rear wheels.
-        self.rear_wheel_base = 1.4178275
+        self.rear_wheel_base = 1.472
         # Gain factor for steering angle to wheel angle conversion.
-        self.steering_gain = 0.36848336
+        self.steering_gain = 0.48
         # Deceleration rate when braking (m/s^2) of other vehicles.
         self.brake_acceleration = -4.952399
         # Acceleration rate when throttling (m/s^2) of other vehicles.
@@ -429,6 +438,7 @@ class GlobalConfig:
         self.route_planner_max_distance = 50.0
 
         # Extent of the ego vehicles bounding box
-        self.ego_extent_x = 2.4508416652679443
-        self.ego_extent_y = 1.0641621351242065
-        self.ego_extent_z = 0.7553732395172119
+        # VTD: 원값 2.4508/1.0642/0.7554 (Lincoln). Ioniq6 4.848/1.886/1.507 의 ½.
+        self.ego_extent_x = 2.424
+        self.ego_extent_y = 0.943
+        self.ego_extent_z = 0.7535

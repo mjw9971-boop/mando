@@ -1,78 +1,58 @@
 """
 Privileged driving agent used for data collection.
 Drives by accessing the simulator directly.
+
+# VTD: CARLA 원본(DriveLM pdm_lite, Apache 2.0)을 VTD 어댑터 위에서 돌린다.
+# 수정한 줄에는 전부 `# VTD:` 주석이 있다. 판단 로직(min 중재·IDM·OBB·forecast·
+# 조향)은 원문 그대로다. 원본 대비 diff: git show <phase3 원본 커밋>..HEAD
 """
 
-import os
-import ujson
-import datetime
-import pathlib
-import gzip
-from collections import deque
-from agents.navigation.local_planner import RoadOption
 import math
 import numpy as np
-import carla
 from scipy.integrate import RK45
 
-from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
-from leaderboard.autoagents import autonomous_agent, autonomous_agent_local
-from nav_planner import RoutePlanner
+import vtd_adapter.carla_types as carla                      # VTD: carla → 어댑터 shim
+from vtd_adapter.carla_types import RoadOption               # VTD: agents.navigation 대체
 from lateral_controller import LateralPIDController
-from privileged_route_planner import PrivilegedRoutePlanner
 from config import GlobalConfig
-import transfuser_utils as t_u
-from scenario_logger import ScenarioLogger
-from longitudinal_controller import LongitudinalLinearRegressionController
 from kinematic_bicycle_model import KinematicBicycleModel
+# VTD: 제거된 원본 의존 — os/ujson/datetime/pathlib/gzip(데이터 수집),
+# CarlaDataProvider/leaderboard(시뮬레이터 프레임워크), nav_planner.RoutePlanner
+# (_command_planner — save() 전용), PrivilegedRoutePlanner(→ vtd_adapter.route.
+# VtdRoutePlanner 주입), transfuser_utils(3개 함수 전부 제거 경로),
+# ScenarioLogger, LongitudinalLinearRegressionController(→ VtdLongitudinalController 주입)
 
 
-def get_entry_point():
-    return "AutoPilot"
-
-
-class AutoPilot(autonomous_agent_local.AutonomousAgent):
+class AutoPilot:                                             # VTD: leaderboard 상속 제거
     """
     Privileged driving agent used for data collection.
     Drives by accessing the simulator directly.
     """
 
-    def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
+    def setup(self, world, world_map, waypoint_planner,
+              longitudinal_controller, ego_vehicle, config=None):
         """
         Set up the autonomous agent for the CARLA simulation.
 
-        Args:
-            path_to_conf_file (str): Path to the configuration file.
-            route_index (int, optional): Index of the route to follow.
-            traffic_manager (object, optional): The traffic manager object.
-
+        # VTD: 센서/CarlaDataProvider 대신 어댑터 객체를 주입받는다 —
+        #   world                  vtd_adapter.world.VtdWorld
+        #   world_map              vtd_adapter.map.VtdMap
+        #   waypoint_planner       vtd_adapter.route.VtdRoutePlanner
+        #   longitudinal_controller vtd_adapter.control.VtdLongitudinalController
+        #   ego_vehicle            vtd_adapter.actor.VtdEgo
+        # 데이터 수집(save_path/datagen/histogram/tp_stats/recording)은 제거.
         """
-        self.recording = False
-        self.track = autonomous_agent.Track.MAP
-        self.config_path = path_to_conf_file
         self.step = -1
-        self.initialized = False
-        self.save_path = None
-        self.route_index = route_index
+        self.initialized = True                              # VTD: _init 불필요 (주입 완료)
 
-        self.datagen = int(os.environ.get("DATAGEN", 0)) == 1
-
-        self.config = GlobalConfig()
-
-        self.speed_histogram = []
-        self.make_histogram = int(os.environ.get("HISTOGRAM", 0))
-
-        self.tp_stats = False
-        self.tp_sign_agrees_with_angle = []
-        if int(os.environ.get("TP_STATS", 0)):
-            self.tp_stats = True
+        self.config = config if config is not None else GlobalConfig()   # VTD
 
         # Dynamics models
         self.ego_model = KinematicBicycleModel(self.config)
         self.vehicle_model = KinematicBicycleModel(self.config)
 
         # Configuration
-        self.visualize = int(os.environ.get("DEBUG_CHALLENGE", 0))
+        self.visualize = 0                                   # VTD: 렌더링 없음 (debug 는 no-op)
 
         self.walker_close = False
         self.distance_to_walker = np.inf
@@ -85,24 +65,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         # Controllers
         self._turn_controller = LateralPIDController(self.config)
 
+        # VTD: 판단은 next_traffic_light(정지선 기반)만 쓴다. CARLA 신호등 전처리
+        # (t_u.get_traffic_light_waypoints)는 close_traffic_lights 데이터 수집
+        # 전용이라 빈 리스트로 무력화 — ego_agent_affected_by_red_light 원문이
+        # 그대로 동작한다.
         self.list_traffic_lights = []
-
-        # Navigation command buffer, needed because the correct command comes from the last cleared waypoint
-        self.commands = deque(maxlen=2)
-        self.commands.append(4)
-        self.commands.append(4)
-        self.next_commands = deque(maxlen=2)
-        self.next_commands.append(4)
-        self.next_commands.append(4)
-        self.target_point_prev = [1e5, 1e5, 1e5]
 
         # Initialize controls
         self.steer = 0.0
         self.throttle = 0.0
         self.brake = 0.0
-
-        self.augmentation_translation = 0
-        self.augmentation_rotation = 0
 
         # Angle to the next waypoint, normalized in [-1, 1] corresponding to [-90, 90]
         self.angle = 0.0
@@ -110,6 +82,9 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         self.traffic_light_hazard = False
         self.walker_hazard = False
         self.vehicle_hazard = False
+        self.vehicle_affecting_id = None                     # VTD: save() 제거로 여기서 초기화
+        self.walker_affecting_id = None                      # VTD
+        self.walker_close_id = None                          # VTD
         self.junction = False
         self.aim_wp = None  # Waypoint the expert is steering towards
         self.remaining_route = None  # Remaining route
@@ -121,177 +96,31 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         self.visible_walker_ids = []
         self.walker_past_pos = {}  # Position of walker in the last frame
 
-        self._vehicle_lights = (
-            carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam
-        )
+        # VTD: 어댑터 주입 (원본은 CarlaDataProvider.get_map()/_init 에서 얻는다)
+        self._world = world
+        self.world_map = world_map
+        self._waypoint_planner = waypoint_planner
+        self._longitudinal_controller = longitudinal_controller
+        self._vehicle = ego_vehicle
 
-        # Get the world map and the ego vehicle
-        self.world_map = CarlaDataProvider.get_map()
-
-        # Set up the save path if specified
-        if os.environ.get("SAVE_PATH", None) is not None:
-            string = self.world_map.name.split('/')[-1]
-            string += "_Rep" + os.environ["REPETITION"]
-            string += f"_{self.route_index}"
-
-            self.save_path = pathlib.Path(os.environ["SAVE_PATH"]) / string
-            self.save_path.mkdir(parents=True, exist_ok=False)
-
-            if self.datagen:
-                (self.save_path / "measurements").mkdir()
-
-            self.lon_logger = ScenarioLogger(
-                save_path=self.save_path,
-                route_index=route_index,
-                logging_freq=self.config.logging_freq,
-                log_only=True,
-                route_only=False,  # with vehicles
-                roi=self.config.logger_region_of_interest,
-            )
-
-    def toggle_recording(self, force_stop=False):
-        """
-        Toggle the recording of the simulation data.
-
-        Args:
-            force_stop (bool, optional): If True, stop the recording regardless of the current state.
-        """
-        # Toggle the recording state and determine the text
-        self.recording = not self.recording
-
-        if self.recording and not force_stop:
-            self.client = CarlaDataProvider.get_client()
-
-            # Determine the scenario name and number
-            scenario_name = pathlib.Path(self.config_path).parent.stem
-            scenario_number = pathlib.Path(self.config_path).stem
-
-            # Construct the log file path
-            log_path = f"{pathlib.Path(os.environ['SAVE_PATH'])}/{scenario_name}/{scenario_number}.log"
-
-            print(f"Saving to {log_path}")
-            pathlib.Path(os.path.dirname(log_path)).mkdir(parents=True, exist_ok=True)
-
-            # Start the recorder with the specified log path
-            self.client.start_recorder(log_path, True)
-        else:
-            # Stop the recorder
-            self.client.stop_recorder()
-
-    def _init(self, hd_map):
-        """
-        Initialize the agent by setting up the route planner, longitudinal controller,
-        command planner, and other necessary components.
-
-        Args:
-            hd_map (carla.Map): The map object of the CARLA world.
-        """
-        print("Sparse Waypoints:", len(self._global_plan))
-        print("Dense Waypoints:", len(self.org_dense_route_world_coord))
-
-        # Get the hero vehicle and the CARLA world
-        self._vehicle = CarlaDataProvider.get_hero_actor()
-        self._world = self._vehicle.get_world()
-
-        # Check if the vehicle starts from a parking spot
-        distance_to_road = self.org_dense_route_world_coord[0][0].location.distance(
-            self._vehicle.get_location()
-        )
-        # The first waypoint starts at the lane center, hence it's more than 2 m away from the center of the
-        # ego vehicle at the beginning.
-        starts_with_parking_exit = distance_to_road > 2
-
-        # Set up the route planner and extrapolation
-        self._waypoint_planner = PrivilegedRoutePlanner(self.config)
-        self._waypoint_planner.setup_route(
-            self.org_dense_route_world_coord,
-            self._world,
-            self.world_map,
-            starts_with_parking_exit,
-            self._vehicle.get_location(),
-        )
-        self._waypoint_planner.save()
-
-        # Set up the longitudinal controller and command planner
-        self._longitudinal_controller = LongitudinalLinearRegressionController(
-            self.config
-        )
-        self._command_planner = RoutePlanner(
-            self.config.route_planner_min_distance,
-            self.config.route_planner_max_distance,
-        )
-        self._command_planner.set_route(self._global_plan_world_coord)
-
-        # Set up logging
-        if self.save_path is not None:
-            self.lon_logger.ego_vehicle = self._vehicle
-            self.lon_logger.world = self._world
-
-        # Preprocess traffic lights
-        all_actors = self._world.get_actors()
-        for actor in all_actors:
-            if "traffic_light" in actor.type_id:
-                center, waypoints = t_u.get_traffic_light_waypoints(
-                    actor, self.world_map
-                )
-                self.list_traffic_lights.append((actor, center, waypoints))
-
-        # Remove bugged 2-wheelers
-        # https://github.com/carla-simulator/carla/issues/3670
-        for actor in all_actors:
-            if "vehicle" in actor.type_id:
-                extent = actor.bounding_box.extent
-                if extent.x < 0.001 or extent.y < 0.001 or extent.z < 0.001:
-                    actor.destroy()
-
-        self.initialized = True
-
-    def sensors(self):
-        """
-        Returns a list of sensor specifications for the ego vehicle.
-
-        Each sensor specification is a dictionary containing the sensor type,
-        reading frequency, position, and other relevant parameters.
-
-        Returns:
-            list: A list of sensor specification dictionaries.
-        """
-        sensor_specs = [
-            {"type": "sensor.opendrive_map", "reading_frequency": 1e-6, "id": "hd_map"},
-            {
-                "type": "sensor.other.imu",
-                "x": 0.0,
-                "y": 0.0,
-                "z": 0.0,
-                "roll": 0.0,
-                "pitch": 0.0,
-                "yaw": 0.0,
-                "sensor_tick": 0.05,
-                "id": "imu",
-            },
-            {"type": "sensor.speedometer", "reading_frequency": 20, "id": "speed"},
-        ]
-
-        return sensor_specs
+    # VTD: toggle_recording()/_init()/sensors() 제거 — 시뮬레이터 녹화·
+    # CARLA 초기화·센서 스펙은 VTD 경로에 없다 (setup 주입으로 대체).
 
     def tick_autopilot(self, input_data):
         """
         Get the current state of the vehicle from the input data and the vehicle's sensors.
 
-        Args:
-            input_data (dict): Input data containing sensor information.
+        # VTD: IMU/speedometer 센서 대신 어댑터(VtdEgo — CARLA 프레임)에서 읽는다.
+        # input_data 는 쓰지 않는다 (원본 시그니처 유지용).
 
         Returns:
             dict: A dictionary containing the vehicle's position (GPS), speed, and compass heading.
         """
-        # Get the vehicle's speed from its velocity vector
+        # VTD: 속도 = EgoSpeedEstimator 추정값 (9910 에 자차 속도 필드가 없다)
         speed = self._vehicle.get_velocity().length()
 
-        # Get the IMU data from the input data
-        imu_data = input_data["imu"][1][-1]
-
-        # Preprocess the compass data from the IMU
-        compass = t_u.preprocess_compass(imu_data)
+        # VTD: compass = CARLA 프레임 yaw [rad] — preprocess_compass(-90° 보정) 불필요
+        compass = np.deg2rad(self._vehicle.get_transform().rotation.yaw)
 
         # Get the vehicle's position from its location
         position = self._vehicle.get_location()
@@ -322,19 +151,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         """
         self.step += 1
 
-        # Initialize the agent if not done yet
-        if not self.initialized:
-            client = CarlaDataProvider.get_client()
-            world_map = client.get_world().get_map()
-            self._init(world_map)
+        # VTD: _init 불필요 (setup 주입), plant/데이터 수집 경로 제거
+        control = self._get_control(input_data, plant)
 
-        # Get the control commands and driving data for the current step
-        control, driving_data = self._get_control(input_data, plant)
-
-        if plant:
-            return driving_data
-        else:
-            return control
+        return control
 
     def _get_control(self, input_data, plant):
         """
@@ -432,6 +252,9 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         control.steer = steer + self.config.steer_noise * np.random.randn()
         control.throttle = throttle
         control.brake = float(brake or control_brake)
+        # VTD: VtdLongitudinalController 는 throttle 자리에 accel [m/s²] 를 낸다
+        # (phase0 §0-4 (b)). 9910 송신은 이 값을 그대로 targetAccel 로 쓴다.
+        control.accel = throttle
 
         # Apply brake if the vehicle is stopped to prevent rolling back
         if (
@@ -441,7 +264,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             control.brake = 1
 
         # Apply throttle if the vehicle is blocked for too long
-        ego_velocity = CarlaDataProvider.get_velocity(self._vehicle)
+        ego_velocity = self._vehicle.get_velocity().length()   # VTD: CarlaDataProvider 대체
         if ego_velocity < 0.1:
             self.ego_blocked_for_ticks += 1
         else:
@@ -456,872 +279,25 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         self.throttle = control.throttle
         self.brake = control.brake
 
-        # Get the target and next target points from the command planner
-        command_route = self._command_planner.run_step(ego_position)
-        if len(command_route) > 2:
-            target_point, far_command = command_route[1]
-            next_target_point, next_far_command = command_route[2]
-        elif len(command_route) > 1:
-            target_point, far_command = command_route[1]
-            next_target_point, next_far_command = command_route[1]
-        else:
-            target_point, far_command = command_route[0]
-            next_target_point, next_far_command = command_route[0]
+        # VTD: command planner(target_point — TF++ 데이터 수집 전용)와 save()
+        # 데이터 수집을 제거 — 틱 기록은 vtd_adapter.logger 가 한다.
+        return control
 
-        # Update command history and save driving datas
-        if (target_point != self.target_point_prev).all():
-            self.target_point_prev = target_point
-            self.commands.append(far_command.value)
-            self.next_commands.append(next_far_command.value)
-
-        driving_data = self.save(
-            target_point,
-            next_target_point,
-            steer,
-            throttle,
-            brake,
-            control_brake,
-            target_speed,
-            speed_limit,
-            tick_data,
-            speed_reduced_by_obj,
-        )
-
-        return control, driving_data
 
     def _manage_route_obstacle_scenarios(
         self, target_speed, ego_speed, route_waypoints, list_vehicles, route_points
     ):
         """
-        This method handles various obstacle and scenario situations that may arise during navigation.
-        It adjusts the target speed, modifies the route, and determines if the ego vehicle should keep driving or wait.
-        The method supports different scenario types such as InvadingTurn, Accident, ConstructionObstacle,
-        ParkedObstacle, AccidentTwoWays, ConstructionObstacleTwoWays, ParkedObstacleTwoWays, VehicleOpensDoorTwoWays,
-        HazardAtSideLaneTwoWays, HazardAtSideLane, and YieldToEmergencyVehicle.
-
-        Args:
-            target_speed (float): The current target speed of the ego vehicle.
-            ego_speed (float): The current speed of the ego vehicle.
-            route_waypoints (list): A list of waypoints representing the current route.
-            list_vehicles (list): A list of all vehicles in the simulation.
-            route_points (numpy.ndarray): A numpy array containing the current route points.
-
-        Returns:
-            tuple: A tuple containing the updated target speed, a boolean indicating whether to keep driving,
-                and a list containing information about a potential decreased target speed due to an object.
+        # VTD: CARLA 시나리오 전용 원문(InvadingTurn/Accident/…TwoWays/
+        # YieldToEmergencyVehicle — CarlaDataProvider.active_scenarios 하드코딩)
+        # 640줄을 stub 으로 대체. 코스에 해당 시나리오가 없고, 정차 차량 추월은
+        # phase4 에서 kr_rules 가 VtdRoutePlanner.shift_route_around_actors 로
+        # 발동한다. 반환 형태는 원문과 동일.
         """
+        return target_speed, False, [target_speed, None, None, None]
 
-        def compute_min_time_for_distance(distance, target_speed, ego_speed):
-            """
-            Computes the minimum time the ego vehicle needs to travel a given distance.
-
-            Args:
-                distance (float): The distance to be traveled.
-                target_speed (float): The target speed of the ego vehicle.
-                ego_speed (float): The current speed of the ego vehicle.
-
-            Returns:
-                float: The minimum time needed to travel the given distance.
-            """
-            min_time_needed = 0.0
-            remaining_distance = distance
-            current_speed = ego_speed
-
-            # Iterate over time steps until the distance is covered
-            while True:
-                # Takes less than a tick to cover remaining_distance with current_speed
-                if remaining_distance - current_speed * self.config.fps_inv < 0:
-                    break
-
-                remaining_distance -= current_speed * self.config.fps_inv
-                min_time_needed += self.config.fps_inv
-
-                # Values from kinematic bicycle model
-                normalized_speed = current_speed / 120.0
-                speed_change_params = (
-                    self.config.compute_min_time_to_cover_distance_params
-                )
-                speed_change = np.clip(
-                    speed_change_params[0]
-                    + normalized_speed * speed_change_params[1]
-                    + speed_change_params[2] * normalized_speed**2
-                    + speed_change_params[3] * normalized_speed**3,
-                    0.0,
-                    np.inf,
-                )
-                current_speed = np.clip(
-                    120 * (normalized_speed + speed_change), 0, target_speed
-                )
-
-            # Add remaining time at the current speed
-            min_time_needed += remaining_distance / current_speed
-
-            return min_time_needed
-
-        def get_previous_road_lane_ids(starting_waypoint):
-            """
-            Retrieves the previous road and lane IDs for a given starting waypoint.
-
-            Args:
-                starting_waypoint (carla.Waypoint): The starting waypoint.
-
-            Returns:
-                list: A list of tuples containing road IDs and lane IDs.
-            """
-            current_waypoint = starting_waypoint
-            previous_lane_ids = [(current_waypoint.road_id, current_waypoint.lane_id)]
-
-            # Traverse backwards up to 100 waypoints to find previous lane IDs
-            for _ in range(self.config.previous_road_lane_retrieve_distance):
-                previous_waypoints = current_waypoint.previous(1)
-
-                # Check if the road ends and no previous route waypoints exist
-                if len(previous_waypoints) == 0:
-                    break
-                current_waypoint = previous_waypoints[0]
-
-                if (
-                    current_waypoint.road_id,
-                    current_waypoint.lane_id,
-                ) not in previous_lane_ids:
-                    previous_lane_ids.append(
-                        (current_waypoint.road_id, current_waypoint.lane_id)
-                    )
-
-            return previous_lane_ids
-
-        def is_overtaking_path_clear(
-            from_index,
-            to_index,
-            list_vehicles,
-            ego_location,
-            target_speed,
-            ego_speed,
-            previous_lane_ids,
-            min_speed=50.0 / 3.6,
-        ):
-            """
-            Checks if the path between two route indices is clear for the ego vehicle to overtake.
-
-            Args:
-                from_index (int): The starting route index.
-                to_index (int): The ending route index.
-                list_vehicles (list): A list of all vehicles in the simulation.
-                ego_location (carla.Location): The location of the ego vehicle.
-                target_speed (float): The target speed of the ego vehicle.
-                ego_speed (float): The current speed of the ego vehicle.
-                previous_lane_ids (list): A list of tuples containing previous road IDs and lane IDs.
-                min_speed (float, optional): The minimum speed to consider for overtaking. Defaults to 50/3.6 km/h.
-
-            Returns:
-                bool: True if the path is clear for overtaking, False otherwise.
-            """
-            # 10 m safety distance, overtake with max. 50 km/h
-            to_location = self._waypoint_planner.route_points[to_index]
-            to_location = carla.Location(to_location[0], to_location[1], to_location[2])
-
-            from_location = self._waypoint_planner.route_points[from_index]
-            from_location = carla.Location(
-                from_location[0], from_location[1], from_location[2]
-            )
-
-            # Compute the distance and time needed for the ego vehicle to overtake
-            ego_distance = (
-                to_location.distance(ego_location)
-                + self._vehicle.bounding_box.extent.x * 2
-                + self.config.check_path_free_safety_distance
-            )
-            ego_time = compute_min_time_for_distance(
-                ego_distance, min(min_speed, target_speed), ego_speed
-            )
-
-            path_clear = True
-            for vehicle in list_vehicles:
-                # Sort out ego vehicle
-                if vehicle.id == self._vehicle.id:
-                    continue
-
-                vehicle_location = vehicle.get_location()
-                vehicle_waypoint = self.world_map.get_waypoint(vehicle_location)
-
-                # Check if the vehicle is on the previous lane IDs
-                if (
-                    vehicle_waypoint.road_id,
-                    vehicle_waypoint.lane_id,
-                ) in previous_lane_ids:
-                    diff_vector = vehicle_location - ego_location
-                    dot_product = (
-                        self._vehicle.get_transform()
-                        .get_forward_vector()
-                        .dot(diff_vector)
-                    )
-                    # Skip if the vehicle is not relevant, because its not on the overtaking path and behind
-                    # the ego vehicle
-                    if dot_product < 0:
-                        continue
-
-                    diff_vector_2 = to_location - vehicle_location
-                    dot_product_2 = (
-                        vehicle.get_transform().get_forward_vector().dot(diff_vector_2)
-                    )
-                    # The overtaking path is blocked by vehicle
-                    if dot_product_2 < 0:
-                        path_clear = False
-                        break
-
-                    other_vehicle_distance = (
-                        to_location.distance(vehicle_location)
-                        - vehicle.bounding_box.extent.x
-                    )
-                    other_vehicle_time = other_vehicle_distance / max(
-                        1.0, vehicle.get_velocity().length()
-                    )
-
-                    # Add 200 ms safety margin
-                    # Vehicle needs less time to arrive at to_location than the ego vehicle
-                    if (
-                        other_vehicle_time
-                        < ego_time + self.config.check_path_free_safety_time
-                    ):
-                        path_clear = False
-                        break
-
-            return path_clear
-
-        def get_horizontal_distance(actor1, actor2):
-            """
-            Calculates the horizontal distance between two actors (ignoring the z-coordinate).
-
-            Args:
-                actor1 (carla.Actor): The first actor.
-                actor2 (carla.Actor): The second actor.
-
-            Returns:
-                float: The horizontal distance between the two actors.
-            """
-            location1, location2 = actor1.get_location(), actor2.get_location()
-
-            # Compute the distance vector (ignoring the z-coordinate)
-            diff_vector = carla.Vector3D(
-                location1.x - location2.x, location1.y - location2.y, 0
-            )
-
-            return diff_vector.length()
-
-        def sort_scenarios_by_distance(ego_location):
-            """
-            Sorts the active scenarios based on the distance from the ego vehicle.
-
-            Args:
-                ego_location (carla.Location): The location of the ego vehicle.
-            """
-            distances = []
-
-            # Calculate the distance of each scenario's first actor from the ego vehicle
-            for _, scenario_data in CarlaDataProvider.active_scenarios:
-                first_actor = scenario_data[0]
-                distances.append(ego_location.distance(first_actor.get_location()))
-
-            # Sort the scenarios based on the calculated distances
-            indices = np.argsort(distances)
-            CarlaDataProvider.active_scenarios = [
-                CarlaDataProvider.active_scenarios[i] for i in indices
-            ]
-
-        keep_driving = False
-        speed_reduced_by_obj = [
-            target_speed,
-            None,
-            None,
-            None,
-        ]  # [target_speed, type, id, distance]
-
-        # Remove scenarios that ended with a scenario timeout
-        active_scenarios = CarlaDataProvider.active_scenarios.copy()
-        for i, (scenario_type, scenario_data) in enumerate(active_scenarios):
-            first_actor, last_actor = scenario_data[:2]
-            if not first_actor.is_alive or (
-                last_actor is not None and not last_actor.is_alive
-            ):
-                CarlaDataProvider.active_scenarios.remove(active_scenarios[i])
-
-        # Only continue if there are some active scenarios available
-        if len(CarlaDataProvider.active_scenarios) != 0:
-            ego_location = self._vehicle.get_location()
-
-            # Sort the scenarios by distance if there is more than one active scenario
-            if len(CarlaDataProvider.active_scenarios) != 1:
-                sort_scenarios_by_distance(ego_location)
-
-            scenario_type, scenario_data = CarlaDataProvider.active_scenarios[0]
-
-            if scenario_type == "InvadingTurn":
-                first_cone, last_cone, offset = scenario_data
-
-                closest_distance = first_cone.get_location().distance(ego_location)
-
-                if (
-                    closest_distance
-                    < self.config.default_max_distance_to_process_scenario
-                ):
-                    self._waypoint_planner.shift_route_for_invading_turn(
-                        first_cone, last_cone, offset
-                    )
-                    CarlaDataProvider.active_scenarios = (
-                        CarlaDataProvider.active_scenarios[1:]
-                    )
-
-            elif scenario_type in [
-                "Accident",
-                "ConstructionObstacle",
-                "ParkedObstacle",
-            ]:
-                first_actor, last_actor, direction = scenario_data[:3]
-
-                horizontal_distance = get_horizontal_distance(
-                    self._vehicle, first_actor
-                )
-
-                # Shift the route around the obstacles
-                if (
-                    horizontal_distance
-                    < self.config.default_max_distance_to_process_scenario
-                ):
-                    transition_length = {
-                        "Accident": self.config.transition_smoothness_distance,
-                        "ConstructionObstacle": self.config.transition_smoothness_factor_construction_obstacle,
-                        "ParkedObstacle": self.config.transition_smoothness_distance,
-                    }[scenario_type]
-                    _, _ = self._waypoint_planner.shift_route_around_actors(
-                        first_actor, last_actor, direction, transition_length
-                    )
-                    CarlaDataProvider.active_scenarios = (
-                        CarlaDataProvider.active_scenarios[1:]
-                    )
-
-            elif scenario_type in [
-                "AccidentTwoWays",
-                "ConstructionObstacleTwoWays",
-                "ParkedObstacleTwoWays",
-                "VehicleOpensDoorTwoWays",
-            ]:
-                (
-                    first_actor,
-                    last_actor,
-                    direction,
-                    changed_route,
-                    from_index,
-                    to_index,
-                    path_clear,
-                ) = scenario_data
-
-                # change the route if the ego is close enough to the obstacle
-                horizontal_distance = get_horizontal_distance(
-                    self._vehicle, first_actor
-                )
-
-                # Shift the route around the obstacles
-                if (
-                    horizontal_distance
-                    < self.config.default_max_distance_to_process_scenario
-                    and not changed_route
-                ):
-                    transition_length = {
-                        "AccidentTwoWays": self.config.transition_length_accident_two_ways,
-                        "ConstructionObstacleTwoWays": self.config.transition_length_construction_obstacle_two_ways,
-                        "ParkedObstacleTwoWays": self.config.transition_length_parked_obstacle_two_ways,
-                        "VehicleOpensDoorTwoWays": self.config.transition_length_vehicle_opens_door_two_ways,
-                    }[scenario_type]
-                    add_before_length = {
-                        "AccidentTwoWays": self.config.add_before_accident_two_ways,
-                        "ConstructionObstacleTwoWays": self.config.add_before_construction_obstacle_two_ways,
-                        "ParkedObstacleTwoWays": self.config.add_before_parked_obstacle_two_ways,
-                        "VehicleOpensDoorTwoWays": self.config.add_before_vehicle_opens_door_two_ways,
-                    }[scenario_type]
-                    add_after_length = {
-                        "AccidentTwoWays": self.config.add_after_accident_two_ways,
-                        "ConstructionObstacleTwoWays": self.config.add_after_construction_obstacle_two_ways,
-                        "ParkedObstacleTwoWays": self.config.add_after_parked_obstacle_two_ways,
-                        "VehicleOpensDoorTwoWays": self.config.add_after_vehicle_opens_door_two_ways,
-                    }[scenario_type]
-                    factor = {
-                        "AccidentTwoWays": self.config.factor_accident_two_ways,
-                        "ConstructionObstacleTwoWays": self.config.factor_construction_obstacle_two_ways,
-                        "ParkedObstacleTwoWays": self.config.factor_parked_obstacle_two_ways,
-                        "VehicleOpensDoorTwoWays": self.config.factor_vehicle_opens_door_two_ways,
-                    }[scenario_type]
-
-                    from_index, to_index = (
-                        self._waypoint_planner.shift_route_around_actors(
-                            first_actor,
-                            last_actor,
-                            direction,
-                            transition_length,
-                            factor,
-                            add_before_length,
-                            add_after_length,
-                        )
-                    )
-
-                    changed_route = True
-                    scenario_data[3] = changed_route
-                    scenario_data[4] = from_index
-                    scenario_data[5] = to_index
-
-                # Check if the ego can overtake the obstacle
-                if (
-                    changed_route
-                    and from_index - self._waypoint_planner.route_index
-                    < self.config.max_distance_to_overtake_two_way_scnearios
-                    and not path_clear
-                ):
-                    # Get previous roads and lanes of the target lane
-                    target_lane = (
-                        route_waypoints[0].get_left_lane()
-                        if direction == "right"
-                        else route_waypoints[0].get_right_lane()
-                    )
-                    if target_lane is None:
-                        return target_speed, keep_driving, speed_reduced_by_obj
-                    prev_road_lane_ids = get_previous_road_lane_ids(target_lane)
-
-                    overtake_speed = (
-                        self.config.overtake_speed_vehicle_opens_door_two_ways
-                        if scenario_type == "VehicleOpensDoorTwoWays"
-                        else self.config.default_overtake_speed
-                    )
-                    path_clear = is_overtaking_path_clear(
-                        from_index,
-                        to_index,
-                        list_vehicles,
-                        ego_location,
-                        target_speed,
-                        ego_speed,
-                        prev_road_lane_ids,
-                        min_speed=overtake_speed,
-                    )
-
-                    scenario_data[6] = path_clear
-
-                # If the overtaking path is clear, keep driving; otherwise, wait behind the obstacle
-                if path_clear:
-                    if (
-                        self._waypoint_planner.route_index
-                        >= to_index
-                        - self.config.distance_to_delete_scenario_in_two_ways
-                    ):
-                        CarlaDataProvider.active_scenarios = (
-                            CarlaDataProvider.active_scenarios[1:]
-                        )
-                    target_speed = {
-                        "AccidentTwoWays": self.config.default_overtake_speed,
-                        "ConstructionObstacleTwoWays": self.config.default_overtake_speed,
-                        "ParkedObstacleTwoWays": self.config.default_overtake_speed,
-                        "VehicleOpensDoorTwoWays": self.config.overtake_speed_vehicle_opens_door_two_ways,
-                    }[scenario_type]
-                    keep_driving = True
-                else:
-                    distance_to_leading_actor = (
-                        float(from_index + 15 - self._waypoint_planner.route_index)
-                        / self.config.points_per_meter
-                    )
-                    target_speed = self._compute_target_speed_idm(
-                        desired_speed=target_speed,
-                        leading_actor_length=self._vehicle.bounding_box.extent.x,
-                        ego_speed=ego_speed,
-                        leading_actor_speed=0,
-                        distance_to_leading_actor=distance_to_leading_actor,
-                        s0=self.config.idm_two_way_scenarios_minimum_distance,
-                        T=self.config.idm_two_way_scenarios_time_headway,
-                    )
-
-                    # Update the object causing the most speed reduction
-                    if (
-                        speed_reduced_by_obj is None
-                        or speed_reduced_by_obj[0] > target_speed
-                    ):
-                        speed_reduced_by_obj = [
-                            target_speed,
-                            first_actor.type_id,
-                            first_actor.id,
-                            distance_to_leading_actor,
-                        ]
-
-            elif scenario_type == "HazardAtSideLaneTwoWays":
-                (
-                    first_actor,
-                    last_actor,
-                    changed_route,
-                    from_index,
-                    to_index,
-                    path_clear,
-                ) = scenario_data
-
-                horizontal_distance = get_horizontal_distance(
-                    self._vehicle, first_actor
-                )
-
-                if (
-                    horizontal_distance
-                    < self.config.max_distance_to_process_hazard_at_side_lane_two_ways
-                    and not changed_route
-                ):
-                    to_index = self._waypoint_planner.get_closest_route_index(
-                        self._waypoint_planner.route_index, last_actor.get_location()
-                    )
-
-                    # Assume the bicycles don't drive more than 7.5 m during the overtaking process
-                    to_index += 135
-                    from_index = self._waypoint_planner.route_index
-
-                    starting_wp = route_waypoints[0].get_left_lane()
-                    prev_road_lane_ids = get_previous_road_lane_ids(starting_wp)
-                    path_clear = is_overtaking_path_clear(
-                        from_index,
-                        to_index,
-                        list_vehicles,
-                        ego_location,
-                        target_speed,
-                        ego_speed,
-                        prev_road_lane_ids,
-                        min_speed=self.config.default_overtake_speed,
-                    )
-
-                    if path_clear:
-                        transition_length = self.config.transition_smoothness_distance
-                        self._waypoint_planner.shift_route_smoothly(
-                            from_index, to_index, True, transition_length
-                        )
-                        changed_route = True
-                        scenario_data[2] = changed_route
-                        scenario_data[3] = from_index
-                        scenario_data[4] = to_index
-                        scenario_data[5] = path_clear
-
-                # the overtaking path is clear
-                if path_clear:
-                    # Check if the overtaking is done
-                    if self._waypoint_planner.route_index >= to_index:
-                        CarlaDataProvider.active_scenarios = (
-                            CarlaDataProvider.active_scenarios[1:]
-                        )
-                    # Overtake with max. 50 km/h
-                    target_speed, keep_driving = (
-                        self.config.default_overtake_speed,
-                        True,
-                    )
-
-            elif scenario_type == "HazardAtSideLane":
-                (
-                    first_actor,
-                    last_actor,
-                    changed_first_part_of_route,
-                    from_index,
-                    to_index,
-                    path_clear,
-                ) = scenario_data
-
-                horizontal_distance = get_horizontal_distance(self._vehicle, last_actor)
-
-                if (
-                    horizontal_distance
-                    < self.config.max_distance_to_process_hazard_at_side_lane
-                    and not changed_first_part_of_route
-                ):
-                    transition_length = self.config.transition_smoothness_distance
-                    from_index, to_index = (
-                        self._waypoint_planner.shift_route_around_actors(
-                            first_actor, last_actor, "right", transition_length
-                        )
-                    )
-
-                    to_index -= transition_length
-                    changed_first_part_of_route = True
-                    scenario_data[2] = changed_first_part_of_route
-                    scenario_data[3] = from_index
-                    scenario_data[4] = to_index
-
-                if changed_first_part_of_route:
-                    to_idx_ = self._waypoint_planner.extend_lane_shift_transition_for_hazard_at_side_lane(
-                        last_actor, to_index
-                    )
-                    to_index = to_idx_
-                    scenario_data[4] = to_index
-
-                if self._waypoint_planner.route_index > to_index:
-                    CarlaDataProvider.active_scenarios = (
-                        CarlaDataProvider.active_scenarios[1:]
-                    )
-
-            elif scenario_type == "YieldToEmergencyVehicle":
-                emergency_veh, _, changed_route, from_index, to_index, to_left = (
-                    scenario_data
-                )
-
-                horizontal_distance = get_horizontal_distance(
-                    self._vehicle, emergency_veh
-                )
-
-                if (
-                    horizontal_distance
-                    < self.config.default_max_distance_to_process_scenario
-                    and not changed_route
-                ):
-                    # Assume the emergency vehicle doesn't drive more than 20 m during the overtaking process
-                    from_index = (
-                        self._waypoint_planner.route_index
-                        + 30 * self.config.points_per_meter
-                    )
-                    to_index = (
-                        from_index
-                        + int(2 * self.config.points_per_meter)
-                        * self.config.points_per_meter
-                    )
-
-                    transition_length = self.config.transition_smoothness_distance
-                    to_left = (
-                        self._waypoint_planner.route_waypoints[from_index].lane_change
-                        != carla.LaneChange.Right
-                    )
-                    self._waypoint_planner.shift_route_smoothly(
-                        from_index, to_index, to_left, transition_length
-                    )
-
-                    changed_route = True
-                    to_index -= transition_length
-                    scenario_data[2] = changed_route
-                    scenario_data[3] = from_index
-                    scenario_data[4] = to_index
-                    scenario_data[5] = to_left
-
-                if changed_route:
-                    to_idx_ = self._waypoint_planner.extend_lane_shift_transition_for_yield_to_emergency_vehicle(
-                        to_left, to_index
-                    )
-                    to_index = to_idx_
-                    scenario_data[4] = to_index
-
-                    # Check if the emergency vehicle is in front of the ego vehicle
-                    diff = emergency_veh.get_location() - ego_location
-                    dot_res = (
-                        self._vehicle.get_transform().get_forward_vector().dot(diff)
-                    )
-                    if dot_res > 0:
-                        CarlaDataProvider.active_scenarios = (
-                            CarlaDataProvider.active_scenarios[1:]
-                        )
-
-        # Visualization for debugging
-        if self.visualize == 1:
-            for i in range(
-                min(
-                    route_points.shape[0] - 1,
-                    self.config.draw_future_route_till_distance,
-                )
-            ):
-                loc = route_points[i]
-                loc = carla.Location(loc[0], loc[1], loc[2] + 0.1)
-                self._world.debug.draw_point(
-                    location=loc,
-                    size=0.05,
-                    color=self.config.future_route_color,
-                    life_time=self.config.draw_life_time,
-                )
-
-        return target_speed, keep_driving, speed_reduced_by_obj
-
-    def save(
-        self,
-        target_point,
-        next_target_point,
-        steering,
-        throttle,
-        brake,
-        control_brake,
-        target_speed,
-        speed_limit,
-        tick_data,
-        speed_reduced_by_obj,
-    ):
-        """
-        Save the driving data for the current frame.
-
-        Args:
-            target_point (numpy.ndarray): Coordinates of the target point.
-            next_target_point (numpy.ndarray): Coordinates of the next target point.
-            steering (float): The steering angle for the current frame.
-            throttle (float): The throttle value for the current frame.
-            brake (float): The brake value for the current frame.
-            control_brake (bool): Whether the brake is controlled by the agent or not.
-            target_speed (float): The target speed for the current frame.
-            speed_limit (float): The speed limit for the current frame.
-            tick_data (dict): Dictionary containing the current state of the vehicle.
-            speed_reduced_by_obj (tuple): Tuple containing information about the object that caused speed reduction.
-
-        Returns:
-            dict: A dictionary containing the driving data for the current frame.
-        """
-        frame = self.step // self.config.data_save_freq
-
-        # Extract relevant data from inputs
-        target_point_2d = target_point[:2]
-        next_target_point_2d = next_target_point[:2]
-        ego_position = tick_data["gps"][:2]
-        ego_orientation = tick_data["compass"]
-        ego_speed = tick_data["speed"]
-
-        # Convert target points to ego vehicle's local coordinate frame
-        ego_target_point = t_u.inverse_conversion_2d(
-            target_point_2d, ego_position, ego_orientation
-        ).tolist()
-        ego_next_target_point = t_u.inverse_conversion_2d(
-            next_target_point_2d, ego_position, ego_orientation
-        ).tolist()
-        ego_aim_point = t_u.inverse_conversion_2d(
-            self.aim_wp[:2], ego_position, ego_orientation
-        ).tolist()
-
-        # Get the remaining route points in the local coordinate frame
-        dense_route = []
-        dense_route_original = []
-        remaining_route = self.remaining_route[: self.config.num_route_points_saved]
-        remaining_route_original = self.remaining_route_original[
-            : self.config.num_route_points_saved
-        ]
-
-        changed_route = bool(
-            (
-                self._waypoint_planner.route_points[self._waypoint_planner.route_index]
-                != self._waypoint_planner.original_route_points[
-                    self._waypoint_planner.route_index
-                ]
-            ).any()
-        )
-        for checkpoint, checkpoint_original in zip(
-            remaining_route, remaining_route_original
-        ):
-            dense_route.append(
-                t_u.inverse_conversion_2d(
-                    checkpoint[:2], ego_position[:2], ego_orientation
-                ).tolist()
-            )
-            dense_route_original.append(
-                t_u.inverse_conversion_2d(
-                    checkpoint_original[:2], ego_position[:2], ego_orientation
-                ).tolist()
-            )
-
-        # Extract speed reduction object information
-        (
-            speed_reduced_by_obj_type,
-            speed_reduced_by_obj_id,
-            speed_reduced_by_obj_distance,
-        ) = (None, None, None)
-        if speed_reduced_by_obj is not None:
-            (
-                speed_reduced_by_obj_type,
-                speed_reduced_by_obj_id,
-                speed_reduced_by_obj_distance,
-            ) = speed_reduced_by_obj[1:]
-            # Convert numpy to float so that it can be saved to json.
-            if speed_reduced_by_obj_distance is not None:
-                speed_reduced_by_obj_distance = float(speed_reduced_by_obj_distance)
-
-        data = {
-            "pos_global": ego_position.tolist(),
-            "theta": ego_orientation,
-            "speed": float(ego_speed),
-            "target_speed": float(target_speed),
-            "speed_limit": float(speed_limit),
-            "target_point": ego_target_point,
-            "target_point_next": ego_next_target_point,
-            "command": self.commands[-2],
-            "next_command": self.next_commands[-2],
-            "aim_wp": ego_aim_point,
-            "route": dense_route,
-            "route_original": dense_route_original,
-            "changed_route": changed_route,
-            "speed_reduced_by_obj_type": speed_reduced_by_obj_type,
-            "speed_reduced_by_obj_id": speed_reduced_by_obj_id,
-            "speed_reduced_by_obj_distance": speed_reduced_by_obj_distance,
-            "steer": steering,
-            "throttle": throttle,
-            "brake": bool(brake),
-            "control_brake": bool(control_brake),
-            "junction": bool(self.junction),
-            "vehicle_hazard": bool(self.vehicle_hazard),
-            "vehicle_affecting_id": self.vehicle_affecting_id,
-            "light_hazard": bool(self.traffic_light_hazard),
-            "walker_hazard": bool(self.walker_hazard),
-            "walker_affecting_id": self.walker_affecting_id,
-            "stop_sign_hazard": bool(self.stop_sign_hazard),
-            "stop_sign_close": bool(self.stop_sign_close),
-            "walker_close": bool(self.walker_close),
-            "walker_close_id": self.walker_close_id,
-            "angle": self.angle,
-            "augmentation_translation": self.augmentation_translation,
-            "augmentation_rotation": self.augmentation_rotation,
-            "ego_matrix": self._vehicle.get_transform().get_matrix(),
-        }
-
-        if self.tp_stats:
-            deg_pred_angle = -math.degrees(
-                math.atan2(-ego_aim_point[1], ego_aim_point[0])
-            )
-
-            tp_angle = -math.degrees(
-                math.atan2(-ego_target_point[1], ego_target_point[0])
-            )
-            if abs(tp_angle) > 1.0 and abs(deg_pred_angle) > 1.0:
-                same_direction = float(tp_angle * deg_pred_angle >= 0.0)
-                self.tp_sign_agrees_with_angle.append(same_direction)
-
-        if (
-            (self.step % self.config.data_save_freq == 0)
-            and (self.save_path is not None)
-            and self.datagen
-        ):
-            measurements_file = self.save_path / "measurements" / f"{frame:04}.json.gz"
-            with gzip.open(measurements_file, "wt", encoding="utf-8") as f:
-                ujson.dump(data, f, indent=4)
-
-        return data
-
-    def destroy(self, results=None):
-        """
-        Save the collected data and statistics to files, and clean up the data structures.
-        This method should be called at the end of the data collection process.
-
-        Args:
-            results (optional): Any additional results to be processed or saved.
-        """
-        if self.save_path is not None:
-            self.lon_logger.dump_to_json()
-
-            # Save the target speed histogram to a compressed JSON file
-            if len(self.speed_histogram) > 0:
-                with gzip.open(
-                    self.save_path / "target_speeds.json.gz", "wt", encoding="utf-8"
-                ) as f:
-                    ujson.dump(self.speed_histogram, f, indent=4)
-
-            del self.speed_histogram
-
-            if self.tp_stats:
-                if len(self.tp_sign_agrees_with_angle) > 0:
-                    print(
-                        "Agreement between TP and steering: ",
-                        sum(self.tp_sign_agrees_with_angle)
-                        / len(self.tp_sign_agrees_with_angle),
-                    )
-                    with gzip.open(
-                        self.save_path / "tp_agreements.json.gz", "wt", encoding="utf-8"
-                    ) as f:
-                        ujson.dump(self.tp_sign_agrees_with_angle, f, indent=4)
-
-        del self.tp_sign_agrees_with_angle
-        del self.visible_walker_ids
-        del self.walker_past_pos
+    # VTD: save()(measurements 데이터 수집)·destroy() 제거 —
+    # 틱 기록은 vtd_adapter.logger(run_*.jsonl 스키마)가 한다.
 
     def _get_steer(
         self, route_points, current_position, current_heading, current_speed
@@ -2470,104 +1446,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         actor_list,
     ):
         """
-        Handles the behavior of the ego vehicle when approaching a stop sign.
-
-        Args:
-            ego_vehicle_location (carla.Location): The location of the ego vehicle.
-            ego_vehicle_speed (float): The current speed of the ego vehicle in m/s.
-            next_stop_sign (carla.TrafficSign or None): The next stop sign in the route.
-            target_speed (float): The target speed for the ego vehicle.
-            actor_list (list): A list of all actors (vehicles, pedestrians, etc.) in the simulation.
-
-        Returns:
-            float: The adjusted target speed for the ego vehicle.
+        # VTD: 한국 코스에 정지표지가 없다 — VtdRoutePlanner 가 next_stop_sign 을
+        # 항상 None 으로 주므로 원문도 target_speed 를 그대로 돌려줬을 경로다.
+        # trigger_volume 조회(우리 액터에 없음)를 피하려고 본문을 stub 으로 대체.
         """
-        self.close_stop_signs.clear()
-        stop_signs = self.get_nearby_object(
-            ego_vehicle_location,
-            actor_list.filter("*traffic.stop*"),
-            self.config.light_radius,
-        )
-
-        for stop_sign in stop_signs:
-            center_bb_stop_sign = stop_sign.get_transform().transform(
-                stop_sign.trigger_volume.location
-            )
-            stop_sign_extent = carla.Vector3D(1.5, 1.5, 0.5)
-            bounding_box_stop_sign = carla.BoundingBox(
-                center_bb_stop_sign, stop_sign_extent
-            )
-            rotation_stop_sign = stop_sign.get_transform().rotation
-            bounding_box_stop_sign.rotation = carla.Rotation(
-                pitch=rotation_stop_sign.pitch,
-                yaw=rotation_stop_sign.yaw,
-                roll=rotation_stop_sign.roll,
-            )
-
-            affects_ego = (
-                next_stop_sign is not None
-                and next_stop_sign.id == stop_sign.id
-                and not self.cleared_stop_sign
-            )
-            self.close_stop_signs.append(
-                [bounding_box_stop_sign, stop_sign.id, affects_ego]
-            )
-
-            if self.visualize:
-                color = carla.Color(0, 1, 0) if affects_ego else carla.Color(1, 0, 0)
-                self._world.debug.draw_box(
-                    box=bounding_box_stop_sign,
-                    rotation=bounding_box_stop_sign.rotation,
-                    thickness=0.1,
-                    color=color,
-                    life_time=(1.0 / self.config.carla_fps) + 1e-6,
-                )
-
-        if next_stop_sign is None:
-            # No stop sign, continue with the current target speed
-            return target_speed
-
-        # Calculate the accurate distance to the stop sign
-        distance_to_stop_sign = (
-            next_stop_sign.get_transform()
-            .transform(next_stop_sign.trigger_volume.location)
-            .distance(ego_vehicle_location)
-        )
-
-        # Reset the stop sign flag if we are farther than 10m away
-        if distance_to_stop_sign > self.config.unclearing_distance_to_stop_sign:
-            self.cleared_stop_sign = False
-            self.waiting_ticks_at_stop_sign = 0
-        else:
-            # Set the stop sign flag if we are closer than 3m and speed is low enough
-            if (
-                ego_vehicle_speed < 0.1
-                and distance_to_stop_sign < self.config.clearing_distance_to_stop_sign
-            ):
-                self.waiting_ticks_at_stop_sign += 1
-                if self.waiting_ticks_at_stop_sign > 25:
-                    self.cleared_stop_sign = True
-            else:
-                self.waiting_ticks_at_stop_sign = 0
-                self.cleared_stop_sign = True
-
-        # Set the distance to stop sign as infinity if the stop sign has been cleared
-        distance_to_stop_sign = (
-            np.inf if self.cleared_stop_sign else distance_to_stop_sign
-        )
-
-        # Compute the target speed using the IDM
-        target_speed = self._compute_target_speed_idm(
-            desired_speed=target_speed,
-            leading_actor_length=0,
-            ego_speed=ego_vehicle_speed,
-            leading_actor_speed=0.0,
-            distance_to_leading_actor=distance_to_stop_sign,
-            s0=self.config.idm_stop_sign_minimum_distance,
-            T=self.config.idm_stop_sign_desired_time_headway,
-        )
-
-        # Return whether the ego vehicle is affected by the stop sign and the adjusted target speed
         return target_speed
 
     def _dot_product(self, vector1, vector2):
