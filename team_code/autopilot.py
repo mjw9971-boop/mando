@@ -281,6 +281,12 @@ class AutoPilot:                                             # VTD: leaderboard 
 
         # VTD: command planner(target_point — TF++ 데이터 수집 전용)와 save()
         # 데이터 수집을 제거 — 틱 기록은 vtd_adapter.logger 가 한다.
+
+        # VTD: 한국 대회 규칙 계층 (team_code/kr_rules.py) — route_end 정지
+        # 후보를 min() 중재 뒤에 덧댄다 (CARLA 리더보드는 결승선 통과로 끝나
+        # PDM 에 종점 정지 개념이 없다). 판단 원문은 무수정.
+        control, target_speed = self.kr_rules.apply(control, target_speed, self)
+
         return control
 
 

@@ -44,6 +44,7 @@ from vtd_adapter.world import VtdWorld                     # noqa: E402
 
 from autopilot import AutoPilot                            # noqa: E402  (team_code)
 from config import GlobalConfig                            # noqa: E402  (team_code)
+from kr_rules import KrRules                               # noqa: E402  (team_code)
 
 
 def load_route(path: str) -> dict:
@@ -120,7 +121,7 @@ class LoggingAutoPilot(AutoPilot):
 
 # decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등 판단(kr_rules)은 phase4.
 _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
-                'vehicle': 'vehicle', 'bicycle': 'bicycle'}
+                'vehicle': 'vehicle', 'bicycle': 'bicycle', 'route_end': 'route_end'}
 
 
 class Runner:
@@ -154,6 +155,9 @@ class Runner:
         self.agent = LoggingAutoPilot()
         self.agent.setup(self.world, self.vmap, self.planner, self.longc,
                          self.world.ego, config=self.pdm_config)
+        # 한국 대회 규칙 계층 — autopilot._get_control 끝의 한 줄이 호출한다
+        self.kr = KrRules(self.cfg)
+        self.agent.kr_rules = self.kr
 
         log_path = args.log
         if log_path is None and bool(self.cfg['log'].get('enabled', True)):
@@ -224,6 +228,12 @@ class Runner:
         cand = dict(getattr(a, 'candidates', {}))
         initial = getattr(a, 'initial_target', None)
         brake, target, reduced = getattr(a, 'final', (False, 0.0, None))
+
+        # kr_rules 의 route_end 후보를 같은 중재 축에 합친다 (작업2)
+        if self.kr.last_candidate is not None:
+            cand['route_end'] = float(self.kr.last_candidate)
+        if self.kr.last_target is not None:
+            target = float(self.kr.last_target)
 
         winner = 'none'
         if cand:

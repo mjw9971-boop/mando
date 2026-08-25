@@ -24,37 +24,68 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 class VtdLongitudinalController:
-    """target_speed [m/s] → accel [m/s²]. PDM LongitudinalController 시그니처 호환."""
+    """target_speed [m/s] → accel [m/s²]. PDM LongitudinalController 시그니처 호환.
+
+    가속: 기존 검증 P (kp 0.8) + a_max 클램프.
+    감속: **IDM 의 의도를 그대로 실행한다** — PDM 의 target_speed 는 IDM 이 낸
+    "1틱(t_bound 0.05 s) 전방 속도"라, P 로만 따르면 의도 감속이 kp·dt(1/25)로
+    희석돼 정지선을 시스템적으로 지나친다 (폐루프 시뮬: 11.4 m 오버런).
+    (target − v)/dt 가 곧 IDM 의 의도 가감속이고, 이를 control.a_dec_max 로
+    클램프해 실행한다 (계단형 목표 하향 — 제한속도 전환 — 에서의 폭주 방지).
+    a_min 은 hazard/비상 축으로 남는다.
+    """
 
     def __init__(self, cfg: dict) -> None:
         s, c = cfg['speed'], cfg['control']
         self.kp = float(c['kp'])
         self.a_min = float(s['a_min'])
         self.a_max = float(s['a_max'])
+        self.a_dec_max = float(c['a_dec_max'])
+        self.jerk_dec_mult = float(c['jerk_dec_mult'])
         self.jerk_max = float(s['jerk_max'])
         self.a_hold = float(s['a_hold'])
         self.dt = 1.0 / float(cfg['comm']['send_hz'])
         self._prev_accel = 0.0
+        self._undo_accel = 0.0
         self._saved_accel = 0.0
+
+    def _raw_accel(self, target: float, v: float) -> float:
+        err = target - v
+        if err < 0.0:
+            # IDM 의도 감속 (err/dt), 상한 a_dec_max — a_min 은 hazard 전용
+            return max(err / self.dt, self.a_dec_max)
+        return min(self.kp * err, self.a_max)
 
     def get_throttle_and_brake(self, hazard_brake: bool, target_speed: float,
                                current_speed: float) -> tuple[float, bool]:
         """(accel [m/s²], brake_bool). brake_bool 은 로그·rolling-back 방지 판정용.
 
         · hazard_brake 또는 목표 0 인데 이미 저속 → a_hold (정지 유지 — 굴러가지 않게)
-        · 그 외 → P 추종 + a_min/a_max 클램프 + jerk 제한
+        · 그 외 → _raw_accel (모듈 docstring) + jerk 제한 (감속 방향은 jerk_dec_mult 배 완화)
         """
+        self._undo_accel = self._prev_accel        # rewind_last() 용 (kr_rules 재호출)
         if (hazard_brake or target_speed < 1e-5) and current_speed < 0.2:
             self._prev_accel = self.a_hold
             return self.a_hold, True
 
         target = 0.0 if hazard_brake else float(target_speed)
-        accel = _clamp(self.kp * (target - float(current_speed)), self.a_min, self.a_max)
+        accel = self._raw_accel(target, float(current_speed))
 
-        max_dj = self.jerk_max * self.dt
-        accel = _clamp(accel, self._prev_accel - max_dj, self._prev_accel + max_dj)
+        accel = _clamp(accel,
+                       self._prev_accel - self.jerk_dec_mult * self.jerk_max * self.dt,
+                       self._prev_accel + self.jerk_max * self.dt)
         self._prev_accel = accel
         return accel, bool(hazard_brake or target_speed < 1e-5)
+
+    def rewind_last(self) -> None:
+        """직전 get_throttle_and_brake 호출을 무효화한다 (jerk 기준 복원).
+
+        kr_rules 가 같은 틱에 더 낮은 목표로 재계산할 때 쓴다 — 되감지 않으면
+        본류 호출(높은 목표, accel↑)과 재호출(낮은 목표, accel↓)이 jerk 창을
+        나눠 갖는 핑퐁이 되어 순감속이 0 에 수렴한다 (2026-08-26 mock 실측:
+        route_end 발동에도 v 6.9→6.65 밖에 못 줄여 종점 통과).
+        """
+        self._prev_accel = self._undo_accel
 
     def get_throttle_extrapolation(self, target_speed: float,
                                    current_speed: float) -> float:
@@ -63,7 +94,7 @@ class VtdLongitudinalController:
         target = float(target_speed)
         if target < 1e-5 and current_speed < 0.2:
             return self.a_hold
-        return _clamp(self.kp * (target - float(current_speed)), self.a_min, self.a_max)
+        return self._raw_accel(target, float(current_speed))
 
     def save(self) -> None:
         self._saved_accel = self._prev_accel

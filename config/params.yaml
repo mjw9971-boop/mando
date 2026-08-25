@@ -65,11 +65,27 @@ percep:
   range_margin_m: 5.0
 
 control:
-  # 종방향 PI (phase1 stub / phase3 VtdLongitudinalController)
+  # 종방향 (VtdLongitudinalController). 가속: P (kp — 기존 검증값).
   kp: 0.8
-  ki: 0.15
-  # 적분은 목표 근처에서만 쌓는다 (와인드업 — 실측: 27 목표에 28.4 오버슛)
-  ki_band_mps: 1.0
+  # 감속: PDM IDM 의 target 은 "1틱 전방 속도"라 P 로 따르면 의도 감속이
+  # kp·dt(1/25)로 희석돼 정지선을 지나친다 (폐루프 시뮬 11.4 m 오버런).
+  # (target−v)/dt = IDM 의도 감속을 이 상한으로 클램프해 실행한다.
+  # -4.0 은 실기 신호 접근 감속 실측(-3.98)과 같은 축. a_min(-6)은 hazard 전용.
+  a_dec_max: -4.0
+  # 감속 방향 jerk 완화 배수 (제동 진입 지연 방지 — 시뮬: ×3 에서 종점 3.5 m 전 정지)
+  jerk_dec_mult: 3.0
+
+route_end:
+  # 종점 정지 (team_code/kr_rules.py): "종점에 정지한 길이 0 유령 선행차"를
+  # PDM IDM 에 넣는다. 정지 위치 관례는 정지선과 동일 — 앞범퍼(뒷축 +
+  # wheelbase + front_overhang)가 종점 − speed.stop_gap_m 에 선다.
+  # batch 완주 임계(total − end_margin)보다 end_slack_m 만큼 안쪽이라 완주
+  # 판정과 자동 정합한다 (tests/test_route_end.py 가 검증).
+  idm_time_headway: 0.1     # 적신호 정지(idm_red_light_desired_time_headway)와 같은 축
+  active_m: 150.0           # 이 거리 안에서만 후보 생성 (오검출 방지)
+  latch_v: 0.5              # 정지 래치 진입 속도 — batch 완주 판정(v<0.5)과 같은 값
+  latch_m: 12.0             # 종점에서 이 안쪽 + 저속이면 래치 (계획 정지점 d_end≈7.8)
+  unlatch_m: 30.0           # d_end 가 다시 이보다 커지면(courseRespawn) 래치 해제
 
 batch:
   # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).
