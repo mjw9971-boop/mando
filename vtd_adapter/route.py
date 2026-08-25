@@ -58,3 +58,446 @@ def check_light_controller(lg: LaneGraph, pkt: RawPacket, ahead: list, flags: di
     flags['light_ctrl_match'] = ok
     if not ok:
         flags['light_ctrl_mismatch'] = f'{light_id} not in {cids}'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VtdRoutePlanner — PDM-Lite privileged_route_planner 의 VTD 구현 (phase2)
+# ═══════════════════════════════════════════════════════════════════════════
+import math as _math
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+from . import frame
+from .carla_types import RoadOption, TrafficLightState
+from .map import VtdWaypoint
+
+# 9910 신호 state → CARLA TrafficLightState (phase2 기본 매핑).
+# 좌회전 화살표(4)의 경로 방향 조건부 처리는 phase3 §0-5 에서 얹는다.
+LIGHT_STATE_MAP = {
+    0: TrafficLightState.Unknown,   # 미할당
+    1: TrafficLightState.Red,
+    2: TrafficLightState.Yellow,
+    3: TrafficLightState.Green,
+    4: TrafficLightState.Red,       # 좌회전 화살표 — 직진/우회전엔 적색과 동등
+    5: TrafficLightState.Green,     # 녹색+좌
+    6: TrafficLightState.Green,     # 점멸 — 기존 flash_mode 'yield' 관례
+}
+
+
+class VtdTrafficLight:
+    """carla.TrafficLight 의 PDM-Lite 사용 표면: id / state / type_id.
+
+    실체는 "신호 걸린 정지선" 이다 — 거리 기준을 정지선으로 쓰기 위해서다
+    (한국 교차로는 신호등이 정지선에서 25 m 이상 떨어져 있다: phase0 §0-5).
+    state 는 매 틱 VtdRoutePlanner.update_lights() 가 9910 으로 갱신한다.
+    """
+
+    def __init__(self, controller_ids: list, signal_ids: list, route_s: float) -> None:
+        self.controller_ids = list(controller_ids)
+        self.signal_ids = list(signal_ids)
+        self.route_s = float(route_s)                    # 정지선의 경로 누적거리
+        self.id = int(controller_ids[0]) if controller_ids else -1
+        self.type_id = 'traffic.traffic_light'
+        self.state = TrafficLightState.Green             # 미수신 = 진행 (phase0 §0-5)
+
+    def __repr__(self) -> str:
+        return (f'VtdTrafficLight(ctrl={self.controller_ids}, '
+                f'rs={self.route_s:.1f}, {self.state.name})')
+
+
+class VtdRoutePlanner:
+    """
+    PDM-Lite PrivilegedRoutePlanner 와 같은 표면. run_step(pos) 반환 8-튜플의
+    순서·타입은 autopilot._get_control 의 언패킹과 글자 단위로 같다:
+
+        (route_points[idx:],                 np.ndarray [N,3]  (CARLA 프레임)
+         route_waypoints[idx:],              list[VtdWaypoint]
+         commands[idx:],                     np.ndarray [N]    (RoadOption 값)
+         distances_to_next_traffic_lights[idx],   float  [m, 정지선까지]
+         next_traffic_lights[idx],           VtdTrafficLight | None
+         distances_to_next_stop_signs[idx],  float  (항상 inf — 코스에 정지표지 없음)
+         next_stop_signs[idx],               None
+         speed_limits[idx])                  float  [m/s, margin 반영]
+
+    route dict(lanes/cum_s/events)를 lanegraph 로 1/points_per_meter 간격 재샘플.
+    차선변경 이음매(나란한 이웃 차로, cum_s 동일)는 window_s0 부터 최대
+    LC_TRANSITION_M 에 걸쳐 cos 블렌드로 옆 차로에 붙인다 — 그 구간의 command 가
+    CHANGELANELEFT/RIGHT 다.
+    """
+
+    LC_TRANSITION_M = 25.0      # 차선변경 블렌드 길이 상한 (기존 transition_min 20 + 여유)
+
+    def __init__(self, lg, route: dict, cfg: dict, config=None) -> None:
+        self.lg = lg
+        self.route = route
+        self.cfg = cfg
+        # PDM GlobalConfig 가 오면 그 값을, 아니면 PDM 원본 기본값을 쓴다 (phase3 주입)
+        g = lambda name, default: getattr(config, name, default) if config is not None else default
+        self.points_per_meter = int(g('points_per_meter', 10))
+        ppm = self.points_per_meter
+        self.ego_vehicles_route_point_search_distance = int(g('ego_vehicles_route_point_search_distance', 4 * ppm))
+        self.leading_vehicles_max_route_distance = g('leading_vehicles_max_route_distance', 2.5)
+        self.leading_vehicles_max_route_angle_distance = g('leading_vehicles_max_route_angle_distance', 35.0)
+        self.leading_vehicles_maximum_detection_radius = int(g('leading_vehicles_maximum_detection_radius', 80 * ppm))
+        self.trailing_vehicles_max_route_distance = g('trailing_vehicles_max_route_distance', 3.0)
+        self.trailing_vehicles_max_route_distance_lane_change = g('trailing_vehicles_max_route_distance_lane_change', 6.0)
+        self.tailing_vehicles_maximum_detection_radius = int(g('tailing_vehicles_maximum_detection_radius', 80 * ppm))
+        self.max_distance_lane_change_trailing_vehicles = int(g('max_distance_lane_change_trailing_vehicles', 15 * ppm))
+        self.transition_smoothness_distance = int(g('transition_smoothness_distance', 8 * ppm))
+        self.extra_route_length = int(g('extra_route_length', 50))
+
+        self.route_index = 0
+        self.last_route_index = 0
+        self._build()
+
+    # ── 경로 재샘플 ───────────────────────────────────────────────────────
+    def _build(self) -> None:
+        lg, route = self.lg, self.route
+        lanes = route['lanes']
+        cum_s = [float(v) for v in route['cum_s']]
+        step = 1.0 / self.points_per_meter
+
+        # 차선변경 이벤트 풀: (from, to) -> (window_s0, window_s1)
+        lc_events = []
+        for e in route.get('events', []):
+            if e['kind'].startswith('lane_change') and e.get('to_lane'):
+                lc_events.append(dict(e))
+
+        pts: list[tuple] = []          # (x, y, z)  VTD 프레임
+        keys: list[tuple] = []         # (lane_key, s_in_lane)
+        cmds: list[int] = []
+        rs_list: list[float] = []
+        limits: list[float] = []
+        stops: list[tuple] = []        # (rs, controller_ids, signal_ids)
+
+        margin_kph = float(self.cfg.get('speed', {}).get('margin_kph', 0.0))
+        default_kph = float(self.cfg.get('default_speed_kph', 50.0))
+        carry_kph: float | None = None
+
+        def limit_mps(key) -> float:
+            nonlocal carry_kph
+            v, _sc = lg.speed_limit_at(key)
+            if v is not None:
+                carry_kph = float(v)
+            kph = carry_kph if carry_kph is not None else default_kph
+            return max(0.0, kph - margin_kph) / 3.6
+
+        def collect_stops(key, i, s_from, s_to) -> None:
+            for sl in lg.lanes[key].get('stop_lines', []):
+                if s_from - 1e-6 <= sl['s'] <= s_to + 1e-6:
+                    if sl.get('controller_ids') or sl.get('signal_ids'):
+                        stops.append((cum_s[i] + float(sl['s']),
+                                      sl.get('controller_ids') or [],
+                                      sl.get('signal_ids') or []))
+
+        i = 0
+        s = float(route.get('start_s_in_lane', 0.0))
+        rs = cum_s[0] + s
+        while i < len(lanes):
+            key = lanes[i]
+            L = lg.length(key)
+            nxt = lanes[i + 1] if i + 1 < len(lanes) else None
+            hop = (nxt is not None and nxt not in lg.successors(key)
+                   and nxt in (lg.neighbor(key, 'left'), lg.neighbor(key, 'right')))
+            blend = None
+            if hop:
+                ev = next((e for e in lc_events
+                           if tuple(e.get('from_lane', ())) == key
+                           and tuple(e['to_lane']) == nxt), None)
+                w0 = max(float(ev['window_s0']) if ev else rs, rs)
+                w1_cap = float(ev['window_s1']) if ev else cum_s[i] + L
+                w1 = min(w0 + self.LC_TRANSITION_M, w1_cap)
+                side = RoadOption.CHANGELANELEFT if nxt == lg.neighbor(key, 'left') \
+                    else RoadOption.CHANGELANERIGHT
+                blend = (w0, max(w1, w0 + 1e-6), side)
+                s_end = min(L, w1 - cum_s[i])
+            else:
+                s_end = L
+
+            s_seg_start = s
+            while s < s_end - 1e-9:
+                x, y, z, _h = lg.point_at(key, s)
+                cmd = RoadOption.LANEFOLLOW
+                cur_key, cur_s = key, s
+                if blend is not None and rs >= blend[0]:
+                    w = -_math.cos(min(1.0, (rs - blend[0]) / (blend[1] - blend[0])) * _math.pi) / 2.0 + 0.5
+                    x2, y2, z2, _h2 = lg.point_at(nxt, min(s, lg.length(nxt)))
+                    x = (1.0 - w) * x + w * x2
+                    y = (1.0 - w) * y + w * y2
+                    z = (1.0 - w) * z + w * z2
+                    cmd = blend[2]
+                    if w >= 0.5:
+                        cur_key, cur_s = nxt, min(s, lg.length(nxt))
+                pts.append((x, y, z))
+                keys.append((cur_key, cur_s))
+                cmds.append(int(cmd))
+                rs_list.append(rs)
+                limits.append(limit_mps(cur_key))
+                s += step
+                rs += step
+            collect_stops(key, i, s_seg_start, s_end)
+
+            if hop:
+                s = min(s, lg.length(nxt))     # 나란한 차로 — s 매개화 유지, rs 연속
+            else:
+                s -= L                          # 초과분 이월 → 간격 유지
+            i += 1
+
+        # ── 꼬리 연장 (extra_route_length) — 경로 끝에서도 checkpoint 소진 방지 ──
+        # 본 루프가 마지막 차로를 끝까지 샘플하고 s -= L 를 이월했으므로,
+        # s 는 이미 **successor 안의 오프셋**이다. successor 부터 이어 간다.
+        key = lanes[-1]
+        nx0 = lg.successors(key)
+        key = nx0[0] if nx0 else None
+        ext = 0.0
+        while key is not None and ext < self.extra_route_length:
+            nx = lg.successors(key)
+            if s >= lg.length(key) - 1e-9:
+                if not nx:
+                    break
+                s -= lg.length(key)
+                key = nx[0]
+                continue
+            x, y, z, _h = lg.point_at(key, s)
+            pts.append((x, y, z))
+            keys.append((key, s))
+            cmds.append(int(RoadOption.LANEFOLLOW))
+            rs_list.append(rs)
+            limits.append(limit_mps(key))
+            s += step
+            rs += step
+            ext += step
+
+        # ── 배열화 (CARLA 프레임) ────────────────────────────────────────
+        self.route_points = frame.to_carla_np(np.array(pts, dtype=float))
+        self.original_route_points = np.copy(self.route_points)
+        self.route_s = np.array(rs_list, dtype=float)
+        self.commands = np.array(cmds, dtype=int)
+        self.commands_orig = np.copy(self.commands)
+        self.speed_limits = np.array(limits, dtype=float)
+        self.route_waypoints = [VtdWaypoint(lg, k, sv) for k, sv in keys]
+        self.rotation_angles = self.compute_rotation_angles(self.route_points)
+        self._kd = cKDTree(self.route_points[:, :2])
+
+        # ── 신호 정지선 → 인덱스별 거리/객체 배열 ────────────────────────
+        stops.sort(key=lambda t: t[0])
+        dedup: list[tuple] = []
+        for rs_stop, ctrl, sigs in stops:                 # 나란한 차로 중복 제거 (0.5 m)
+            if dedup and rs_stop - dedup[-1][0] < 0.5:
+                continue
+            dedup.append((rs_stop, ctrl, sigs))
+        self.traffic_lights = [VtdTrafficLight(c, sg, r) for r, c, sg in dedup]
+
+        n = len(self.route_points)
+        self.distances_to_next_traffic_lights = np.full(n, np.inf)
+        self.next_traffic_lights: list = [None] * n
+        self.distances_to_next_stop_signs = np.full(n, np.inf)
+        self.next_stop_signs: list = [None] * n           # 코스에 정지표지 없음
+        ti = 0
+        for idx in range(n):
+            while ti < len(self.traffic_lights) and \
+                    self.traffic_lights[ti].route_s < self.route_s[idx] - 0.5:
+                ti += 1
+            if ti < len(self.traffic_lights):
+                self.next_traffic_lights[idx] = self.traffic_lights[ti]
+                self.distances_to_next_traffic_lights[idx] = \
+                    self.traffic_lights[ti].route_s - self.route_s[idx]
+
+    # ── 매 틱 ─────────────────────────────────────────────────────────────
+    def run_step(self, agent_position):
+        """PDM 원문과 동일 — 전방 창에서 최근접 점으로 인덱스 전진 후 슬라이스 반환."""
+        till = self.ego_vehicles_route_point_search_distance
+        search_range = min(self.route_index + till, self.route_points.shape[0])
+
+        self.route_index += int(np.argmin(np.linalg.norm(
+            np.asarray(agent_position)[None, :2]
+            - self.route_points[self.route_index:search_range, :2], axis=1)))
+
+        idx = self.route_index
+        return (
+            self.route_points[idx:],
+            self.route_waypoints[idx:],
+            self.commands[idx:],
+            self.distances_to_next_traffic_lights[idx],
+            self.next_traffic_lights[idx],
+            self.distances_to_next_stop_signs[idx],
+            self.next_stop_signs[idx],
+            self.speed_limits[idx],
+        )
+
+    def save(self) -> None:
+        self.last_route_index = self.route_index
+
+    def load(self) -> None:
+        self.route_index = self.last_route_index
+
+    def reset_index(self, agent_position) -> None:
+        """courseRespawn 뒤 — 경로상 위치가 뒤로 갈 수 있어 전역 재탐색한다."""
+        _d, idx = self._kd.query(np.asarray(agent_position)[:2], k=1)
+        self.route_index = int(idx)
+        self.last_route_index = self.route_index
+
+    def update_lights(self, lights: list) -> None:
+        """9910 lights [(id, state)] → 매칭되는 정지선 신호의 state 갱신.
+
+        9910 id 는 controller id 다 (junction_ctrl_map / controller_ids 로 검증됨).
+        매칭 안 된 신호는 직전 state 유지 — 9910 은 '지금 볼 신호' 하나만 주므로
+        멀어진 신호의 낡은 state 가 남지만, 판단은 next_traffic_light(전방 첫
+        정지선)만 보므로 무해하다.
+        """
+        for lid, state in lights:
+            mapped = LIGHT_STATE_MAP.get(int(state), TrafficLightState.Unknown)
+            for tl in self.traffic_lights:
+                if int(lid) in tl.controller_ids:
+                    tl.state = mapped
+
+    # ── 이하 PDM-Lite privileged_route_planner.py 원문 이식 ──────────────
+    def compute_rotation_angles(self, route_points):
+        """경로 점열의 yaw [deg, CARLA 프레임] — PDM 원문."""
+        indices = np.arange(1, route_points.shape[0] - 1)
+        differences = route_points[indices + 1] - route_points[indices - 1]
+        yaws = np.arctan2(differences[:, 1], differences[:, 0]) * 180.0 / np.pi
+        return np.concatenate([[yaws[0]], yaws, [yaws[-1]]])
+
+    def get_closest_route_index(self, begin_idx, location):
+        """PDM 원문 — 일정 그래디언트 하강으로 최근접 경로 인덱스."""
+        index = begin_idx
+        location_np = np.array([location.x, location.y])
+        direction = 1
+        if np.linalg.norm(location_np - self.original_route_points[index, :2]) \
+                < np.linalg.norm(location_np - self.original_route_points[index + 1, :2]):
+            direction = -1
+        while True:
+            if index + direction == 0 or index + direction == self.original_route_points.shape[0]:
+                return index
+            dist1 = np.linalg.norm(location_np - self.original_route_points[index, :2])
+            dist2 = np.linalg.norm(location_np - self.original_route_points[index + direction, :2])
+            if dist1 < dist2:
+                return index
+            index += direction
+
+    def _smooth_transition(self, value):
+        """PDM 원문 — 0..1 선형 전이를 cos 전이로."""
+        return -np.cos(value * np.pi) / 2.0 + 0.5
+
+    def shift_route_smoothly(self, start_index, end_index, shift_to_left_lane,
+                             transition_length=120.0, lane_transition_factor=1.0):
+        """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트."""
+        for idx in range(start_index, end_index):
+            if shift_to_left_lane:
+                loc = self.route_waypoints[idx].get_left_lane()
+            else:
+                loc = self.route_waypoints[idx].get_right_lane()
+            loc = (self.route_waypoints[idx].transform.location
+                   if loc is None else loc.transform.location)
+            loc = np.array([loc.x, loc.y, loc.z])
+
+            transition_factor = 1.0
+            if idx <= start_index + transition_length and idx - start_index < end_index - idx:
+                transition_factor = self._smooth_transition(
+                    float(idx - start_index) / transition_length)
+                self.commands[idx] = (RoadOption.CHANGELANELEFT if shift_to_left_lane
+                                      else RoadOption.CHANGELANERIGHT)
+            elif idx >= end_index - transition_length:
+                transition_factor = self._smooth_transition(
+                    float(end_index - idx) / transition_length)
+                self.commands[idx] = (RoadOption.CHANGELANERIGHT if shift_to_left_lane
+                                      else RoadOption.CHANGELANELEFT)
+
+            self.route_points[idx] = (
+                lane_transition_factor * transition_factor * loc
+                + (1.0 - lane_transition_factor * transition_factor) * self.route_points[idx])
+
+    def shift_route_around_actors(self, first_actor, last_actor=None,
+                                  obstacle_direction='right', transition_length=120.0,
+                                  lane_transition_factor=1.0,
+                                  extra_length_before=0.0, extra_length_after=0.0):
+        """PDM 원문 — 액터 주위로 경로 시프트. 발동은 phase4 에서."""
+        tree = cKDTree(self.original_route_points[self.route_index:, :2])
+        first_actor_location = np.array(
+            [first_actor.get_location().x, first_actor.get_location().y])
+        _, closest_idx = tree.query(first_actor_location, k=1)
+        first_idx = closest_idx + self.route_index
+
+        first_actor_extent = first_actor.bounding_box.extent.x
+        shift_start_index = first_idx - int(
+            first_actor_extent * self.points_per_meter + transition_length + extra_length_before)
+
+        if last_actor is None:
+            shift_end_index = first_idx + int(
+                first_actor_extent * self.points_per_meter + transition_length + extra_length_after)
+        else:
+            last_idx = self.get_closest_route_index(first_idx, last_actor.get_location())
+            last_actor_extent = last_actor.bounding_box.extent.x
+            shift_end_index = last_idx + int(
+                last_actor_extent * self.points_per_meter + transition_length + extra_length_after)
+
+        shift_to_left_lane = obstacle_direction == 'right'
+        self.shift_route_smoothly(shift_start_index, shift_end_index, shift_to_left_lane,
+                                  transition_length=transition_length,
+                                  lane_transition_factor=lane_transition_factor)
+        return shift_start_index, shift_end_index
+
+    def compute_leading_vehicles(self, list_vehicles, ego_vehicle_id):
+        """PDM 원문 — 경로 전방 80 m 에서 경로에 붙어(2.5 m) 진행방향이 35° 이내인 차."""
+        vehicle_ids = np.array(
+            [vehicle.id for vehicle in list_vehicles if vehicle.id != ego_vehicle_id])
+        if len(vehicle_ids) and self.route_index != self.route_points.shape[0]:
+            max_distance = self.leading_vehicles_maximum_detection_radius
+            vehicle_yaws = np.array(
+                [vehicle.get_transform().rotation.yaw
+                 for vehicle in list_vehicles if vehicle.id != ego_vehicle_id])
+            vehicle_locations = np.array(
+                [[v.get_location().x, v.get_location().y, v.get_location().z]
+                 for v in list_vehicles if v.id != ego_vehicle_id])
+
+            distances = (vehicle_locations[:, None, :2]
+                         - self.route_points[None, self.route_index:self.route_index + max_distance, :2][:, ::self.points_per_meter, :])
+            distances = np.linalg.norm(distances, axis=2)
+            route_indices = distances.argmin(axis=1)
+            distances = distances.min(axis=1)
+            rotation_angles = self.rotation_angles[
+                self.route_index:self.route_index + max_distance][::self.points_per_meter]
+            route_yaws = rotation_angles[route_indices]
+            yaw_differences = (route_yaws - vehicle_yaws) % 360
+            yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
+
+            leading_vehicle_ids = vehicle_ids[
+                (distances < self.leading_vehicles_max_route_distance)
+                & (yaw_differences < self.leading_vehicles_max_route_angle_distance)]
+            return leading_vehicle_ids.tolist()
+        return []
+
+    def compute_trailing_vehicles(self, list_vehicles, ego_vehicle_id):
+        """PDM 원문 — 경로 후방에서 따라오는 차."""
+        vehicle_ids = np.array(
+            [vehicle.id for vehicle in list_vehicles if vehicle.id != ego_vehicle_id])
+        max_distance = self.trailing_vehicles_max_route_distance
+        for i in range(max(0, self.route_index - self.max_distance_lane_change_trailing_vehicles),
+                       self.route_index):
+            if self.commands[i] in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+                max_distance = self.trailing_vehicles_max_route_distance_lane_change
+                break
+
+        if len(vehicle_ids) and self.route_index != 0:
+            vehicle_yaws = np.array(
+                [vehicle.get_transform().rotation.yaw
+                 for vehicle in list_vehicles if vehicle.id != ego_vehicle_id])
+            vehicle_locations = np.array(
+                [[v.get_location().x, v.get_location().y, v.get_location().z]
+                 for v in list_vehicles if v.id != ego_vehicle_id])
+
+            from_idx = max(0, self.route_index - self.tailing_vehicles_maximum_detection_radius)
+            distances = (vehicle_locations[:, None, :2]
+                         - self.route_points[None, from_idx:self.route_index, :2][:, ::self.points_per_meter, :])
+            distances = np.linalg.norm(distances, axis=2)
+            route_indices = distances.argmin(axis=1)
+            distances = distances.min(axis=1)
+            rotation_angles = self.rotation_angles[from_idx:self.route_index][::self.points_per_meter]
+            route_yaws = rotation_angles[route_indices]
+            yaw_differences = (route_yaws - vehicle_yaws) % 360
+            yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
+            vehicles_behind_ids = vehicle_ids[(distances < max_distance) & (yaw_differences < 30)]
+            return vehicles_behind_ids.tolist()
+        return []
