@@ -26,9 +26,9 @@ import socket
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'src' / 'hlfma'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from hlfma.core.comm import CTRL_FMT, CTRL_SIZE, build_frame  # noqa: E402
+from vtd_adapter.comm import CTRL_FMT, CTRL_SIZE, build_frame  # noqa: E402
 
 WHEELBASE = 2.944
 MAX_STEER = 0.48

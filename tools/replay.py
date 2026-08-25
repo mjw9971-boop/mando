@@ -1,14 +1,16 @@
 """
 로그 jsonl → Comm 대체 소스  (SPEC §3.7)
 
-VTD 없이 Perception/Planner/Shield/Control 을 다시 돌린다.
-판단 로직을 고친 뒤 회귀 테스트하는 기반.
+VTD 없이 로그를 다시 파이프라인에 흘린다:
 
-    python3 tools/run_standalone.py --replay logs/run_xxx.jsonl
-    python3 tools/replay.py logs/run_xxx.jsonl          # 지시등 시퀀스 원본 vs 재생 비교
+    python3 run_agent.py --replay logs/run_xxx.jsonl    # 파이프라인 재생 (개루프)
+    python3 tools/replay.py logs/run_xxx.jsonl          # 지시등 시퀀스 분석
 
 **개루프**다: 자차 궤적은 원본 런 그대로이고 새 판단이 궤적을 바꾸지는
-않는다. 지시등·상태·속도후보처럼 "같은 입력에 대한 판단" 의 회귀 비교에 쓴다.
+않는다. "같은 입력에 대한 판단" 의 회귀 비교에 쓴다.
+
+(자체 planner 재생·비교 기능은 PDM-Lite 이식으로 제거 — git 이력 phase1 이전 참조.
+ phase3 이후 필요해지면 autopilot 재생으로 다시 만든다.)
 """
 from __future__ import annotations
 
@@ -17,9 +19,9 @@ import pathlib
 import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / 'src' / 'hlfma'))
+sys.path.insert(0, str(_ROOT))
 
-from hlfma.core.types import Command, RawPacket  # noqa: E402
+from vtd_adapter.types import Command, RawPacket  # noqa: E402
 
 
 class ReplaySource:
@@ -109,53 +111,31 @@ def fmt_segments(segs: list[dict]) -> str:
     return '\n'.join(rows) if rows else '  (점등 없음)'
 
 
-def replay_signals(path: str, config: str | None = None,
-                   graph: str = 'data/lane_graph.pkl', route: str = 'data/route.pkl'):
-    """로그를 Perception→Planner→Shield 로 재생. (원본 열, 재생 열) 을 돌려준다."""
-    from hlfma.core.lanegraph import LaneGraph
-    from hlfma.core.perception import Perception
-    from hlfma.core.planner import Planner
-    from hlfma.core.shield import Shield
-    from hlfma.nodes.params import load_params_yaml
-    import pickle
-
-    cfg = load_params_yaml(config or str(_ROOT / 'src' / 'hlfma' / 'config' / 'params.yaml'))
-    lg = LaneGraph(str(_ROOT / graph))
-    with open(_ROOT / route, 'rb') as f:
-        rt = pickle.load(f)
-    per = Perception(lg, rt, cfg)
-    pl = Planner(lg, rt, cfg)
-    sh = Shield(lg, cfg, planner=pl)
-
-    src = ReplaySource(path)
-    orig, new = [], []
-    while True:
-        pkt = src.recv()
-        if pkt is None:
-            break
-        rec = src.records[-1]
-        w = per.update(pkt)
-        d = sh.apply(w, pl.plan(w))
-        orig.append((rec['ego']['route_s'], rec['decision']['turn_signal'], rec['decision']['state']))
-        new.append((w.ego.route_s, d.turn_signal, d.state))
-    src.close()
-    return orig, new, pl
+def load_signal_ticks(path: str) -> list[tuple[float, int, str]]:
+    """로그에서 (route_s, turn_signal, state) 열을 읽는다."""
+    out = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            if '"raw"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            out.append((rec['ego']['route_s'], rec['decision']['turn_signal'],
+                        rec['decision']['state']))
+    return out
 
 
 def main(argv=None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(description='로그 재생 — 지시등 시퀀스 비교')
+    ap = argparse.ArgumentParser(description='로그 분석 — 지시등 시퀀스')
     ap.add_argument('log')
-    ap.add_argument('--config', default=None)
     a = ap.parse_args(argv)
 
-    orig, new, pl = replay_signals(a.log, a.config)
-    so, sn = segments(orig), segments(new)
-    print(f'원본 ({pathlib.Path(a.log).name}) — 깜빡임 {flicker_count(so)}회, 전환 {len(so) - 1}회')
+    so = segments(load_signal_ticks(a.log))
+    print(f'{pathlib.Path(a.log).name} — 깜빡임 {flicker_count(so)}회, 전환 {len(so) - 1}회')
     print(fmt_segments(so))
-    print(f'재생 — 깜빡임 {flicker_count(sn)}회, 전환 {len(sn) - 1}회  '
-          f'(LC 완료 {pl.lc_done}, 중단 {pl.lc_aborted})')
-    print(fmt_segments(sn))
     return 0
 
 

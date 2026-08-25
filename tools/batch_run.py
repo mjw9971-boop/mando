@@ -14,7 +14,7 @@
 한 사이클:
   1. build_route.py 로 data/route_{name}.pkl 생성 (**공용 route.pkl 은 건드리지 않는다**)
   2. SCP(48179) 로 VTD 에 시나리오 로드 → Init → Start   (실측 확인 2026-08-24)
-  3. ros2 launch 를 서브프로세스로 (route:=data/route_{name}.pkl)
+  3. run_agent.py 를 서브프로세스로 (--route data/route_{name}.pkl)
   4. 로그 꼬리를 감시해 종료 판정 (EndJudge — 완주 임계는 params.yaml 연동):
        완주        : route_s ≥ total − (stop_gap+앞범퍼+end_slack), 이후 v<0.5 또는 유예
        stall       : 정지인데 계획은 진행(v_target≥0.5)이 batch.stall_end_s 지속
@@ -33,7 +33,6 @@ import json
 import math
 import os
 import pathlib
-import shutil
 import signal
 import subprocess
 import sys
@@ -41,7 +40,7 @@ import time
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / 'tools'))
-sys.path.insert(0, str(_ROOT / 'src' / 'hlfma'))
+sys.path.insert(0, str(_ROOT))
 
 from scp_client import ScpClient                       # noqa: E402
 
@@ -245,10 +244,12 @@ class Runner:
         build_cmd = [sys.executable, str(_ROOT / 'tools' / 'build_route.py'),
                      str(_ROOT / 'data' / 'lane_graph.pkl'), sc['route_csv'],
                      '-o', str(route_pkl)]
-        launch_cmd = ['ros2', 'launch', 'hlfma', 'drive.launch.py',
-                      f'route:={route_pkl}',
-                      f'graph:={_ROOT / "data" / "lane_graph.pkl"}',
-                      f'host:={self.args.host}']
+        agent_log = self.out_dir / f'{name}.jsonl'
+        launch_cmd = [sys.executable, str(_ROOT / 'run_agent.py'),
+                      '--route', str(route_pkl),
+                      '--graph', str(_ROOT / 'data' / 'lane_graph.pkl'),
+                      '--host', self.args.host,
+                      '--log', str(agent_log)]
         if self.args.dry_run:
             print(f'\n[dry-run] {name}')
             print('  route :', ' '.join(build_cmd))
@@ -294,13 +295,12 @@ class Runner:
         if waited > 1.0:
             print(f'    VTD 예열 {waited:.0f}s 후 9910 수신 시작')
 
-        # 3) 컨트롤러 launch (새 세션 = 프로세스 그룹 → SIGINT 로 통째로 정리)
-        before = set((_ROOT / 'logs').glob('run_*.jsonl'))
+        # 3) 컨트롤러 실행 (새 세션 = 프로세스 그룹 → SIGINT 로 통째로 정리)
         launch_out = open(self.out_dir / f'{name}.launch.txt', 'w')
         self.launch = subprocess.Popen(launch_cmd, cwd=str(_ROOT), start_new_session=True,
                                        stdout=launch_out, stderr=subprocess.STDOUT)
 
-        # 4) 로그 감시 — 새 run_*.jsonl 이 이 시나리오의 로그다
+        # 4) 로그 감시 — --log 로 지정한 파일이 이 시나리오의 로그다
         log_path = None
         t0 = time.monotonic()
         deadline = t0 + float(sc['timeout_s'])
@@ -314,9 +314,8 @@ class Runner:
                 status = f'launch 사망 (rc={self.launch.returncode})'
                 break
             if log_path is None:
-                new = set((_ROOT / 'logs').glob('run_*.jsonl')) - before
-                if new:
-                    log_path = max(new, key=lambda p: p.stat().st_mtime)
+                if agent_log.exists():
+                    log_path = agent_log
                     print(f'    로그: {log_path.name}')
                 elif time.monotonic() - t0 > NO_DATA_S:
                     status = 'no-data (로그 파일이 생기지 않음)'
@@ -339,14 +338,12 @@ class Runner:
                 status = verdict
                 break
 
-        # 5) 정리 + 로그 회수
+        # 5) 정리 + 로그 회수 (--log 로 이미 out_dir 에 쓰였다)
         self.cleanup()
         launch_out.close()
         res['status'] = status
-        if log_path is not None and log_path.exists():
-            dst = self.out_dir / f'{name}.jsonl'
-            shutil.copy2(log_path, dst)
-            res['log'] = str(dst)
+        if agent_log.exists():
+            res['log'] = str(agent_log)
         return res
 
     # ── 결과 수집 ─────────────────────────────────────────────────────────

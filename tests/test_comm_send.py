@@ -12,8 +12,8 @@ import time
 
 import pytest
 
-from hlfma.core.comm import CTRL_SIZE, Comm
-from hlfma.core.types import Command
+from vtd_adapter.comm import CTRL_SIZE, Comm
+from vtd_adapter.types import Command
 
 CMD = Command(steering=0.1, accel=-1.0, turn_signal=0)
 

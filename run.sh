@@ -3,16 +3,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-
-HOST="${VTD_HOST:-127.0.0.1}"
+HOST="${VTD_HOST:-192.168.10.1}"
 PORT="${VTD_PORT:-9910}"
 GRAPH="${GRAPH:-data/lane_graph.pkl}"
-ROUTE="${ROUTE:-data/route.pkl}"
-RECORD="${RECORD:-true}"          # 기본 녹화 — 끝나고 원인 분석에 쓴다
 
-exec ros2 launch hlfma drive.launch.py \
-    host:="$HOST" port:="$PORT" \
-    graph:="$GRAPH" route:="$ROUTE" \
-    record:="$RECORD" bag_path:="bags/drive_$(date +%Y%m%d_%H%M%S)"
+# 대회 배포 waypoints.csv 가 있으면 그걸로 route 를 빌드해 쓰고,
+# 아니면 ROUTE(기본 data/route.pkl)를 그대로 쓴다.
+if [[ -n "${CSV:-}" ]]; then
+    exec python3 run_agent.py --host "$HOST" --port "$PORT" --graph "$GRAPH" --csv "$CSV"
+else
+    ROUTE="${ROUTE:-data/route.pkl}"
+    exec python3 run_agent.py --host "$HOST" --port "$PORT" --graph "$GRAPH" --route "$ROUTE"
+fi

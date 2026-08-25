@@ -3,9 +3,9 @@ import struct
 
 import pytest
 
-from hlfma.core.comm import (CTRL_SIZE, FRAME_SIZE, OBJ_BASE, OBJ_SIZE, TL_BASE,
+from vtd_adapter.comm import (CTRL_SIZE, FRAME_SIZE, OBJ_BASE, OBJ_SIZE, TL_BASE,
                       build_frame, pack_command, parse)
-from hlfma.core.types import Command
+from vtd_adapter.types import Command
 
 EGO = (508.80, -168.29, 42.0, 0.52727822, 0.01, -0.02)
 

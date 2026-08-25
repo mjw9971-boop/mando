@@ -25,10 +25,10 @@ import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))                                   # build_route
-sys.path.insert(0, str(ROOT.parent / 'src' / 'hlfma'))          # hlfma.core
+sys.path.insert(0, str(ROOT.parent))          # vtd_adapter
 
 from build_route import RouteError, read_waypoints_csv          # noqa: E402
-from hlfma.core.lanegraph import LaneGraph                      # noqa: E402
+from vtd_adapter.lanegraph import LaneGraph                      # noqa: E402
 
 NUM = r'[-+0-9.eE]+'
 

@@ -14,15 +14,15 @@ import pathlib
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'src' / 'hlfma'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from hlfma.core.comm import FRAME_SIZE, parse  # noqa: E402
+from vtd_adapter.comm import FRAME_SIZE, parse  # noqa: E402
 
 STATE_NAME = {0: '미할당', 1: '적', 2: '황', 3: '녹', 4: '좌회전', 5: '녹+좌', 6: '점멸'}
 
 
 def decode(frame: bytes):
-    """1109 B → RawPacket. hlfma.core.comm.parse 와 동일."""
+    """1109 B → RawPacket. vtd_adapter.comm.parse 와 동일."""
     return parse(frame)
 
 

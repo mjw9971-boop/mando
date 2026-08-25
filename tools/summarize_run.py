@@ -23,7 +23,7 @@ import sys
 from collections import Counter
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / 'src' / 'hlfma'))
+sys.path.insert(0, str(_ROOT))
 
 SIG = {0: 'OFF', 1: 'LEFT', 2: 'RIGHT'}
 
@@ -49,7 +49,7 @@ def load(path: str):
 def load_map():
     """lane_graph / route 가 있으면 (lg, route) — 없으면 (None, None)."""
     try:
-        from hlfma.core.lanegraph import LaneGraph
+        from vtd_adapter.lanegraph import LaneGraph
         lg = LaneGraph(str(_ROOT / 'data' / 'lane_graph.pkl'))
         with open(_ROOT / 'data' / 'route.pkl', 'rb') as f:
             rt = pickle.load(f)
@@ -59,13 +59,10 @@ def load_map():
 
 
 def load_cfg() -> dict:
-    """params.yaml (없으면 DEFAULTS) — 완주 임계가 컨트롤러 정지 정책과 같은 값을 보게."""
-    from hlfma.nodes.params import DEFAULTS, load_params_yaml
-    yaml_path = _ROOT / 'src' / 'hlfma' / 'config' / 'params.yaml'
-    try:
-        return load_params_yaml(str(yaml_path))
-    except Exception:                                   # noqa: BLE001
-        return DEFAULTS
+    """config/params.yaml — 완주 임계가 컨트롤러 정지 정책과 같은 값을 보게.
+    DEFAULTS 폴백은 폐지 — 파일이 없으면 죽는 게 맞다 (설정 이중화 금지)."""
+    from vtd_adapter.config import load_params_yaml
+    return load_params_yaml()
 
 
 def end_margin_m(cfg: dict) -> float:

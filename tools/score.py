@@ -12,9 +12,9 @@ import json
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'src' / 'hlfma'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from hlfma.core.scoring import SpeedMonitor  # noqa: E402
+from vtd_adapter.scoring import SpeedMonitor  # noqa: E402
 
 # SPEC §1.4 법규 10개
 CHECKS = [

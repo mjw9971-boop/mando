@@ -1,0 +1,93 @@
+# VTD·어댑터 상수의 단일 출처 (vtd_adapter/config.py 가 읽는다)
+# 단위: m, m/s, m/s^2, rad. km/h 는 *_kph 키와 로그 출력에서만.
+#
+# 여기에는 **VTD 연결·차량 제원·추정기·배치 판정** 상수만 둔다.
+# 판단(IDM·forecast·lateral PID) 상수는 team_code/config.py (PDM-Lite) 가 단일 출처다.
+# 옛 자체 planner/shield 상수(caps/signal/lead/ttc/lane_change/cross/shield)는
+# PDM-Lite 이식으로 폐기 — 필요해지면 kr_rules.py 도입 시 여기로 되살린다.
+
+comm:
+  host: 192.168.10.1
+  port: 9910
+  send_hz: 20
+  watchdog_s: 1.0
+  # 실측 확정 (2026-08-19, VTD 2025.2): +1.0.
+  # -1.0 이면 직선 구간에서 발산하며 courseRespawn 리셋이 발생한다.
+  # corr(steering, yaw_rate) = -0.93 으로 확인 (logs/run_20260819_185936.jsonl).
+  steer_sign: 1.0
+  connect_retry_s: 1.0
+  recv_bufsize: 65536
+
+vehicle:
+  # Ioniq 6 제원: 전장 4855 / 축거 2950 / 앞 오버행 855 / 뒤 오버행 1050 mm
+  wheelbase: 2.944
+  max_steer: 0.48
+  length: 4.848
+  width: 1.886
+  height: 1.507
+  front_overhang_m: 0.855
+  # 경로 계획의 연결로 통행 금지 임계 (build_route 소비): R_min < 축거/tan(최대조향) × 이 값.
+  # 실증 — R 4.52 m 연결로는 통과, R 2.55 m 는 이탈. 0.7 → 임계 3.96 m.
+  min_turn_margin: 0.7
+
+speed:
+  # 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
+  # (phase3: VtdRoutePlanner 가 speed_limits 에 반영)
+  margin_kph: 5.0
+  # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
+  a_max: 2.0
+  a_min: -6.0
+  a_emergency: -8.0
+  jerk_max: 2.0
+  # 정지 유지 브레이크 (v_target=0 & v<0.2)
+  a_hold: -1.0
+  # 계획 정지점 = 정지선 − stop_gap − 앞범퍼. 완주 임계(end_margin_m)가 이 값을 따른다.
+  stop_gap_m: 4.0
+
+percep:
+  horizon_m: 200.0
+  coast_s: 1.5
+  # courseRespawn 감지 문턱. 실제 리셋 이동량이 3.3 m 남짓이라 그보다 낮아야 한다.
+  jump_m: 2.0
+  speed_lpf: 0.3
+  # 속도 추정 슬라이딩 창 [s] (Σ변위/Σ벽시계 dt). 9910 송신 간격이
+  # 40/80 ms 로 불규칙해 틱 단위 d/dt 는 못 쓴다 (2026-08-23 실측).
+  speed_win_s: 0.4
+  # respawnPoseToleranceM=1.5 라 실제 리셋 이동량은 3 m 남짓이다.
+  reset_route_s_drop_m: 5.0
+  stall_dt_s: 0.2          # 이보다 긴 틱 간격은 '스톨'로 분류
+  stall_teleport_m: 50.0   # 스톨이라도 이동량이 이보다 크면 텔레포트 = 리셋
+  reset_speed_factor: 3.0
+  reset_abs_speed: 30.0
+  reset_toff_jump_m: 2.0
+  # 공식 확인: 객체는 수평거리 80 m 이내만, 가까운 순 최대 30개
+  gt_range_m: 80.0
+  range_margin_m: 5.0
+
+control:
+  # 종방향 PI (phase1 stub / phase3 VtdLongitudinalController)
+  kp: 0.8
+  ki: 0.15
+  # 적분은 목표 근처에서만 쌓는다 (와인드업 — 실측: 27 목표에 28.4 오버슛)
+  ki_band_mps: 1.0
+
+batch:
+  # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).
+  # route_s 는 뒷축 기준이고 계획 정지점이 total − stop_gap − 앞범퍼 이므로
+  # 임계가 stop_gap 튜닝을 자동으로 따라간다.
+  end_slack_m: 1.0
+  # 정지(v<0.1)인데 계획은 진행(v_target≥0.5)이 이 시간 지속 → stall 종료
+  stall_end_s: 20.0
+  # route_s 무전진이 이 시간 지속 → no_progress 종료 (적60 대기 60 s 보다 길게)
+  no_progress_end_s: 120.0
+
+log:
+  enabled: true
+  dir: logs
+  path: ""
+  flush_every: 20
+
+debug:
+  print_hz: 1.0
+
+default_speed_kph: 50.0

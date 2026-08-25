@@ -20,3 +20,7 @@ logs/
 bags/
 *.bin
 *.log
+# ===== 생성물 (gen_scenarios / build_route) =====
+scenarios/
+data/route_*.pkl
+!data/route_example.pkl

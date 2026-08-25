@@ -29,10 +29,9 @@ route.pkl:
 """
 import argparse, heapq, math, pickle, sys
 import numpy as np
-# core/ 는 ROS 패키지 안(src/hlfma/hlfma/core)에 있다. 그 패키지 루트를 올린다.
 import pathlib as _pathlib, sys as _sys
-_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent / 'src' / 'hlfma'))
-from hlfma.core.lanegraph import LaneGraph, wrap
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
+from vtd_adapter.lanegraph import LaneGraph, wrap
 
 LC_PENALTY = 25.0
 # 같은 거리 층 안에서 목표 차로를 고를 때의 가중치 [비용/m] — 경유점에 가까운 쪽 우선
@@ -172,9 +171,8 @@ def lane_change_window(lg, lanes, cum, seq, i, side, target):
 def min_turn_radius_m():
     """차량 최소회전반경 [m] = 축거 / tan(최대조향). params.yaml 을 읽는다."""
     try:
-        from hlfma.nodes.params import load_params_yaml
-        cfg = load_params_yaml(str(_pathlib.Path(__file__).resolve().parent.parent
-                                    / 'src' / 'hlfma' / 'config' / 'params.yaml'))
+        from vtd_adapter.config import load_params_yaml
+        cfg = load_params_yaml()
         vh = cfg['vehicle']
         return (float(vh['wheelbase']) / math.tan(float(vh['max_steer'])),
                 float(vh.get('min_turn_margin', 1.2)))

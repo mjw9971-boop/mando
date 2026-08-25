@@ -48,11 +48,11 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
-sys.path.insert(0, str(ROOT / 'src' / 'hlfma'))
+sys.path.insert(0, str(ROOT))
 
 from build_route import (RouteError, build_route, junction_segments,   # noqa: E402
                          read_waypoints_csv, report as route_report)
-from hlfma.core.lanegraph import LaneGraph                             # noqa: E402
+from vtd_adapter.lanegraph import LaneGraph                             # noqa: E402
 
 TEMPLATE = ROOT / 'templates' / '9_clean_drive.xml'
 THEMES_YAML = ROOT / 'configs' / 'themes.yaml'
