@@ -48,10 +48,11 @@ STOP_GRACE_S = 10.0       # 완주 도달 후 정지(v<0.5)를 기다리는 최�
 NO_DATA_S = 20.0          # 로그가 이 시간 동안 안 자라면 no-data 실패
 POLL_S = 2.0
 
-# 완주 임계는 하드코딩하지 않는다 — summarize_run.end_margin_m(params.yaml) 과 공용.
+# 완주 임계는 하드코딩하지 않는다 — vtd_adapter.config.end_margin_m(params.yaml) 과
+# 공용 (summarize_run·score 도 같은 함수를 본다).
 # (2026-08-25: stop_gap 1→4 튜닝 후 고정 임계 5 m 에 계획 정지점이 7.9 m 못 미쳐
 #  정상 완주가 전부 timeout 처리된 사고)
-from summarize_run import end_margin_m, load_cfg     # noqa: E402
+from vtd_adapter.config import end_margin_m, load_params_yaml as load_cfg  # noqa: E402
 
 DONE_RULE = ('완주 판정: 로그 ego.route_s ≥ route_{name}.pkl 총길이 − {margin:.1f} m '
              '(stop_gap+앞범퍼+여유, params.yaml 연동), 도달 후 v < 0.5 m/s 또는 '
@@ -350,11 +351,16 @@ class Runner:
     def collect(self, res: dict) -> None:
         if not res.get('log'):
             return
+        import pickle
+        lg = route = None
         try:
-            from summarize_run import load_map, summarize
-            import pickle
+            from summarize_run import load_map
             lg, _ = load_map()
             route = pickle.load(open(_ROOT / 'data' / f"route_{res['name']}.pkl", 'rb'))
+        except Exception as e:                          # noqa: BLE001
+            res['collect_error'] = f'map: {type(e).__name__}: {e}'
+        try:
+            from summarize_run import summarize
             s = summarize(res['log'], lg, route)
             f = s.get('finish', {})
             res.update(done=f.get('done'), dist_m=f.get('dist_m'), time_s=f.get('time_s'),
@@ -375,23 +381,28 @@ class Runner:
                     dmin = min(dmin, math.hypot(o['x'] - ex, o['y'] - ey))
             res['min_obj_dist_m'] = None if math.isinf(dmin) else round(dmin, 2)
         except Exception as e:                          # noqa: BLE001 — 수집 실패도 표에 남긴다
-            res['collect_error'] = f'{type(e).__name__}: {e}'
+            res['collect_error'] = res.get('collect_error', '') + f' {type(e).__name__}: {e}'
+        # 위반 검출 (tools/score.py — 배점 없음, 건수만). 전문은 {name}.score.txt 로.
         try:
-            cp = subprocess.run([sys.executable, str(_ROOT / 'tools' / 'score.py'), res['log']],
-                                capture_output=True, text=True, timeout=120)
-            (self.out_dir / f"{res['name']}.score.txt").write_text(cp.stdout + cp.stderr)
-            res['score_ok'] = (cp.returncode == 0)
+            import score as score_tool
+            rep = score_tool.analyze(res['log'], load_cfg(), lg, route)
+            (self.out_dir / f"{res['name']}.score.txt").write_text(
+                score_tool.render(rep), encoding='utf-8')
+            res['n_violations'] = rep['n_violations']
+            res['violations'] = {k: d['count'] for k, d in rep['violations'].items()
+                                 if d['count'] and k not in score_tool.INFO_KEYS}
         except Exception as e:                          # noqa: BLE001
-            res['score_ok'] = None
+            res['n_violations'] = None
             res['collect_error'] = res.get('collect_error', '') + f' score:{e}'
 
     # ── 표 ────────────────────────────────────────────────────────────────
     def report(self) -> str:
         hdr = ['시나리오', '상태', '완주', '거리[m]', '시간[s]', '평균[km/h]',
-               '최소객체거리[m]', 'E_STOP', 'shield', '과속틱', '감점없음', '비고']
+               '최소객체거리[m]', 'E_STOP', 'shield', '위반', '위반내역', '비고']
         rows = []
         for r in self.results:
             col = 'Y' if r.get('min_obj_dist_m') is not None and r['min_obj_dist_m'] < 2.5 else ''
+            nv = r.get('n_violations')
             rows.append([
                 r['name'], r['status'],
                 {True: 'O', False: 'X'}.get(r.get('done'), '-'),
@@ -399,8 +410,8 @@ class Runner:
                 ('%s%s' % (r.get('min_obj_dist_m', '-'), ' ⚠충돌?' if col else '')),
                 r.get('estop_ticks', '-'),
                 ','.join(f'{k}:{v}' for k, v in (r.get('shield') or {}).items()) or '-',
-                r.get('overspeed_ticks', '-'),
-                {True: 'O', False: 'X', None: '-'}.get(r.get('score_ok'), '-'),
+                '-' if nv is None else nv,
+                ','.join(f'{k}:{v}' for k, v in (r.get('violations') or {}).items()) or '-',
                 r.get('collect_error', ''),
             ])
         w = [max(len(str(h)), *(len(str(row[i])) for row in rows)) if rows else len(str(h))

@@ -192,11 +192,12 @@ def test_warned_csv_route_rejected():
     지나간다 — 그때는 기본 경로 재사용이 다시 허용되는 것이 맞다.
     """
     lg = gs.LaneGraph(str(ROOT / 'data' / 'lane_graph.pkl'))
-    pool = gs.RoutePool(lg, {'기본': {'csv': 'waypoints.csv'}}, seed=1)
+    _routes, _themes, gen_cfg = gs.load_themes()
+    pool = gs.RoutePool(lg, {'기본': {'csv': 'waypoints.csv'}}, seed=1, gen_cfg=gen_cfg)
     try:
         route = pool.get('기본')
     except gs.GenError as e:
-        assert 'build_route 경고' in str(e)
+        assert 'build_route 경고' in str(e) or '스폰 게이트' in str(e)
         with pytest.raises(gs.GenError):     # 두 번째 조회도 같은 사유로 즉시 탈락(캐시)
             pool.get('기본')
     else:

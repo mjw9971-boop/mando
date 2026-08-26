@@ -17,6 +17,5 @@ PDM-Lite(team_code/)가 CARLA 에서 받던 것들을 VTD 로부터 만들어 �
   control.py     VtdLongitudinalController (accel 직접 출력) + Command 변환
   ego.py         자차 속도 추정(9910 에 속도 필드 없음) + courseRespawn 리셋 감지
   config.py      config/params.yaml 로더 (VTD·어댑터 상수의 단일 출처)
-  logger.py      run_*.jsonl 틱 로그 (채점 파이프라인이 읽는 스키마 — 변경 금지)
-  scoring.py     제한속도 감점 판정 (tools/score.py 가 사용)
+  logger.py      run_*.jsonl 틱 로그 (위반 검출 파이프라인이 읽는 스키마 — 변경 금지)
 """

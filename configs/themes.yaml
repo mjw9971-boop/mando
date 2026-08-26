@@ -26,6 +26,19 @@
 # 로직이 아직 대응 못 하는 주제(대향차·컷인 등)도 생성은 된다 — 실패 목록이
 # 곧 미구현 우선순위 자료다.
 
+# [gen] 생성 검증 게이트 상수 (하드코딩 금지 — gen_scenarios.spawn_gate 가 읽는다)
+gen:
+  # 스폰-경로 정합: XML 의 Ego 스폰(Path01 첫 waypoint + PathRef StartS/StartLane)을
+  # lane_graph 로 되짚은 해석의 heading 이 경로 시작 heading 과 이보다 크게 다르면
+  # 그 시나리오를 폐기하고 다른 시작점으로 재시도한다.
+  # 실측(2026-08-26, 완주속도_01_속도전환2): 첫 waypoint 뒤(−s)로도 둘째 waypoint
+  # 도로에 닿는 우회가 있으면 VTD 가 Path 를 역방향 차로망으로 해석해 반대편
+  # 연결로 (3174,0,-1) 에 스폰했다 (heading 차 173°, 조향 포화 → courseRespawn 반복).
+  spawn_heading_max_deg: 30.0
+  # 역방향 우회가 "정방향 경로거리 × 이 값" 이내로 존재할 때만 역방향 해석이
+  # 실재한다고 본다 (VTD 라우터 메트릭을 모르므로 통행방향 무시 탐색, 보수적).
+  reverse_ratio_max: 2.0
+
 routes:
   기본:
     csv: waypoints.csv        # 검증된 연습 경로 (교차로 짝 1)

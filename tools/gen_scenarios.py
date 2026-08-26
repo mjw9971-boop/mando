@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import itertools
 import json
 import math
@@ -52,7 +53,7 @@ sys.path.insert(0, str(ROOT))
 
 from build_route import (RouteError, build_route, junction_segments,   # noqa: E402
                          read_waypoints_csv, report as route_report)
-from vtd_adapter.lanegraph import LaneGraph                             # noqa: E402
+from vtd_adapter.lanegraph import LaneGraph, wrap                       # noqa: E402
 
 TEMPLATE = ROOT / 'templates' / '9_clean_drive.xml'
 THEMES_YAML = ROOT / 'configs' / 'themes.yaml'
@@ -364,7 +365,112 @@ def route_check(lg, rt):
     return warns, first
 
 
-def synth_walk(lg, rng, name, spec) -> Route:
+# ── 스폰-경로 정합 게이트 ────────────────────────────────────────────────
+# XML 의 Ego 스폰(Path01 첫 waypoint + PathRef StartS/StartLane)은 도로·s 만
+# 지정하고 진행방향을 못 박는다. 실측(2026-08-26, 완주속도_01_속도전환2):
+# 첫 waypoint 뒤쪽(−s)에도 둘째 waypoint 도로로 이어지는 우회가 있으면
+# (무방향 608 m vs 정방향 587 m) VTD 가 Path 를 역방향 차로망으로 해석해
+# 반대편 연결로에 스폰했다 — 되짚기 예측 (3174,0,-1)@7.5 m·hdg −4.2° 가
+# 실측 (1423.0,1163.2)·hdg −3.4° 와 일치. 정상 케이스(도로 30)는 시작점
+# 뒤가 막다른 끝(반대 차로 successors=[])이라 역방향 해석 자체가 없다.
+
+GATE_STATS = {'ok': 0, 'reject': 0}     # main 이 리셋·요약 출력
+
+
+def _reverse_spawn(lg, rt, wp1_road_s):
+    """역방향 해석의 스폰 되짚기 → (lane, s_in_lane, heading). 반대 차로망이 없으면 None.
+
+    Path01 첫 waypoint(road_s=wp1_road_s)를 도로 −s 방향(반대 dir 차로망) 위치로
+    보고, 그 차로의 주행방향으로 StartS 만큼 전진한 지점 — VTD 가 역방향으로
+    해석했을 때 Ego 가 놓이는 자리다."""
+    start_key = tuple(rt['lanes'][0])
+    start_s = float(rt['start_s_in_lane'])
+    opp = lg.opposite_of(start_key)
+    if opp is None:
+        return None
+    r = lg.lanes[opp]
+    rs = np.asarray(r['road_s'], float)
+    ls = np.asarray(r['s'], float)
+    # dir=-1 차로는 road_s 가 감소 배열 — np.interp 는 x 증가 필요
+    if rs[0] > rs[-1]:
+        s_cur = float(np.interp(wp1_road_s, rs[::-1], ls[::-1]))
+    else:
+        s_cur = float(np.interp(wp1_road_s, rs, ls))
+    cur, rem = opp, start_s
+    for _ in range(30):
+        left = lg.length(cur) - s_cur
+        if rem <= left:
+            s_fin = s_cur + rem
+            _x, _y, _z, h = lg.point_at(cur, s_fin)
+            return cur, s_fin, h
+        rem -= left
+        nxts = lg.successors(cur)
+        if not nxts:
+            L = lg.length(cur)
+            _x, _y, _z, h = lg.point_at(cur, L)
+            return cur, L, h
+        cur = min(nxts, key=lambda k2: abs(wrap(_hdg_start(lg, k2) - _hdg_end(lg, cur))))
+        s_cur = 0.0
+    _x, _y, _z, h = lg.point_at(cur, s_cur)
+    return cur, s_cur, h
+
+
+def _reverse_reaches(lg, seed_lane, target_road, cap_m) -> bool:
+    """seed_lane 에서 **주행방향(successor)으로** target_road 까지 cap_m 안에 닿는가.
+
+    역방향 해석이 실재하려면 그 스폰 지점에서 차가 실제로 굴러갈 경로가 wp2
+    도로로 이어져야 한다 — 실측 케이스도 successor 체인(864 m)으로 설명된다.
+    반대 차로가 막다른 끝(successors 없음, 예: 도로 30)이면 VTD 는 그 해석으로
+    Path 를 완성할 수 없으므로 통과다."""
+    heap = [(0.0, seed_lane)]
+    seen = set()
+    while heap:
+        c, k = heapq.heappop(heap)
+        if k in seen:
+            continue
+        seen.add(k)
+        if k[0] == target_road:
+            return True
+        if c > cap_m:
+            continue
+        for k2 in lg.successors(k):
+            if k2 not in seen:
+                heapq.heappush(heap, (c + lg.length(k2), k2))
+    return False
+
+
+def spawn_gate(lg, rt, gen_cfg):
+    """스폰-경로 정합 게이트. 문제가 있으면 사유 문자열, 통과면 None.
+
+    "XML 에 쓸 값을 lane_graph 로 되짚은 스폰 해석"과 "경로 첫 차로 heading"을
+    대조한다. 정방향 해석은 경로 시작 차로 그 자체(차 0°)이므로, 역방향 해석이
+    존재하고(반대 차로망으로 둘째 waypoint 도로 도달, 정방향 경로거리 ×
+    reverse_ratio_max 이내) heading 차가 spawn_heading_max_deg 를 넘으면 폐기."""
+    thr_deg = float(gen_cfg['spawn_heading_max_deg'])
+    ratio = float(gen_cfg['reverse_ratio_max'])
+    try:
+        wps = path_waypoints(lg, rt)
+    except GenError as e:
+        return f'Path01 waypoint 구성 불가: {e}'
+    start_key = tuple(rt['lanes'][0])
+    _x, _y, _z, h_route = lg.point_at(start_key, float(rt['start_s_in_lane']))
+    rev = _reverse_spawn(lg, rt, wps[0][1])
+    if rev is None:
+        return None                     # 시작점 뒤로 나가는 차로망이 없다 — 모호성 없음
+    lane_r, s_r, h_r = rev
+    d_deg = math.degrees(abs(wrap(h_r - h_route)))
+    if d_deg <= thr_deg:
+        return None
+    wp2_road = wps[1][0]
+    fwd_m = next((rt['cum_s'][i] for i, k in enumerate(rt['lanes']) if k[0] == wp2_road),
+                 rt['total_length'])
+    if not _reverse_reaches(lg, lane_r, wp2_road, max(float(fwd_m), 50.0) * ratio):
+        return None                     # 역방향으로는 wp2 도로에 못 간다 — VTD 가 택할 수 없음
+    return (f'스폰 방향 모호 — 역방향 해석 {lane_r}@{s_r:.1f} m, 경로 시작과 heading 차 '
+            f'{d_deg:.0f}° (>{thr_deg:g}°), 뒤쪽으로 waypoint2 도로({wp2_road}) 우회 존재')
+
+
+def synth_walk(lg, rng, name, spec, gen_cfg) -> Route:
     """walk 사양 → 검증까지 마친 Route. 실패는 GenError (무음 실패 금지)."""
     turns = spec.get('turns', ['any'])
     tail = float(spec.get('tail_m', 100))
@@ -398,9 +504,14 @@ def synth_walk(lg, rng, name, spec) -> Route:
         warns, first = route_check(lg, route.rt)
         if warns:
             continue                     # build_route 경고가 하나라도 있으면 폐기 후 재시도
+        why = spawn_gate(lg, route.rt, gen_cfg)
+        if why:
+            GATE_STATS['reject'] += 1    # VTD 가 역방향 스폰할 수 있는 시작점 — 재시도
+            continue
+        GATE_STATS['ok'] += 1
         return route
-    raise GenError(f'경로 {name}: {min(len(order),300)}개 출발 후보로 걸어도 빌드 경고 0 인 '
-                   f'경로를 못 만들었다 (turns={turns}, require={require})')
+    raise GenError(f'경로 {name}: {min(len(order),300)}개 출발 후보로 걸어도 빌드 경고 0 · '
+                   f'스폰 게이트 통과인 경로를 못 만들었다 (turns={turns}, require={require})')
 
 
 class RoutePool:
@@ -411,8 +522,9 @@ class RoutePool:
     csv 경로는 시작점이 파일에 고정이라 salt 의 영향이 없다.
     """
 
-    def __init__(self, lg, defs: dict, seed: int):
+    def __init__(self, lg, defs: dict, seed: int, gen_cfg: dict):
         self.lg, self.defs, self.seed = lg, defs, seed
+        self.gen_cfg = gen_cfg
         self.cache: dict = {}
 
     def get(self, name: str, variant: int = 1, salt: str = '') -> Route:
@@ -437,11 +549,18 @@ class RoutePool:
                 err = GenError(f'경로 {name}({d["csv"]}): build_route 경고 {warns}건 — {first}')
                 self.cache[key] = err
                 raise err
+            why = spawn_gate(self.lg, r.rt, self.gen_cfg)
+            if why:                     # csv 는 재시도할 다른 시작점이 없다 — 경로째 탈락
+                GATE_STATS['reject'] += 1
+                err = GenError(f'경로 {name}({d["csv"]}): 스폰 게이트 탈락 — {why}')
+                self.cache[key] = err
+                raise err
+            GATE_STATS['ok'] += 1
         elif 'walk' in d:
             seed_str = f'{self.seed}:route:{name}:{variant}' + (f':{salt}' if salt else '')
             rng = random.Random(seed_str)
             label = name if variant == 1 else f'{name}{variant}'
-            r = synth_walk(self.lg, rng, label, d['walk'])
+            r = synth_walk(self.lg, rng, label, d['walk'], self.gen_cfg)
         else:
             raise GenError(f'경로 {name}: csv 또는 walk 정의가 필요하다')
         self.cache[key] = r
@@ -1448,7 +1567,12 @@ def load_themes():
     if not THEMES_YAML.exists():
         raise GenError(f'{THEMES_YAML} 이 없다')
     data = yaml.safe_load(THEMES_YAML.read_text(encoding='utf-8'))
-    return data.get('routes', {}), data.get('themes', {})
+    gen_cfg = data.get('gen') or {}
+    for k in ('spawn_heading_max_deg', 'reverse_ratio_max'):
+        if k not in gen_cfg:
+            raise GenError(f'{THEMES_YAML} 에 gen.{k} 가 없다 — 게이트 임계는 '
+                           f'설정 파일이 단일 출처다 (하드코딩 금지)')
+    return data.get('routes', {}), data.get('themes', {}), gen_cfg
 
 
 def write_scenario(out_dir, theme, name, xml_text, sdef, rows):
@@ -1509,7 +1633,8 @@ def main(argv=None) -> int:
     if a.hours is not None and a.count is not None:
         raise GenError('--hours 와 --count 는 함께 쓸 수 없다')
 
-    route_defs, themes = load_themes()
+    route_defs, themes, gen_cfg = load_themes()
+    GATE_STATS['ok'] = GATE_STATS['reject'] = 0
 
     if a.list:
         for th, cfg in themes.items():
@@ -1526,6 +1651,9 @@ def main(argv=None) -> int:
         sdef = yaml.safe_load(pathlib.Path(a.from_yaml).read_text(encoding='utf-8'))
         rows = [tuple(r) for r in sdef['route']['rows']]
         route = _build_from_rows(lg, sdef['route']['name'], rows)
+        why = spawn_gate(lg, route.rt, gen_cfg)
+        if why:                         # 게이트 도입 전에 저장된 정의일 수 있다 — 재생성 거부
+            raise GenError(f'{a.from_yaml}: 스폰 게이트 탈락 — {why}')
         axes = sdef['axes']
         variant = {k: v for k, v in axes.items() if k not in ('route', 'event')}
         variant['route'] = tuple(axes['route'])
@@ -1547,7 +1675,7 @@ def main(argv=None) -> int:
         if th not in themes:
             raise GenError(f'모르는 주제 "{th}" — 가능한 주제: {", ".join(themes)}')
 
-    pool = RoutePool(lg, route_defs, a.seed)
+    pool = RoutePool(lg, route_defs, a.seed, gen_cfg)
     combos = {th: expand_theme(th, themes[th], a.seed) for th in a.themes}
 
     def route_len(route_key):
@@ -1635,6 +1763,12 @@ def main(argv=None) -> int:
                   f'{" 외" if len(uniq) > 3 else ""}]: {why}')
     if warn_total:
         print(f'\n⚠ 횡거리 경고 {warn_total}건 — 위 로그 확인')
+    g_ok, g_rej = GATE_STATS['ok'], GATE_STATS['reject']
+    line = f'\n스폰-경로 게이트: 통과 {g_ok}경로 / 폐기 {g_rej}회 (재시도 포함)'
+    if g_rej > g_ok:
+        line += ('  ⚠ 폐기가 통과보다 많다 — walk 시작점 선정이 "뒤쪽 탈출로 있는 '
+                 '양방향 도로"에 편중됐다는 신호 (start_pool 조건 검토)')
+    print(line)
     if walk_starts:
         print(f'\n[실기 1회 확인] 합성 경로 시작 도로 {sorted(walk_starts)} — '
               f'Ego PathRef/Path01 은 경로 기준으로 생성했지만, VTD 스폰이 실제로 '

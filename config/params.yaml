@@ -97,6 +97,17 @@ batch:
   # route_s 무전진이 이 시간 지속 → no_progress 종료 (적60 대기 60 s 보다 길게)
   no_progress_end_s: 120.0
 
+score:
+  # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.
+  # 충돌·근접: 자차·객체를 회전 사각형으로 보고 **외곽 간 최소 간격** 기준.
+  collision_dist_m: 0.1    # 간격 ≤ 이 값 → 충돌로 집계
+  near_dist_m: 1.5         # 간격 ≤ 이 값 → 근접 경고 (충돌 미만)
+  stop_speed_mps: 0.5      # "정지 상태" 판정 속도 (정지선 침범 검출)
+  time_limit_s: 300.0      # 대회 완주 제한시간 (5분)
+  # 초과 구간 병합: 이 시간 이하로 임계 아래로 내려갔다 다시 넘으면 같은 1건
+  # (제어기가 임계 바로 밑에서 진동하면 1틱짜리 건이 수백 개로 쪼개진다)
+  merge_gap_s: 1.0
+
 log:
   enabled: true
   dir: logs

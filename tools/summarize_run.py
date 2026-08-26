@@ -73,10 +73,8 @@ def end_margin_m(cfg: dict) -> float:
     따라간다 — 2026-08-25: stop_gap 1→4 후 고정 임계 5 m 로 완주가 timeout 처리.
     batch_run 과 여기(완주 표기)가 같은 함수를 쓴다.
     """
-    sp, vh = cfg['speed'], cfg['vehicle']
-    return (float(sp['stop_gap_m']) + float(vh['wheelbase'])
-            + float(vh.get('front_overhang_m', 0.855))
-            + float(cfg.get('batch', {}).get('end_slack_m', 1.0)))
+    from vtd_adapter.config import end_margin_m as _canon   # 단일 출처로 위임
+    return _canon(cfg)
 
 
 def segments(vals):
