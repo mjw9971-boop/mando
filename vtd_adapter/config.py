@@ -42,11 +42,11 @@ def end_margin_m(cfg: dict[str, Any]) -> float:
     """완주 임계 [m]: route_s(뒷축) ≥ total − 이 값이면 완주.
 
     계획 정지점이 total − stop_gap − (wheelbase + front_overhang) 이므로
-    임계 = stop_gap + 앞범퍼거리 + 여유(end_slack). stop_gap 튜닝을 자동으로
+    임계 = stop_gap_route_end + 앞범퍼거리 + 여유(end_slack). stop_gap 튜닝을 자동으로
     따라간다 — 2026-08-25: stop_gap 1→4 후 고정 임계 5 m 로 완주가 timeout 처리.
     batch_run / summarize_run / score 가 전부 이 함수를 본다 (단일 출처).
     """
     sp, vh = cfg['speed'], cfg['vehicle']
-    return (float(sp['stop_gap_m']) + float(vh['wheelbase'])
+    return (float(sp['stop_gap_route_end_m']) + float(vh['wheelbase'])
             + float(vh.get('front_overhang_m', 0.855))
             + float(cfg.get('batch', {}).get('end_slack_m', 1.0)))

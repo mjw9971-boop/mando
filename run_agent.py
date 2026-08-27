@@ -73,6 +73,21 @@ def build_route_from_csv(csv_path: str, graph_path: str, out_dir: str | None = N
     return str(out)
 
 
+def build_pdm_config(cfg: dict) -> 'GlobalConfig':
+    """PDM GlobalConfig — 원문 무수정 유지, 대회 정합 오버라이드만 주입한다.
+
+    정지선(적신호) 정지 위치는 PDM 의 idm_red_light_minimum_distance(뒷축 gap,
+    원문 6.0)가 지배한다. 대회 7번(범퍼가 정지선 앞 2 m 이내 정지 = 정상,
+    통과 = 중대)에 맞춰 앞범퍼가 정지선 앞 speed.stop_gap_stopline_m 에 서도록
+    (그 값 + 앞범퍼 오프셋)으로 유도한다 — params.yaml 이 단일 출처.
+    """
+    gc = GlobalConfig()
+    vh = cfg['vehicle']
+    front = float(vh['wheelbase']) + float(vh['front_overhang_m'])
+    gc.idm_red_light_minimum_distance = float(cfg['speed']['stop_gap_stopline_m']) + front
+    return gc
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description='HL FMA 2026 에이전트 (PDM-Lite/VTD)')
     ap.add_argument('--host', default=None, help='VTD 호스트 (기본: config)')
@@ -151,7 +166,7 @@ class Runner:
             raise SystemExit(f'route 파일 없음: {route_path}')
 
         # ── 어댑터 + PDM-Lite 조립 ────────────────────────────────────────
-        self.pdm_config = GlobalConfig()
+        self.pdm_config = build_pdm_config(self.cfg)
         self.tracker = EgoTracker(self.lg, self.route, self.cfg)
         self.world = VtdWorld(self.cfg)
         self.vmap = VtdMap(self.lg)

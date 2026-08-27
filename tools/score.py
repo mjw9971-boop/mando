@@ -755,7 +755,7 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
         total = float(route['total_length'])
         stop_s, _clipped = plan_stop_s(cfg, total, finish_s)
         front = float(cfg['vehicle']['wheelbase']) + float(cfg['vehicle']['front_overhang_m'])
-        planned_stop = stop_s - float(cfg['speed']['stop_gap_m']) - front   # 계획 정지 시 뒷축
+        planned_stop = stop_s - float(cfg['speed']['stop_gap_route_end_m']) - front   # 계획 정지 시 뒷축
         rep['finish']['finish_s'] = None if finish_s is None else round(float(finish_s), 1)
         rep['finish']['planned_stop_s'] = round(planned_stop, 1)
         rep['finish']['margin_m'] = (None if finish_s is None

@@ -29,7 +29,7 @@ from test_route_end import (FakeEgo, FakePlanner, TOTAL,   # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
 FRONT = CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m']
-GAP = CFG['speed']['stop_gap_m']
+GAP = CFG['speed']['stop_gap_route_end_m']
 CLEAR = CFG['scoring']['finish_clearance_m']
 SLACK = CFG['batch']['end_slack_m']
 

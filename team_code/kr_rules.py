@@ -14,10 +14,19 @@ route_end — 경로 종점 정지:
   주행 → 경로 밖 이탈 → courseRespawn 9회.
 
   구현: "종점에 정지해 있는 길이 0 유령 선행차" 를 IDM 에 넣는다. 유효거리를
-  d_end − 앞범퍼, s0 를 speed.stop_gap_m 으로 주면 앞범퍼가 종점 −
-  stop_gap 에 선다 — 기존 정지선 정지와 같은 관례고, batch 완주 임계
-  (total − end_margin, end_margin = stop_gap + 앞범퍼 + end_slack)보다
-  end_slack_m 만큼 안쪽이라 완주 판정과 자동 정합한다 (tests/test_route_end).
+  d_end − 앞범퍼, s0 를 speed.stop_gap_route_end_m 으로 주면 앞범퍼가 기준점 −
+  stop_gap 에 선다. batch 완주 임계(total − end_margin, end_margin = stop_gap +
+  앞범퍼 + end_slack)보다 end_slack_m 만큼 안쪽이라 완주 판정과 자동 정합한다
+  (tests/test_route_end). ※ 정지선(적신호) 정지는 이 관례와 무관 — PDM
+  red-light IDM 소관이고 run_agent.build_pdm_config 가 stop_gap_stopline_m 로
+  주입한다. 여기서는 그 정지의 **0.5 s 유지**만 홀드로 보강한다 (아래).
+
+stopline hold — 정지선 정지 유지:
+  대회 7번: 정지선 앞 정지는 0.5 s 이상 유지해야 정상. 실측(2026-08-27,
+  보행자집중_06) 0.4 s 만에 재출발한 사례가 감점 대상이라, 적신호 정지선
+  근처(stopline_hold_near_m)에서 저속(latch_v — 기존 래치 관례 재사용)이 되면
+  stopline_hold_s 동안 목표 0 을 유지한다. 홀드 중에는 신호가 녹색으로 바뀌어도
+  잔여 시간을 채운다.
 
   래치: 종점 근처(latch_m)에서 저속(latch_v)이 되면 래치 — 재출발하지 않는다.
   d_end 가 unlatch_m 이상으로 다시 커지면(courseRespawn 으로 뒤로 간 경우)
@@ -46,7 +55,7 @@ def plan_stop_s(cfg: dict, total: float, finish_s: float | None) -> tuple[float,
         return float(total), False
     sp, vh = cfg['speed'], cfg['vehicle']
     want = (float(finish_s) + float(cfg['scoring']['finish_clearance_m'])
-            + float(sp['stop_gap_m'])
+            + float(sp['stop_gap_route_end_m'])
             + float(vh['wheelbase']) + float(vh['front_overhang_m']))
     cap = float(total) - float(cfg.get('batch', {}).get('end_slack_m', 1.0))
     return (min(want, cap), want > cap)
@@ -70,7 +79,7 @@ class KrRules:
         re_cfg = cfg['route_end']
         sp, vh = cfg['speed'], cfg['vehicle']
         self.cfg = cfg
-        self.stop_gap = float(sp['stop_gap_m'])
+        self.stop_gap = float(sp['stop_gap_route_end_m'])
         self.front = float(vh['wheelbase']) + float(vh['front_overhang_m'])
         self.T = float(re_cfg['idm_time_headway'])
         self.active_m = float(re_cfg['active_m'])
@@ -79,9 +88,15 @@ class KrRules:
         self.unlatch_m = float(re_cfg['unlatch_m'])
         self.target_mode = str(re_cfg['target_mode'])
         self.finish_xy = (cfg['scoring'] or {}).get('finish_xy')
+        # 정지선 0.5 s 유지 홀드 (규정 + 여유는 params 가 단일 출처).
+        # 틱 카운트로 잰다 — wall clock 은 리플레이/시뮬에서 흐름이 다르다.
+        self.sl_hold_ticks = int(round(float(sp['stopline_hold_s'])
+                                       * float(cfg['comm']['send_hz'])))
+        self.sl_near_m = float(sp['stopline_hold_near_m'])
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
+        self.sl_hold_left = 0                      # 정지선 홀드 잔여 틱
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
@@ -108,6 +123,31 @@ class KrRules:
             print(f'[kr_rules] ⚠ 계획 정지점이 종료선을 못 넘는다 — finish_s {finish_s:.1f} '
                   f'+ 여유가 경로 종점을 초과 (경로 꼬리 부족). 종점까지 주행한다', flush=True)
         return stop_s
+
+    def _stopline_hold(self, planner, ego_speed: float) -> float | None:
+        """적신호 정지선 정지의 최소 유지 (speed.stopline_hold_s) — 목표 0 후보.
+
+        다음 신호 정지선이 적색이고 앞범퍼가 stopline_hold_near_m 안에서
+        저속(latch_v — 기존 래치 관례 재사용)이 되면 홀드 시작. 홀드 중에는
+        신호가 녹색으로 바뀌어도 잔여 틱을 채운다 (규정 "0.5 s 이상 정지" —
+        실측 0.4 s 재출발이 감점 대상). 신호 정보가 없는 환경(목 플래너 등)
+        에서는 개입하지 않는다.
+        """
+        if self.sl_hold_left > 0:
+            self.sl_hold_left -= 1
+            return 0.0
+        dists = getattr(planner, 'distances_to_next_traffic_lights', None)
+        tls = getattr(planner, 'next_traffic_lights', None)
+        if dists is None or tls is None:
+            return None
+        tl = tls[planner.route_index]
+        if tl is None or getattr(getattr(tl, 'state', None), 'name', None) != 'Red':
+            return None
+        d_front = float(dists[planner.route_index]) - self.front
+        if d_front < self.sl_near_m and ego_speed < self.latch_v:
+            self.sl_hold_left = max(0, self.sl_hold_ticks - 1)   # 이번 틱 포함
+            return 0.0
+        return None
 
     def apply(self, control, target_speed: float, ap):
         """(control, target_speed) → 규칙 반영 후 (control, target_speed).
@@ -150,6 +190,11 @@ class KrRules:
                 s0=self.stop_gap,
                 T=self.T,
             ))
+
+        # 정지선 0.5 s 유지 홀드 — route_end 후보와 min 으로 합류
+        hold = self._stopline_hold(planner, ego_speed)
+        if hold is not None and (candidate is None or hold < candidate):
+            candidate = hold
 
         if candidate is not None:
             self.last_candidate = candidate

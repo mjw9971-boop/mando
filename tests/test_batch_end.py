@@ -18,7 +18,7 @@ def test_end_margin_tracks_stop_policy():
     cfg = load_cfg()
     m = end_margin_m(cfg)
     sp, vh = cfg['speed'], cfg['vehicle']
-    planned_stop_short = sp['stop_gap_m'] + vh['wheelbase'] + vh['front_overhang_m']
+    planned_stop_short = sp['stop_gap_route_end_m'] + vh['wheelbase'] + vh['front_overhang_m']
     # 임계는 계획 정지점 미달량보다 커야 하고(안 그러면 사고 재발),
     # 과거 통과 기준(5.0)보다 좁아지면 안 된다(회귀).
     assert m > planned_stop_short

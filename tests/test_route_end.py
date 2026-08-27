@@ -29,7 +29,7 @@ from vtd_adapter.carla_types import VehicleControl  # noqa: E402
 CFG = load_params_yaml(PARAMS_YAML)
 TOTAL = 821.1
 FRONT = CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m']
-GAP = CFG['speed']['stop_gap_m']
+GAP = CFG['speed']['stop_gap_route_end_m']
 
 
 class FakePlanner:
