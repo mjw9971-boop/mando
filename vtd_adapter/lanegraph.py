@@ -157,6 +157,26 @@ class LaneGraph:
                 return typ, col, ok
         return ('none', 'standard', False) if not segs else segs[-1][2:]
 
+    # 점선 구간 두 개가 이만큼 안쪽으로 붙어 있으면 하나로 잇는다 (샘플 경계 오차)
+    MARK_JOIN_M = 1e-6
+
+    def dashed_runs(self, key: LaneKey, side: str):
+        """side 방향 **연속 점선** 구간 [(s0, s1) ...]. 실선/none 에서 끊긴다.
+
+        차선변경이 물리적으로 허용되는 구간의 단일 출처다 — build_route(경로 생성)와
+        VtdRoutePlanner(제어기 블렌드)가 같은 답을 봐야 실선 위 차선변경(S2.2.05)이
+        한쪽에서만 걸러지는 일이 없다.
+        """
+        marks = self.lanes[key]['left_mark' if side == 'left' else 'right_mark']
+        segs = sorted((a, b) for a, b, typ, col, ok in marks if ok)
+        out: List[List[float]] = []
+        for a, b in segs:
+            if out and a - out[-1][1] <= self.MARK_JOIN_M:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return [(a, b) for a, b in out]
+
     def lane_change_ok(self, key: LaneKey, s: float, side: str) -> bool:
         """이 지점에서 side 로 차선변경 가능? (점선 + 옆차로 존재)"""
         if self.neighbor(key, side) is None:

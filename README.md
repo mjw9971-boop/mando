@@ -30,7 +30,7 @@ vtd_adapter/        VTD ↔ CARLA 어댑터. **판단 없음**
   world.py actor.py   carla.World / carla.Actor 흉내 (객체 트래킹·코스팅)
   map.py              carla.Map / Waypoint 흉내 (lanegraph 위)
   lanegraph.py        lane_graph.pkl 런타임 조회
-  route.py            VtdRoutePlanner + 9910 light ↔ 정지선 controller 대조
+  route.py            VtdRoutePlanner (+실선 차선변경 가드) + 9910 light ↔ 정지선 대조
   control.py          종방향 P 제어 (throttle 자리에 accel 출력) + Command 변환
   config.py           config/params.yaml 로더 + end_margin_m
   logger.py           run_*.jsonl 틱 로그 (score/summarize/replay 의 계약)
@@ -223,9 +223,9 @@ python3 tools/plot_lane_graph.py data/lane_graph.pkl -o docs/images/map_full.png
 | `vtd_adapter/comm` `frame` `carla_types` `types` `config` `logger` | 완전 구현 |
 | `vtd_adapter/ego` | 창 기반 속도추정·차로매칭·route_s·리셋/스톨 감지 완비 |
 | `vtd_adapter/world` `actor` `map` | CARLA 표면 흉내 완비 (객체 80 m/30개 규칙·코스팅 포함) |
-| `vtd_adapter/route` | 경로 재샘플·LC 블렌드·테이퍼 보정·신호 대조 완비 |
+| `vtd_adapter/route` | 경로 재샘플·LC 블렌드·테이퍼 보정·신호 대조·실선 LC 가드 완비 |
 | `vtd_adapter/control` | 종방향 P + 감속 클램프 + jerk 제한 |
-| `vtd_adapter/lanegraph` | 창 병합·cum_s·lookahead 완비 |
+| `vtd_adapter/lanegraph` | 창 병합·cum_s·lookahead·dashed_runs(점선 단일 출처) 완비 |
 | `team_code/autopilot` | PDM-Lite 원문 (`_manage_route_obstacle_scenarios` 는 stub) |
 | `team_code/kr_rules` | route_end 종점 정지 + 적신호 정지선 최소 유지 + 방향지시등. RTOR·황색 딜레마는 미착수 |
 | shield (corridor·실선·중앙선·TTC 비상제동) | **없음** — 안전망은 SAFE_STOP·watchdog·리셋 초기화뿐 |

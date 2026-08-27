@@ -46,8 +46,8 @@ run_agent.py                     (a) 진입점. 어댑터+PDM 조립, 20 Hz 틱 
 │  ├─ world.py                   VtdWorld = carla.World 흉내. 객체 트래킹·80 m/30개 규칙·코스팅
 │  ├─ actor.py                   VtdActor / VtdEgo = carla.Actor 흉내 (CARLA 프레임)
 │  ├─ map.py                     VtdMap / VtdWaypoint = carla.Map 흉내 (lanegraph 위에 얹음)
-│  ├─ lanegraph.py               lane_graph.pkl 런타임 조회 (차로 매칭·정지선·제한속도·lookahead)
-│  ├─ route.py                   VtdRoutePlanner (PDM 경로 플래너 표면) + 9910 light↔정지선 대조
+│  ├─ lanegraph.py               lane_graph.pkl 런타임 조회 (차로 매칭·정지선·제한속도·lookahead·점선)
+│  ├─ route.py                   VtdRoutePlanner (PDM 경로 플래너 표면) + 실선 LC 가드 + 신호 대조
 │  ├─ control.py                 종방향 P 제어 → **accel 직접 출력**, VehicleControl → Command 변환
 │  ├─ config.py                  params.yaml 로더 + end_margin_m (완주 임계 공용 함수)
 │  └─ logger.py                  run_*.jsonl 틱 로그 (score/summarize/replay 의 계약 스키마)
@@ -71,8 +71,8 @@ run_agent.py                     (a) 진입점. 어댑터+PDM 조립, 20 Hz 틱 
 ├─ templates/*.xml               (d) 검증된 VTD 시나리오 원본. gen_scenarios 가 9_clean_drive.xml 을 베이스로 사용
 ├─ data/                         (d) 지도·경로 자산 (xodr, lane_graph.pkl, route.pkl, junction_ctrl_map.json)
 ├─ docs/                         (d) lane_graph.md(지도 빌드), PDM_MIGRATION_PLAN.md(이식 계획), 이 문서
-└─ tests/                        (e) pytest 19개 — comm 파싱/송신, 속도추정, 리셋, lanegraph,
-                                     adapter, route_end/finish/stopline, scoring, batch, gen_scenarios
+└─ tests/                        (e) pytest 20개 — comm 파싱/송신, 속도추정, 리셋, lanegraph,
+                                     adapter, route_end/finish/stopline, 지시등, 실선 LC, scoring, batch, gen_scenarios
 ```
 
 ### config/ 와 configs/ 의 차이

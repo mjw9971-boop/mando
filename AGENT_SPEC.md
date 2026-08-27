@@ -240,8 +240,14 @@ min 중재 구조 자체는 PDM 이 그대로 한다 **[구현됨]** [autopilot.
   — 매칭 전환 시 base 교체가 경계 요동(1.2 s, ±0.36) 실사고.
   - **[부분]** — 차선변경 **경로**는 빌드 시점에 확정된다: `VtdRoutePlanner._build` 가
     LC 이음매를 최대 25 m 코사인 블렌드로 이어 붙이고 그 구간 command 를
-    CHANGELANELEFT/RIGHT 로 둔다 ([route.py:126-131](vtd_adapter/route.py#L126-L131)).
-    base 고정 문제는 경로가 정적이라 구조적으로 사라졌다.
+    CHANGELANELEFT/RIGHT 로 둔다. base 고정 문제는 경로가 정적이라 구조적으로 사라졌다.
+  - **실선 금지(S2.2.05) [구현됨]** — 이중 게이트다. ① 경로 탐색이 점선 있는 이웃만
+    확장하고 창을 점선 구간에서 뽑는다 ([build_route.has_broken](tools/build_route.py#L63),
+    [lane_change_window](tools/build_route.py#L116)) ② 제어기가 마지막 관문으로 블렌드
+    구간을 점선 안으로 좁힌다 ([route._clip_to_dashed](vtd_adapter/route.py#L158)) —
+    손으로 만든·옛 route.pkl 방어. 점선 판정은 [LaneGraph.dashed_runs](vtd_adapter/lanegraph.py#L164)
+    가 단일 출처다 (두 게이트가 다른 답을 보면 한쪽만 걸러진다).
+    ※ 계획 밖 **드리프트로 실선을 넘는 것**은 여전히 못 막는다 — §3.4 shield 몫.
   - **[미구현]** — 런타임 판단: `lc_clear`(측방 안전 확인), 창 연장·`lead_short`.
     즉 **옆차로에 차가 있어도 그대로 진입한다.** (지시등 lead 는 아래 항목에서 구현됨)
 - **지시등**: 회전 = lookahead turn 이벤트 lead 4 s 전 점등, 연결로 끝(end_s)까지 유지.
@@ -266,8 +272,9 @@ corridor·실선·중앙선 가드, TTC 비상제동(1.5 s, 저크 해제). §7-
 
 > 현재 저장소에 shield 에 해당하는 모듈이 없다. PDM 의 OBB forecast 충돌 회피가
 > TTC 비상제동 역할을 일부 대신하지만, **Planner 를 불신하는 독립 감시 계층은 없다.**
-> corridor·실선·중앙선 가드는 주행 중 강제하는 코드가 없고 `tools/score.py` 의
-> 사후 검출만 있다 ([score.py:170](tools/score.py#L170), [score.py:237](tools/score.py#L237)).
+> corridor·중앙선 가드는 주행 중 강제하는 코드가 없고 `tools/score.py` 의 사후 검출만
+> 있다 ([score.py:170](tools/score.py#L170), [score.py:237](tools/score.py#L237)).
+> 실선 차선변경은 **계획 단계**에서만 막힌다(§3.3) — 드리프트로 넘는 것은 못 막는다.
 > 규격은 유효하다 — 다시 만들 때 이 절을 계약으로 쓴다.
 
 ### 3.5 Control

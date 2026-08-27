@@ -103,16 +103,8 @@ MARK_EDGE_M = 0.5
 
 
 def dashed_runs(lg, key, side):
-    """side 방향 **연속 점선** 구간 [(s0, s1) ...]. 실선/none 에서 끊긴다."""
-    segs = sorted((a, b) for a, b, typ, col, ok in
-                  lg.lanes[key]['left_mark' if side == 'left' else 'right_mark'] if ok)
-    out = []
-    for a, b in segs:
-        if out and a - out[-1][1] <= MARK_JOIN_M:
-            out[-1][1] = max(out[-1][1], b)
-        else:
-            out.append([a, b])
-    return [(a, b) for a, b in out]
+    """side 방향 연속 점선 구간 — lanegraph 가 단일 출처다 (제어기와 같은 답)."""
+    return lg.dashed_runs(key, side)
 
 
 def lane_change_window(lg, lanes, cum, seq, i, side, target):
