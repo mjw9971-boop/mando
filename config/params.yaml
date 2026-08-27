@@ -170,6 +170,14 @@ scoring:
   # hold 이상 지속 = 중대. left_is_center 차로만, junction 차로 제외.
   center_depth_m: 0.6
   center_hold_s: 0.6
+  # 대회 8번 녹색신호 통과: 정지선 앞 dist 이내 + 녹색 + 정차가 minor 이상
+  # 지속 = 경미, major 이상 = 중대. 면책: 보행자 존재 / 전방 lead(전방 lead_m·
+  # 횡 lead_lat_m 이내 차량) / reasons.winner 에 정당한 정차 원인 기록.
+  green_dist_m: 30.0
+  green_minor_s: 5.0
+  green_major_s: 10.0
+  green_lead_m: 15.0
+  green_lead_lat_m: 2.0
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.

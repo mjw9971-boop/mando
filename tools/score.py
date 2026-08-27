@@ -26,6 +26,8 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
   red_stop_far       적신호 정지가 정지선에서 stop_ok_m 이상 떨어짐 (경미)
   stop_line_encroach 적신호 정지인데 앞범퍼가 정지선 너머 (침범 거리)
                      — red_stop_far 와 함께 detect_red_stop 의 갈래다
+  green_stall        녹색인데 정지선 앞 green_dist_m 이내 이유 없는 정차
+                     (green_minor_s 경미 / green_major_s 중대, 면책 3종)
   off_route          경로 이탈 구간 (route 있으면 최대 이탈 거리)
   reset              courseRespawn 리셋
   collision / near_miss  객체 외곽 간 최소 간격 ≤ params score.* 임계
@@ -63,8 +65,14 @@ INFO_KEYS = ('speed_margin', 'red_right_turn', 'red_stop_ok', 'near_miss', 'over
 SCORING_ITEM = {'stop_line_encroach': 'red_light', 'red_stop_far': 'red_light'}
 COUNT_ESCALATE = ('lane_departure', 'solid_lane_change')   # 구간 내 2회 이상 → 중대
 
-RED = 1                    # 9910 신호 state (logger.py 주석: 1=적 4=좌 5=녹+좌)
+RED = 1                    # 9910 신호 state (logger.py 주석: 1=적 3=녹 4=좌 5=녹+좌)
+GREEN = 3
 LEFT_ARROW = 4
+GREEN_LEFT = 5
+
+# 녹색 정차 면책으로 인정하는 decision.reasons.winner (run_agent _HAZARD_NAME).
+# 'light'(신호 오인)·'none'(원인 기록 없음)은 면책이 아니다 — 그게 항목 8이다.
+GREEN_EXEMPT_WINNERS = ('walker', 'lead', 'vehicle', 'bicycle', 'route_end')
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -480,17 +488,23 @@ def detect_red_light(ticks: list[dict], t0: float, stop_speed: float) -> tuple[l
     return viol, right
 
 
-def _tick_red(t: dict) -> bool | None:
-    """이 틱에서 전방 정지선의 신호가 적색인가. 정지선/신호 대조 불가면 None.
-
-    적색 정의는 detect_red_light 의 통과 판정과 같다: state RED, 또는
-    LEFT_ARROW 인데 좌회전 경로가 아니면 적색과 동등."""
+def _ctrl_states(t: dict) -> list | None:
+    """이 틱의 전방 정지선 controller 들의 신호 state 목록. 대조 불가면 None."""
     ctrl = t['world']['flags'].get('stop_ctrl_ids') or []
     if not ctrl:
         return None
     states = dict((int(a), int(b)) for a, b in t['raw']['lights'])
     got = [states[c] for c in ctrl if c in states]
-    if not got:
+    return got or None
+
+
+def _tick_red(t: dict) -> bool | None:
+    """이 틱에서 전방 정지선의 신호가 적색인가. 정지선/신호 대조 불가면 None.
+
+    적색 정의는 detect_red_light 의 통과 판정과 같다: state RED, 또는
+    LEFT_ARROW 인데 좌회전 경로가 아니면 적색과 동등."""
+    got = _ctrl_states(t)
+    if got is None:
         return None
     summ = t['world'].get('summ') or {}
     turn = summ.get('next_turn')
@@ -541,6 +555,74 @@ def detect_red_stop(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
         else:
             ok.append(ev)
     return ok, far, enc
+
+
+def _tick_green(t: dict) -> bool:
+    """전방 정지선 신호가 녹색(직진 가능)인가 — GREEN/GREEN_LEFT 이고 적색 아님."""
+    got = _ctrl_states(t)
+    if got is None:
+        return False
+    return any(s in (GREEN, GREEN_LEFT) for s in got) and _tick_red(t) is not True
+
+
+def detect_green_stall(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
+                       merge_gap_s: float = 0.0) -> list:
+    """녹색신호 불통과 (대회 항목 8 — 5 s 이상 경미 / 10 s 이상 중대).
+
+    정지선 앞 green_dist_m 이내(앞범퍼 기준, 선 통과 전) + 녹색 + v<stop_speed
+    가 지속되는데 정차할 이유가 없는 경우. 면책(하나라도 참이면 그 틱 제외):
+      · 보행자 객체 존재 (cls=pedestrian — GT 80 m 범위)
+      · 선행차: cls=vehicle 이 자차 전방 green_lead_m 이내·횡 green_lead_lat_m 이내
+      · decision.reasons.winner 가 GREEN_EXEMPT_WINNERS (기록된 정당한 정차 원인)
+    reset 틱 제외. 지속시간으로 severity 를 가른다 (green_minor_s/green_major_s
+    — _severity 가 dur_s 로 판정)."""
+    dist_m = float(sc['green_dist_m'])
+    lead_m = float(sc['green_lead_m'])
+    lead_lat_m = float(sc['green_lead_lat_m'])
+    minor_s = float(sc['green_minor_s'])
+
+    def exempt(t):
+        r = t['decision'].get('reasons') or {}
+        if r.get('winner') in GREEN_EXEMPT_WINNERS:
+            return True
+        e = t['ego']
+        c, s_ = math.cos(e['yaw']), math.sin(e['yaw'])
+        for o in t['objects']:
+            if o.get('cls') == 'pedestrian':
+                return True
+            if o.get('cls') == 'vehicle' and o.get('x') is not None:
+                dx, dy = o['x'] - e['x'], o['y'] - e['y']
+                fwd = dx * c + dy * s_
+                lat = -dx * s_ + dy * c
+                if 0.0 < fwd <= lead_m and abs(lat) <= lead_lat_m:
+                    return True
+        return False
+
+    def cond(t):
+        f = t['world'].get('stop_line_front_m')
+        return (f is not None and -dist_m <= f <= 0.0
+                and t['ego']['speed'] < stop_speed
+                and _tick_green(t)
+                and not t['world']['flags'].get('reset')
+                and not exempt(t))
+
+    mask = [cond(t) for t in ticks]
+    merged = []
+    for r in _runs(mask):
+        if merged and ticks[r[0]]['t'] - ticks[merged[-1][1]]['t'] <= merge_gap_s:
+            merged[-1] = (merged[-1][0], r[1], True)
+        else:
+            merged.append(r)
+    out = []
+    for i0, i1, _ in merged:
+        if ticks[i1]['t'] - ticks[i0]['t'] < minor_s:
+            continue
+        worst = max((i for i in range(i0, i1 + 1) if mask[i]),
+                    key=lambda i: ticks[i]['world']['stop_line_front_m'])
+        out.append(_ev(ticks, t0, i0, i1,
+                       front_m=round(ticks[worst]['world']['stop_line_front_m'], 2),
+                       winner=ticks[worst]['decision'].get('reasons', {}).get('winner')))
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -784,6 +866,8 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'minor'
     if cat == 'center_line':
         return 'major'
+    if cat == 'green_stall':
+        return 'major' if float(ev.get('dur_s', 0.0)) >= float(sc['green_major_s']) else 'minor'
     if cat == 'red_light':
         return 'major'
     if cat in ('stop_line_encroach', 'red_stop_far'):
@@ -923,6 +1007,9 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     V['red_stop_ok'] = {'count': 0, 'events': rs_ok}
     V['red_stop_far'] = {'count': 0, 'events': rs_far}
     V['stop_line_encroach'] = {'count': 0, 'events': rs_enc}
+    V['green_stall'] = {'count': 0, 'events': detect_green_stall(
+        span, t0, stop_speed, cfg['scoring'],
+        float(cfg['score'].get('merge_gap_s', 0.0)))}
     V['off_route'] = {'count': 0, 'events': detect_off_route(
         span, t0, lg, route, float(cfg['score'].get('merge_gap_s', 0.0)))}
 
@@ -988,6 +1075,7 @@ LABEL = {
     'turn_signal': '차선변경 지시등 미점등', 'center_line': '중앙선 침범',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
+    'green_stall': '녹색신호 정차',
     'stop_line_encroach': '정지선 침범', 'off_route': '경로 이탈',
     'reset': '리셋(courseRespawn)', 'collision': '충돌', 'near_miss': '근접 경고(정보)',
     'not_finished': '미완주', 'overtime': '시간 초과(정보)', 'stall': '정지 고착',
@@ -1005,6 +1093,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'red_stop_ok': ('front_m',),
     'red_stop_far': ('front_m',),
     'stop_line_encroach': ('front_m', 'encroach_m'),
+    'green_stall': ('front_m', 'winner'),
     'off_route': ('max_dist_m',),
     'reset': ('why',),
     'collision': ('obj_id', 'obj_cls', 'min_gap_m', 'v_kph'),
