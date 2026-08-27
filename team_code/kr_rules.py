@@ -6,7 +6,7 @@ PDM-Lite(autopilot.py) 원문은 건드리지 않는다. autopilot._get_control 
 중재에 **후보를 덧대는** 형태로만 개입한다 — 새 감속 프로파일을 만들지 않고
 PDM 의 _compute_target_speed_idm / 종방향 컨트롤러를 그대로 재사용한다.
 
-phase4 현재: route_end 정지만 구현. (깜빡이·RTOR·황색 딜레마는 이후 단계.)
+phase4 현재: route_end 정지 / 정지선 유지 홀드 / 방향지시등. (RTOR·황색 딜레마는 이후 단계.)
 
 route_end — 경로 종점 정지:
   CARLA 리더보드는 결승선 통과로 시나리오가 끝나 PDM 에 종점 정지 개념이
@@ -37,6 +37,22 @@ stopline hold — 정지선 정지 유지:
   (finish_s)을 뒷축이 finish_clearance_m 만큼 넘어 정지하도록 기준점을 잡는다
   (plan_stop_s — 채점 score.py 와 공용, 단일 출처). d_eff/s0 관례·래치·active_m
   판정 거리는 전부 stop_s 기준으로 그대로 동작한다.
+
+turn signal — 방향지시등:
+  채점 동적항목("방향지시등 n초 전"). PDM 은 CARLA 리더보드용이라 지시등 개념이
+  없어 9910 turnSignal 이 계속 0 이었다.
+
+  경로가 정적이므로 **점등 구간을 시작 시 1회 계산**한다 — route['events'] 의
+  turn_left/right(연결로 시작 s, 끝은 같은 junction 차로가 이어지는 데까지)와
+  lane_change_left/right(window_s0 ~ 블렌드 끝). 매 틱은 route_s 로 고르기만
+  하므로 재선택 깜빡임(실사고 §6-9)이 구조적으로 생기지 않는다.
+
+  점등 조건: 남은거리 ≤ max(v · lead_s, lead_min_m). 시간 기준만 쓰면 적신호
+  대기(v→0)에서 선행거리가 0 이 돼 회전 지시등이 안 켜지므로 거리 하한을 둔다.
+  겹치면 SPEC §3.3 대로 **남은거리가 짧은 쪽 우선, 동률이면 회전 우선**.
+
+  결과는 last_turn_signal/last_sig_src/last_sig_lead_s 로 노출하고 run_agent 가
+  Command.turn_signal 과 로그에 싣는다 (기존 last_candidate/last_target 관례).
 """
 from __future__ import annotations
 
@@ -59,6 +75,66 @@ def plan_stop_s(cfg: dict, total: float, finish_s: float | None) -> tuple[float,
             + float(vh['wheelbase']) + float(vh['front_overhang_m']))
     cap = float(total) - float(cfg.get('batch', {}).get('end_slack_m', 1.0))
     return (min(want, cap), want > cap)
+
+
+SIG_OFF, SIG_LEFT, SIG_RIGHT = 0, 1, 2        # 9910 turnSignal (SPEC §1.2)
+
+
+def _turn_end_s(lg, lanes, cum, lens, ev) -> float:
+    """회전 이벤트의 소등 지점 [route_s] — 같은 junction 차로가 이어지는 끝까지.
+
+    build_route 의 turn 이벤트는 시작 s 만 준다(연결로가 여러 개 이어질 수 있어
+    끝은 경로에서 되짚어야 한다). lg 나 lanes 가 없으면(목 플래너) 시작점 반환.
+    """
+    s0 = float(ev['s'])
+    if lg is None or not lanes or not cum:
+        return s0
+    i = min(range(len(cum)), key=lambda j: abs(float(cum[j]) - s0))
+    rec = lg.lanes.get(tuple(lanes[i]))
+    if rec is None:
+        return s0
+    end_of = lambda j: float(cum[j]) + (float(lens[j]) if j < len(lens) else 0.0)
+    jid = rec.get('junction', -1)
+    if jid == -1:
+        return end_of(i)
+    j = i
+    while j + 1 < len(lanes):
+        nxt = lg.lanes.get(tuple(lanes[j + 1]))
+        if nxt is None or nxt.get('junction') != jid:
+            break
+        j += 1
+    return end_of(j)
+
+
+def signal_intervals(planner) -> list[dict]:
+    """route['events'] → 지시등 점등 구간 [{sig, src, ev_s, end_s}]. 시작 시 1회.
+
+    turn : ev_s = 연결로 시작, end_s = 연결로 끝
+    lc   : ev_s = 창 시작(window_s0), end_s = 블렌드 끝(창 끝과 전이길이 중 짧은 쪽
+           — 창 끝까지 켜 두면 이미 옮겨탄 뒤에도 점등이 남는다)
+    """
+    route = getattr(planner, 'route', None) or {}
+    lg = getattr(planner, 'lg', None)
+    lanes = route.get('lanes') or []
+    cum = route.get('cum_s') or []
+    lens = route.get('lengths') or []
+    lc_span = float(getattr(planner, 'LC_TRANSITION_M', 25.0))
+
+    out: list[dict] = []
+    for ev in route.get('events') or []:
+        kind = str(ev.get('kind', ''))
+        if kind.startswith('turn_'):
+            out.append({'sig': SIG_LEFT if kind.endswith('left') else SIG_RIGHT,
+                        'src': 'turn', 'ev_s': float(ev['s']),
+                        'end_s': _turn_end_s(lg, lanes, cum, lens, ev)})
+        elif kind.startswith('lane_change_'):
+            s0 = float(ev.get('window_s0', ev['s']))
+            s1 = float(ev.get('window_s1', s0))
+            out.append({'sig': SIG_LEFT if kind.endswith('left') else SIG_RIGHT,
+                        'src': 'lc', 'ev_s': s0,
+                        'end_s': min(s1, s0 + lc_span) if s1 > s0 else s0 + lc_span})
+    out.sort(key=lambda d: d['ev_s'])
+    return out
 
 
 def _project_route_s(lg, route: dict, x: float, y: float) -> float | None:
@@ -93,6 +169,11 @@ class KrRules:
         self.sl_hold_ticks = int(round(float(sp['stopline_hold_s'])
                                        * float(cfg['comm']['send_hz'])))
         self.sl_near_m = float(sp['stopline_hold_near_m'])
+        # 방향지시등 (SPEC §3.3). lc_lead_s 는 규정 미확정 가정값 (§7-2).
+        sig = cfg['signal']
+        self.turn_lead_s = float(sig['turn_lead_s'])
+        self.lc_lead_s = float(sig['lc_lead_s'])
+        self.sig_lead_min_m = float(sig['lead_min_m'])
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -100,6 +181,10 @@ class KrRules:
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
+        self.sig_plan: list[dict] | None = None    # 시작 시 1회 계산 (매 틱 재구성 금지)
+        self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
+        self.last_sig_src: str | None = None       # 'turn' | 'lc'
+        self.last_sig_lead_s: float | None = None  # 이벤트까지 남은 시간 [s]
 
     def _resolve_stop_s(self, planner) -> float:
         """정지 목표 기준점 1회 산출. finish 모드 실패 시 경고 후 total 폴백."""
@@ -123,6 +208,35 @@ class KrRules:
             print(f'[kr_rules] ⚠ 계획 정지점이 종료선을 못 넘는다 — finish_s {finish_s:.1f} '
                   f'+ 여유가 경로 종점을 초과 (경로 꼬리 부족). 종점까지 주행한다', flush=True)
         return stop_s
+
+    def _turn_signal(self, planner, route_s: float, ego_speed: float) -> tuple:
+        """점등 구간 중 지금 켤 것을 고른다 → (sig, src, lead_s).
+
+        점등 조건은 남은거리 ≤ max(v·lead_s, lead_min_m). 겹치면 SPEC §3.3 대로
+        남은거리가 짧은 쪽, 동률이면 회전 우선. 지난 구간(route_s > end_s)은
+        후보에서 빠지므로 재점등이 없다.
+        """
+        if self.sig_plan is None:
+            self.sig_plan = signal_intervals(planner)
+
+        best = None
+        for iv in self.sig_plan:
+            if route_s > iv['end_s']:
+                continue
+            lead_s = self.turn_lead_s if iv['src'] == 'turn' else self.lc_lead_s
+            remain = iv['ev_s'] - route_s
+            if remain > max(ego_speed * lead_s, self.sig_lead_min_m):
+                continue
+            key = (max(0.0, remain), 0 if iv['src'] == 'turn' else 1)
+            if best is None or key < best[0]:
+                best = (key, iv, remain)
+
+        if best is None:
+            return SIG_OFF, None, None
+        _key, iv, remain = best
+        # 남은 시간은 참고용 로그 — 저속에서는 발산하므로 남기지 않는다
+        lead = max(0.0, remain) / ego_speed if ego_speed > 0.1 else None
+        return iv['sig'], iv['src'], lead
 
     def _stopline_hold(self, planner, ego_speed: float) -> float | None:
         """적신호 정지선 정지의 최소 유지 (speed.stopline_hold_s) — 목표 0 후보.
@@ -161,10 +275,15 @@ class KrRules:
         planner = ap._waypoint_planner
         if self.stop_s is None:
             self.stop_s = self._resolve_stop_s(planner)
-        d_end = self.stop_s - float(planner.route_s[planner.route_index])
+        route_s = float(planner.route_s[planner.route_index])
+        d_end = self.stop_s - route_s
         ego_speed = ap._vehicle.get_velocity().length()
         self.last_candidate = None
         self.last_d_end = d_end
+
+        # 방향지시등 — 속도 중재와 독립이다 (켜는 것이 감속을 만들지 않는다)
+        (self.last_turn_signal, self.last_sig_src,
+         self.last_sig_lead_s) = self._turn_signal(planner, route_s, ego_speed)
 
         # 래치 해제: 종점에서 다시 멀어졌다 = 리셋으로 뒤로 갔다 (고착 방지)
         if self.latched and d_end > self.unlatch_m:

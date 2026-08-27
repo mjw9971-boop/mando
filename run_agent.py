@@ -142,7 +142,7 @@ class LoggingAutoPilot(AutoPilot):
         return ts
 
 
-# decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등 판단(kr_rules)은 phase4.
+# decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등은 kr_rules 가 따로 낸다.
 _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
                 'vehicle': 'vehicle', 'bicycle': 'bicycle', 'route_end': 'route_end'}
 
@@ -232,7 +232,9 @@ class Runner:
         self.planner.update_lights(pkt.lights)
 
         control = self.agent.run_step(world_state, pkt.t_recv)
-        cmd = command_from_control(control, self.max_steer, turn_signal=0)
+        # 지시등은 kr_rules 가 경로 이벤트로 판단한다 (run_step 안에서 갱신됨)
+        cmd = command_from_control(control, self.max_steer,
+                                   turn_signal=self.kr.last_turn_signal)
 
         decision = self._build_decision()
         world_state.objects = self._log_objects()
@@ -244,8 +246,8 @@ class Runner:
         """autopilot 부수 상태 → 로그 스키마의 decision.
 
         state = 이긴 hazard 명 (walker/light/lead/vehicle/bicycle/none),
-        reasons = 원인별 목표속도 + winner + 최저 원인 객체. turn_signal 은 0
-        고정 (phase4 kr_rules 몫).
+        reasons = 원인별 목표속도 + winner + 최저 원인 객체 + 지시등 근거
+        (sig_src/sig_lead_s — SPEC §3.3).
         """
         a = self.agent
         cand = dict(getattr(a, 'candidates', {}))
@@ -264,12 +266,16 @@ class Runner:
             if initial is None or cand[low] < initial - 1e-6:
                 winner = _HAZARD_NAME[low]
 
-        reasons = {'initial': initial, 'winner': winner, **cand}
+        reasons = {'initial': initial, 'winner': winner, **cand,
+                   'sig_src': self.kr.last_sig_src,
+                   'sig_lead_s': (None if self.kr.last_sig_lead_s is None
+                                  else round(float(self.kr.last_sig_lead_s), 2))}
         if reduced is not None and reduced[1] is not None:
             reasons['speed_reduced_by'] = {
                 'type': reduced[1], 'id': reduced[2],
                 'dist': None if reduced[3] is None else round(float(reduced[3]), 1)}
-        return Decision(v_target=float(target), path=[], turn_signal=0,
+        return Decision(v_target=float(target), path=[],
+                        turn_signal=int(self.kr.last_turn_signal),
                         state=winner, reasons=reasons)
 
     def _log_objects(self) -> list:
