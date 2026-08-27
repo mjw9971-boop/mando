@@ -20,6 +20,9 @@ build_lane_graph.py  ─  xodr(OpenDRIVE) → lane_graph.pkl   (대회 전 1번 
     crosswalks : [(s0, s1, kind)]      kind = 'pelican'(실제 객체) / 'inferred'(정지선 뒤 8m, xodr에 없어서 추정)
     crosswalk_warn / yield_marks / arrows / speed_marks / markings
     speed_limit, school_zone, speed_src
+    sidewalk_left_m / sidewalk_right_m : 차로 중심선→보도 안쪽 경계 횡거리 프로파일
+                 (운전자 기준 좌/우, s 정렬 배열, 그 쪽에 보도 없으면 None.
+                  좌측은 반대 차선 건너편 보도까지 포함 — 월선 후 보도 침범 판정용)
 
 전제/주의 (README 참고):
   - 신호등 방향: validity 태그 > hOffset(0→우측차로 +s, π→좌측차로 -s) > t 부호  (이 맵에서 검증됨)
@@ -463,6 +466,24 @@ def build_lanes(road, ds, warnings):
             t_out[lid] = t.copy()
             wid[lid] = w
 
+        # 보도 프로파일용: 이 섹션의 sidewalk 차로들 (t_in/t_out 은 위에서 전 타입 계산됨)
+        sw_ids = [l for l in sec['lanes'] if sec['lanes'][l]['type'] == 'sidewalk']
+
+        def sidewalk_profile(tc, side_sign):
+            """차로 중심선 tc(샘플별)에서 도로 프레임 side_sign(+1 = +t 쪽) 방향으로
+            가장 가까운 보도의 **안쪽 경계**까지 횡거리 [m]. 그 쪽에 보도 없으면 None.
+            사이에 낀 차로(border/none/parking 등)의 폭은 t 좌표 차에 자동 포함된다."""
+            best = None
+            for l in sw_ids:
+                c_sw = 0.5 * (t_in[l] + t_out[l])
+                if (float(np.mean(c_sw)) - float(np.mean(tc))) * side_sign <= 0:
+                    continue                                   # 반대쪽 보도
+                edge = np.minimum(t_in[l], t_out[l]) if side_sign > 0 else np.maximum(t_in[l], t_out[l])
+                d = (edge - tc) * side_sign
+                if best is None or float(np.mean(d)) < float(np.mean(best)):
+                    best = d                                   # 같은 쪽에 여럿이면 가까운 것
+            return best
+
         def marks_of(lid, ds_arr):
             if lid == 0:
                 pieces = sec['center_marks']
@@ -531,6 +552,9 @@ def build_lanes(road, ds, warnings):
                 return None
             left_nb = nb(inner_id) if inner_id != 0 else None
             right_nb = nb(lid - 1 if lid < 0 else lid + 1)
+            # 운전자 기준 좌/우 → 도로 프레임 t 부호 (d=+1 이면 +t 가 왼쪽)
+            sw_l = sidewalk_profile(tc, 1 if d == 1 else -1)
+            sw_r = sidewalk_profile(tc, -1 if d == 1 else 1)
             rec = {
                 'road': road['id'], 'sec': i, 'lane_id': lid, 'dir': d, 'type': L['type'],
                 'junction': road['junction'],
@@ -542,6 +566,8 @@ def build_lanes(road, ds, warnings):
                 'left_mark': left_mark, 'right_mark': right_mark,
                 'left_nb': left_nb, 'right_nb': right_nb,
                 'left_is_center': left_nb is None,
+                'sidewalk_left_m': None if sw_l is None else sw_l[order].astype(np.float32),
+                'sidewalk_right_m': None if sw_r is None else sw_r[order].astype(np.float32),
                 'next': [], 'prev': [],
                 'stop_lines': [], 'signals': [], 'crosswalks': [], 'crosswalk_warn': [],
                 'yield_marks': [], 'arrows': [], 'speed_marks': [], 'markings': [],
@@ -949,6 +975,7 @@ def build(xodr_path, ds=0.5):
                 'crosswalk zones after stop lines are INFERRED (8 m); only 2 real crosswalk objects (pelican)',
                 'left_mark = mark toward road center, right_mark = outer mark (driver frame, both lane sides)',
                 '9910 light_id == xodr <controller> id (NOT signal id); stop_lines carry controller_ids',
+                'sidewalk_left_m/right_m: driver-frame lateral distance from lane center to nearest sidewalk inner edge (None if absent on that side; left crosses opposite carriageway)',
             ],
             'n_controllers': len(ctrl2sig),
             'n_signals_controlled': len(sig2ctrl),

@@ -8,6 +8,7 @@ lanegraph.py ─ lane_graph.pkl 런타임 헬퍼 (인지 노드에서 import)
     lg.point_at(lane, s)                  # → x, y, z, hdg
     lg.mark_at(lane, s, 'left')           # → (type, color, lane_change_ok)
     lg.speed_limit_at(lane)               # → (limit or None, school_zone)
+    lg.sidewalk_dist_at(lane, s, side)    # → 보도 안쪽 경계까지 횡거리 (없으면 None)
     lg.lookahead(route, idx, s_in_lane, horizon=200)   # 전방 프로파일 (정지선/신호/횡단보도/제한속도/실선/회전)
 
 좌표계: xodr 월드 (VTD 9910 ego X,Y 와 동일 좌표계라고 가정 — 연습 때 확인)
@@ -170,6 +171,16 @@ class LaneGraph:
     def width_at(self, key: LaneKey, s: float) -> float:
         r = self.lanes[key]
         return float(np.interp(s, r['s'], r['width']))
+
+    def sidewalk_dist_at(self, key: LaneKey, s: float, side: str) -> Optional[float]:
+        """차로 중심선에서 side('left'/'right', 운전자 기준) 보도 안쪽 경계까지
+        횡거리 [m]. 그 쪽에 보도가 없으면 None — 판정 대상 아님이 명시적이도록
+        inf 가 아니라 None 이다. 구 pkl(필드 없음)도 None (rec.get 방어)."""
+        r = self.lanes[key]
+        arr = r.get('sidewalk_left_m' if side == 'left' else 'sidewalk_right_m')
+        if arr is None:
+            return None
+        return float(np.interp(np.clip(s, 0.0, r['length']), r['s'], arr))
 
     def lanes_of_road(self, road_id: int) -> List[LaneKey]:
         return list(self.roads[road_id]['lanes'])
