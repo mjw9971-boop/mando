@@ -19,6 +19,7 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
   lane_departure     |t_off| > 차로폭/2 − 차체폭/2 (계획된 차선변경 창·테이퍼 차로 제외)
   solid_lane_change  실선(left_solid/right_solid) 구간에서의 차로 변경
   turn_signal        차선변경 시작(경계 통과) 전 signal_lead_s 연속 점등 미달 (경미)
+  center_line        중앙선 침범 — 깊이 center_depth_m 이상 center_hold_s 지속 (중대)
   red_light          적신호에 정지선 통과 (stop_line_front_m 부호 전환 시점 판정)
   red_right_turn     [정보] 적신호 우회전 통과 — 직전 일시정지 여부를 남긴다
   red_stop_ok        [정보] 적신호 정지 정상 — 앞범퍼가 정지선 앞 stop_ok_m 이내
@@ -275,6 +276,74 @@ def detect_solid_lane_change(ticks: list[dict], t0: float, lg,
     for ev in out:
         del ev['_pair']
     return out
+
+
+def _depth_events(ticks: list[dict], t0: float, depth_of, depth_m: float,
+                  hold_s: float, merge_gap_s: float = 0.0, extra_of=None) -> list:
+    """"깊이 ≥ depth_m 가 hold_s 이상 지속" 구조의 공통 검출 (중앙선·보도).
+
+    depth_of(tick) → float | None (None = 판정 대상 아님 — reset·차로 없음 등).
+    merge_gap_s 이내 끊김은 병합 후 지속시간을 보고, 극값 틱은 판정된 틱
+    중에서만 고른다 (lane_departure 병합 관례와 동일)."""
+    vals = [depth_of(t) for t in ticks]
+    mask = [v is not None and v >= depth_m for v in vals]
+    merged = []
+    for r in _runs(mask):
+        if merged and ticks[r[0]]['t'] - ticks[merged[-1][1]]['t'] <= merge_gap_s:
+            merged[-1] = (merged[-1][0], r[1], True)
+        else:
+            merged.append(r)
+    out = []
+    for i0, i1, _ in merged:
+        if ticks[i1]['t'] - ticks[i0]['t'] < hold_s:
+            continue
+        worst = max((i for i in range(i0, i1 + 1) if mask[i]), key=lambda i: vals[i])
+        ev = _ev(ticks, t0, i0, i1, depth_m=round(vals[worst], 2))
+        if extra_of is not None:
+            ev.update(extra_of(ticks[worst]))
+        out.append(ev)
+    return out
+
+
+def detect_center_line(ticks: list[dict], t0: float, lg, veh_width: float,
+                       sc: dict, merge_gap_s: float = 0.0) -> list:
+    """중앙선 침범·우측통행 (대회 항목 4 — 중대).
+
+    침범 깊이 = t_off + 차폭/2 − 차로폭/2 (t_off 좌 +) 가
+    scoring.center_depth_m 이상 & center_hold_s 이상 지속.
+    대상은 left_is_center 틱만. left_is_center 는 "left_nb 없음"의 근사라
+    교차로 연결로에서도 True 가 된다 → junction 차로는 제외 (작업1 대조표).
+    반대 차로로 완전히 넘어가 lane 배정이 끊기는(중심선 8 m 밖) 구간은
+    off_route 소관 — 여기서는 세지 않는다.
+    보강: 왼쪽 마크가 노란색인지(lg.mark_at)를 이벤트에 기록만 한다
+    (판정 기준 아님 — left_is_center 교차검증용)."""
+    def depth_of(t):
+        e = t['ego']
+        if (not t['world']['valid'] or not e['lane']
+                or not t['world']['left_is_center']
+                or t['world']['flags'].get('reset')):
+            return None
+        key = tuple(e['lane'])
+        try:
+            if lg.lanes[key]['junction'] != -1:
+                return None
+            half = lg.width_at(key, e['s']) / 2.0
+        except KeyError:
+            return None
+        return e['t_off'] + veh_width / 2.0 - half
+
+    def extra_of(t):
+        e = t['ego']
+        key = tuple(e['lane'])
+        try:
+            _typ, col, _ok = lg.mark_at(key, e['s'], 'left')
+        except KeyError:
+            col = None
+        return {'lane': e['lane'], 't_off': round(e['t_off'], 2),
+                'left_mark_yellow': col == 'yellow'}
+
+    return _depth_events(ticks, t0, depth_of, float(sc['center_depth_m']),
+                         float(sc['center_hold_s']), merge_gap_s, extra_of)
 
 
 def _change_side(lg, ka, kb) -> str | None:
@@ -713,6 +782,8 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'minor'
     if cat == 'turn_signal':
         return 'minor'
+    if cat == 'center_line':
+        return 'major'
     if cat == 'red_light':
         return 'major'
     if cat in ('stop_line_encroach', 'red_stop_far'):
@@ -834,11 +905,15 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
                                             float(cfg['score'].get('merge_gap_s', 0.0)))
         rep['n_lane_changes'] = len(changes)
         V['turn_signal'] = {'count': 0, 'events': [e for e in changes if not e['signal_ok']]}
+        V['center_line'] = {'count': 0, 'events': detect_center_line(
+            span, t0, lg, float(cfg['vehicle']['width']), cfg['scoring'],
+            float(cfg['score'].get('merge_gap_s', 0.0)))}
     else:
         rep['warnings'].append('lane_graph 없음 — 차선 이탈·실선 차선변경·지시등 생략')
         V['lane_departure'] = {'count': 0, 'events': []}
         V['solid_lane_change'] = {'count': 0, 'events': []}
         V['turn_signal'] = {'count': 0, 'events': []}
+        V['center_line'] = {'count': 0, 'events': []}
 
     red, red_right = detect_red_light(span, t0, stop_speed)
     V['red_light'] = {'count': 0, 'events': red}
@@ -910,7 +985,7 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
 LABEL = {
     'speed': '속도 초과(법규)', 'speed_margin': '여유 침범(정보)',
     'lane_departure': '차선 이탈', 'solid_lane_change': '실선 차선변경',
-    'turn_signal': '차선변경 지시등 미점등',
+    'turn_signal': '차선변경 지시등 미점등', 'center_line': '중앙선 침범',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
     'stop_line_encroach': '정지선 침범', 'off_route': '경로 이탈',
@@ -924,6 +999,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'lane_departure': ('lane', 'max_t_off', 'exceed_m'),
     'solid_lane_change': ('side', 'from_lane', 'to_lane', 'n_crossings'),
     'turn_signal': ('side', 'from_lane', 'to_lane', 'on_s', 'n_crossings'),
+    'center_line': ('depth_m', 'lane', 't_off', 'left_mark_yellow'),
     'red_light': ('ctrl_ids', 'states', 'v_kph', 'next_turn'),
     'red_right_turn': ('states', 'v_kph', 'stopped_before'),
     'red_stop_ok': ('front_m',),

@@ -166,6 +166,10 @@ scoring:
   # 대회 13번 방향지시등: 차선변경 시작(차로 경계 통과) 전 이 시간 이상
   # 해당 방향 turn_signal 이 연속 점등돼 있어야 한다. 미달 = 경미.
   signal_lead_s: 3.0
+  # 대회 4번 중앙선 침범: 깊이(t_off + 차폭/2 − 차로폭/2)가 depth 이상,
+  # hold 이상 지속 = 중대. left_is_center 차로만, junction 차로 제외.
+  center_depth_m: 0.6
+  center_hold_s: 0.6
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.
