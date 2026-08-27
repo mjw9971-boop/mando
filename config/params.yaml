@@ -163,6 +163,9 @@ scoring:
   # 정지 판정은 v<score.stop_speed_mps 가 stop_hold_s 이상 지속.
   stop_ok_m: 2.0
   stop_hold_s: 0.5
+  # 대회 13번 방향지시등: 차선변경 시작(차로 경계 통과) 전 이 시간 이상
+  # 해당 방향 turn_signal 이 연속 점등돼 있어야 한다. 미달 = 경미.
+  signal_lead_s: 3.0
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.

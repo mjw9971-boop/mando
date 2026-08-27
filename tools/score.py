@@ -18,6 +18,7 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
   speed_margin       [정보] params speed.margin_kph 여유 침범 — 위반 아님
   lane_departure     |t_off| > 차로폭/2 − 차체폭/2 (계획된 차선변경 창·테이퍼 차로 제외)
   solid_lane_change  실선(left_solid/right_solid) 구간에서의 차로 변경
+  turn_signal        차선변경 시작(경계 통과) 전 signal_lead_s 연속 점등 미달 (경미)
   red_light          적신호에 정지선 통과 (stop_line_front_m 부호 전환 시점 판정)
   red_right_turn     [정보] 적신호 우회전 통과 — 직전 일시정지 여부를 남긴다
   red_stop_ok        [정보] 적신호 정지 정상 — 앞범퍼가 정지선 앞 stop_ok_m 이내
@@ -254,23 +255,7 @@ def detect_solid_lane_change(ticks: list[dict], t0: float, lg,
         if b['world']['flags'].get('reset') or a['world']['flags'].get('reset'):
             continue                                       # 리스폰 텔레포트는 제외
         ka, kb = tuple(la), tuple(lb)
-        side = None
-        try:
-            if lg.neighbor(ka, 'left') == kb:
-                side = 'left'
-            elif lg.neighbor(ka, 'right') == kb:
-                side = 'right'
-            elif kb in lg.successors(ka):
-                side = None                                # 정상 진행
-            else:
-                # 세그먼트 이음매에서 대각으로 잡히는 경우: successor 의 이웃인지
-                for s in lg.successors(ka):
-                    if lg.neighbor(s, 'left') == kb:
-                        side = 'left'
-                    elif lg.neighbor(s, 'right') == kb:
-                        side = 'right'
-        except KeyError:
-            continue
+        side = _change_side(lg, ka, kb)                    # 이음매 대각 포함 (공용)
         if side is None:
             continue
         solid = a['world']['left_solid'] if side == 'left' else a['world']['right_solid']
@@ -285,6 +270,73 @@ def detect_solid_lane_change(ticks: list[dict], t0: float, lg,
             out[-1]['n_crossings'] += 1
             continue
         ev = _ev(ticks, t0, i - 1, i, side=side, from_lane=la, to_lane=lb, n_crossings=1)
+        ev['_pair'] = pair
+        out.append(ev)
+    for ev in out:
+        del ev['_pair']
+    return out
+
+
+def _change_side(lg, ka, kb) -> str | None:
+    """차로 ka→kb 전환의 방향 ('left'/'right'), 정상 진행(successor)이면 None.
+    detect_solid_lane_change 와 같은 판정 (세그먼트 이음매 대각 포함)."""
+    try:
+        if lg.neighbor(ka, 'left') == kb:
+            return 'left'
+        if lg.neighbor(ka, 'right') == kb:
+            return 'right'
+        if kb in lg.successors(ka):
+            return None                                    # 정상 진행
+        for s in lg.successors(ka):
+            if lg.neighbor(s, 'left') == kb:
+                return 'left'
+            if lg.neighbor(s, 'right') == kb:
+                return 'right'
+    except KeyError:
+        return None
+    return None
+
+
+def detect_lane_change_signal(ticks: list[dict], t0: float, lg, sc: dict,
+                              merge_gap_s: float = 0.0) -> list:
+    """차선변경마다 방향지시등 점등 검사 (대회 항목 13).
+
+    차선변경 시작 = 실제 차로 경계 통과 틱 (lane id 가 lg.neighbor 로 옆
+    차로로 바뀌는 틱 — solid_lane_change 와 동일 관례. route 의 lane_change
+    window 는 계획 창이라 판정 기준으로 쓰지 않는다). 통과 직전 틱을 기준으로
+    cmd.turn_signal 이 해당 방향(좌=1/우=2, SPEC §1.2)으로 연속 점등된 시간
+    on_s 를 재고, scoring.signal_lead_s 미만이면 위반(signal_ok=False).
+    같은 차로쌍의 플리커는 merge_gap_s 로 1건 병합. **모든 차선변경**을
+    이벤트로 반환한다 — analyze 가 위반만 V['turn_signal'] 에 담는다."""
+    lead_s = float(sc['signal_lead_s'])
+    out = []
+    for i in range(1, len(ticks)):
+        a, b = ticks[i - 1], ticks[i]
+        la, lb = a['ego']['lane'], b['ego']['lane']
+        if not la or not lb or tuple(la) == tuple(lb):
+            continue
+        if b['world']['flags'].get('reset') or a['world']['flags'].get('reset'):
+            continue                                       # 리스폰 텔레포트는 제외
+        ka, kb = tuple(la), tuple(lb)
+        side = _change_side(lg, ka, kb)
+        if side is None:
+            continue
+        pair = frozenset((ka, kb))
+        if (out and out[-1]['_pair'] == pair
+                and b['t'] - ticks[out[-1]['i1']]['t'] <= merge_gap_s):
+            out[-1]['i1'] = i
+            out[-1]['t1'] = round(b['t'] - t0, 1)
+            out[-1]['s1'] = round(b['ego']['route_s'], 1)
+            out[-1]['n_crossings'] += 1
+            continue
+        want = 1 if side == 'left' else 2
+        j = i - 1
+        while j >= 0 and int(ticks[j]['cmd']['turn_signal']) == want:
+            j -= 1
+        on_s = a['t'] - ticks[j + 1]['t'] if j < i - 1 else None   # None = 통과 시점에 미점등
+        ev = _ev(ticks, t0, i - 1, i, side=side, from_lane=la, to_lane=lb,
+                 n_crossings=1, on_s=None if on_s is None else round(on_s, 2),
+                 signal_ok=on_s is not None and on_s >= lead_s - 1e-9)
         ev['_pair'] = pair
         out.append(ev)
     for ev in out:
@@ -659,6 +711,8 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'major' if over > float(sc['speed_major_kph']) else 'minor'
     if cat in COUNT_ESCALATE:
         return 'minor'
+    if cat == 'turn_signal':
+        return 'minor'
     if cat == 'red_light':
         return 'major'
     if cat in ('stop_line_encroach', 'red_stop_far'):
@@ -776,10 +830,15 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
             float(cfg['score'].get('merge_gap_s', 0.0)))}
         V['solid_lane_change'] = {'count': 0, 'events': detect_solid_lane_change(
             span, t0, lg, float(cfg['score'].get('merge_gap_s', 0.0)))}
+        changes = detect_lane_change_signal(span, t0, lg, cfg['scoring'],
+                                            float(cfg['score'].get('merge_gap_s', 0.0)))
+        rep['n_lane_changes'] = len(changes)
+        V['turn_signal'] = {'count': 0, 'events': [e for e in changes if not e['signal_ok']]}
     else:
-        rep['warnings'].append('lane_graph 없음 — 차선 이탈·실선 차선변경 생략')
+        rep['warnings'].append('lane_graph 없음 — 차선 이탈·실선 차선변경·지시등 생략')
         V['lane_departure'] = {'count': 0, 'events': []}
         V['solid_lane_change'] = {'count': 0, 'events': []}
+        V['turn_signal'] = {'count': 0, 'events': []}
 
     red, red_right = detect_red_light(span, t0, stop_speed)
     V['red_light'] = {'count': 0, 'events': red}
@@ -851,6 +910,7 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
 LABEL = {
     'speed': '속도 초과(법규)', 'speed_margin': '여유 침범(정보)',
     'lane_departure': '차선 이탈', 'solid_lane_change': '실선 차선변경',
+    'turn_signal': '차선변경 지시등 미점등',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
     'stop_line_encroach': '정지선 침범', 'off_route': '경로 이탈',
@@ -863,6 +923,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'speed_margin': ('limit_kph', 'school_zone', 'max_kph'),
     'lane_departure': ('lane', 'max_t_off', 'exceed_m'),
     'solid_lane_change': ('side', 'from_lane', 'to_lane', 'n_crossings'),
+    'turn_signal': ('side', 'from_lane', 'to_lane', 'on_s', 'n_crossings'),
     'red_light': ('ctrl_ids', 'states', 'v_kph', 'next_turn'),
     'red_right_turn': ('states', 'v_kph', 'stopped_before'),
     'red_stop_ok': ('front_m',),
