@@ -178,6 +178,10 @@ scoring:
   green_major_s: 10.0
   green_lead_m: 15.0
   green_lead_lat_m: 2.0
+  # 대회 5번 보도 침범: 깊이(|t_off| + 차폭/2 − sidewalk_dist_at)가 depth 이상,
+  # hold 이상 지속 = 중대. 그 쪽 보도 없음(None)은 판정 대상 아님.
+  sidewalk_depth_m: 0.5
+  sidewalk_hold_s: 0.3
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.

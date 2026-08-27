@@ -20,6 +20,7 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
   solid_lane_change  실선(left_solid/right_solid) 구간에서의 차로 변경
   turn_signal        차선변경 시작(경계 통과) 전 signal_lead_s 연속 점등 미달 (경미)
   center_line        중앙선 침범 — 깊이 center_depth_m 이상 center_hold_s 지속 (중대)
+  sidewalk           보도 침범 — 깊이 sidewalk_depth_m 이상 sidewalk_hold_s 지속 (중대)
   red_light          적신호에 정지선 통과 (stop_line_front_m 부호 전환 시점 판정)
   red_right_turn     [정보] 적신호 우회전 통과 — 직전 일시정지 여부를 남긴다
   red_stop_ok        [정보] 적신호 정지 정상 — 앞범퍼가 정지선 앞 stop_ok_m 이내
@@ -352,6 +353,37 @@ def detect_center_line(ticks: list[dict], t0: float, lg, veh_width: float,
 
     return _depth_events(ticks, t0, depth_of, float(sc['center_depth_m']),
                          float(sc['center_hold_s']), merge_gap_s, extra_of)
+
+
+def detect_sidewalk(ticks: list[dict], t0: float, lg, veh_width: float,
+                    sc: dict, merge_gap_s: float = 0.0) -> list:
+    """보도 침범 (대회 항목 5 — 중대).
+
+    침범 깊이 = |t_off| + 차폭/2 − lg.sidewalk_dist_at(lane, s, side) 가
+    scoring.sidewalk_depth_m 이상 & sidewalk_hold_s 이상 지속. side 는 t_off
+    부호(좌 + → left). sidewalk_dist_at 이 None(그 쪽 보도 없음 / 구 그래프)
+    이면 판정 대상 아님. reset 틱 제외."""
+    def depth_of(t):
+        e = t['ego']
+        if (not t['world']['valid'] or not e['lane']
+                or t['world']['flags'].get('reset')):
+            return None
+        side = 'left' if e['t_off'] > 0 else 'right'
+        try:
+            d = lg.sidewalk_dist_at(tuple(e['lane']), e['s'], side)
+        except KeyError:
+            return None
+        if d is None:
+            return None
+        return abs(e['t_off']) + veh_width / 2.0 - d
+
+    def extra_of(t):
+        e = t['ego']
+        return {'lane': e['lane'], 't_off': round(e['t_off'], 2),
+                'side': 'left' if e['t_off'] > 0 else 'right'}
+
+    return _depth_events(ticks, t0, depth_of, float(sc['sidewalk_depth_m']),
+                         float(sc['sidewalk_hold_s']), merge_gap_s, extra_of)
 
 
 def _change_side(lg, ka, kb) -> str | None:
@@ -864,7 +896,7 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'minor'
     if cat == 'turn_signal':
         return 'minor'
-    if cat == 'center_line':
+    if cat in ('center_line', 'sidewalk'):
         return 'major'
     if cat == 'green_stall':
         return 'major' if float(ev.get('dur_s', 0.0)) >= float(sc['green_major_s']) else 'minor'
@@ -992,12 +1024,16 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
         V['center_line'] = {'count': 0, 'events': detect_center_line(
             span, t0, lg, float(cfg['vehicle']['width']), cfg['scoring'],
             float(cfg['score'].get('merge_gap_s', 0.0)))}
+        V['sidewalk'] = {'count': 0, 'events': detect_sidewalk(
+            span, t0, lg, float(cfg['vehicle']['width']), cfg['scoring'],
+            float(cfg['score'].get('merge_gap_s', 0.0)))}
     else:
         rep['warnings'].append('lane_graph 없음 — 차선 이탈·실선 차선변경·지시등 생략')
         V['lane_departure'] = {'count': 0, 'events': []}
         V['solid_lane_change'] = {'count': 0, 'events': []}
         V['turn_signal'] = {'count': 0, 'events': []}
         V['center_line'] = {'count': 0, 'events': []}
+        V['sidewalk'] = {'count': 0, 'events': []}
 
     red, red_right = detect_red_light(span, t0, stop_speed)
     V['red_light'] = {'count': 0, 'events': red}
@@ -1073,6 +1109,7 @@ LABEL = {
     'speed': '속도 초과(법규)', 'speed_margin': '여유 침범(정보)',
     'lane_departure': '차선 이탈', 'solid_lane_change': '실선 차선변경',
     'turn_signal': '차선변경 지시등 미점등', 'center_line': '중앙선 침범',
+    'sidewalk': '보도 침범',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
     'green_stall': '녹색신호 정차',
@@ -1088,6 +1125,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'solid_lane_change': ('side', 'from_lane', 'to_lane', 'n_crossings'),
     'turn_signal': ('side', 'from_lane', 'to_lane', 'on_s', 'n_crossings'),
     'center_line': ('depth_m', 'lane', 't_off', 'left_mark_yellow'),
+    'sidewalk': ('depth_m', 'lane', 't_off', 'side'),
     'red_light': ('ctrl_ids', 'states', 'v_kph', 'next_turn'),
     'red_right_turn': ('states', 'v_kph', 'stopped_before'),
     'red_stop_ok': ('front_m',),
