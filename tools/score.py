@@ -20,7 +20,10 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
   solid_lane_change  실선(left_solid/right_solid) 구간에서의 차로 변경
   red_light          적신호에 정지선 통과 (stop_line_front_m 부호 전환 시점 판정)
   red_right_turn     [정보] 적신호 우회전 통과 — 직전 일시정지 여부를 남긴다
-  stop_line_encroach 정지 상태인데 앞범퍼가 정지선 너머 (침범 거리, 발진 크리프 제외)
+  red_stop_ok        [정보] 적신호 정지 정상 — 앞범퍼가 정지선 앞 stop_ok_m 이내
+  red_stop_far       적신호 정지가 정지선에서 stop_ok_m 이상 떨어짐 (경미)
+  stop_line_encroach 적신호 정지인데 앞범퍼가 정지선 너머 (침범 거리)
+                     — red_stop_far 와 함께 detect_red_stop 의 갈래다
   off_route          경로 이탈 구간 (route 있으면 최대 이탈 거리)
   reset              courseRespawn 리셋
   collision / near_miss  객체 외곽 간 최소 간격 ≤ params score.* 임계
@@ -50,10 +53,12 @@ from vtd_adapter.config import end_margin_m, load_params_yaml  # noqa: E402
 # 정보성 집계 — 위반 총계(n_violations)에 넣지 않는다.
 # overtime: 안내문 채점 규칙에 없음 (20분은 세팅 포함 운영 시간, 완주 시간은
 # 동점 타이브레이커) — 검출은 유지하되 정보로 강등 (2026-08-27).
-INFO_KEYS = ('speed_margin', 'red_right_turn', 'near_miss', 'overtime')
+INFO_KEYS = ('speed_margin', 'red_right_turn', 'red_stop_ok', 'near_miss', 'overtime')
 
 # ── 채점 매핑 (2026 HL FMA 안내문, params scoring.* 이 감점값의 단일 출처) ──
-SCORING_ITEM = {'stop_line_encroach': 'red_light'}   # 정지선 침범은 "적색신호 정지" 항목으로 흡수
+# 정지선 침범·원거리 정지는 "적색신호 정지" 항목(7)으로 흡수 — 통과(red_light)와
+# 같은 항목의 정도 차이일 뿐이다.
+SCORING_ITEM = {'stop_line_encroach': 'red_light', 'red_stop_far': 'red_light'}
 COUNT_ESCALATE = ('lane_departure', 'solid_lane_change')   # 구간 내 2회 이상 → 중대
 
 RED = 1                    # 9910 신호 state (logger.py 주석: 1=적 4=좌 5=녹+좌)
@@ -354,19 +359,67 @@ def detect_red_light(ticks: list[dict], t0: float, stop_speed: float) -> tuple[l
     return viol, right
 
 
-def detect_stop_line_encroach(ticks: list[dict], t0: float, stop_speed: float) -> list:
-    """정지 상태(v<stop_speed)인데 앞범퍼가 정지선 너머(stop_line_front_m>0).
-    발진 크리프 제외: v_target>0 이면 이미 출발 계획이 난 구간이라 침범으로
-    세지 않는다 (녹색 전환 후 v<stop_speed 인 첫 몇 틱이 잡히던 오탐)."""
-    mask = [t['ego']['speed'] < stop_speed
-            and (t['world'].get('stop_line_front_m') or 0) > 0
-            and (t['decision'].get('v_target') or 0.0) <= 1e-3 for t in ticks]
-    out = []
-    for i0, i1, _ in _runs(mask):
-        worst = max(range(i0, i1 + 1), key=lambda i: ticks[i]['world']['stop_line_front_m'])
-        out.append(_ev(ticks, t0, i0, i1,
-                       encroach_m=round(ticks[worst]['world']['stop_line_front_m'], 2)))
-    return out
+def _tick_red(t: dict) -> bool | None:
+    """이 틱에서 전방 정지선의 신호가 적색인가. 정지선/신호 대조 불가면 None.
+
+    적색 정의는 detect_red_light 의 통과 판정과 같다: state RED, 또는
+    LEFT_ARROW 인데 좌회전 경로가 아니면 적색과 동등."""
+    ctrl = t['world']['flags'].get('stop_ctrl_ids') or []
+    if not ctrl:
+        return None
+    states = dict((int(a), int(b)) for a, b in t['raw']['lights'])
+    got = [states[c] for c in ctrl if c in states]
+    if not got:
+        return None
+    summ = t['world'].get('summ') or {}
+    turn = summ.get('next_turn')
+    d_turn = summ.get('dist_next_turn')
+    near_turn = d_turn is not None and d_turn < 30.0
+    return any(s == RED for s in got) or \
+        (any(s == LEFT_ARROW for s in got) and not (turn == 'turn_left' and near_turn))
+
+
+def detect_red_stop(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
+                    merge_gap_s: float = 0.0) -> tuple[list, list, list]:
+    """적신호 정지 이벤트 (대회 항목 7 — 정지 품질).
+
+    전방 정지선 존재(stop_line_front_m) + 적색(_tick_red) 에서 v<stop_speed 가
+    scoring.stop_hold_s 이상 지속된 에피소드를 잡고, 앞범퍼 최전방 위치
+    (stop_line_front_m 최대)로 3분류:
+      [-stop_ok_m, 0] → red_stop_ok  정상 (정보)
+      < -stop_ok_m    → red_stop_far 멀리 정지 (경미)
+      > 0             → stop_line_encroach 선 넘어 정지 (경미)
+    정지 없이 통과(중대)는 기존 detect_red_light 소관. 속도가 임계 주위에서
+    진동하면 merge_gap_s 로 병합 후 지속시간을 본다. 적색 조건이 에피소드를
+    한정하므로 옛 발진 크리프 오탐(녹색 전환 직후 저속 틱)은 자연 배제된다.
+    reset 틱은 제외."""
+    ok_m = float(sc['stop_ok_m'])
+    hold_s = float(sc['stop_hold_s'])
+    mask = [bool(_tick_red(t)) and t['world'].get('stop_line_front_m') is not None
+            and t['ego']['speed'] < stop_speed
+            and not t['world']['flags'].get('reset') for t in ticks]
+    merged = []
+    for r in _runs(mask):
+        if merged and ticks[r[0]]['t'] - ticks[merged[-1][1]]['t'] <= merge_gap_s:
+            merged[-1] = (merged[-1][0], r[1], True)
+        else:
+            merged.append(r)
+    ok, far, enc = [], [], []
+    for i0, i1, _ in merged:
+        if ticks[i1]['t'] - ticks[i0]['t'] < hold_s:
+            continue                                       # 일시 감속 — 정지로 안 본다
+        worst = max((i for i in range(i0, i1 + 1) if mask[i]),
+                    key=lambda i: ticks[i]['world']['stop_line_front_m'])
+        f = float(ticks[worst]['world']['stop_line_front_m'])
+        ev = _ev(ticks, t0, i0, i1, front_m=round(f, 2))
+        if f > 0:
+            ev['encroach_m'] = round(f, 2)
+            enc.append(ev)
+        elif f < -ok_m:
+            far.append(ev)
+        else:
+            ok.append(ev)
+    return ok, far, enc
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -608,7 +661,7 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'minor'
     if cat == 'red_light':
         return 'major'
-    if cat == 'stop_line_encroach':
+    if cat in ('stop_line_encroach', 'red_stop_far'):
         return 'minor'
     if cat == 'collision':
         return 'major'
@@ -731,7 +784,11 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     red, red_right = detect_red_light(span, t0, stop_speed)
     V['red_light'] = {'count': 0, 'events': red}
     V['red_right_turn'] = {'count': 0, 'events': red_right}
-    V['stop_line_encroach'] = {'count': 0, 'events': detect_stop_line_encroach(span, t0, stop_speed)}
+    rs_ok, rs_far, rs_enc = detect_red_stop(span, t0, stop_speed, cfg['scoring'],
+                                            float(cfg['score'].get('merge_gap_s', 0.0)))
+    V['red_stop_ok'] = {'count': 0, 'events': rs_ok}
+    V['red_stop_far'] = {'count': 0, 'events': rs_far}
+    V['stop_line_encroach'] = {'count': 0, 'events': rs_enc}
     V['off_route'] = {'count': 0, 'events': detect_off_route(
         span, t0, lg, route, float(cfg['score'].get('merge_gap_s', 0.0)))}
 
@@ -795,6 +852,7 @@ LABEL = {
     'speed': '속도 초과(법규)', 'speed_margin': '여유 침범(정보)',
     'lane_departure': '차선 이탈', 'solid_lane_change': '실선 차선변경',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
+    'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
     'stop_line_encroach': '정지선 침범', 'off_route': '경로 이탈',
     'reset': '리셋(courseRespawn)', 'collision': '충돌', 'near_miss': '근접 경고(정보)',
     'not_finished': '미완주', 'overtime': '시간 초과(정보)', 'stall': '정지 고착',
@@ -807,7 +865,9 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'solid_lane_change': ('side', 'from_lane', 'to_lane', 'n_crossings'),
     'red_light': ('ctrl_ids', 'states', 'v_kph', 'next_turn'),
     'red_right_turn': ('states', 'v_kph', 'stopped_before'),
-    'stop_line_encroach': ('encroach_m',),
+    'red_stop_ok': ('front_m',),
+    'red_stop_far': ('front_m',),
+    'stop_line_encroach': ('front_m', 'encroach_m'),
     'off_route': ('max_dist_m',),
     'reset': ('why',),
     'collision': ('obj_id', 'obj_cls', 'min_gap_m', 'v_kph'),

@@ -158,6 +158,11 @@ scoring:
   # 제한속도 severity [km/h]: 초과 ≤allow 감점 없음 / ~major 경미 / >major 중대
   speed_allow_kph: 1.0
   speed_major_kph: 20.0
+  # 대회 7번 적색신호 정지 품질 (detect_red_stop): 앞범퍼가 정지선 앞 stop_ok_m
+  # 이내 정지 = 정상 / 그보다 멀면 경미 / 선 넘으면 침범(경미) / 통과는 중대.
+  # 정지 판정은 v<score.stop_speed_mps 가 stop_hold_s 이상 지속.
+  stop_ok_m: 2.0
+  stop_hold_s: 0.5
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.
