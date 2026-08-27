@@ -470,6 +470,34 @@ def spawn_gate(lg, rt, gen_cfg):
             f'{d_deg:.0f}° (>{thr_deg:g}°), 뒤쪽으로 waypoint2 도로({wp2_road}) 우회 존재')
 
 
+_PARAMS_CFG = None     # polyline_gate 용 params.yaml 캐시 (VtdRoutePlanner 재샘플에 필요)
+
+
+def polyline_gate(lg, rt, gen_cfg):
+    """경로 폴리라인 연속성 게이트. 문제가 있으면 사유 문자열, 통과면 None.
+
+    컨트롤러가 실제로 따라갈 재샘플(VtdRoutePlanner._build, 10 cm 간격)을 그대로
+    만들어 연속 점 간격을 검사한다 — 소멸 차로 킹크(2026-08-26 실기 1.5 m 점프
+    → 조향 풀포화·차선이탈 진동) 같은 불연속 경로를 생성 시점에 폐기한다.
+    route.py 의 taper_blend_m 수정과 독립적인 이중 방어 — 저쪽이 퇴행해도
+    여기서 잡힌다.
+    """
+    global _PARAMS_CFG
+    thr = float(gen_cfg['max_polyline_step_m'])
+    if _PARAMS_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _PARAMS_CFG = load_params_yaml()
+    from vtd_adapter.route import VtdRoutePlanner
+    pl = VtdRoutePlanner(lg, rt, _PARAMS_CFG)
+    pts = pl.route_points
+    d = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+    i = int(np.argmax(d))
+    if d[i] > thr:
+        return (f'경로 폴리라인 불연속 {d[i]:.2f} m (>{thr:g} m) — '
+                f'route_s≈{float(pl.route_s[i]):.1f} m 부근 (테이퍼 킹크 의심)')
+    return None
+
+
 def synth_walk(lg, rng, name, spec, gen_cfg) -> Route:
     """walk 사양 → 검증까지 마친 Route. 실패는 GenError (무음 실패 금지)."""
     turns = spec.get('turns', ['any'])
@@ -504,9 +532,9 @@ def synth_walk(lg, rng, name, spec, gen_cfg) -> Route:
         warns, first = route_check(lg, route.rt)
         if warns:
             continue                     # build_route 경고가 하나라도 있으면 폐기 후 재시도
-        why = spawn_gate(lg, route.rt, gen_cfg)
+        why = spawn_gate(lg, route.rt, gen_cfg) or polyline_gate(lg, route.rt, gen_cfg)
         if why:
-            GATE_STATS['reject'] += 1    # VTD 가 역방향 스폰할 수 있는 시작점 — 재시도
+            GATE_STATS['reject'] += 1    # 역방향 스폰 가능 또는 폴리라인 킹크 — 재시도
             continue
         GATE_STATS['ok'] += 1
         return route
@@ -549,10 +577,11 @@ class RoutePool:
                 err = GenError(f'경로 {name}({d["csv"]}): build_route 경고 {warns}건 — {first}')
                 self.cache[key] = err
                 raise err
-            why = spawn_gate(self.lg, r.rt, self.gen_cfg)
+            why = (spawn_gate(self.lg, r.rt, self.gen_cfg)
+                   or polyline_gate(self.lg, r.rt, self.gen_cfg))
             if why:                     # csv 는 재시도할 다른 시작점이 없다 — 경로째 탈락
                 GATE_STATS['reject'] += 1
-                err = GenError(f'경로 {name}({d["csv"]}): 스폰 게이트 탈락 — {why}')
+                err = GenError(f'경로 {name}({d["csv"]}): 경로 게이트 탈락 — {why}')
                 self.cache[key] = err
                 raise err
             GATE_STATS['ok'] += 1
@@ -1568,11 +1597,52 @@ def load_themes():
         raise GenError(f'{THEMES_YAML} 이 없다')
     data = yaml.safe_load(THEMES_YAML.read_text(encoding='utf-8'))
     gen_cfg = data.get('gen') or {}
-    for k in ('spawn_heading_max_deg', 'reverse_ratio_max'):
+    for k in ('spawn_heading_max_deg', 'reverse_ratio_max', 'max_polyline_step_m'):
         if k not in gen_cfg:
             raise GenError(f'{THEMES_YAML} 에 gen.{k} 가 없다 — 게이트 임계는 '
                            f'설정 파일이 단일 출처다 (하드코딩 금지)')
     return data.get('routes', {}), data.get('themes', {}), gen_cfg
+
+
+def batch_item(vtd_dir: str, out_dir_name: str, theme: str, name: str, timeout_s) -> dict:
+    """batch 목록 항목 — batch_run._load_one 이 읽는 스키마 그대로 (변경 금지)."""
+    return {'name': name,
+            'vtd_xml_path': f'{vtd_dir.rstrip("/")}/{theme}/{name}.xml',
+            'route_csv': f'{out_dir_name}/{theme}/{name}.csv',
+            'timeout_s': timeout_s}
+
+
+def rebuild_batch_lists(out_dir: pathlib.Path, vtd_dir: str) -> tuple[int, int]:
+    """디스크의 <주제>/*.yaml 을 단일 출처로 batch_<주제>.json / batch_all.json 재생성.
+
+    "이번 호출분" 메모리로 쓰던 예전 방식은 호출마다 목록을 덮어써서, 주제를
+    차례로 생성하면 batch_all.json 에 마지막 주제만 남았다 (2026-08-27 실측:
+    4개 주제 생성 후 보행자집중 6개만 잔존, 완주속도는 두 번째 시드분 9개만).
+    주제 순서 = 디렉터리 생성 시각 오름차순(처음 생성된 순서), 주제 안 =
+    파일명(번호) 순. 이름 중복이면 아무 목록도 쓰지 않고 실패한다.
+    → (전체 항목 수, 주제 수)
+    """
+    per_theme: list[tuple[str, list]] = []
+    for d in sorted((p for p in out_dir.iterdir() if p.is_dir()),
+                    key=lambda p: p.stat().st_ctime):
+        items = []
+        for y in sorted(d.glob('*.yaml')):
+            sdef = yaml.safe_load(y.read_text(encoding='utf-8'))
+            items.append(batch_item(vtd_dir, out_dir.name, d.name,
+                                    sdef['name'], sdef['timeout_s']))
+        if items:
+            per_theme.append((d.name, items))
+    all_items = [it for _th, items in per_theme for it in items]
+    names = [it['name'] for it in all_items]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:                              # 통합 기준 중복 검사 — batch_run 과 같은 규칙
+        raise GenError(f'통합 batch 목록에서 이름이 중복된다: {dup}')
+    for th, items in per_theme:
+        (out_dir / f'batch_{th}.json').write_text(
+            json.dumps(items, ensure_ascii=False, indent=1), encoding='utf-8')
+    (out_dir / 'batch_all.json').write_text(
+        json.dumps(all_items, ensure_ascii=False, indent=1), encoding='utf-8')
+    return len(all_items), len(per_theme)
 
 
 def write_scenario(out_dir, theme, name, xml_text, sdef, rows):
@@ -1628,10 +1698,21 @@ def main(argv=None) -> int:
     ap.add_argument('--graph', default=str(ROOT / 'data' / 'lane_graph.pkl'))
     ap.add_argument('--list', action='store_true', help='주제 목록만 출력')
     ap.add_argument('--from-yaml', default=None, help='저장된 정의 YAML 로 단건 재생성')
+    ap.add_argument('--rebuild-lists', action='store_true',
+                    help='생성 없이 디스크(<주제>/*.yaml) 기준으로 batch 목록만 재생성')
     a = ap.parse_args(argv)
 
     if a.hours is not None and a.count is not None:
         raise GenError('--hours 와 --count 는 함께 쓸 수 없다')
+
+    # ── 복구용: 목록만 재생성 (lane_graph 불필요) ────────────────────────
+    if a.rebuild_lists:
+        out_dir = pathlib.Path(a.out_dir)
+        if not out_dir.is_dir():
+            raise GenError(f'{out_dir} 가 없다')
+        n_all, n_themes = rebuild_batch_lists(out_dir, a.vtd_dir)
+        print(f'batch_all.json: {n_all}개 (주제 {n_themes}개)  ({out_dir}/)')
+        return 0
 
     route_defs, themes, gen_cfg = load_themes()
     GATE_STATS['ok'] = GATE_STATS['reject'] = 0
@@ -1651,9 +1732,9 @@ def main(argv=None) -> int:
         sdef = yaml.safe_load(pathlib.Path(a.from_yaml).read_text(encoding='utf-8'))
         rows = [tuple(r) for r in sdef['route']['rows']]
         route = _build_from_rows(lg, sdef['route']['name'], rows)
-        why = spawn_gate(lg, route.rt, gen_cfg)
+        why = spawn_gate(lg, route.rt, gen_cfg) or polyline_gate(lg, route.rt, gen_cfg)
         if why:                         # 게이트 도입 전에 저장된 정의일 수 있다 — 재생성 거부
-            raise GenError(f'{a.from_yaml}: 스폰 게이트 탈락 — {why}')
+            raise GenError(f'{a.from_yaml}: 경로 게이트 탈락 — {why}')
         axes = sdef['axes']
         variant = {k: v for k, v in axes.items() if k not in ('route', 'event')}
         variant['route'] = tuple(axes['route'])
@@ -1683,7 +1764,6 @@ def main(argv=None) -> int:
 
     chosen = allocate(themes, combos, a.count, a.hours, route_len, a.seed)
 
-    batch_by_theme = {th: [] for th in a.themes}
     summary, warn_total = [], 0
     skipped = []
     walk_starts: set = set()            # 합성 경로 시작 도로들 — 실기 스폰 확인 항목
@@ -1720,28 +1800,14 @@ def main(argv=None) -> int:
             for _, x, y, dm in bad:
                 print(f'  ⚠ {name}: ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
                 warn_total += 1
-            batch_by_theme[th].append({
-                'name': name,
-                'vtd_xml_path': f'{a.vtd_dir.rstrip("/")}/{th}/{name}.xml',
-                'route_csv': str(pathlib.Path(a.out_dir).name + f'/{th}/{name}.csv'),
-                'timeout_s': sdef['timeout_s']})
             n_ok += 1
             est_total += sdef['est_s']
         unsup = sorted({UNSUPPORTED[e] for e in cfg.get('event', []) if e in UNSUPPORTED})
         summary.append((th, n_ok, est_total, '; '.join(unsup)))
 
-    # ── batch 목록: 주제별 + 이번 실행 전체 통합(batch_all.json) ─────────
+    # ── batch 목록: 디스크(<주제>/*.yaml)가 단일 출처 — 매번 전체 재생성 ──
     out_dir.mkdir(parents=True, exist_ok=True)
-    batch_all = [it for th in a.themes for it in batch_by_theme[th]]
-    names = [it['name'] for it in batch_all]
-    dup = sorted({n for n in names if names.count(n) > 1})
-    if dup:                              # 통합 기준 중복 검사 — batch_run 과 같은 규칙
-        raise GenError(f'통합 batch 목록에서 이름이 중복된다: {dup}')
-    for th in a.themes:
-        (out_dir / f'batch_{th}.json').write_text(
-            json.dumps(batch_by_theme[th], ensure_ascii=False, indent=1), encoding='utf-8')
-    (out_dir / 'batch_all.json').write_text(
-        json.dumps(batch_all, ensure_ascii=False, indent=1), encoding='utf-8')
+    n_all, n_themes = rebuild_batch_lists(out_dir, a.vtd_dir)
 
     # ── 요약 ─────────────────────────────────────────────────────────────
     print()
@@ -1773,8 +1839,7 @@ def main(argv=None) -> int:
         print(f'\n[실기 1회 확인] 합성 경로 시작 도로 {sorted(walk_starts)} — '
               f'Ego PathRef/Path01 은 경로 기준으로 생성했지만, VTD 스폰이 실제로 '
               f'그 위치에 되는지는 새 시작점마다 실기에서 한 번 확인할 것')
-    print(f'\nbatch 목록: ' + ', '.join(f'batch_{th}.json' for th in a.themes)
-          + f'  +  batch_all.json  ({out_dir}/)')
+    print(f'\nbatch_all.json: {n_all}개 (주제 {n_themes}개)  ({out_dir}/)')
     print(f'실행:  python3 tools/batch_run.py {out_dir / "batch_all.json"}')
     print('       (batch_run 은 목록 여러 개·glob 도 받는다 — 주제별 batch_<주제>.json 조합 가능)')
     return 0

@@ -21,6 +21,9 @@ bags/
 *.bin
 *.log
 # ===== 생성물 (gen_scenarios / build_route) =====
+# 배치가 만드는 route pkl 은 logs/batch/<ts>/routes/ 에 남는다 (logs/ 로 무시).
+# data/ 에는 손으로 만든 pkl 만 둔다 — 그중 추적할 것만 화이트리스트.
 scenarios/
 data/route_*.pkl
 !data/route_example.pkl
+!data/route_official_route.pkl

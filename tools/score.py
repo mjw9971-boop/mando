@@ -1,6 +1,11 @@
 """
-로그 → 위반 검출기. **배점·감점 계산은 하지 않는다** — 대회 채점 규칙 원문이
-없으므로 "무엇을 몇 번 위반했는가"만 정확히 잡는다.
+로그 → 위반 검출 + 채점.
+
+검출 층은 "무엇을 몇 번 위반했는가"를 잡고, 그 위에 2026 HL FMA 안내문
+(2026-08-27 공개) 채점 층(score_run)이 구간별 점수를 얹는다: 구간 100점,
+(항목,구간)당 1회 감점(경미 -3/중대 -6, params scoring.*), 리스폰 구간당 1회
+무료, 미완주 시 도달 구간까지만 집계. 검출과 채점은 분리 — 검출 건수는
+severity 와 무관하게 유지된다.
 
     python3 tools/score.py logs/run_xxx.jsonl
     python3 tools/score.py LOG --route data/route_X.pkl --json
@@ -11,11 +16,11 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
 검출 항목 (각각 위반 횟수 + 구간(route_s·틱 범위) + 정도):
   speed              법규 제한속도 초과 (구간별 50/30/스쿨존 구분, 연속 틱 = 1건)
   speed_margin       [정보] params speed.margin_kph 여유 침범 — 위반 아님
-  lane_departure     |t_off| > 차로폭/2 − 차체폭/2 (LANE_CHANGE 상태 제외)
+  lane_departure     |t_off| > 차로폭/2 − 차체폭/2 (계획된 차선변경 창·테이퍼 차로 제외)
   solid_lane_change  실선(left_solid/right_solid) 구간에서의 차로 변경
   red_light          적신호에 정지선 통과 (stop_line_front_m 부호 전환 시점 판정)
   red_right_turn     [정보] 적신호 우회전 통과 — 직전 일시정지 여부를 남긴다
-  stop_line_encroach 정지 상태인데 앞범퍼가 정지선 너머 (침범 거리)
+  stop_line_encroach 정지 상태인데 앞범퍼가 정지선 너머 (침범 거리, 발진 크리프 제외)
   off_route          경로 이탈 구간 (route 있으면 최대 이탈 거리)
   reset              courseRespawn 리셋
   collision / near_miss  객체 외곽 간 최소 간격 ≤ params score.* 임계
@@ -28,18 +33,28 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import pathlib
 import pickle
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / 'team_code'))
 
+from kr_rules import plan_stop_s                               # noqa: E402 — 제어와 공용 (단일 출처)
 from vtd_adapter.config import end_margin_m, load_params_yaml  # noqa: E402
 
-# 정보성 집계 — 위반 총계(n_violations)에 넣지 않는다
-INFO_KEYS = ('speed_margin', 'red_right_turn', 'near_miss')
+# 정보성 집계 — 위반 총계(n_violations)에 넣지 않는다.
+# overtime: 안내문 채점 규칙에 없음 (20분은 세팅 포함 운영 시간, 완주 시간은
+# 동점 타이브레이커) — 검출은 유지하되 정보로 강등 (2026-08-27).
+INFO_KEYS = ('speed_margin', 'red_right_turn', 'near_miss', 'overtime')
+
+# ── 채점 매핑 (2026 HL FMA 안내문, params scoring.* 이 감점값의 단일 출처) ──
+SCORING_ITEM = {'stop_line_encroach': 'red_light'}   # 정지선 침범은 "적색신호 정지" 항목으로 흡수
+COUNT_ESCALATE = ('lane_departure', 'solid_lane_change')   # 구간 내 2회 이상 → 중대
 
 RED = 1                    # 9910 신호 state (logger.py 주석: 1=적 4=좌 5=녹+좌)
 LEFT_ARROW = 4
@@ -152,25 +167,62 @@ def detect_speed(ticks: list[dict], t0: float, margin_kph: float,
 # ══════════════════════════════════════════════════════════════════════════
 # 2. 차선 이탈
 # ══════════════════════════════════════════════════════════════════════════
-def detect_lane_departure(ticks: list[dict], t0: float, lg, veh_width: float) -> list:
+def detect_lane_departure(ticks: list[dict], t0: float, lg, veh_width: float,
+                          route=None, merge_gap_s: float = 0.0) -> list:
     """|t_off| > 차로폭/2 − 차체폭/2. 차로폭은 lanegraph 의 해당 s 값.
-    차로를 옮기는 중(LANE_CHANGE)은 경계 통과가 정상이라 제외한다."""
+
+    제외 3종 (2026-08-26 오탐 분석):
+      · 계획된 차선변경 — 어댑터(PDM-lite)는 LANE_CHANGE 상태를 내지 않으므로
+        state 대신 route 의 lane_change window(route_s 구간)로 판정한다
+      · 테이퍼(소멸) 차로 — 끝 폭 < 차폭인 차로(route.py taper_blend 와 같은
+        기준). 계획 경로가 중심선을 떠나 successor 로 붙는 구간이라 이 차로
+        기준 t_off 판정은 무의미하다 (임계도 0 근처로 붕괴해 cm 단위 오탐)
+      · reset 틱
+    진동이 경계를 여러 번 넘으면 잘게 쪼개지므로 merge_gap_s 이하 끊김은
+    같은 1건으로 병합한다 (speed/off_route 와 같은 규칙)."""
+    windows = []
+    if route:
+        windows = [(float(e['window_s0']), float(e['window_s1']))
+                   for e in route.get('events', [])
+                   if e['kind'].startswith('lane_change') and 'window_s0' in e]
+    taper_cache: dict = {}      # lane -> 끝 폭 < 차폭 (소멸 차로)
+
+    def is_taper(key) -> bool:
+        if key not in taper_cache:
+            try:
+                taper_cache[key] = lg.width_at(key, lg.length(key)) < veh_width
+            except KeyError:
+                taper_cache[key] = False
+        return taper_cache[key]
+
     mask = []
     for t in ticks:
         e = t['ego']
+        rs = e['route_s']
         ok = (t['world']['valid'] and e['lane']
               and t['decision']['state'] != 'LANE_CHANGE'
-              and not t['world']['flags'].get('reset'))
+              and not any(a - 1e-6 <= rs <= b + 1e-6 for a, b in windows)
+              and not t['world']['flags'].get('reset')
+              and not is_taper(tuple(e['lane'])))
         thr = None
         if ok:
             try:
                 thr = lg.width_at(tuple(e['lane']), e['s']) / 2.0 - veh_width / 2.0
             except KeyError:
                 thr = None
-        mask.append(thr is not None and abs(e['t_off']) > thr)
+        mask.append(thr is not None and thr > 0 and abs(e['t_off']) > thr)
+    runs = _runs(mask)
+    merged = []
+    for r in runs:
+        if merged and ticks[r[0]]['t'] - ticks[merged[-1][1]]['t'] <= merge_gap_s:
+            merged[-1] = (merged[-1][0], r[1], True)
+        else:
+            merged.append(r)
     out = []
-    for i0, i1, _ in _runs(mask):
-        worst = max(range(i0, i1 + 1), key=lambda i: abs(ticks[i]['ego']['t_off']))
+    for i0, i1, _ in merged:
+        # 병합 구간에는 임계 미달(gap) 틱도 섞인다 — 극값은 판정된 틱 중에서만
+        worst = max((i for i in range(i0, i1 + 1) if mask[i]),
+                    key=lambda i: abs(ticks[i]['ego']['t_off']))
         e = ticks[worst]['ego']
         thr = lg.width_at(tuple(e['lane']), e['s']) / 2.0 - veh_width / 2.0
         out.append(_ev(ticks, t0, i0, i1, lane=e['lane'],
@@ -303,9 +355,12 @@ def detect_red_light(ticks: list[dict], t0: float, stop_speed: float) -> tuple[l
 
 
 def detect_stop_line_encroach(ticks: list[dict], t0: float, stop_speed: float) -> list:
-    """정지 상태(v<stop_speed)인데 앞범퍼가 정지선 너머(stop_line_front_m>0)."""
+    """정지 상태(v<stop_speed)인데 앞범퍼가 정지선 너머(stop_line_front_m>0).
+    발진 크리프 제외: v_target>0 이면 이미 출발 계획이 난 구간이라 침범으로
+    세지 않는다 (녹색 전환 후 v<stop_speed 인 첫 몇 틱이 잡히던 오탐)."""
     mask = [t['ego']['speed'] < stop_speed
-            and (t['world'].get('stop_line_front_m') or 0) > 0 for t in ticks]
+            and (t['world'].get('stop_line_front_m') or 0) > 0
+            and (t['decision'].get('v_target') or 0.0) <= 1e-3 for t in ticks]
     out = []
     for i0, i1, _ in _runs(mask):
         worst = max(range(i0, i1 + 1), key=lambda i: ticks[i]['world']['stop_line_front_m'])
@@ -464,20 +519,28 @@ def detect_proximity(ticks: list[dict], t0: float, cfg: dict) -> tuple[list, lis
 # ══════════════════════════════════════════════════════════════════════════
 # 9. 미완주·시간 초과 / 10. 정지 고착
 # ══════════════════════════════════════════════════════════════════════════
-def detect_finish(ticks: list[dict], t0: float, route, cfg: dict) -> dict:
-    """완주 판정은 batch_run/summarize 와 같은 end_margin_m(params 연동)."""
+def detect_finish(ticks: list[dict], t0: float, route, cfg: dict,
+                  finish_s: float | None = None) -> dict:
+    """완주 판정.
+
+    규칙(안내문): **뒷바퀴 축이 종료 지점 좌표 통과** — ego x/y 가 뒷축 기준이라
+    (AGENT_SPEC §1.3) scoring.finish_xy 를 경로에 투영한 route_s(finish_s) 도달로
+    판정한다. finish_s 가 없으면 기존 route_s 임계(end_margin — batch_run 의
+    운영 종료 판정과 같은 식)로 폴백한다.
+    """
     limit_s = float(cfg['score']['time_limit_s'])
     s = [t['ego']['route_s'] for t in ticks]
     peak_i = max(range(len(s)), key=lambda i: s[i])
     res = {'peak_route_s': round(s[peak_i], 1), 'route_total': None,
            'done': None, 'finish_time_s': None, 'time_limit_s': limit_s,
+           'finish_basis': 'finish_xy' if finish_s is not None else 'route_s_margin',
            'wall_s': round(ticks[-1]['t'] - t0, 1)}
     not_finished, overtime = [], []
     if route is not None:
         total = float(route['total_length'])
-        margin = end_margin_m(cfg)
+        thr = float(finish_s) if finish_s is not None else total - end_margin_m(cfg)
         res['route_total'] = round(total, 1)
-        hit = next((i for i in range(len(s)) if s[i] >= total - margin), None)
+        hit = next((i for i in range(len(s)) if s[i] >= thr), None)
         res['done'] = hit is not None
         if hit is not None:
             res['finish_time_s'] = round(ticks[hit]['t'] - t0, 1)
@@ -509,6 +572,125 @@ def detect_stall(ticks: list[dict], t0: float, cfg: dict) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 채점 층 (2026 HL FMA 안내문) — 검출 결과 위에 얹는다. 검출 로직은 불변.
+# ══════════════════════════════════════════════════════════════════════════
+def project_route_s(lg, route, x: float, y: float) -> float | None:
+    """좌표 → 경로 누적거리 (종료 지점 통과 판정용). 경로 차로들에 투영해 최근접."""
+    best = None
+    for i, k in enumerate(route['lanes']):
+        try:
+            s_p, _t, d_p, _ = lg.project(tuple(k), x, y)
+        except KeyError:
+            continue
+        if best is None or d_p < best[0]:
+            best = (d_p, float(route['cum_s'][i]) + float(s_p))
+    return best[1] if best else None
+
+
+def _severity(cat: str, ev: dict, sc: dict) -> str:
+    """이벤트 → 'minor' | 'major' | 'none' (안내문 매핑, 작업3).
+
+    · speed: 초과 ≤ speed_allow_kph 감점 없음 / ~speed_major_kph 경미 / 초과 중대
+    · lane_departure / solid_lane_change: 건당 경미 — 구간 내 2회 이상이면
+      score_run 이 중대로 심화 (COUNT_ESCALATE)
+    · red_light(정지선 통과·무정차): 중대.  stop_line_encroach(정지는 했으나
+      앞범퍼가 선을 넘음): 같은 항목의 경미로 흡수 — "2 m 이내 정지" 품질
+      판정(멀리 정지 = 경미)은 별도 검출기 필요라 이번 범위 밖
+    · collision: 중대.  reset 은 score_run 특칙.  그 외(off_route·stall 등)는
+      안내문 매핑 미확정 — 'none' (검출·집계는 유지, 감점 없음)
+    """
+    if cat == 'speed':
+        over = float(ev.get('max_over_kph', 0.0))
+        if over <= float(sc['speed_allow_kph']):
+            return 'none'
+        return 'major' if over > float(sc['speed_major_kph']) else 'minor'
+    if cat in COUNT_ESCALATE:
+        return 'minor'
+    if cat == 'red_light':
+        return 'major'
+    if cat == 'stop_line_encroach':
+        return 'minor'
+    if cat == 'collision':
+        return 'major'
+    if cat == 'reset':
+        return 'major'                  # 초과분에만 적용 (score_run 특칙)
+    return 'none'
+
+
+def _section_edges(sc: dict, total: float) -> list[float]:
+    bounds = sorted(float(b) for b in (sc.get('section_bounds_s') or []))
+    return [0.0] + [b for b in bounds if 0.0 < b < total] + [max(total, 1e-6)]
+
+
+def annotate_scoring(rep: dict, cfg: dict) -> None:
+    """모든 위반 이벤트에 severity 와 section_idx(이벤트 s0 기준)를 붙인다."""
+    sc = cfg['scoring']
+    total = rep['finish'].get('route_total') or rep['finish']['peak_route_s']
+    edges = _section_edges(sc, float(total))
+    for cat, d in rep['violations'].items():
+        for ev in d['events']:
+            ev['severity'] = _severity(cat, ev, sc) if cat not in INFO_KEYS else 'none'
+            ev['section_idx'] = min(bisect.bisect_right(edges, ev['s0']) - 1,
+                                    len(edges) - 2)
+
+
+def score_run(rep: dict, cfg: dict) -> dict:
+    """구간별 독립 채점 (2026 HL FMA 안내문).
+
+    구간 100점 시작 · (항목,구간)당 1회 감점(경미 minor_penalty / 중대
+    major_penalty) · 경미+중대 공존이면 중대 하나 · 차로유지·실선은 구간 내
+    2회 이상이면 중대(경미 심화 +3 = 총 -6) · 리스폰은 구간당
+    respawn_free_per_section 회 무감점, 초과분 1회당 -major 누적(1회 규칙
+    미적용) · 미완주면 뒷축이 진입한 구간까지만 만점·감점 집계 · 음수 허용.
+    """
+    sc = cfg['scoring']
+    minor, major = int(sc['minor_penalty']), int(sc['major_penalty'])
+    free = int(sc['respawn_free_per_section'])
+    total = float(rep['finish'].get('route_total') or rep['finish']['peak_route_s'])
+    edges = _section_edges(sc, total)
+    n_sec = len(edges) - 1
+    peak = float(rep['finish']['peak_route_s'])
+    reached = n_sec if rep['finish'].get('done') else \
+        max(1, sum(1 for i in range(n_sec) if peak > edges[i] + 1e-6))
+
+    buckets: dict = {}                  # (item, sec) -> [(severity, i0)]
+    resets: dict = {}                   # sec -> [i0, ...]
+    for cat, d in rep['violations'].items():
+        if cat in INFO_KEYS:
+            continue
+        for ev in d['events']:
+            sec = int(ev.get('section_idx', 0))
+            if cat == 'reset':
+                resets.setdefault(sec, []).append(ev['i0'])
+                continue
+            if ev.get('severity', 'none') == 'none':
+                continue
+            item = SCORING_ITEM.get(cat, cat)
+            buckets.setdefault((item, sec), []).append((ev['severity'], ev['i0']))
+
+    sections = []
+    for i in range(n_sec):
+        deds = []
+        for (item, sec), evs in sorted(buckets.items()):
+            if sec != i:
+                continue
+            sev = 'major' if (any(s == 'major' for s, _ in evs)
+                              or (item in COUNT_ESCALATE and len(evs) >= 2)) else 'minor'
+            deds.append({'item': item, 'severity': sev, 'event_i0': evs[0][1]})
+        for i0 in sorted(resets.get(i, []))[free:]:
+            deds.append({'item': 'reset', 'severity': 'major', 'event_i0': i0})
+        entered = i < reached
+        score = (100 - sum(major if d['severity'] == 'major' else minor
+                           for d in deds)) if entered else None
+        sections.append({'idx': i, 's0': round(edges[i], 1), 's1': round(edges[i + 1], 1),
+                         'score': score, 'deductions': deds})
+    return {'sections': sections,
+            'total': sum(s['score'] for s in sections if s['score'] is not None),
+            'max_possible': 100 * reached,
+            'reached_sections': reached}
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 종합
 # ══════════════════════════════════════════════════════════════════════════
 def analyze(log_path: str, cfg: dict, lg=None, route=None,
@@ -537,7 +719,8 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
 
     if lg is not None:
         V['lane_departure'] = {'count': 0, 'events': detect_lane_departure(
-            span, t0, lg, float(cfg['vehicle']['width']))}
+            span, t0, lg, float(cfg['vehicle']['width']), route,
+            float(cfg['score'].get('merge_gap_s', 0.0)))}
         V['solid_lane_change'] = {'count': 0, 'events': detect_solid_lane_change(
             span, t0, lg, float(cfg['score'].get('merge_gap_s', 0.0)))}
     else:
@@ -552,10 +735,35 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     V['off_route'] = {'count': 0, 'events': detect_off_route(
         span, t0, lg, route, float(cfg['score'].get('merge_gap_s', 0.0)))}
 
-    fin = detect_finish(span, t0, route, cfg)
+    # 완주: 안내문 규칙은 "뒷축이 종료 지점 좌표 통과" — finish_xy 를 경로에
+    # 투영한 route_s 로 판정. 미설정이면 기존 route_s 임계(end_margin) + 경고.
+    finish_s = None
+    fxy = cfg['scoring'].get('finish_xy')
+    if fxy and lg is not None and route is not None:
+        finish_s = project_route_s(lg, route, float(fxy[0]), float(fxy[1]))
+        if finish_s is None:
+            rep['warnings'].append('finish_xy 를 경로에 투영하지 못함 — route_s 임계로 폴백')
+    elif not fxy:
+        rep['warnings'].append('scoring.finish_xy 미설정 — 완주를 route_s 임계(end_margin)로 판정')
+    fin = detect_finish(span, t0, route, cfg, finish_s)
     rep['finish'] = fin['summary']
     if route is None:
         rep['warnings'].append('route 없음 — 완주/시간초과 판정·이탈거리 생략')
+    else:
+        # 계획 정지점 vs 종료선 정합 — 제어(kr_rules.plan_stop_s)와 같은 식(단일 출처).
+        # 채점 통과 기준은 finish_s 그 자체 (clearance 는 제어 여유일 뿐).
+        total = float(route['total_length'])
+        stop_s, _clipped = plan_stop_s(cfg, total, finish_s)
+        front = float(cfg['vehicle']['wheelbase']) + float(cfg['vehicle']['front_overhang_m'])
+        planned_stop = stop_s - float(cfg['speed']['stop_gap_m']) - front   # 계획 정지 시 뒷축
+        rep['finish']['finish_s'] = None if finish_s is None else round(float(finish_s), 1)
+        rep['finish']['planned_stop_s'] = round(planned_stop, 1)
+        rep['finish']['margin_m'] = (None if finish_s is None
+                                     else round(planned_stop - float(finish_s), 2))
+        if finish_s is not None and planned_stop - float(finish_s) <= 0:
+            rep['warnings'].append(
+                f'계획 정지점(뒷축 {planned_stop:.1f} m)이 종료선(finish_s '
+                f'{float(finish_s):.1f} m)을 못 넘는다 — 정상 정지해도 미완주 채점')
     V['not_finished'] = {'count': 0, 'events': fin['not_finished']}
     V['overtime'] = {'count': 0, 'events': fin['overtime']}
 
@@ -573,6 +781,10 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     for k, d in V.items():
         d['count'] = len(d['events'])
     rep['n_violations'] = sum(d['count'] for k, d in V.items() if k not in INFO_KEYS)
+
+    # ── 채점 층 (검출 결과는 위에서 확정 — 여기서는 severity·구간·점수만 얹는다)
+    annotate_scoring(rep, cfg)
+    rep['scoring'] = score_run(rep, cfg)
     return rep
 
 
@@ -585,7 +797,7 @@ LABEL = {
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'stop_line_encroach': '정지선 침범', 'off_route': '경로 이탈',
     'reset': '리셋(courseRespawn)', 'collision': '충돌', 'near_miss': '근접 경고(정보)',
-    'not_finished': '미완주', 'overtime': '시간 초과', 'stall': '정지 고착',
+    'not_finished': '미완주', 'overtime': '시간 초과(정보)', 'stall': '정지 고착',
 }
 
 _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
@@ -618,6 +830,9 @@ def render(rep: dict) -> str:
         tot = f"/{f['route_total']}" if f['route_total'] else ''
         L.append(f"완주: {done}  route_s {f['peak_route_s']}{tot} m  "
                  f"완주시간 {ft} (제한 {f['time_limit_s']:.0f} s, 벽시계 {f['wall_s']} s)")
+        if f.get('finish_s') is not None:
+            L.append(f"종료선: finish_s {f['finish_s']} m  계획 정지 뒷축 "
+                     f"{f['planned_stop_s']} m  여유 {f['margin_m']:+.2f} m")
     if 'speed_groups' in rep:
         L.append('구간별 속도: ' + '  '.join(
             f"[{k}] {g['ticks']}틱 v_max {g['v_max']:.1f}"
@@ -632,6 +847,18 @@ def render(rep: dict) -> str:
         mark = '' if d['count'] == 0 else ('  ←' if k not in INFO_KEYS else '')
         L.append(f"{LABEL[k]:<22} {d['count']:>4}{mark}")
     L.append(f"\n위반 합계(정보 제외): {rep.get('n_violations', 0)}")
+    if 'scoring' in rep:
+        s = rep['scoring']
+        L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}"
+                 f"  (구간 {len(s['sections'])}개 중 도달 {s['reached_sections']})")
+        for sec in s['sections']:
+            if sec['score'] is None:
+                L.append(f"  구간{sec['idx']} s {sec['s0']}~{sec['s1']}: 미도달 (집계 제외)")
+                continue
+            ded = '  '.join(f"{LABEL.get(d['item'], d['item'])}"
+                            f"[{'중대' if d['severity'] == 'major' else '경미'}]"
+                            for d in sec['deductions']) or '감점 없음'
+            L.append(f"  구간{sec['idx']} s {sec['s0']}~{sec['s1']}: {sec['score']}점  {ded}")
     for k in LABEL:
         d = rep['violations'].get(k)
         if not d or not d['events']:

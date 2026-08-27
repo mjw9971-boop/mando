@@ -12,9 +12,12 @@
       "timeout_s": 180}, ...]
 
 한 사이클:
-  1. build_route.py 로 data/route_{name}.pkl 생성 (**공용 route.pkl 은 건드리지 않는다**)
-  2. SCP(48179) 로 VTD 에 시나리오 로드 → Init → Start   (실측 확인 2026-08-24)
-  3. run_agent.py 를 서브프로세스로 (--route data/route_{name}.pkl)
+  1. build_route.py 로 logs/batch/<ts>/routes/route_{name}.pkl 생성
+     (data/ 에는 안 남긴다 — 손으로 만든 pkl 만 두는 곳이다. 배치 산출 route 는
+      로그와 같은 디렉터리에 묶여 사후 분석·replay 후 통째로 지운다)
+  2. SCP(48179) 로 VTD 에 시나리오 로드 → Init → 팔로워 카메라(<Camera>,
+     IG 표시 전용 — params camera.*) → Start   (실측 확인 2026-08-24)
+  3. run_agent.py 를 서브프로세스로 (--route <routes>/route_{name}.pkl)
   4. 로그 꼬리를 감시해 종료 판정 (EndJudge — 완주 임계는 params.yaml 연동):
        완주        : route_s ≥ total − (stop_gap+앞범퍼+end_slack), 이후 v<0.5 또는 유예
        stall       : 정지인데 계획은 진행(v_target≥0.5)이 batch.stall_end_s 지속
@@ -37,6 +40,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / 'tools'))
@@ -167,6 +171,58 @@ def tail_tick(path: pathlib.Path) -> dict | None:
     return None
 
 
+# ── IG 팔로워 뷰 카메라 (표시 전용 — GT·제어·채점 무관) ───────────────────
+def build_camera_scp(cfg: dict) -> str | None:
+    """IG 팔로워 뷰 <Camera> SCP 문자열. camera.enabled=false 면 None.
+
+    GUI 프리셋 "Relative - follower view" 와 동일 뷰 (VTD 2025.2 Doc/SCP_HTML
+    실기 확인 2026-08-27): PosRelative 는 자차 로컬 [m], ViewRelative 각도는
+    [rad], Show Owner 는 <Camera showOwner="true|false"> 속성, <Set/> 이 적용.
+    값은 params.yaml camera.* 가 단일 출처 — 키가 없으면 KeyError 로 죽는 게 맞다.
+    """
+    cam = cfg['camera']
+    if not cam['enabled']:
+        return None
+    return (f'<Camera name="followCam" showOwner="{str(bool(cam["show_owner"])).lower()}">'
+            f'<PosRelative player="{cam["player"]}" dx="{float(cam["dx"]):.2f}" '
+            f'dy="{float(cam["dy"]):.2f}" dz="{float(cam["dz"]):.2f}"/>'
+            f'<ViewRelative dh="{float(cam["dh"]):.4f}" dp="{float(cam["dp"]):.4f}" '
+            f'dr="{float(cam["dr"]):.4f}"/>'
+            f'<Set/></Camera>')
+
+
+# ── 표 렌더 (콘솔과 report.txt 가 같은 함수를 쓴다 — 중복 구현 금지) ──────
+OVERFLOW_W = 24     # 무한정 길어질 수 있는 열(shield·위반내역)의 폭 상한 [표시칸]
+
+
+def disp_w(s) -> int:
+    """표시 폭 — 한글·전각(east_asian_width W/F)은 2칸.
+    str.ljust 는 한글을 1칸으로 세므로 그대로 쓰면 표가 어긋난다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in str(s))
+
+
+def _pad(s, w: int) -> str:
+    return str(s) + ' ' * max(0, w - disp_w(s))
+
+
+def render_table(hdr: list, rows: list, overflow: tuple = ()) -> str:
+    """폭 정렬 텍스트 표. 컬럼 폭은 실제 내용의 최대 표시폭에 동적으로 맞춘다.
+
+    overflow 에 든 열 이름은 폭을 OVERFLOW_W 로 상한한다 — 그보다 긴 셀은
+    자르지 않고 **그 행만** 넘치게 둔다 (앞 열들의 정렬은 유지된다).
+    """
+    widths = []
+    for i, h in enumerate(hdr):
+        w = max(disp_w(h), *(disp_w(r[i]) for r in rows)) if rows else disp_w(h)
+        if h in overflow:
+            w = min(w, max(disp_w(h), OVERFLOW_W))
+        widths.append(w)
+    lines = ['  '.join(_pad(c, widths[i]) for i, c in enumerate(hdr)).rstrip()]
+    lines += ['  '.join(_pad(c, widths[i]) for i, c in enumerate(row)).rstrip()
+              for row in rows]
+    return '\n'.join(lines)
+
+
 class Runner:
     def __init__(self, args) -> None:
         self.args = args
@@ -176,7 +232,7 @@ class Runner:
         self.out_dir = _ROOT / 'logs' / 'batch' / ts
         self.results: list[dict] = []
         # 종료 판정 값은 컨트롤러와 같은 params.yaml 에서 (하드코딩 금지)
-        cfg = load_cfg()
+        self.cfg = cfg = load_cfg()
         self.margin = end_margin_m(cfg)
         b = cfg.get('batch', {})
         self.stall_end_s = float(b.get('stall_end_s', 20.0))
@@ -209,6 +265,23 @@ class Runner:
                 pass
             self.scp = None
 
+    # ── IG 카메라 ─────────────────────────────────────────────────────────
+    def _apply_camera(self):
+        """팔로워 뷰 SCP 1회 전송. 표시 전용 — 실패해도 배치는 계속 (경고만).
+
+        반환값이 run 메타(res['camera_sent'])에 남는다:
+        True 전송 / False 실패(무시) / None 비활성(camera.enabled=false).
+        """
+        xml = build_camera_scp(self.cfg)
+        if xml is None:
+            return None
+        try:
+            self.scp.send(xml)
+            return True
+        except (OSError, RuntimeError) as e:
+            print(f'  ⚠ 카메라 뷰 SCP 실패 — 무시하고 진행: {e}')
+            return False
+
     # ── VTD 9910 예열 확인 ────────────────────────────────────────────────
     def _wait_9910(self, warmup_s: float) -> float | None:
         """9910 에서 1 프레임이라도 받을 때까지 대기 → 걸린 시간 [s], 초과 시 None.
@@ -239,7 +312,8 @@ class Runner:
     def run_one(self, sc: dict) -> dict:
         name = sc['name']
         res = {'name': name, 'status': '?', 'log': None}
-        route_pkl = _ROOT / 'data' / f'route_{name}.pkl'
+        # route pkl 은 이 배치의 로그 디렉터리에 — data/ 를 오염시키지 않는다
+        route_pkl = self.out_dir / 'routes' / f'route_{name}.pkl'
 
         # 1) route 빌드 — 공용 data/route.pkl 은 건드리지 않는다
         build_cmd = [sys.executable, str(_ROOT / 'tools' / 'build_route.py'),
@@ -254,13 +328,16 @@ class Runner:
         if self.args.dry_run:
             print(f'\n[dry-run] {name}')
             print('  route :', ' '.join(build_cmd))
-            print('  scp   : load_and_run(%r) @ %s:48179' % (sc['vtd_xml_path'], self.args.host))
+            print('  scp   : Load(%r) → Init → Camera → Start @ %s:48179'
+                  % (sc['vtd_xml_path'], self.args.host))
+            print('  camera:', build_camera_scp(self.cfg) or '비활성 (camera.enabled=false)')
             print('  launch:', ' '.join(launch_cmd))
             print(f'  종료   : {DONE_RULE.format(name=name, margin=self.margin)} '
                   f'/ timeout {sc["timeout_s"]}s')
             res['status'] = 'dry-run'
             return res
 
+        route_pkl.parent.mkdir(parents=True, exist_ok=True)
         cp = subprocess.run(build_cmd, capture_output=True, text=True, timeout=120)
         (self.out_dir / f'{name}.build_route.txt').write_text(cp.stdout + cp.stderr)
         if cp.returncode != 0 or not route_pkl.exists():
@@ -276,10 +353,19 @@ class Runner:
         total = float(pickle.load(open(route_pkl, 'rb'))['total_length'])
         res['route_total_m'] = round(total, 1)
 
-        # 2) VTD 로드→Init→Start
+        # 2) VTD 로드→Init→(카메라)→Start — scp_client.load_and_run 을 단계로
+        #    분해했다: IG 팔로워 뷰는 시나리오 Load 마다 초기화되므로 Init 완료
+        #    후·Start 직전에 시나리오당 1회 다시 적용해야 한다 (표시 전용).
         try:
             self.scp = ScpClient(self.args.host, verbose=False).connect()
-            self.scp.load_and_run(sc['vtd_xml_path'], settle_s=self.args.settle_s)
+            settle = self.args.settle_s
+            self.scp.load_scenario(sc['vtd_xml_path'])
+            self.scp.poll(settle)
+            self.scp.init()
+            self.scp.poll(settle)                  # Init 완료 대기 (기존 settle 관례)
+            res['camera_sent'] = self._apply_camera()
+            self.scp.start()
+            self.scp.poll(settle)
         except OSError as e:
             res['status'] = f'SCP 실패: {e}'
             self.cleanup()
@@ -356,7 +442,7 @@ class Runner:
         try:
             from summarize_run import load_map
             lg, _ = load_map()
-            route = pickle.load(open(_ROOT / 'data' / f"route_{res['name']}.pkl", 'rb'))
+            route = pickle.load(open(self.out_dir / 'routes' / f"route_{res['name']}.pkl", 'rb'))
         except Exception as e:                          # noqa: BLE001
             res['collect_error'] = f'map: {type(e).__name__}: {e}'
         try:
@@ -403,6 +489,7 @@ class Runner:
         for r in self.results:
             col = 'Y' if r.get('min_obj_dist_m') is not None and r['min_obj_dist_m'] < 2.5 else ''
             nv = r.get('n_violations')
+            detail = ','.join(f'{k}:{v}' for k, v in (r.get('violations') or {}).items())
             rows.append([
                 r['name'], r['status'],
                 {True: 'O', False: 'X'}.get(r.get('done'), '-'),
@@ -411,14 +498,11 @@ class Runner:
                 r.get('estop_ticks', '-'),
                 ','.join(f'{k}:{v}' for k, v in (r.get('shield') or {}).items()) or '-',
                 '-' if nv is None else nv,
-                ','.join(f'{k}:{v}' for k, v in (r.get('violations') or {}).items()) or '-',
+                # 검출이 돌았고 위반이 없으면 '0건' — '-' 는 "검출 못 함"에만 쓴다
+                detail or ('0건' if nv == 0 else '-'),
                 r.get('collect_error', ''),
             ])
-        w = [max(len(str(h)), *(len(str(row[i])) for row in rows)) if rows else len(str(h))
-             for i, h in enumerate(hdr)]
-        lines = ['  '.join(str(c).ljust(w[i]) for i, c in enumerate(hdr))]
-        lines += ['  '.join(str(c).ljust(w[i]) for i, c in enumerate(row)) for row in rows]
-        return '\n'.join(lines)
+        return render_table(hdr, rows, overflow=('shield', '위반내역'))
 
     # ── 전체 ──────────────────────────────────────────────────────────────
     # ── 실행 전 검사: VTD PC 에 시나리오 xml 이 실제로 있는가 ────────────

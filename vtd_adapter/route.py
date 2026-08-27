@@ -146,6 +146,9 @@ class VtdRoutePlanner:
         self.max_distance_lane_change_trailing_vehicles = int(g('max_distance_lane_change_trailing_vehicles', 15 * ppm))
         self.transition_smoothness_distance = int(g('transition_smoothness_distance', 8 * ppm))
         self.extra_route_length = int(g('extra_route_length', 50))
+        # 테이퍼 꼬리 블렌드 (params 가 단일 출처 — 없으면 KeyError 로 죽는 게 맞다)
+        self.taper_blend_m = float(cfg['route']['taper_blend_m'])
+        self.veh_width = float(cfg['vehicle']['width'])
 
         self.route_index = 0
         self.last_route_index = 0
@@ -215,9 +218,28 @@ class VtdRoutePlanner:
             else:
                 s_end = L
 
+            # 소멸(테이퍼) 차로 꼬리: 끝 폭이 차폭 미만이면 중심선이 폭과 함께
+            # 이웃 경계로 수렴하다 successor 중심선(반폭 ≈1.5 m 옆)으로 순간이동
+            # 한다 — 2026-08-26 실기: (2192,3,4)→(2192,2,3) 1.50 m 킹크에 룩어헤드
+            # 2.5 m 짜리 lateral PID 가 한 틱 만에 풀포화, ±1.5 m 진동으로 차선이탈.
+            # 마지막 taper_blend_m 구간에 successor 시작점과의 오프셋을 코사인
+            # 가중(차선변경 blend 와 같은 방식)으로 얹어 폴리라인을 연속으로 만든다.
+            taper = None
+            if (not hop and nxt is not None and nxt in lg.successors(key)
+                    and lg.width_at(key, L) < self.veh_width):
+                p_end = np.array(lg.point_at(key, L)[:3], dtype=float)
+                p_nxt = np.array(lg.point_at(nxt, 0.0)[:3], dtype=float)
+                taper = (max(0.0, L - self.taper_blend_m), p_nxt - p_end)
+
             s_seg_start = s
             while s < s_end - 1e-9:
                 x, y, z, _h = lg.point_at(key, s)
+                if taper is not None and s >= taper[0]:
+                    wt = -_math.cos(min(1.0, (s - taper[0]) / max(L - taper[0], 1e-6))
+                                    * _math.pi) / 2.0 + 0.5
+                    x += wt * taper[1][0]
+                    y += wt * taper[1][1]
+                    z += wt * taper[1][2]
                 cmd = RoadOption.LANEFOLLOW
                 cur_key, cur_s = key, s
                 if blend is not None and rs >= blend[0]:

@@ -18,6 +18,21 @@ comm:
   connect_retry_s: 1.0
   recv_bufsize: 65536
 
+camera:
+  # IG 표시 전용 팔로워 뷰 — batch_run 이 매 시나리오 Init 완료 후·Start 전에
+  # SCP <Camera> 1회로 적용한다. GUI 프리셋 "Relative - follower view" 동일 값.
+  # 9910 GT·제어·채점에는 영향 없음. 전송 실패는 경고만 하고 배치는 계속된다.
+  # 각도(dh/dp/dr)는 rad (VTD 2025.2 Doc/SCP_HTML: ViewRelative 단위 확인).
+  enabled: true
+  player: Ego
+  dx: -6.5      # 자차 로컬 [m] — 뒤 6.5 m
+  dy: 0.0
+  dz: 2.6       # 위 2.6 m
+  dh: 0.0
+  dp: 0.0
+  dr: 0.0
+  show_owner: true   # <Camera showOwner> — 자차 표시
+
 vehicle:
   # Ioniq 6 제원: 전장 4855 / 축거 2950 / 앞 오버행 855 / 뒤 오버행 1050 mm
   wheelbase: 2.944
@@ -75,12 +90,25 @@ control:
   # 감속 방향 jerk 완화 배수 (제동 진입 지연 방지 — 시뮬: ×3 에서 종점 3.5 m 전 정지)
   jerk_dec_mult: 3.0
 
+route:
+  # 소멸(테이퍼) 차로 꼬리 블렌드 길이 [m] (VtdRoutePlanner._build).
+  # 끝 폭이 vehicle.width 미만으로 줄어드는 차로는 중심선이 이웃 경계로 수렴하다
+  # successor 중심선(반폭 ≈1.5 m 옆)으로 순간이동한다 — 2026-08-26 실기에서
+  # 이 킹크가 조향 풀포화·차선이탈 진동을 만들었다. 마지막 이 길이 구간을
+  # successor 중심선으로 코사인 블렌드해 연속으로 만든다.
+  taper_blend_m: 15.0
+
 route_end:
   # 종점 정지 (team_code/kr_rules.py): "종점에 정지한 길이 0 유령 선행차"를
   # PDM IDM 에 넣는다. 정지 위치 관례는 정지선과 동일 — 앞범퍼(뒷축 +
   # wheelbase + front_overhang)가 종점 − speed.stop_gap_m 에 선다.
   # batch 완주 임계(total − end_margin)보다 end_slack_m 만큼 안쪽이라 완주
   # 판정과 자동 정합한다 (tests/test_route_end.py 가 검증).
+  # 정지 목표 기준: 'finish' = scoring.finish_xy 를 투영한 종료선을 뒷축이
+  # finish_clearance_m 만큼 넘는 위치 (stop_s = min(finish_s + clearance +
+  # stop_gap + 앞범퍼, total − end_slack); finish_xy 미설정이면 자동으로
+  # route_total 동작 + 경고 1회). 'route_total' = 기존 경로 종점 기준.
+  target_mode: finish
   idm_time_headway: 0.1     # 적신호 정지(idm_red_light_desired_time_headway)와 같은 축
   active_m: 150.0           # 이 거리 안에서만 후보 생성 (오검출 방지)
   latch_v: 0.5              # 정지 래치 진입 속도 — batch 완주 판정(v<0.5)과 같은 값
@@ -96,6 +124,26 @@ batch:
   stall_end_s: 20.0
   # route_s 무전진이 이 시간 지속 → no_progress 종료 (적60 대기 60 s 보다 길게)
   no_progress_end_s: 120.0
+
+scoring:
+  # 2026 HL FMA 안내문 채점 (2026-08-27 공개, tools/score.py score_run):
+  # 구간별 독립 100점, (항목,구간)당 1회 감점 — 경미 -3 / 중대 -6,
+  # 경미+중대 공존 시 중대 하나. 리스폰은 구간당 free 회 무감점, 초과 -6/회.
+  # 미완주면 뒷축이 진입한 구간까지만 만점·감점 집계. 구간 점수 음수 허용.
+  section_bounds_s: []          # 구간 경계 route_s [m] 오름차순. 비면 전체 1구간
+  minor_penalty: 3
+  major_penalty: 6
+  respawn_free_per_section: 1
+  # 완주 = 뒷바퀴 축이 종료 지점 좌표 통과 (경로 투영 route_s 로 환산 판정).
+  # null 이면 기존 route_s 임계(end_margin) 방식 유지 + 경고.
+  # 실제 좌표는 9/3 접속 테스트에서 확보 후 기입.
+  finish_xy: null               # [x, y]
+  # 제어 정지 목표의 여유: 뒷축이 종료선을 이만큼 넘어 정지하도록 계획한다
+  # (kr_rules.plan_stop_s). 채점 기준이 아니다 — 채점은 finish_s 통과 여부만 본다.
+  finish_clearance_m: 2.0
+  # 제한속도 severity [km/h]: 초과 ≤allow 감점 없음 / ~major 경미 / >major 중대
+  speed_allow_kph: 1.0
+  speed_major_kph: 20.0
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.

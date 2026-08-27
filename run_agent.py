@@ -54,10 +54,16 @@ def load_route(path: str) -> dict:
         return pickle.load(f)
 
 
-def build_route_from_csv(csv_path: str, graph_path: str) -> str:
-    """--csv: tools/build_route.py 를 돌려 data/route_<csv이름>.pkl 을 만들고 경로를 돌려준다."""
+def build_route_from_csv(csv_path: str, graph_path: str, out_dir: str | None = None) -> str:
+    """--csv: tools/build_route.py 를 돌려 <out_dir>/route_<csv이름>.pkl 을 만들고 경로를 돌려준다.
+
+    out_dir 기본은 data/ (손으로 돌리는 경우). batch_run 처럼 산출물을 로그와
+    묶고 싶으면 --route-out 으로 바꾼다.
+    """
     stem = pathlib.Path(csv_path).stem
-    out = _ROOT / 'data' / f'route_{stem}.pkl'
+    out_d = pathlib.Path(out_dir) if out_dir else _ROOT / 'data'
+    out_d.mkdir(parents=True, exist_ok=True)
+    out = out_d / f'route_{stem}.pkl'
     cmd = [sys.executable, str(_ROOT / 'tools' / 'build_route.py'),
            graph_path, csv_path, '-o', str(out)]
     print(f'[main] route 빌드: {" ".join(cmd)}', flush=True)
@@ -72,9 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--host', default=None, help='VTD 호스트 (기본: config)')
     ap.add_argument('--port', type=int, default=None, help='9910')
     ap.add_argument('--graph', default='data/lane_graph.pkl')
-    ap.add_argument('--route', default=None, help='build_route.py 산출 pkl')
+    ap.add_argument('--route', default=None, help='build_route.py 산출 pkl (임의 경로 가능)')
     ap.add_argument('--csv', default=None,
                     help='대회 배포 waypoints.csv — 내부에서 route 를 빌드해 쓴다')
+    ap.add_argument('--route-out', default=None,
+                    help='--csv 로 빌드한 route pkl 을 쓸 디렉터리 (기본: data/)')
     ap.add_argument('--config', default=str(_ROOT / 'config' / 'params.yaml'))
     ap.add_argument('--replay', default=None,
                     help='jsonl 로그를 Comm 대신 소스로 사용 (VTD 불필요)')
@@ -133,7 +141,7 @@ class Runner:
 
         route_path = args.route
         if args.csv:
-            route_path = build_route_from_csv(args.csv, args.graph)
+            route_path = build_route_from_csv(args.csv, args.graph, args.route_out)
         if not route_path:
             raise SystemExit('--route 또는 --csv 를 줘야 한다')
 
