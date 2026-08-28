@@ -51,6 +51,7 @@ import math
 import pathlib
 import pickle
 import sys
+import unicodedata
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -68,6 +69,38 @@ INFO_KEYS = ('speed_margin', 'red_right_turn', 'red_stop_ok', 'near_miss', 'over
 # 정지선 침범·원거리 정지는 "적색신호 정지" 항목(7)으로 흡수 — 통과(red_light)와
 # 같은 항목의 정도 차이일 뿐이다.
 SCORING_ITEM = {'stop_line_encroach': 'red_light', 'red_stop_far': 'red_light'}
+
+# 대회 안내문 평가항목 (번호, 채점 item 키, 한글명). key None = 미구현(검출기 없음).
+# · 1/2: speed 검출은 하나지만 항목은 둘 — _item_of 가 이벤트의 school_zone 으로
+#   가른다 ((항목)당 1회 규칙이 안내문 항목 단위로 적용되도록).
+# · 11: 충돌은 "장애물 대응" 단일 항목. 항목 14(도로 이용자 충돌)는 채점에서
+#   제거 — objects[] 인터페이스에 종류 필드가 없어 차량·장애물 구분이 불가하고,
+#   단일 항목이면 같은 접촉의 중복 감점이 원천 차단된다 (2026-08-28 결정).
+ITEMS = [
+    (1, 'speed', '제한속도 준수'),
+    (2, 'speed_school', '보호구역 속도 준수'),
+    (3, 'lane_departure', '차로 유지'),
+    (4, 'center_line', '중앙선 침범·우측통행'),
+    (5, 'sidewalk', '보도 침범'),
+    (6, 'solid_lane_change', '실선 차로 변경'),
+    (7, 'red_light', '적색신호 정지'),
+    (8, 'green_stall', '녹색신호 통과'),
+    (9, None, '적색점멸 일시정지'),
+    (10, 'ped_response', '보행자 대응'),
+    (11, 'collision', '장애물 대응'),
+    (12, None, '횡단보도 정차 금지'),
+    (13, 'turn_signal', '차로 변경 방향지시등'),
+    (15, 'reset', '리스폰'),
+]
+ITEM_LABEL = {key: f'{no} {name}' for no, key, name in ITEMS if key}
+
+
+def _item_of(cat: str, ev: dict) -> str:
+    """검출 카테고리 + 이벤트 → 채점 항목 키 (buckets·표 집계의 단일 출처)."""
+    item = SCORING_ITEM.get(cat, cat)
+    if item == 'speed' and ev.get('school_zone'):
+        return 'speed_school'
+    return item
 COUNT_ESCALATE = ('lane_departure', 'solid_lane_change')   # 구간 내 2회 이상 → 중대
 
 RED = 1                    # 9910 신호 state (logger.py 주석: 1=적 3=녹 4=좌 5=녹+좌)
@@ -1094,7 +1127,7 @@ def score_run(rep: dict, cfg: dict) -> dict:
                 continue
             if ev.get('severity', 'none') == 'none':
                 continue
-            item = SCORING_ITEM.get(cat, cat)
+            item = _item_of(cat, ev)
             buckets.setdefault((item, sec), []).append((ev['severity'], ev['i0']))
 
     sections = []
@@ -1105,9 +1138,12 @@ def score_run(rep: dict, cfg: dict) -> dict:
                 continue
             sev = 'major' if (any(s == 'major' for s, _ in evs)
                               or (item in COUNT_ESCALATE and len(evs) >= 2)) else 'minor'
-            deds.append({'item': item, 'severity': sev, 'event_i0': evs[0][1]})
+            deds.append({'item': item, 'severity': sev, 'event_i0': evs[0][1],
+                         'penalty': major if sev == 'major' else minor,
+                         'label_ko': ITEM_LABEL.get(item, item)})
         for i0 in sorted(resets.get(i, []))[free:]:
-            deds.append({'item': 'reset', 'severity': 'major', 'event_i0': i0})
+            deds.append({'item': 'reset', 'severity': 'major', 'event_i0': i0,
+                         'penalty': major, 'label_ko': ITEM_LABEL['reset']})
         entered = i < reached
         score = (100 - sum(major if d['severity'] == 'major' else minor
                            for d in deds)) if entered else None
@@ -1237,6 +1273,7 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
 
     for k, d in V.items():
         d['count'] = len(d['events'])
+        d['label_ko'] = LABEL.get(k, k)          # --json 소비자용 (스키마 추가만)
     rep['n_violations'] = sum(d['count'] for k, d in V.items() if k not in INFO_KEYS)
 
     # ── 채점 층 (검출 결과는 위에서 확정 — 여기서는 severity·구간·점수만 얹는다)
@@ -1248,6 +1285,12 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
 # ══════════════════════════════════════════════════════════════════════════
 # 출력
 # ══════════════════════════════════════════════════════════════════════════
+def _pad_ko(s, w: int) -> str:
+    """한글(전각) 2칸 기준 좌측 정렬 — str.ljust 는 한글을 1칸으로 세서 어긋난다."""
+    disp = sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in str(s))
+    return str(s) + ' ' * max(0, w - disp)
+
+
 LABEL = {
     'speed': '속도 초과(법규)', 'speed_margin': '여유 침범(정보)',
     'lane_departure': '차선 이탈', 'solid_lane_change': '실선 차선변경',
@@ -1306,27 +1349,48 @@ def render(rep: dict) -> str:
             f"[{k}] {g['ticks']}틱 v_max {g['v_max']:.1f}"
             + (f" 위반 {g['over_ticks']}틱 +{g['max_over']:.2f}" if g['over_ticks'] else '')
             for k, g in rep['speed_groups'].items()))
-    L.append('')
-    L.append(f"{'항목':<22} {'건수':>4}")
-    for k in LABEL:
-        if k not in rep['violations']:
+    # ── 대회 항목 표: 번호 · 한글 항목명 · 위반 건수 · 감점 ──
+    counts: dict = {}
+    for cat, d in rep['violations'].items():
+        if cat in INFO_KEYS:
             continue
-        d = rep['violations'][k]
-        mark = '' if d['count'] == 0 else ('  ←' if k not in INFO_KEYS else '')
-        L.append(f"{LABEL[k]:<22} {d['count']:>4}{mark}")
+        for e in d['events']:
+            it = _item_of(cat, e)
+            counts[it] = counts.get(it, 0) + 1
+    pens: dict = {}
+    for sec in rep.get('scoring', {}).get('sections', []):
+        for dd in sec['deductions']:
+            pens[dd['item']] = pens.get(dd['item'], 0) + int(dd.get('penalty', 0))
+    L.append('')
+    L.append(f"번호  {_pad_ko('평가항목', 22)} 건수  감점")
+    for no, key, name in ITEMS:
+        if key is None:
+            L.append(f'{no:>3}  {_pad_ko(name, 22)}    —  미구현')
+            continue
+        c = counts.pop(key, 0)
+        p = pens.get(key, 0)
+        mark = '  ←' if p else ''
+        L.append(f'{no:>3}  {_pad_ko(name, 22)} {c:>4}  {-p if p else 0:>4}{mark}')
+    if counts:                                   # 안내문 항목 밖 검출 — 감점 없음
+        L.append('항목 외 검출(감점 없음): '
+                 + '  '.join(f'{LABEL.get(k, k)} {v}' for k, v in sorted(counts.items())))
+    infos = '  '.join(f'{LABEL[k]} {rep["violations"][k]["count"]}'
+                      for k in INFO_KEYS
+                      if rep['violations'].get(k, {}).get('count'))
+    if infos:
+        L.append(f'정보성(감점 무관): {infos}')
     L.append(f"\n위반 합계(정보 제외): {rep.get('n_violations', 0)}")
     if 'scoring' in rep:
         s = rep['scoring']
 
         def ded_str(sec):
-            return '  '.join(f"{LABEL.get(d['item'], d['item'])}"
+            return '  '.join(f"{d.get('label_ko', d['item'])}"
                              f"[{'중대' if d['severity'] == 'major' else '경미'}]"
                              for d in sec['deductions']) or '감점 없음'
 
         if len(s['sections']) == 1:
-            # 단일 구간 모드 — 총점 한 줄 (--json 은 sections 1원소로 스키마 유지)
-            L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}  "
-                     f"{ded_str(s['sections'][0])}")
+            # 단일 구간 모드 — 감점 내역은 위 표에 있으니 총점 한 줄만
+            L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}")
         else:
             L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}"
                      f"  (구간 {len(s['sections'])}개 중 도달 {s['reached_sections']})")

@@ -149,6 +149,58 @@ def test_single_section_not_finished_aggregates_full_course():
     assert s['sections'][0]['score'] == 97
 
 
+# ── 대회 항목 매핑 (한글 표·충돌 통합·속도 항목 1/2 분리) ────────────────
+def test_collision_single_item_no_double_deduction():
+    """접촉은 객체 종류 무관 '11 장애물 대응' 단일 항목 — 1회만 -6 (중복 차단)."""
+    cfg = base_cfg(single_section=True)
+    s = scored({'collision': [ev(10, 0, obj_id=1, obj_cls='vehicle'),
+                              ev(50, 1, obj_id=2, obj_cls='obstacle')]}, cfg)
+    deds = s['sections'][0]['deductions']
+    assert [d['item'] for d in deds] == ['collision']
+    assert deds[0]['label_ko'] == '11 장애물 대응'
+    assert s['total'] == 94
+
+
+def test_speed_school_zone_is_separate_item():
+    """안내문 항목 1(제한속도)/2(보호구역)는 별개 — 각각 1회씩 감점된다."""
+    cfg = base_cfg(single_section=True)
+    s = scored({'speed': [ev(10, 0, max_over_kph=5.0, school_zone=False),
+                          ev(50, 1, max_over_kph=5.0, school_zone=True)]}, cfg)
+    items = sorted(d['item'] for d in s['sections'][0]['deductions'])
+    assert items == ['speed', 'speed_school']
+    assert s['total'] == 94
+
+
+def test_render_item_table_snapshot():
+    """render 요약 표: 번호·한글 항목명·건수·감점 + 총점 1줄 (스냅샷)."""
+    cfg = base_cfg(single_section=True)
+    rep = make_rep({'speed': [ev(10, 0, max_over_kph=5.0, school_zone=False)],
+                    'collision': [ev(50, 1, obj_id=1, obj_cls='vehicle'),
+                                  ev(60, 2, obj_id=2, obj_cls='obstacle')],
+                    'reset': [ev(70, 3, why={}), ev(80, 4, why={})]},
+                   300.0, 300.0, True)
+    rep.update({'file': 'x.jsonl', 'ticks': 1, 'warnings': []})
+    rep['finish'].update({'finish_time_s': 100.0, 'time_limit_s': 300.0, 'wall_s': 100.0})
+    sc_mod.annotate_scoring(rep, cfg)
+    rep['scoring'] = sc_mod.score_run(rep, cfg)
+    out = sc_mod.render(rep)
+    lines = out.splitlines()
+    P = sc_mod._pad_ko
+    start = next(i for i, l in enumerate(lines) if l.startswith('번호'))
+    table = lines[start:start + 1 + len(sc_mod.ITEMS)]
+    assert table[0] == f"번호  {P('평가항목', 22)} 건수  감점"
+    expect = {1: (1, -3), 11: (2, -6), 15: (2, -6)}     # 리셋 2회 − 무료 1 = -6
+    for no, key, name in sc_mod.ITEMS:
+        row = next(l for l in table if l.startswith(f'{no:>3}  '))
+        if key is None:
+            assert '미구현' in row                       # 9·12 — 생략 대신 명시
+        else:
+            c, p = expect.get(no, (0, 0))
+            mark = '  ←' if p else ''
+            assert row == f'{no:>3}  {P(name, 22)} {c:>4}  {p:>4}{mark}'
+    assert '[채점] 총점 85 / 100' in out                 # 100 −3 −6 −6
+
+
 def test_single_section_hand_computed_total():
     # 손계산: 속도 경미 -3, 충돌 중대 -6, 차선이탈 2회 심화 -6,
     # 리스폰 2회(무료 1) -6 → 100 - 21 = 79
