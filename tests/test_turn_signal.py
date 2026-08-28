@@ -204,6 +204,24 @@ def test_overlap_prefers_nearer_then_turn():
     assert sig_at(ap2, 100.0, 10.0) == SIG_RIGHT   # 동률 → 회전(우) 우선
 
 
+def test_off_delay_keeps_signal_after_maneuver_then_cancels():
+    """회전을 마친 뒤 off_delay_s 만큼 더 켜 두고 자동 소등한다 (실차 자동소등).
+
+    min_on 과 기준 시점이 다르다 — min_on 은 켜진 시점부터, off_delay 는 조건이
+    끝난 시점부터다. 그래서 긴 회전 뒤 꼬리는 min_on 이 아니라 off_delay 만큼이다.
+    """
+    ap = make_ap(FakePlanner([TURN_EV], TURN_LANES, TURN_CUM, TURN_LENS, TURN_JUNC))
+    kr = ap.kr_rules
+    for _ in range(200):                                   # 충분히 긴 회전
+        assert sig_at(ap, 110.0, 10.0) == SIG_LEFT
+    tail = 0
+    while sig_at(ap, 200.0, 10.0) != SIG_OFF:              # 구간을 완전히 지났다
+        tail += 1
+        assert tail < 200, '꺼지지 않는다 — 고착'
+    assert tail == kr.sig_off_delay_ticks, (tail, kr.sig_off_delay_ticks)
+    assert kr.sig_off_delay_ticks < kr.sig_min_on_ticks, 'min_on 이 꼬리를 지배하면 안 된다'
+
+
 def test_min_on_time_absorbs_flicker_and_releases():
     """0.1 s 깜빡임은 최소 점등으로 흡수되고, 그 시간이 지나면 반드시 꺼진다."""
     lat = ramp(200.0, 220.0, 3.0)

@@ -177,6 +177,8 @@ class KrRules:
         self.lat_on_m = float(sig['lat_shift_on_m'])
         self.sig_min_on_ticks = int(round(float(sig['min_on_s'])
                                           * float(cfg['comm']['send_hz'])))
+        self.sig_off_delay_ticks = int(round(float(sig['off_delay_s'])
+                                             * float(cfg['comm']['send_hz'])))
         # 정적 장애물 회피 시프트 (SPEC §3.4 회피 — PDM 원문은 stub)
         ot = cfg['overtake']
         self.ot_enabled = bool(ot['enabled'])
@@ -196,7 +198,8 @@ class KrRules:
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
         self.sig_plan: list[dict] | None = None    # 회전 구간 (시작 시 1회)
-        self.sig_hold_left = 0                     # 최소 점등 잔여 틱 (상한 있음)
+        self.sig_on_ticks = 0                      # 켜진 뒤 지난 틱 (min_on 기준)
+        self.sig_off_left = 0                      # 소등 지연 잔여 틱 (상한 있음)
         self.sig_held: int = SIG_OFF               # 유지 중인 값
         self.ot_blocked_ticks = 0                  # 막힌 채 정지한 틱
         self.ot_span: tuple | None = None          # 시프트한 인덱스 구간
@@ -294,15 +297,26 @@ class KrRules:
         else:
             _k, sig, src, remain = best
 
-        # 최소 점등 (상한 있는 유지 — 고착 불가)
+        # 유지 장치 둘. 기준 시점이 다르다 — 둘 다 상한이 있어 고착되지 않는다.
+        #   min_on   : **켜진 시점부터** 최소 점등 시간. 켜자마자 꺼지는 깜빡임 방지
+        #              (조건이 계속 참인 동안 갱신하지 않는다 — 갱신하면 이게 곧
+        #               소등 지연이 돼 off_delay 가 무의미해진다)
+        #   off_delay: **조건이 끝난 시점부터** 소등까지. 다 돌기 전에 꺼지는 것 방지
+        #              (실차 자동소등 관례)
         if sig != SIG_OFF:
-            self.sig_hold_left = self.sig_min_on_ticks
+            if self.sig_held != sig:
+                self.sig_on_ticks = 0                  # 새로 켜짐 / 방향 전환
             self.sig_held = sig
-        elif self.sig_hold_left > 0:
-            self.sig_hold_left -= 1
+            self.sig_on_ticks += 1
+            self.sig_off_left = self.sig_off_delay_ticks
+        elif self.sig_held != SIG_OFF and (self.sig_off_left > 0
+                                           or self.sig_on_ticks < self.sig_min_on_ticks):
+            self.sig_off_left = max(0, self.sig_off_left - 1)
+            self.sig_on_ticks += 1
             sig, src = self.sig_held, 'hold'
         else:
             self.sig_held = SIG_OFF
+            self.sig_on_ticks = 0
 
         lead = (max(0.0, remain) / ego_speed
                 if remain is not None and ego_speed > 0.1 else None)
