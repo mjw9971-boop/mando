@@ -269,15 +269,19 @@ def test_ped_crossing_ends_off_roadway(outputs):
 
 
 def test_start_pool_conditions():
-    """시작점 후보 풀: 일반 도로 주행 차선 + 가속 50 m + 전방 회전 가능."""
+    """시작점 후보 풀: 일반 도로 주행 차선 + 가속 확보(successor 누적 허용) +
+    전방 회전 가능. 임계는 params gen_coverage 가 단일 출처."""
     lg = gs.LaneGraph(str(ROOT / 'data' / 'lane_graph.pkl'))
+    cov = gs.cov_cfg()
+    min_len, accel = float(cov['start_min_lane_m']), float(cov['start_accel_m'])
     pool = gs.start_pool(lg)
     assert len(pool) >= 100, f'후보가 너무 적다: {len(pool)}'
     assert len({k[0] for k in pool}) >= 50                          # 여러 도로에 분포
     for k in pool[:20]:
         v = lg.lanes[k]
         assert v['type'] == 'driving' and v['junction'] == -1
-        assert v['length'] >= 58.0 and v['next']
+        assert v['length'] >= min_len and v['next']
+        assert gs._forward_clear_m(lg, k, accel) >= accel           # 가속 구간 확보
     assert gs.start_pool(lg) is pool                                # 1회 수집 캐시
 
 

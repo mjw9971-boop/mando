@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import heapq
 import itertools
 import json
@@ -297,6 +298,60 @@ def _check_require(lg, chain, require) -> bool:
 
 
 _START_POOL_CACHE: dict = {}
+_COV_CFG = None      # params.yaml gen_coverage 캐시 (후보 선별·추첨 상수의 단일 출처)
+
+
+def cov_cfg() -> dict:
+    global _COV_CFG
+    if _COV_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _COV_CFG = load_params_yaml()['gen_coverage']
+    return _COV_CFG
+
+
+def _forward_clear_m(lg, k, need: float) -> float:
+    """k 시작(오프셋 8 m 제외)부터 비교차로 successor 를 따라 확보되는 전진
+    거리 [m]. need 에 닿으면 조기 반환 — 짧은 차로의 가속 구간 보완용."""
+    acc = lg.length(k) - 8.0
+    cur = k
+    for _ in range(20):
+        if acc >= need:
+            break
+        nxts = [n for n in lg.successors(cur) if lg.lanes[n]['junction'] == -1]
+        if not nxts:
+            break
+        cur = nxts[0]
+        acc += lg.length(cur)
+    return acc
+
+
+def _cell_of(lg, k, cell_m: float) -> tuple:
+    x, y, _, _ = lg.point_at(k, 0.0)
+    return (int(x // cell_m), int(y // cell_m))
+
+
+def _spatial_order(lg, cands, rng, used_cells: dict) -> list:
+    """공간 분산 추첨 순서 — 맵을 격자 셀로 나눠 셀을 먼저 뽑고 셀 안에서 추첨.
+
+    셀 순열은 라운드마다 가중 무작위(Efraimidis-Spirakis: u^(1/w) 내림차순,
+    같은 실행에서 이미 쓴 셀은 w=1/(1+사용횟수) 로 감쇠). 게이트 폐기 후
+    재시도는 이 순서를 따라가므로 자연히 "풀 전체 재추첨"이다 — 인접 후보로
+    밀리며 편향이 쌓이는 일이 없다."""
+    cell_m = float(cov_cfg()['grid_cell_m'])
+    by: dict = {}
+    for k in cands:
+        by.setdefault(_cell_of(lg, k, cell_m), []).append(k)
+    for lst in by.values():
+        rng.shuffle(lst)
+    order = []
+    while True:
+        live = [c for c in by if by[c]]
+        if not live:
+            return order
+        keyed = sorted(live, reverse=True,
+                       key=lambda c: rng.random() ** (1.0 + used_cells.get(c, 0)))
+        for c in keyed:
+            order.append(by[c].pop())
 
 
 def _forward_junction_ok(lg, start, horizon_m=700.0) -> bool:
@@ -325,15 +380,23 @@ def _forward_junction_ok(lg, start, horizon_m=700.0) -> bool:
 def start_pool(lg) -> list:
     """맵 전체(도로 651개)에서 걷기 출발 후보를 1회 수집해 캐시.
 
-    조건: 일반 도로(junction=-1)의 주행 차선, 출발 오프셋(≤8 m)을 빼고도
-    가속 구간 50 m 이상, 전방이 회전 가능한 연결로로 이어짐.
-    """
-    key = id(lg)
+    조건 (params gen_coverage 가 단일 출처): 일반 도로(junction=-1)의 주행
+    차선, 길이 ≥ start_min_lane_m, 출발 오프셋(≤8 m) 이후 전진 거리(짧은
+    차로는 비교차로 successor 누적)가 start_accel_m 이상, 전방이 회전 가능한
+    연결로로 이어짐. 구 조건(차로 단독 58 m)은 실효 가속 50 m 과 같았고,
+    successor 누적 보완으로 후보를 늘리되 가속 확보는 유지한다 (2026-08-28
+    커버리지 분석: 58 m 필터가 후보를 1773→309 로 깎아 시작점이 63/651
+    도로에 몰렸다)."""
+    cov = cov_cfg()
+    min_len = float(cov['start_min_lane_m'])
+    accel = float(cov['start_accel_m'])
+    key = (id(lg), min_len, accel)
     if key not in _START_POOL_CACHE:
         _START_POOL_CACHE[key] = [
             k for k, v in sorted(lg.lanes.items())
             if v['type'] == 'driving' and v['junction'] == -1
-            and v['length'] >= 58.0 and v['next']
+            and v['length'] >= min_len and v['next']
+            and _forward_clear_m(lg, k, accel) >= accel
             and _forward_junction_ok(lg, k)]
     return _START_POOL_CACHE[key]
 
@@ -498,8 +561,11 @@ def polyline_gate(lg, rt, gen_cfg):
     return None
 
 
-def synth_walk(lg, rng, name, spec, gen_cfg) -> Route:
-    """walk 사양 → 검증까지 마친 Route. 실패는 GenError (무음 실패 금지)."""
+def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None) -> Route:
+    """walk 사양 → 검증까지 마친 Route. 실패는 GenError (무음 실패 금지).
+
+    used_cells: 같은 실행에서 이미 시작점을 뽑은 격자 셀 → 사용 횟수. 공간
+    분산 추첨(_spatial_order)의 감쇠 가중치로 쓰고, 성공 시 여기 기록한다."""
     turns = spec.get('turns', ['any'])
     tail = float(spec.get('tail_m', 100))
     require = spec.get('require')
@@ -514,9 +580,11 @@ def synth_walk(lg, rng, name, spec, gen_cfg) -> Route:
         cands = start_pool(lg)          # 맵 전체 후보 풀(1회 수집)에서 시드 샘플링
     if not cands:
         raise GenError(f'경로 {name}: 출발 후보 차로가 없다 (require={require})')
-    order = list(cands)
-    rng.shuffle(order)
-    for start in order[:300]:
+    if used_cells is None:
+        used_cells = {}
+    redraw_max = int(cov_cfg()['redraw_max'])
+    order = _spatial_order(lg, cands, rng, used_cells)
+    for start in order[:redraw_max]:
         res = _walk_once(lg, rng, start, turns, tail, max_gap)
         if res is None:
             continue
@@ -537,8 +605,10 @@ def synth_walk(lg, rng, name, spec, gen_cfg) -> Route:
             GATE_STATS['reject'] += 1    # 역방향 스폰 가능 또는 폴리라인 킹크 — 재시도
             continue
         GATE_STATS['ok'] += 1
+        cell = _cell_of(lg, start, float(cov_cfg()['grid_cell_m']))
+        used_cells[cell] = used_cells.get(cell, 0) + 1
         return route
-    raise GenError(f'경로 {name}: {min(len(order),300)}개 출발 후보로 걸어도 빌드 경고 0 · '
+    raise GenError(f'경로 {name}: {min(len(order), redraw_max)}개 출발 후보로 걸어도 빌드 경고 0 · '
                    f'스폰 게이트 통과인 경로를 못 만들었다 (turns={turns}, require={require})')
 
 
@@ -554,6 +624,7 @@ class RoutePool:
         self.lg, self.defs, self.seed = lg, defs, seed
         self.gen_cfg = gen_cfg
         self.cache: dict = {}
+        self.used_cells: dict = {}      # 같은 실행 내 시작 셀 사용 이력 (공간 분산)
 
     def get(self, name: str, variant: int = 1, salt: str = '') -> Route:
         if name not in self.defs:
@@ -589,7 +660,8 @@ class RoutePool:
             seed_str = f'{self.seed}:route:{name}:{variant}' + (f':{salt}' if salt else '')
             rng = random.Random(seed_str)
             label = name if variant == 1 else f'{name}{variant}'
-            r = synth_walk(self.lg, rng, label, d['walk'], self.gen_cfg)
+            r = synth_walk(self.lg, rng, label, d['walk'], self.gen_cfg,
+                           used_cells=self.used_cells)
         else:
             raise GenError(f'경로 {name}: csv 또는 walk 정의가 필요하다')
         self.cache[key] = r
@@ -1507,7 +1579,7 @@ def axis_pool(theme_cfg: dict, axis: str):
     return list(theme_cfg.get(axis, AXIS_DEFAULTS.get(axis, [None])))
 
 
-def expand_theme(theme: str, cfg: dict, seed: int) -> list:
+def expand_theme(theme: str, cfg: dict, seed: int, route_defs: dict | None = None) -> list:
     """주제 → 변형 목록 [{'route': (이름, 변형), 'event': [...], axes…}] (샘플링 전 전체)."""
     rng = random.Random(f'{seed}:{theme}')
     routes = list(cfg.get('routes', ['기본']))
@@ -1515,6 +1587,14 @@ def expand_theme(theme: str, cfg: dict, seed: int) -> list:
     events = list(cfg.get('event', ['none']))
     # start: 자유 → walk 경로 시드에 주제 이름을 섞어 주제·변형마다 다른 시작점
     salt = theme if cfg.get('start', '고정') == '자유' else ''
+    # 자유 모드에서 csv 경로(시작점 파일 고정)는 커버리지에 기여하지 못하고
+    # 다양성만 깎는다 — walk 경로가 하나라도 있으면 제외한다 (routes 가 csv 뿐이면
+    # 유지: 자유 지정이 무의미할 뿐 생성은 되어야 한다). csv 검증 회귀는
+    # start: 고정 주제·단독 실행으로 커버한다 (2026-08-28 커버리지 분석).
+    if salt and route_defs:
+        walk_routes = [r for r in routes if 'walk' in (route_defs.get(r) or {})]
+        if walk_routes:
+            routes = walk_routes
     pools = {ax: axis_pool(cfg, ax) for ax in vary}
     combos = []
     if cfg.get('random_axes'):
@@ -1547,6 +1627,13 @@ def expand_theme(theme: str, cfg: dict, seed: int) -> list:
             c['event'] = [events[i % len(events)]]
         combos = base
     rng.shuffle(combos)
+    if salt:
+        # 캐시 고정 해제 (2026-08-28 커버리지 분석): 자유 모드는 경로변형 축
+        # 유무와 무관하게 시나리오 순번(0..N-1)을 변형 번호로 써서 RoutePool
+        # 캐시 키가 매번 달라지게 한다 — 구현 전에는 축이 없으면 rv=1 고정이라
+        # 주제당 walk 시작점이 1개로 수렴했다. random_axes 는 기존 동작 유지.
+        for i, c in enumerate(combos):
+            c['route'] = (c['route'][0], i, c['route'][2])
     return combos
 
 
@@ -1555,6 +1642,16 @@ def allocate(themes: dict, combos: dict, count, hours, route_len, seed):
     chosen = {}
     if count is not None:
         for th, lst in combos.items():
+            if len(lst) < count and lst and lst[0]['route'][2]:
+                # start: 자유 — 변형 번호가 시나리오 순번이라 축 조합을 순환하며
+                # 새 순번을 붙이면 얼마든지 늘릴 수 있다 (다른 시작점의 walk).
+                base = list(lst)
+                i = len(lst)
+                while len(lst) < count:
+                    c = dict(base[i % len(base)])
+                    c['route'] = (c['route'][0], i, c['route'][2])
+                    lst.append(c)
+                    i += 1
             if len(lst) < count:
                 print(f'  [주의] {th}: 조합이 {len(lst)}개뿐이라 --count {count} 를 다 못 채운다')
             chosen[th] = lst[:count]
@@ -1700,6 +1797,8 @@ def main(argv=None) -> int:
     ap.add_argument('--from-yaml', default=None, help='저장된 정의 YAML 로 단건 재생성')
     ap.add_argument('--rebuild-lists', action='store_true',
                     help='생성 없이 디스크(<주제>/*.yaml) 기준으로 batch 목록만 재생성')
+    ap.add_argument('--coverage-report', action='store_true',
+                    help='이번 생성분이 밟은 road 커버리지 요약(유니크/%%/미방문) 출력')
     a = ap.parse_args(argv)
 
     if a.hours is not None and a.count is not None:
@@ -1757,7 +1856,7 @@ def main(argv=None) -> int:
             raise GenError(f'모르는 주제 "{th}" — 가능한 주제: {", ".join(themes)}')
 
     pool = RoutePool(lg, route_defs, a.seed, gen_cfg)
-    combos = {th: expand_theme(th, themes[th], a.seed) for th in a.themes}
+    combos = {th: expand_theme(th, themes[th], a.seed, route_defs) for th in a.themes}
 
     def route_len(route_key):
         return pool.get(*route_key).rt['total_length']
@@ -1767,6 +1866,7 @@ def main(argv=None) -> int:
     summary, warn_total = [], 0
     skipped = []
     walk_starts: set = set()            # 합성 경로 시작 도로들 — 실기 스폰 확인 항목
+    cov_roads: collections.Counter = collections.Counter()   # 생성분이 밟은 road 빈도
     for th in a.themes:
         cfg = themes[th]
         n_ok = 0
@@ -1797,6 +1897,7 @@ def main(argv=None) -> int:
                   f'교차로 {rs["junctions"] or "없음"}  도로 {len(rs["roads"])}개')
             if 'walk' in route_defs.get(variant['route'][0], {}):
                 walk_starts.add(rs['start']['road'])
+            cov_roads.update(rs['roads'])
             for _, x, y, dm in bad:
                 print(f'  ⚠ {name}: ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
                 warn_total += 1
@@ -1835,6 +1936,14 @@ def main(argv=None) -> int:
         line += ('  ⚠ 폐기가 통과보다 많다 — walk 시작점 선정이 "뒤쪽 탈출로 있는 '
                  '양방향 도로"에 편중됐다는 신호 (start_pool 조건 검토)')
     print(line)
+    if a.coverage_report:
+        all_roads = set(lg.roads)
+        visited = set(cov_roads)
+        pct = 100.0 * len(visited) / max(1, len(all_roads))
+        print(f'\n[커버리지] 이번 생성분 road {len(visited)}개 / {len(all_roads)}개 ({pct:.1f}%)')
+        print('  상위 빈도: ' + '  '.join(f'{r}×{n}' for r, n in cov_roads.most_common(20)))
+        missing = sorted(all_roads - visited)
+        print(f'  미방문 {len(missing)}개: ' + ' '.join(map(str, missing)))
     if walk_starts:
         print(f'\n[실기 1회 확인] 합성 경로 시작 도로 {sorted(walk_starts)} — '
               f'Ego PathRef/Path01 은 경로 기준으로 생성했지만, VTD 스폰이 실제로 '
