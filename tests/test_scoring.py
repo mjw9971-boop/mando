@@ -15,6 +15,8 @@ from vtd_adapter.config import load_params_yaml
 
 def base_cfg(**scoring_over):
     cfg = copy.deepcopy(load_params_yaml())
+    # 구간 규칙 회귀 테스트가 기본 — 단일 구간 모드는 명시적으로 켠다
+    cfg['scoring']['single_section'] = False
     cfg['scoring'].update(scoring_over)
     return cfg
 
@@ -115,3 +117,44 @@ def test_section_idx_by_event_s0():
     evs = rep['violations']['speed']['events']
     assert [e['section_idx'] for e in evs] == [0, 1]
     assert all(e['severity'] == 'minor' for e in evs)
+
+
+# ── 단일 구간 모드 (scoring.single_section — 대회 CSV 확정 전 기본) ──────
+def test_single_section_ignores_bounds():
+    cfg = base_cfg(single_section=True, section_bounds_s=[100.0, 200.0])
+    s = scored({'speed': [ev(10, 0, max_over_kph=5.0), ev(250, 1, max_over_kph=5.0)]}, cfg)
+    assert len(s['sections']) == 1                     # 경계 무시, 전체 1구간
+    assert s['sections'][0]['score'] == 97             # (항목)당 1회 — 경미 한 번
+
+
+def test_single_section_escalates_across_whole_course():
+    # 구간 모드에서는 구간별 각 1회 경미(-3×2)였던 배치가 전체 2회 → 중대 -6
+    cfg = base_cfg(single_section=True, section_bounds_s=[100.0])
+    s = scored({'lane_departure': [ev(10, 0), ev(150, 1)]}, cfg)
+    assert s['sections'][0]['score'] == 94
+
+
+def test_single_section_respawn_one_free_total():
+    cfg = base_cfg(single_section=True, section_bounds_s=[100.0, 200.0])
+    s = scored({'reset': [ev(10, 0, why={}), ev(150, 1, why={}), ev(250, 2, why={})]}, cfg)
+    assert s['sections'][0]['score'] == 88             # 3회 − 전체 무료 1 = 2 × -6
+
+
+def test_single_section_not_finished_aggregates_full_course():
+    # 미완주여도 전체 1구간으로 집계 — peak 너머의 위반도 감점에 들어간다
+    cfg = base_cfg(single_section=True)
+    s = scored({'speed': [ev(250, 0, max_over_kph=5.0)]}, cfg,
+               peak=150.0, total=300.0, done=False)
+    assert s['reached_sections'] == 1 and s['max_possible'] == 100
+    assert s['sections'][0]['score'] == 97
+
+
+def test_single_section_hand_computed_total():
+    # 손계산: 속도 경미 -3, 충돌 중대 -6, 차선이탈 2회 심화 -6,
+    # 리스폰 2회(무료 1) -6 → 100 - 21 = 79
+    cfg = base_cfg(single_section=True)
+    s = scored({'speed': [ev(10, 0, max_over_kph=5.0)],
+                'collision': [ev(50, 1, obj_id=1, min_gap_m=0.0)],
+                'lane_departure': [ev(100, 2), ev(200, 3)],
+                'reset': [ev(120, 4, why={}), ev(220, 5, why={})]}, cfg)
+    assert s['total'] == 79 and s['max_possible'] == 100

@@ -6,6 +6,8 @@
 (항목,구간)당 1회 감점(경미 -3/중대 -6, params scoring.*), 리스폰 구간당 1회
 무료, 미완주 시 도달 구간까지만 집계. 검출과 채점은 분리 — 검출 건수는
 severity 와 무관하게 유지된다.
+scoring.single_section(현재 기본)이면 전체 코스를 1구간으로 집계한다 —
+대회 CSV 확정 전까지 구간 경계가 무의미해서다 (_section_edges 참조).
 
     python3 tools/score.py logs/run_xxx.jsonl
     python3 tools/score.py LOG --route data/route_X.pkl --json
@@ -1036,6 +1038,15 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
 
 
 def _section_edges(sc: dict, total: float) -> list[float]:
+    """구간 경계 route_s 목록.
+
+    scoring.single_section 이면 전체 코스를 1구간으로 접는다 (대회 당일 경로
+    CSV 확정 전 기본 — 경계가 무의미하다). 구간 분할·감점·리스폰 무료·
+    COUNT_ESCALATE 로직은 그대로 두고 경계만 하나가 되므로, (항목)당 1회
+    감점·전체 1회 무료가 자연히 전체 코스 단위가 된다. CSV 확정 시
+    single_section: false + section_bounds_s 로 되돌린다."""
+    if sc.get('single_section'):
+        return [0.0, max(total, 1e-6)]
     bounds = sorted(float(b) for b in (sc.get('section_bounds_s') or []))
     return [0.0] + [b for b in bounds if 0.0 < b < total] + [max(total, 1e-6)]
 
@@ -1306,16 +1317,25 @@ def render(rep: dict) -> str:
     L.append(f"\n위반 합계(정보 제외): {rep.get('n_violations', 0)}")
     if 'scoring' in rep:
         s = rep['scoring']
-        L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}"
-                 f"  (구간 {len(s['sections'])}개 중 도달 {s['reached_sections']})")
-        for sec in s['sections']:
-            if sec['score'] is None:
-                L.append(f"  구간{sec['idx']} s {sec['s0']}~{sec['s1']}: 미도달 (집계 제외)")
-                continue
-            ded = '  '.join(f"{LABEL.get(d['item'], d['item'])}"
-                            f"[{'중대' if d['severity'] == 'major' else '경미'}]"
-                            for d in sec['deductions']) or '감점 없음'
-            L.append(f"  구간{sec['idx']} s {sec['s0']}~{sec['s1']}: {sec['score']}점  {ded}")
+
+        def ded_str(sec):
+            return '  '.join(f"{LABEL.get(d['item'], d['item'])}"
+                             f"[{'중대' if d['severity'] == 'major' else '경미'}]"
+                             for d in sec['deductions']) or '감점 없음'
+
+        if len(s['sections']) == 1:
+            # 단일 구간 모드 — 총점 한 줄 (--json 은 sections 1원소로 스키마 유지)
+            L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}  "
+                     f"{ded_str(s['sections'][0])}")
+        else:
+            L.append(f"\n[채점] 총점 {s['total']} / {s['max_possible']}"
+                     f"  (구간 {len(s['sections'])}개 중 도달 {s['reached_sections']})")
+            for sec in s['sections']:
+                if sec['score'] is None:
+                    L.append(f"  구간{sec['idx']} s {sec['s0']}~{sec['s1']}: 미도달 (집계 제외)")
+                    continue
+                L.append(f"  구간{sec['idx']} s {sec['s0']}~{sec['s1']}: "
+                         f"{sec['score']}점  {ded_str(sec)}")
     for k in LABEL:
         d = rep['violations'].get(k)
         if not d or not d['events']:
