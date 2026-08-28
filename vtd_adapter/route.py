@@ -202,6 +202,11 @@ class VtdRoutePlanner:
         cmds: list[int] = []
         rs_list: list[float] = []
         limits: list[float] = []
+        lat: list[float] = []          # 누적 횡오프셋 (+좌 / −우)
+        # 차선변경이 끝나면 기준 차로가 바뀐다. 여기서 0 으로 되돌리면 앞을 볼 때
+        # "반대로 돌아온다" 로 읽혀 지시등이 역방향으로 켜진다(2026-08-28 재생에서
+        # 확인). 그래서 **누적값**으로 둔다 — 판정은 차이만 보므로 절대값은 무의미하다.
+        lat_acc = 0.0
         stops: list[tuple] = []        # (rs, controller_ids, signal_ids)
 
         margin_kph = float(self.cfg.get('speed', {}).get('margin_kph', 0.0))
@@ -250,7 +255,7 @@ class VtdRoutePlanner:
                 w1 = min(w0 + self.LC_TRANSITION_M, w1_cap)
                 side = RoadOption.CHANGELANELEFT if left \
                     else RoadOption.CHANGELANERIGHT
-                blend = (w0, max(w1, w0 + 1e-6), side)
+                blend = (w0, max(w1, w0 + 1e-6), side, 1.0 if left else -1.0)
                 s_end = min(L, w1 - cum_s[i])
             else:
                 s_end = L
@@ -279,9 +284,14 @@ class VtdRoutePlanner:
                     z += wt * taper[1][2]
                 cmd = RoadOption.LANEFOLLOW
                 cur_key, cur_s = key, s
+                off = lat_acc
                 if blend is not None and rs >= blend[0]:
                     w = -_math.cos(min(1.0, (rs - blend[0]) / (blend[1] - blend[0])) * _math.pi) / 2.0 + 0.5
                     x2, y2, z2, _h2 = lg.point_at(nxt, min(s, lg.length(nxt)))
+                    # 지시등 입력: 원 차로 중심에서 옆으로 밀린 양 (테이퍼는 제외 —
+                    # 차로를 옮기는 게 아니라 소멸 차로 기하 보정이라 지시등 대상이
+                    # 아니다. 실측: 테이퍼 최대 2.36 m 로 LC 3.0 m 와 임계로는 못 가른다)
+                    off = lat_acc + blend[3] * w * _math.hypot(x2 - x, y2 - y)
                     x = (1.0 - w) * x + w * x2
                     y = (1.0 - w) * y + w * y2
                     z = (1.0 - w) * z + w * z2
@@ -293,11 +303,13 @@ class VtdRoutePlanner:
                 cmds.append(int(cmd))
                 rs_list.append(rs)
                 limits.append(limit_mps(cur_key))
+                lat.append(off)
                 s += step
                 rs += step
             collect_stops(key, i, s_seg_start, s_end)
 
             if hop:
+                lat_acc = lat[-1] if lat else lat_acc   # 옮겨탄 차로가 새 기준
                 s = min(s, lg.length(nxt))     # 나란한 차로 — s 매개화 유지, rs 연속
             else:
                 s -= L                          # 초과분 이월 → 간격 유지
@@ -324,6 +336,7 @@ class VtdRoutePlanner:
             cmds.append(int(RoadOption.LANEFOLLOW))
             rs_list.append(rs)
             limits.append(limit_mps(key))
+            lat.append(lat_acc)
             s += step
             rs += step
             ext += step
@@ -335,6 +348,9 @@ class VtdRoutePlanner:
         self.commands = np.array(cmds, dtype=int)
         self.commands_orig = np.copy(self.commands)
         self.speed_limits = np.array(limits, dtype=float)
+        # 지시등 판단 입력 (kr_rules). 런타임 시프트가 얹히면 갱신된다.
+        self.lat_shift = np.array(lat, dtype=float)
+        self._lat_build = np.copy(self.lat_shift)
         self.route_waypoints = [VtdWaypoint(lg, k, sv) for k, sv in keys]
         self.rotation_angles = self.compute_rotation_angles(self.route_points)
         self._kd = cKDTree(self.route_points[:, :2])
@@ -467,6 +483,12 @@ class VtdRoutePlanner:
             self.route_points[idx] = (
                 lane_transition_factor * transition_factor * loc
                 + (1.0 - lane_transition_factor * transition_factor) * self.route_points[idx])
+            # 지시등 입력 갱신 — 회피로 경로를 밀면 깜빡이가 따라온다 (kr_rules).
+            # 빌드 시 LC 오프셋 + 런타임 시프트 변위. 부호는 +좌 / −우.
+            if getattr(self, 'lat_shift', None) is not None and idx < len(self.lat_shift):
+                d = float(np.linalg.norm(
+                    self.route_points[idx][:2] - self.original_route_points[idx][:2]))
+                self.lat_shift[idx] = self._lat_build[idx] + (d if shift_to_left_lane else -d)
 
     def shift_route_around_actors(self, first_actor, last_actor=None,
                                   obstacle_direction='right', transition_length=120.0,
