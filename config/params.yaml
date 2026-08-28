@@ -182,6 +182,16 @@ scoring:
   # hold 이상 지속 = 중대. 그 쪽 보도 없음(None)은 판정 대상 아님.
   sidewalk_depth_m: 0.5
   sidewalk_hold_s: 0.3
+  # 대회 10번 보행자 대응 (detect_pedestrian_response, 2026-08-28 실측 근거 승인):
+  # 대응 = (경로 중심선까지 ≤ near) OR (차로 쪽 횡속도 ≥ cross_v), 전방 engage 이내.
+  # 횡단 완료 = |lat| > 차로폭/2 + clear. 완료 전 무정차 통과 / 정지 후
+  # 완료 전 재출발(v ≥ restart_v) = 중대. 실측: 횡단 횡속도 1.0~2.0 m/s,
+  # 차로 반폭 1.5 m, 횡단 시 경로 접근 0.1~0.23 m vs 보도 대기 ≥ 2.26 m.
+  ped_near_m: 2.0
+  ped_cross_v: 0.3
+  ped_engage_m: 40.0
+  ped_restart_v: 1.0
+  ped_clear_m: 0.5
 
 score:
   # 위반 검출기(tools/score.py) 임계. 배점·감점 없음 — 검출 기준값만 둔다.

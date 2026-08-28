@@ -21,6 +21,8 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
   turn_signal        차선변경 시작(경계 통과) 전 signal_lead_s 연속 점등 미달 (경미)
   center_line        중앙선 침범 — 깊이 center_depth_m 이상 center_hold_s 지속 (중대)
   sidewalk           보도 침범 — 깊이 sidewalk_depth_m 이상 sidewalk_hold_s 지속 (중대)
+  ped_response       보행자 대응 — 무정차 통과(no_stop)/횡단 완료 전 재출발
+                     (early_start), 보행자당 최대 1건 (중대)
   red_light          적신호에 정지선 통과 (stop_line_front_m 부호 전환 시점 판정)
   red_right_turn     [정보] 적신호 우회전 통과 — 직전 일시정지 여부를 남긴다
   red_stop_ok        [정보] 적신호 정지 정상 — 앞범퍼가 정지선 앞 stop_ok_m 이내
@@ -353,6 +355,135 @@ def detect_center_line(ticks: list[dict], t0: float, lg, veh_width: float,
 
     return _depth_events(ticks, t0, depth_of, float(sc['center_depth_m']),
                          float(sc['center_hold_s']), merge_gap_s, extra_of)
+
+
+def _route_project(lg, route, x: float, y: float):
+    """점 (x,y) → 경로 차로들 중 최근접 투영.
+    반환 (dist, lane_key, s_in_lane, t_signed(좌 +), route_s) 또는 None."""
+    best = None
+    for i, k in enumerate(route['lanes']):
+        try:
+            s_p, t_p, d_p, _ = lg.project(tuple(k), x, y)
+        except KeyError:
+            continue
+        if best is None or d_p < best[0]:
+            best = (float(d_p), tuple(k), float(s_p), float(t_p),
+                    float(route['cum_s'][i]) + float(s_p))
+    return best
+
+
+def detect_pedestrian_response(ticks: list[dict], t0: float, lg, route, sc: dict,
+                               stop_speed: float, merge_gap_s: float = 0.0) -> list:
+    """보행자 대응 (대회 항목 10 — 중대).
+
+    대응 구간(engagement) — 보행자 id 별 연속 틱:
+      · cls 가 pedestrian, 또는 unknown(차량 미만 치수 — 자전거 등 애매
+        케이스도 보호 대상. 놓쳐서 중대를 받느니 과검출이 낫다)
+      · 경로를 침범했거나 침범하려는 상태: 경로 중심선까지 거리 ≤ ped_near_m
+        OR 차로 쪽으로 접근 중(횡속도 성분 ≥ ped_cross_v). OR 이다 — 차로
+        위에 서 있는 보행자(횡속도 0)를 놓치면 안 된다. 도로와 나란히 걷는
+        보행자는 어느 쪽에도 안 걸린다.
+      · 종방향(route_s 차) 0 ≤ gap ≤ ped_engage_m
+    로그 objects[] 의 lat_off/on_route/will_enter_lane 은 사장 필드(항상
+    None/False — run_agent._log_objects)라 쓰지 않고 raw.objects 기하로 계산.
+
+    판정 (횡단 완료 = |lat| > 차로폭/2 + ped_clear_m):
+      · no_stop     대응 구간 내내 v ≥ stop_speed 인 채로, 완료 전(차로 위
+                    또는 접근 중) 보행자의 횡단 지점(route_s)을 통과 → 중대
+      · early_start 구간 중 정지(v<stop_speed)했다가 보행자가 아직 차로 위
+                    (|lat| ≤ 완료 임계, 전방 gap>0)인데 v ≥ ped_restart_v 로
+                    재출발 → 중대
+      · 정상        정지 후 완료를 기다려 출발 — 이벤트 없음
+    보행자당 최대 1건 (구간 쪼개짐은 merge_gap_s 병합). reset 틱 제외.
+    충돌(항목 14, detect_proximity)과는 별개 집계다."""
+    near_m = float(sc['ped_near_m'])
+    cross_v = float(sc['ped_cross_v'])
+    engage_m = float(sc['ped_engage_m'])
+    restart_v = float(sc['ped_restart_v'])
+    clear_m = float(sc['ped_clear_m'])
+
+    cls_by_id = {}
+    for t in ticks:
+        for o in t['objects']:
+            cls_by_id.setdefault(o['id'], o.get('cls'))
+    ped_ids = [i for i, c in cls_by_id.items() if c in ('pedestrian', 'unknown')]
+    if not ped_ids:
+        return []
+
+    # 틱×보행자 상태 사전 계산 (raw.objects: [id,x,y,z,heading,speed,l,w,h])
+    st: list[dict] = [{} for _ in ticks]
+    for i, t in enumerate(ticks):
+        if t['world']['flags'].get('reset'):
+            continue
+        raw = {int(o[0]): o for o in t['raw']['objects']}
+        for oid in ped_ids:
+            o = raw.get(oid)
+            if o is None:
+                continue
+            p = _route_project(lg, route, o[1], o[2])
+            if p is None:
+                continue
+            d, lane, s_in, lat, ped_rs = p
+            try:
+                thr = lg.width_at(lane, s_in) / 2.0 + clear_m
+            except KeyError:
+                continue
+            _x, _y, _z, lane_hd = lg.point_at(lane, s_in)
+            v_lat = (o[5] or 0.0) * math.sin((o[4] or 0.0) - lane_hd)
+            approaching = (lat > 0 and v_lat < -cross_v) or (lat < 0 and v_lat > cross_v)
+            st[i][oid] = {'gap': ped_rs - t['ego']['route_s'], 'd': d, 'lat': lat,
+                          'thr': thr, 'block': d <= near_m or approaching}
+
+    out = []
+    for oid in ped_ids:
+        mask = [oid in s and s[oid]['block'] and 0.0 <= s[oid]['gap'] <= engage_m
+                for s in st]
+        merged = []
+        for r in _runs(mask):
+            if merged and ticks[r[0]]['t'] - ticks[merged[-1][1]]['t'] <= merge_gap_s:
+                merged[-1] = (merged[-1][0], r[1], True)
+            else:
+                merged.append(r)
+        for i0, i1, _ in merged:
+            ep = range(i0, i1 + 1)
+            min_d = min(st[j][oid]['d'] for j in ep if oid in st[j])
+            min_v = min(ticks[j]['ego']['speed'] for j in ep)
+            stop_i = next((j for j in ep if ticks[j]['ego']['speed'] < stop_speed), None)
+            kind = None
+            if stop_i is None:
+                # 무정차 — 이후 통과 시점(gap≤0 전환)에 아직 완료 전인가.
+                # 통과는 대응 구간이 끝나며 일어나므로 구간 밖까지 쫓아간다.
+                last_seen = ticks[i0]['t']
+                for j in range(i0, len(ticks)):
+                    s = st[j].get(oid)
+                    if ticks[j]['ego']['speed'] < stop_speed and j <= i1:
+                        break                              # 뒤늦게 정지 (구간 내)
+                    if s is None:
+                        if ticks[j]['t'] - last_seen > 2.0:
+                            break                          # 보행자 소멸 — 판정 불가
+                        continue
+                    last_seen = ticks[j]['t']
+                    if s['gap'] <= 0.0:
+                        if s['block'] or abs(s['lat']) <= s['thr']:
+                            kind = 'no_stop'
+                        break
+            else:
+                # 정지 후 재출발 — 보행자가 아직 차로 위(완료 전)·전방인데 출발?
+                for j in range(stop_i + 1, len(ticks)):
+                    s = st[j].get(oid)
+                    if s is None:
+                        continue
+                    if abs(s['lat']) > s['thr'] or s['gap'] <= 0.0:
+                        break                              # 횡단 완료 또는 지나감
+                    if ticks[j]['ego']['speed'] >= restart_v:
+                        kind = 'early_start'
+                        break
+            if kind is not None:
+                out.append(_ev(ticks, t0, i0, i1, obj_id=oid, obj_cls=cls_by_id.get(oid),
+                               kind=kind, min_dist_m=round(min_d, 2),
+                               min_v_kph=round(min_v * 3.6, 1)))
+                break                                      # 보행자당 최대 1건
+    return out
 
 
 def detect_sidewalk(ticks: list[dict], t0: float, lg, veh_width: float,
@@ -863,16 +994,9 @@ def detect_stall(ticks: list[dict], t0: float, cfg: dict) -> list:
 # 채점 층 (2026 HL FMA 안내문) — 검출 결과 위에 얹는다. 검출 로직은 불변.
 # ══════════════════════════════════════════════════════════════════════════
 def project_route_s(lg, route, x: float, y: float) -> float | None:
-    """좌표 → 경로 누적거리 (종료 지점 통과 판정용). 경로 차로들에 투영해 최근접."""
-    best = None
-    for i, k in enumerate(route['lanes']):
-        try:
-            s_p, _t, d_p, _ = lg.project(tuple(k), x, y)
-        except KeyError:
-            continue
-        if best is None or d_p < best[0]:
-            best = (d_p, float(route['cum_s'][i]) + float(s_p))
-    return best[1] if best else None
+    """좌표 → 경로 누적거리 (종료 지점 통과 판정용). _route_project 의 route_s."""
+    p = _route_project(lg, route, x, y)
+    return p[4] if p else None
 
 
 def _severity(cat: str, ev: dict, sc: dict) -> str:
@@ -896,7 +1020,7 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'minor'
     if cat == 'turn_signal':
         return 'minor'
-    if cat in ('center_line', 'sidewalk'):
+    if cat in ('center_line', 'sidewalk', 'ped_response'):
         return 'major'
     if cat == 'green_stall':
         return 'major' if float(ev.get('dur_s', 0.0)) >= float(sc['green_major_s']) else 'minor'
@@ -1049,6 +1173,14 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     V['off_route'] = {'count': 0, 'events': detect_off_route(
         span, t0, lg, route, float(cfg['score'].get('merge_gap_s', 0.0)))}
 
+    if lg is not None and route is not None:
+        V['ped_response'] = {'count': 0, 'events': detect_pedestrian_response(
+            span, t0, lg, route, cfg['scoring'], stop_speed,
+            float(cfg['score'].get('merge_gap_s', 0.0)))}
+    else:
+        rep['warnings'].append('lane_graph/route 없음 — 보행자 대응 생략')
+        V['ped_response'] = {'count': 0, 'events': []}
+
     # 완주: 안내문 규칙은 "뒷축이 종료 지점 좌표 통과" — finish_xy 를 경로에
     # 투영한 route_s 로 판정. 미설정이면 기존 route_s 임계(end_margin) + 경고.
     finish_s = None
@@ -1109,7 +1241,7 @@ LABEL = {
     'speed': '속도 초과(법규)', 'speed_margin': '여유 침범(정보)',
     'lane_departure': '차선 이탈', 'solid_lane_change': '실선 차선변경',
     'turn_signal': '차선변경 지시등 미점등', 'center_line': '중앙선 침범',
-    'sidewalk': '보도 침범',
+    'sidewalk': '보도 침범', 'ped_response': '보행자 대응',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
     'green_stall': '녹색신호 정차',
@@ -1126,6 +1258,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'turn_signal': ('side', 'from_lane', 'to_lane', 'on_s', 'n_crossings'),
     'center_line': ('depth_m', 'lane', 't_off', 'left_mark_yellow'),
     'sidewalk': ('depth_m', 'lane', 't_off', 'side'),
+    'ped_response': ('obj_id', 'obj_cls', 'kind', 'min_dist_m', 'min_v_kph'),
     'red_light': ('ctrl_ids', 'states', 'v_kph', 'next_turn'),
     'red_right_turn': ('states', 'v_kph', 'stopped_before'),
     'red_stop_ok': ('front_m',),
