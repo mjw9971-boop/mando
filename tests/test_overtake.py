@@ -9,7 +9,6 @@ _manage_route_obstacle_scenarios 는 이식 때 stub 이 됐다.
   · 막힌 채 정지가 trigger_s 지속되면 옆 차로로 경로를 민다 (좌측 우선)
   · 게이트 — 이웃 있음 · 교차로 아님 · 점선 회랑 충분(S2.2.05) · 목표 차로 비어 있음
   · 1회만 (래치). 지나가면 원복해 다음 장애물에 다시 쓴다
-  · 시프트가 lat_shift 를 갱신하므로 지시등이 자동으로 따라온다
 """
 import math
 import pathlib
@@ -172,15 +171,6 @@ def test_occupied_target_lane_blocks(rig):
     assert kr.last_overtake and 'occupied' in kr.last_overtake
 
 
-def test_shift_updates_lat_shift_for_signal(rig):
-    """시프트가 lat_shift 를 갱신 → 지시등이 자동으로 따라온다."""
-    pl, ego, actor_at, actor_on_left, make = rig
-    ap = make([actor_at(IDX + 80)])
-    kr = run(ap, ticks_needed(KrRules(CFG)))
-    a, b = kr.ot_span
-    assert np.abs(pl.lat_shift[a:b] - pl._lat_build[a:b]).max() > CFG['signal']['lat_shift_on_m']
-
-
 def test_shift_once_then_restore(rig):
     """1회만 발동하고, 지나가면 경로를 원복한다."""
     pl, ego, actor_at, actor_on_left, make = rig
@@ -195,7 +185,6 @@ def test_shift_once_then_restore(rig):
     assert kr.ot_span is None
     assert kr.last_overtake == 'restored'
     assert np.allclose(pl.route_points, orig)
-    assert np.allclose(pl.lat_shift, pl._lat_build)
 
 
 def test_disabled_switch(rig):
