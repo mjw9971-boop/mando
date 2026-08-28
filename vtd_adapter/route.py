@@ -85,6 +85,10 @@ LIGHT_STATE_MAP = {
 }
 
 
+def lg_neighbor_missing(lg, key, side) -> bool:
+    return lg.neighbor(key, side) is None
+
+
 class VtdTrafficLight:
     """carla.TrafficLight 의 PDM-Lite 사용 표면: id / state / type_id.
 
@@ -149,12 +153,73 @@ class VtdRoutePlanner:
         # 테이퍼 꼬리 블렌드 (params 가 단일 출처 — 없으면 KeyError 로 죽는 게 맞다)
         self.taper_blend_m = float(cfg['route']['taper_blend_m'])
         self.veh_width = float(cfg['vehicle']['width'])
+        # 정적 장애물 인식 (compute_leading_vehicles) — params 가 단일 출처
+        self.obstacle_speed_max = float(cfg['percep']['obstacle_speed_max'])
+        self.obstacle_clearance_m = float(cfg['percep']['obstacle_clearance_m'])
 
         self.route_index = 0
         self.last_route_index = 0
         self.lc_solid_warnings: list = []   # 점선 없는 차선변경 (경로 결함)
         self.lc_clipped: list = []          # 점선 안으로 좁힌 차선변경 구간
         self._build()
+
+    def _ramp_is_dashed(self, lanes, cum_s, lens, w0: float, w1: float,
+                        side: str, step: float = 1.0) -> bool:
+        """램프 [w0, w1] 전 구간이 점선인가 — 차로 경계를 넘어 확인한다.
+
+        build_route 의 창은 이미 연속 점선을 보장하지만(lane_change_window), 손으로
+        만든·옛 route.pkl 은 그 게이트를 안 탄다. 램프를 창 앞쪽으로 옮기면 확인
+        범위가 여러 차로에 걸치므로 _clip_to_dashed(한 차로 기준)로는 부족하다.
+        """
+        rs = float(w0)
+        while rs < w1 - 1e-6:
+            j = None
+            for k in range(len(lanes)):
+                L = float(lens[k]) if k < len(lens) else 0.0
+                if cum_s[k] - 1e-6 <= rs < cum_s[k] + L:
+                    j = k
+                    break
+            if j is None:
+                return False
+            key = tuple(lanes[j])
+            if lg_neighbor_missing(self.lg, key, side):
+                return False
+            if not self.lg.lane_change_ok(key, rs - cum_s[j], side):
+                return False
+            rs += step
+        return True
+
+    def _build_lc_ramps(self, lanes, cum_s, lens, lc_events) -> dict:
+        """차선변경 램프를 **창 앞쪽**에 배치한다 → {hop_index: ramp}.
+
+        창은 넓은데(실측 93 m) 종전에는 hop 차로 안에서만 블렌드해서 회전 직전
+        17 m 에 몰려 있었다 — 우회전을 위해 오른쪽으로 붙어야 하는데 차선변경과
+        회전이 겹쳤다. 길이(LC_TRANSITION_M)는 그대로 두고 **시작만 창 앞으로**
+        옮기면, 옮겨탄 뒤 남은 거리를 목표 차로에서 주행한다.
+        """
+        ramps: dict = {}
+        for ev in lc_events:
+            frm, to = tuple(ev['from_lane']), tuple(ev['to_lane'])
+            i_hop = next((k for k in range(len(lanes) - 1)
+                          if tuple(lanes[k]) == frm and tuple(lanes[k + 1]) == to), None)
+            if i_hop is None:
+                continue
+            left = to == self.lg.neighbor(frm, 'left')
+            side = 'left' if left else 'right'
+            w0 = float(ev.get('window_s0', cum_s[i_hop]))
+            w1_cap = float(ev.get('window_s1', cum_s[i_hop]))
+            w1 = min(w0 + self.LC_TRANSITION_M, w1_cap)
+            if w1 - w0 > 1e-6 and self._ramp_is_dashed(lanes, cum_s, lens, w0, w1, side):
+                ramps[i_hop] = {'w0': w0, 'w1': w1, 'side': side,
+                                'sign': 1.0 if left else -1.0, 'i_hop': i_hop}
+            else:
+                # 확인 실패 → 기존 동작(hop 차로 안에서 블렌드 + 점선 클립)으로 폴백
+                w0f = max(float(ev.get('window_s0', cum_s[i_hop])), cum_s[i_hop])
+                w0f, w1f = self._clip_to_dashed(frm, cum_s[i_hop], w0f, w1_cap, side)
+                ramps[i_hop] = {'w0': w0f, 'w1': min(w0f + self.LC_TRANSITION_M, w1f),
+                                'side': side, 'sign': 1.0 if left else -1.0,
+                                'i_hop': i_hop, 'fallback': True}
+        return ramps
 
     def _clip_to_dashed(self, key, base: float, w0: float, w1: float,
                         side: str) -> tuple:
@@ -202,7 +267,16 @@ class VtdRoutePlanner:
         cmds: list[int] = []
         rs_list: list[float] = []
         limits: list[float] = []
+        lat: list[float] = []          # 누적 횡오프셋 (+좌 / −우)
+        # 차선변경이 끝나면 기준 차로가 바뀐다. 여기서 0 으로 되돌리면 앞을 볼 때
+        # "반대로 돌아온다" 로 읽혀 지시등이 역방향으로 켜진다(2026-08-28 재생에서
+        # 확인). 그래서 **누적값**으로 둔다 — 판정은 차이만 보므로 절대값은 무의미하다.
+        lat_acc = 0.0
         stops: list[tuple] = []        # (rs, controller_ids, signal_ids)
+
+        lengths = [float(v) for v in route.get('lengths') or
+                   [lg.length(tuple(k)) for k in lanes]]
+        ramps = self._build_lc_ramps(lanes, cum_s, lengths, lc_events)
 
         margin_kph = float(self.cfg.get('speed', {}).get('margin_kph', 0.0))
         default_kph = float(self.cfg.get('default_speed_kph', 50.0))
@@ -233,27 +307,27 @@ class VtdRoutePlanner:
             nxt = lanes[i + 1] if i + 1 < len(lanes) else None
             hop = (nxt is not None and nxt not in lg.successors(key)
                    and nxt in (lg.neighbor(key, 'left'), lg.neighbor(key, 'right')))
+            # 차선변경 램프: hop 차로 안이 아니라 **창 앞쪽**에서 시작한다.
+            # 램프가 이 차로를 지나가면(hop 이전 차로 포함) 그 차로의 side 이웃으로
+            # 민다 — 이웃들이 successor 로 이어져 목표 차로에 닿는 것은 창 계산
+            # (lane_change_window)이 이미 확인했다.
+            # 램프는 hop 까지 **살아 있다**. w1 이후에는 가중치 1 로 고정돼 목표
+            # 차로 중심을 그대로 따라간다 — 여기서 램프를 끄면 원 차로로 되돌아가
+            # 옮겨탄 게 취소된다 (2026-08-28: 횡이동 0.00 으로 확인).
+            ramp = next((r for r in ramps.values()
+                         if i <= r['i_hop'] and r['w0'] < cum_s[i] + L), None)
             blend = None
-            if hop:
-                ev = next((e for e in lc_events
-                           if tuple(e.get('from_lane', ())) == key
-                           and tuple(e['to_lane']) == nxt), None)
-                w0 = max(float(ev['window_s0']) if ev else rs, rs)
-                w1_cap = float(ev['window_s1']) if ev else cum_s[i] + L
-                left = nxt == lg.neighbor(key, 'left')
-                # S2.2.05 실선 차선변경 금지 — 넘는 자리를 점선 안으로 밀어 넣는다.
-                # build_route 가 이미 점선만 통과시키지만(has_broken/dashed_runs),
-                # 손으로 만든·옛 route.pkl 은 그 게이트를 안 탄다. 제어기가 마지막
-                # 관문이므로 여기서 한 번 더 본다.
-                w0, w1_cap = self._clip_to_dashed(
-                    key, cum_s[i], w0, w1_cap, 'left' if left else 'right')
-                w1 = min(w0 + self.LC_TRANSITION_M, w1_cap)
-                side = RoadOption.CHANGELANELEFT if left \
-                    else RoadOption.CHANGELANERIGHT
-                blend = (w0, max(w1, w0 + 1e-6), side)
-                s_end = min(L, w1 - cum_s[i])
+            if ramp is not None:
+                tgt = lg.neighbor(key, ramp['side'])
+                if tgt is not None:
+                    side = (RoadOption.CHANGELANELEFT if ramp['side'] == 'left'
+                            else RoadOption.CHANGELANERIGHT)
+                    blend = (ramp['w0'], max(ramp['w1'], ramp['w0'] + 1e-6),
+                             side, ramp['sign'], tgt)
+            if hop and ramp is not None and ramp['w1'] > cum_s[i] + 1e-6:
+                s_end = min(L, ramp['w1'] - cum_s[i])   # 램프가 이 차로 안에서 끝난다
             else:
-                s_end = L
+                s_end = L                               # 이미 목표 차로 위 — 끝까지
 
             # 소멸(테이퍼) 차로 꼬리: 끝 폭이 차폭 미만이면 중심선이 폭과 함께
             # 이웃 경계로 수렴하다 successor 중심선(반폭 ≈1.5 m 옆)으로 순간이동
@@ -279,25 +353,34 @@ class VtdRoutePlanner:
                     z += wt * taper[1][2]
                 cmd = RoadOption.LANEFOLLOW
                 cur_key, cur_s = key, s
+                off = lat_acc
                 if blend is not None and rs >= blend[0]:
-                    w = -_math.cos(min(1.0, (rs - blend[0]) / (blend[1] - blend[0])) * _math.pi) / 2.0 + 0.5
-                    x2, y2, z2, _h2 = lg.point_at(nxt, min(s, lg.length(nxt)))
+                    tgt = blend[4]
+                    u = min(1.0, max(0.0, (rs - blend[0]) / (blend[1] - blend[0])))
+                    w = -_math.cos(u * _math.pi) / 2.0 + 0.5
+                    x2, y2, z2, _h2 = lg.point_at(tgt, min(s, lg.length(tgt)))
+                    # 지시등 입력: 원 차로 중심에서 옆으로 밀린 양 (테이퍼는 제외 —
+                    # 차로를 옮기는 게 아니라 소멸 차로 기하 보정이라 지시등 대상이
+                    # 아니다. 실측: 테이퍼 최대 2.36 m 로 LC 3.0 m 와 임계로는 못 가른다)
+                    off = lat_acc + blend[3] * w * _math.hypot(x2 - x, y2 - y)
                     x = (1.0 - w) * x + w * x2
                     y = (1.0 - w) * y + w * y2
                     z = (1.0 - w) * z + w * z2
                     cmd = blend[2]
                     if w >= 0.5:
-                        cur_key, cur_s = nxt, min(s, lg.length(nxt))
+                        cur_key, cur_s = tgt, min(s, lg.length(tgt))
                 pts.append((x, y, z))
                 keys.append((cur_key, cur_s))
                 cmds.append(int(cmd))
                 rs_list.append(rs)
                 limits.append(limit_mps(cur_key))
+                lat.append(off)
                 s += step
                 rs += step
             collect_stops(key, i, s_seg_start, s_end)
 
             if hop:
+                lat_acc = lat[-1] if lat else lat_acc   # 옮겨탄 차로가 새 기준
                 s = min(s, lg.length(nxt))     # 나란한 차로 — s 매개화 유지, rs 연속
             else:
                 s -= L                          # 초과분 이월 → 간격 유지
@@ -324,6 +407,7 @@ class VtdRoutePlanner:
             cmds.append(int(RoadOption.LANEFOLLOW))
             rs_list.append(rs)
             limits.append(limit_mps(key))
+            lat.append(lat_acc)
             s += step
             rs += step
             ext += step
@@ -335,6 +419,9 @@ class VtdRoutePlanner:
         self.commands = np.array(cmds, dtype=int)
         self.commands_orig = np.copy(self.commands)
         self.speed_limits = np.array(limits, dtype=float)
+        # 지시등 판단 입력 (kr_rules). 런타임 시프트가 얹히면 갱신된다.
+        self.lat_shift = np.array(lat, dtype=float)
+        self._lat_build = np.copy(self.lat_shift)
         self.route_waypoints = [VtdWaypoint(lg, k, sv) for k, sv in keys]
         self.rotation_angles = self.compute_rotation_angles(self.route_points)
         self._kd = cKDTree(self.route_points[:, :2])
@@ -467,6 +554,12 @@ class VtdRoutePlanner:
             self.route_points[idx] = (
                 lane_transition_factor * transition_factor * loc
                 + (1.0 - lane_transition_factor * transition_factor) * self.route_points[idx])
+            # 지시등 입력 갱신 — 회피로 경로를 밀면 깜빡이가 따라온다 (kr_rules).
+            # 빌드 시 LC 오프셋 + 런타임 시프트 변위. 부호는 +좌 / −우.
+            if getattr(self, 'lat_shift', None) is not None and idx < len(self.lat_shift):
+                d = float(np.linalg.norm(
+                    self.route_points[idx][:2] - self.original_route_points[idx][:2]))
+                self.lat_shift[idx] = self._lat_build[idx] + (d if shift_to_left_lane else -d)
 
     def shift_route_around_actors(self, first_actor, last_actor=None,
                                   obstacle_direction='right', transition_length=120.0,
@@ -499,7 +592,15 @@ class VtdRoutePlanner:
         return shift_start_index, shift_end_index
 
     def compute_leading_vehicles(self, list_vehicles, ego_vehicle_id):
-        """PDM 원문 — 경로 전방 80 m 에서 경로에 붙어(2.5 m) 진행방향이 35° 이내인 차."""
+        """경로 전방 80 m 의 선행 객체 id.
+
+        PDM 원문 조건: 경로에 붙어(2.5 m) 진행방향이 35° 이내인 차.
+        **VTD 추가**: 정지한 객체는 방향을 묻지 않고 "경로를 막는가" 만 본다
+        (percep.obstacle_*). 라바콘·공사 자재·비스듬히 선 차는 heading 이 임의라
+        35° 조건에서 빠지는데, 그러면 IDM 감속이 안 걸려 OBB 충돌예측이 코앞에서
+        급제동하는 것만 남는다. 막는 폭은 차폭/2 + 객체폭/2 + 여유로 크기에
+        비례시킨다 — 갓길에 비켜 선 물체까지 세우지 않기 위해서다.
+        """
         vehicle_ids = np.array(
             [vehicle.id for vehicle in list_vehicles if vehicle.id != ego_vehicle_id])
         if len(vehicle_ids) and self.route_index != self.route_points.shape[0]:
@@ -522,10 +623,19 @@ class VtdRoutePlanner:
             yaw_differences = (route_yaws - vehicle_yaws) % 360
             yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
 
-            leading_vehicle_ids = vehicle_ids[
-                (distances < self.leading_vehicles_max_route_distance)
-                & (yaw_differences < self.leading_vehicles_max_route_angle_distance)]
-            return leading_vehicle_ids.tolist()
+            moving_ok = ((distances < self.leading_vehicles_max_route_distance)
+                         & (yaw_differences < self.leading_vehicles_max_route_angle_distance))
+
+            # VTD: 정지 객체는 heading 무관 — 경로를 막는지만 (크기 비례 폭)
+            speeds = np.array([v.get_velocity().length() for v in list_vehicles
+                               if v.id != ego_vehicle_id])
+            half_widths = np.array([float(v.bounding_box.extent.y)
+                                    for v in list_vehicles if v.id != ego_vehicle_id])
+            blocking = ((speeds < self.obstacle_speed_max)
+                        & (distances < self.veh_width / 2.0 + half_widths
+                           + self.obstacle_clearance_m))
+
+            return vehicle_ids[moving_ok | blocking].tolist()
         return []
 
     def compute_trailing_vehicles(self, list_vehicles, ego_vehicle_id):

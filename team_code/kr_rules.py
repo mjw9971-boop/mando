@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import math as _math
 
+import numpy as np
 from scipy.spatial import cKDTree as _cKDTree
 
 from vtd_adapter import frame
@@ -112,20 +113,19 @@ def _turn_end_s(lg, lanes, cum, lens, ev) -> float:
     return end_of(j)
 
 
-def signal_intervals(planner) -> list[dict]:
-    """route['events'] → 지시등 점등 구간 [{sig, src, ev_s, end_s}]. 시작 시 1회.
+def turn_intervals(planner) -> list[dict]:
+    """route['events'] 의 **회전만** → 점등 구간 [{sig, src, ev_s, end_s}]. 시작 시 1회.
 
-    turn : ev_s = 연결로 시작, end_s = 연결로 끝
-    lc   : ev_s = 창 시작(window_s0), end_s = 블렌드 끝(창 끝과 전이길이 중 짧은 쪽
-           — 창 끝까지 켜 두면 이미 옮겨탄 뒤에도 점등이 남는다)
+    회전은 연결로 중심선을 따라가므로 "차로 중심에서 벗어남" 이 0 이라 기하로는
+    잡히지 않는다 — 이벤트 목록이 유일한 근거다. 반대로 **차로를 옮기는 움직임**
+    (계획된 차선변경 · 런타임 회피 시프트)은 목록이 아니라 경로 기하로 본다
+    (_lane_shift). 목록에 없는 런타임 시프트도 자동으로 잡히게 하기 위해서다.
     """
     route = getattr(planner, 'route', None) or {}
     lg = getattr(planner, 'lg', None)
     lanes = route.get('lanes') or []
     cum = route.get('cum_s') or []
     lens = route.get('lengths') or []
-    lc_span = float(getattr(planner, 'LC_TRANSITION_M', 25.0))
-
     out: list[dict] = []
     for ev in route.get('events') or []:
         kind = str(ev.get('kind', ''))
@@ -133,12 +133,6 @@ def signal_intervals(planner) -> list[dict]:
             out.append({'sig': SIG_LEFT if kind.endswith('left') else SIG_RIGHT,
                         'src': 'turn', 'ev_s': float(ev['s']),
                         'end_s': _turn_end_s(lg, lanes, cum, lens, ev)})
-        elif kind.startswith('lane_change_'):
-            s0 = float(ev.get('window_s0', ev['s']))
-            s1 = float(ev.get('window_s1', s0))
-            out.append({'sig': SIG_LEFT if kind.endswith('left') else SIG_RIGHT,
-                        'src': 'lc', 'ev_s': s0,
-                        'end_s': min(s1, s0 + lc_span) if s1 > s0 else s0 + lc_span})
     out.sort(key=lambda d: d['ev_s'])
     return out
 
@@ -175,6 +169,16 @@ class KrRules:
         self.sl_hold_ticks = int(round(float(sp['stopline_hold_s'])
                                        * float(cfg['comm']['send_hz'])))
         self.sl_near_m = float(sp['stopline_hold_near_m'])
+        # 방향지시등 (SPEC §3.3). lc_lead_s 는 규정 미확정 가정값 (§7-2).
+        sig = cfg['signal']
+        self.turn_lead_s = float(sig['turn_lead_s'])
+        self.lc_lead_s = float(sig['lc_lead_s'])
+        self.sig_lead_min_m = float(sig['lead_min_m'])
+        self.lat_on_m = float(sig['lat_shift_on_m'])
+        self.sig_min_on_ticks = int(round(float(sig['min_on_s'])
+                                          * float(cfg['comm']['send_hz'])))
+        self.sig_off_delay_ticks = int(round(float(sig['off_delay_s'])
+                                             * float(cfg['comm']['send_hz'])))
         # 정적 장애물 회피 시프트 (SPEC §3.4 회피 — PDM 원문은 stub)
         ot = cfg['overtake']
         self.ot_enabled = bool(ot['enabled'])
@@ -186,11 +190,6 @@ class KrRules:
         self.ot_trans_m = float(ot['transition_m'])
         self.ot_before_m = float(ot['extra_before_m'])
         self.ot_after_m = float(ot['extra_after_m'])
-        # 방향지시등 (SPEC §3.3). lc_lead_s 는 규정 미확정 가정값 (§7-2).
-        sig = cfg['signal']
-        self.turn_lead_s = float(sig['turn_lead_s'])
-        self.lc_lead_s = float(sig['lc_lead_s'])
-        self.sig_lead_min_m = float(sig['lead_min_m'])
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -198,10 +197,13 @@ class KrRules:
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
+        self.sig_plan: list[dict] | None = None    # 회전 구간 (시작 시 1회)
+        self.sig_on_ticks = 0                      # 켜진 뒤 지난 틱 (min_on 기준)
+        self.sig_off_left = 0                      # 소등 지연 잔여 틱 (상한 있음)
+        self.sig_held: int = SIG_OFF               # 유지 중인 값
         self.ot_blocked_ticks = 0                  # 막힌 채 정지한 틱
         self.ot_span: tuple | None = None          # 시프트한 인덱스 구간
         self.last_overtake: str | None = None      # 로그용 ('left'|'right'|사유)
-        self.sig_plan: list[dict] | None = None    # 시작 시 1회 계산 (매 틱 재구성 금지)
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
         self.last_sig_lead_s: float | None = None  # 이벤트까지 남은 시간 [s]
@@ -229,34 +231,96 @@ class KrRules:
                   f'+ 여유가 경로 종점을 초과 (경로 꼬리 부족). 종점까지 주행한다', flush=True)
         return stop_s
 
-    def _turn_signal(self, planner, route_s: float, ego_speed: float) -> tuple:
-        """점등 구간 중 지금 켤 것을 고른다 → (sig, src, lead_s).
+    def _lane_shift(self, planner, ego_speed: float):
+        """앞 창에서 경로가 차로 중심 기준으로 옆으로 갈 예정인가 → (sig, 남은거리).
 
-        점등 조건은 남은거리 ≤ max(v·lead_s, lead_min_m). 겹치면 SPEC §3.3 대로
-        남은거리가 짧은 쪽, 동률이면 회전 우선. 지난 구간(route_s > end_s)은
-        후보에서 빠지므로 재점등이 없다.
+        planner.lat_shift 는 경로점마다 "기준 차로 중심에서 밀린 양"(+좌/−우)이다.
+        계획된 차선변경 블렌드와 **런타임 회피 시프트**가 둘 다 여기에 반영되므로,
+        경로를 옆으로 미는 어떤 동작이든 지시등이 따라온다. 테이퍼(소멸 차로 기하
+        보정)는 차로를 옮기는 게 아니라 제외돼 있다.
+
+        한 점만 비교하지 않고 **창 전체를 훑는다** — 창 끝점이 이미 이동을 마친
+        뒤라면 차이가 0 으로 나와 놓친다.
+        """
+        lat = getattr(planner, 'lat_shift', None)
+        if lat is None or len(lat) == 0:
+            return None
+        i = int(getattr(planner, 'route_index', 0))
+        if i >= len(lat):
+            return None
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        look = max(ego_speed * self.lc_lead_s, self.sig_lead_min_m)
+        j = min(len(lat), i + int(look * ppm) + 1)
+        seg = lat[i:j] - lat[i]
+        if seg.size == 0:
+            return None
+        k = int(np.argmax(np.abs(seg)))
+        if abs(float(seg[k])) < self.lat_on_m:
+            return None
+        # 남은거리 = 임계를 처음 넘는 지점까지 (우선순위 비교용)
+        over = np.nonzero(np.abs(seg) >= self.lat_on_m)[0]
+        remain = float(over[0]) / ppm if over.size else 0.0
+        return (SIG_LEFT if seg[k] > 0 else SIG_RIGHT), remain
+
+    def _turn_signal(self, planner, route_s: float, ego_speed: float) -> tuple:
+        """이번 틱 지시등 → (sig, src, lead_s).
+
+        후보는 둘 — 회전(이벤트 구간)과 차로 이동(경로 기하). 겹치면 SPEC §3.3
+        대로 남은거리가 짧은 쪽, 동률이면 회전 우선.
+
+        깜빡임 방지는 **최소 점등 시간뿐**이다. 끄는 임계도 래치도 두지 않는다 —
+        조건이 거짓이 되면 그대로 꺼진다. 유지 구간에 상한이 있으니 고착되지 않는다.
         """
         if self.sig_plan is None:
-            self.sig_plan = signal_intervals(planner)
+            self.sig_plan = turn_intervals(planner)
 
-        best = None
+        best = None                                  # (정렬키, sig, src, remain)
         for iv in self.sig_plan:
             if route_s > iv['end_s']:
                 continue
-            lead_s = self.turn_lead_s if iv['src'] == 'turn' else self.lc_lead_s
             remain = iv['ev_s'] - route_s
-            if remain > max(ego_speed * lead_s, self.sig_lead_min_m):
+            if remain > max(ego_speed * self.turn_lead_s, self.sig_lead_min_m):
                 continue
-            key = (max(0.0, remain), 0 if iv['src'] == 'turn' else 1)
+            key = (max(0.0, remain), 0)              # 0 = 회전 우선
             if best is None or key < best[0]:
-                best = (key, iv, remain)
+                best = (key, iv['sig'], 'turn', remain)
+
+        shift = self._lane_shift(planner, ego_speed)
+        if shift is not None:
+            sig, remain = shift
+            key = (max(0.0, remain), 1)
+            if best is None or key < best[0]:
+                best = (key, sig, 'lc', remain)
 
         if best is None:
-            return SIG_OFF, None, None
-        _key, iv, remain = best
-        # 남은 시간은 참고용 로그 — 저속에서는 발산하므로 남기지 않는다
-        lead = max(0.0, remain) / ego_speed if ego_speed > 0.1 else None
-        return iv['sig'], iv['src'], lead
+            sig, src, remain = SIG_OFF, None, None
+        else:
+            _k, sig, src, remain = best
+
+        # 유지 장치 둘. 기준 시점이 다르다 — 둘 다 상한이 있어 고착되지 않는다.
+        #   min_on   : **켜진 시점부터** 최소 점등 시간. 켜자마자 꺼지는 깜빡임 방지
+        #              (조건이 계속 참인 동안 갱신하지 않는다 — 갱신하면 이게 곧
+        #               소등 지연이 돼 off_delay 가 무의미해진다)
+        #   off_delay: **조건이 끝난 시점부터** 소등까지. 다 돌기 전에 꺼지는 것 방지
+        #              (실차 자동소등 관례)
+        if sig != SIG_OFF:
+            if self.sig_held != sig:
+                self.sig_on_ticks = 0                  # 새로 켜짐 / 방향 전환
+            self.sig_held = sig
+            self.sig_on_ticks += 1
+            self.sig_off_left = self.sig_off_delay_ticks
+        elif self.sig_held != SIG_OFF and (self.sig_off_left > 0
+                                           or self.sig_on_ticks < self.sig_min_on_ticks):
+            self.sig_off_left = max(0, self.sig_off_left - 1)
+            self.sig_on_ticks += 1
+            sig, src = self.sig_held, 'hold'
+        else:
+            self.sig_held = SIG_OFF
+            self.sig_on_ticks = 0
+
+        lead = (max(0.0, remain) / ego_speed
+                if remain is not None and ego_speed > 0.1 else None)
+        return sig, src, lead
 
     # ── 정적 장애물 회피 시프트 ──────────────────────────────────────────
     def _blocker(self, ap, planner):
@@ -323,6 +387,7 @@ class KrRules:
             a, b = self.ot_span
             planner.route_points[a:b] = planner.original_route_points[a:b]
             planner.commands[a:b] = planner.commands_orig[a:b]
+            planner.lat_shift[a:b] = planner._lat_build[a:b]
             planner._kd = _cKDTree(planner.route_points[:, :2])
             self.ot_span = None
             self.last_overtake = 'restored'
@@ -429,8 +494,8 @@ class KrRules:
         self.last_candidate = None
         self.last_d_end = d_end
 
-        # 정적 장애물 회피 — 경로를 옆 차로로 밀면 PDM 의 선행차 판정에서 빠져
-        # 다시 달린다. 충돌 판단은 PDM 의 OBB forecast 가 그대로 한다.
+        # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
+        # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
         self._try_overtake(ap, planner, ego_speed)
 
         # 방향지시등 — 속도 중재와 독립이다 (켜는 것이 감속을 만들지 않는다)
