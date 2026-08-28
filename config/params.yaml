@@ -155,6 +155,13 @@ gen_coverage:
   grid_cell_m: 200.0
   # 시작 후보 재추첨 횟수 상한 (구 300 하드코딩)
   redraw_max: 300
+  # walk 경로 최소 길이 [m] — turns 소진 후 목표까지 'any' 교차로 통과를 자동
+  # 연장한다. routes 정의의 min_length_m 이 우선(0 = 연장 없음). 기본값은
+  # 연속교차로 수준(교차로 6회 ≈ 830 m) 참고 (2026-08-28 실측: turns 수가
+  # 경로당 road 수를 선형 지배 — 교차로 1회당 +2~2.5 roads).
+  walk_min_length_m: 800.0
+  # 길이 연장으로 추가할 교차로 통과 상한 (무한 확장 방지)
+  walk_ext_turns_max: 8
 
 batch:
   # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).

@@ -9,6 +9,8 @@
 #         require: school_zone | speed_change  (경로가 반드시 포함해야 하는 성질)
 #         max_gap_m: 교차로 사이 최대 간격 (연속교차로용)
 #         tail_m: 마지막 교차로 뒤 여유 주행 거리
+#         min_length_m: 경로 최소 길이 — turns 소진 후 'any' 교차로 통과를 자동
+#                       연장 (기본 params gen_coverage.walk_min_length_m, 0=연장 없음)
 #
 # [themes]  주제 프리셋.
 #   event:  이벤트 종류 나열 — pedestrian jaywalk ped_blind lead_brake slow_lead

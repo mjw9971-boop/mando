@@ -184,16 +184,39 @@ def _junction_options(lg, approach):
     return opts
 
 
-def _walk_once(lg, rng, start, turns, tail_m, max_gap_m):
-    """start 차로에서 turns 정책대로 걷는다. 성공 → (chain, waypoint rows), 실패 → None."""
+def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
+               min_len_m: float = 0.0, ext_max: int = 0,
+               used_roads: dict | None = None):
+    """start 차로에서 turns 정책대로 걷는다. 성공 → (chain, waypoint rows), 실패 → None.
+
+    · turns 소진 후 경로 길이가 min_len_m 미만이면 'any' 교차로 통과를 최대
+      ext_max 회 자동 연장한다. 연장 중 실패(전진 불가·옵션 없음·gap 초과)는
+      walk 전체 실패가 아니라 연장 중단이다 — 필수 turns 는 이미 충족됐다.
+    · 'any' 의 교차로 출구는 균등이 아니라 **미방문 road 가중**으로 뽑는다
+      (실행 내 방문 횟수 n → 가중 1/(1+n), Efraimidis-Spirakis 1개 추첨) —
+      used_roads 는 RoutePool 이 실행 단위로 유지·기록한다.
+    · 비교차로 전진의 successors[0] 은 실측상 아무것도 버리지 않는다
+      (2026-08-28 전수: 일반도로 lane 의 비교차로 successor 는 0 또는 1개)."""
+    if used_roads is None:
+        used_roads = {}
     chain = [start]
     s0 = min(8.0, lg.length(start) * 0.2)
-    rows = [(s0, start, 'start')]
     entries = []            # (entry_lane, exit_lane)
     cur = start
     dist_since_exit = lg.length(start) - s0
-    for ti, want in enumerate(turns):
+    route_len = dist_since_exit
+    ti = 0
+    while True:
+        required = ti < len(turns)
+        if required:
+            want = turns[ti]
+        elif route_len < min_len_m and ti - len(turns) < ext_max:
+            want = 'any'                        # 목표 길이까지 연장
+        else:
+            break
+        ti += 1
         # 다음 교차로까지 전진
+        ok = True
         guard = 0
         while guard < 60:
             guard += 1
@@ -211,26 +234,38 @@ def _walk_once(lg, rng, start, turns, tail_m, max_gap_m):
                 break
             nxts = [k for k in lg.successors(cur) if lg.lanes[k]['junction'] == -1]
             if not nxts:
-                return None
+                ok = False
+                break
             cur = nxts[0]
             chain.append(cur)
             dist_since_exit += lg.length(cur)
+            route_len += lg.length(cur)
             if dist_since_exit > 700.0:
-                return None
+                ok = False
+                break
         else:
-            return None
-        if max_gap_m is not None and ti > 0 and dist_since_exit > max_gap_m:
-            return None
-        pick = ([o for o in opts if o[0] == want] if want != 'any'
-                else [o for o in opts if o[0] != 'uturn'])
+            ok = False
+        if ok and max_gap_m is not None and ti > 1 and dist_since_exit > max_gap_m:
+            ok = False
+        pick = []
+        if ok:
+            pick = ([o for o in opts if o[0] == want] if want != 'any'
+                    else [o for o in opts if o[0] != 'uturn'])
         if not pick:
-            return None
-        kind, ap, jchain, exit_lane = pick[rng.randrange(len(pick))]
+            if required:
+                return None
+            break                               # 연장 중단 — 필수 구간은 완성
+        if want == 'any':
+            kind, ap, jchain, exit_lane = max(
+                pick, key=lambda o: rng.random() ** (1.0 + used_roads.get(o[3][0], 0)))
+        else:
+            kind, ap, jchain, exit_lane = pick[rng.randrange(len(pick))]
         if ap is not cur and ap != cur:
             chain.append(ap)                     # 진입 전 차선변경 (이웃 차로로)
         entries.append((ap, exit_lane))
         chain += jchain
         chain.append(exit_lane)
+        route_len += sum(lg.length(k) for k in jchain) + lg.length(exit_lane)
         cur = exit_lane
         dist_since_exit = lg.length(exit_lane)
     # 꼬리 주행
@@ -561,15 +596,24 @@ def polyline_gate(lg, rt, gen_cfg):
     return None
 
 
-def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None) -> Route:
+def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
+               used_roads: dict | None = None) -> Route:
     """walk 사양 → 검증까지 마친 Route. 실패는 GenError (무음 실패 금지).
 
     used_cells: 같은 실행에서 이미 시작점을 뽑은 격자 셀 → 사용 횟수. 공간
-    분산 추첨(_spatial_order)의 감쇠 가중치로 쓰고, 성공 시 여기 기록한다."""
+    분산 추첨(_spatial_order)의 감쇠 가중치로 쓰고, 성공 시 여기 기록한다.
+    used_roads: 실행 내 방문 road → 횟수 — 'any' 출구 가중과 연장 통과가
+    미방문 도로를 우선하게 한다 (커버리지 지렛대, params gen_coverage)."""
     turns = spec.get('turns', ['any'])
     tail = float(spec.get('tail_m', 100))
     require = spec.get('require')
     max_gap = spec.get('max_gap_m')
+    cov = cov_cfg()
+    # 경로 최소 길이 — routes 정의의 min_length_m 이 우선, 없으면 전역 기본
+    min_len = float(spec.get('min_length_m', cov['walk_min_length_m']))
+    ext_max = int(cov['walk_ext_turns_max'])
+    if used_roads is None:
+        used_roads = {}
     if require == 'school_zone':
         cands = _upstream_starts(lg, lambda v: v['school_zone'])
     elif require == 'speed_change':
@@ -585,7 +629,8 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None) -> 
     redraw_max = int(cov_cfg()['redraw_max'])
     order = _spatial_order(lg, cands, rng, used_cells)
     for start in order[:redraw_max]:
-        res = _walk_once(lg, rng, start, turns, tail, max_gap)
+        res = _walk_once(lg, rng, start, turns, tail, max_gap,
+                         min_len_m=min_len, ext_max=ext_max, used_roads=used_roads)
         if res is None:
             continue
         chain, rows = res
@@ -607,6 +652,8 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None) -> 
         GATE_STATS['ok'] += 1
         cell = _cell_of(lg, start, float(cov_cfg()['grid_cell_m']))
         used_cells[cell] = used_cells.get(cell, 0) + 1
+        for rd in {k[0] for k in chain}:
+            used_roads[rd] = used_roads.get(rd, 0) + 1
         return route
     raise GenError(f'경로 {name}: {min(len(order), redraw_max)}개 출발 후보로 걸어도 빌드 경고 0 · '
                    f'스폰 게이트 통과인 경로를 못 만들었다 (turns={turns}, require={require})')
@@ -625,6 +672,7 @@ class RoutePool:
         self.gen_cfg = gen_cfg
         self.cache: dict = {}
         self.used_cells: dict = {}      # 같은 실행 내 시작 셀 사용 이력 (공간 분산)
+        self.used_roads: dict = {}      # 같은 실행 내 방문 road 이력 ('any' 출구 가중)
 
     def get(self, name: str, variant: int = 1, salt: str = '') -> Route:
         if name not in self.defs:
@@ -661,7 +709,7 @@ class RoutePool:
             rng = random.Random(seed_str)
             label = name if variant == 1 else f'{name}{variant}'
             r = synth_walk(self.lg, rng, label, d['walk'], self.gen_cfg,
-                           used_cells=self.used_cells)
+                           used_cells=self.used_cells, used_roads=self.used_roads)
         else:
             raise GenError(f'경로 {name}: csv 또는 walk 정의가 필요하다')
         self.cache[key] = r
