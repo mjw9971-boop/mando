@@ -54,11 +54,19 @@ def load_route(path: str) -> dict:
         return pickle.load(f)
 
 
-def build_route_from_csv(csv_path: str, graph_path: str, out_dir: str | None = None) -> str:
+def build_route_from_csv(csv_path: str, graph_path: str, out_dir: str | None = None,
+                        allow_warnings: bool = False) -> str:
     """--csv: tools/build_route.py 를 돌려 <out_dir>/route_<csv이름>.pkl 을 만들고 경로를 돌려준다.
 
     out_dir 기본은 data/ (손으로 돌리는 경우). batch_run 처럼 산출물을 로그와
     묶고 싶으면 --route-out 으로 바꾼다.
+
+    **경고(rc=1)가 있으면 주행을 시작하지 않는다.** build_route 의 경고는 전부
+    "이 경로로 달리면 문제가 생긴다" 류다 — 경유점을 스치지 않음, junction 미경유,
+    교차로 내부 차선변경, 차선변경 창 부족, 회전 불가 기하. 예전에는 rc=1 을
+    "진행 가능" 으로 통과시켜서, 대회날 급하게 --csv 한 방으로 돌리면 리포트를
+    아무도 안 보고 출발할 수 있었다 (README 체크리스트의 눈검사가 건너뛰어진다).
+    그래도 진행해야 하면 --allow-route-warnings 로 명시한다.
     """
     stem = pathlib.Path(csv_path).stem
     out_d = pathlib.Path(out_dir) if out_dir else _ROOT / 'data'
@@ -68,8 +76,12 @@ def build_route_from_csv(csv_path: str, graph_path: str, out_dir: str | None = N
            graph_path, csv_path, '-o', str(out)]
     print(f'[main] route 빌드: {" ".join(cmd)}', flush=True)
     cp = subprocess.run(cmd, text=True)
-    if cp.returncode not in (0, 1) or not out.exists():   # 1 = 경고 있음(진행 가능)
+    if cp.returncode not in (0, 1) or not out.exists():
         raise SystemExit(f'build_route 실패 (rc={cp.returncode})')
+    if cp.returncode == 1 and not allow_warnings:         # 1 = 경고 있음
+        raise SystemExit(
+            '[main] build_route 경고 — 위 리포트의 [경고] 항목을 확인할 것.\n'
+            '       경로를 고치거나, 알고도 진행하려면 --allow-route-warnings 를 붙인다.')
     return str(out)
 
 
@@ -98,6 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help='대회 배포 waypoints.csv — 내부에서 route 를 빌드해 쓴다')
     ap.add_argument('--route-out', default=None,
                     help='--csv 로 빌드한 route pkl 을 쓸 디렉터리 (기본: data/)')
+    ap.add_argument('--allow-route-warnings', action='store_true',
+                    help='--csv 빌드에 경고가 있어도 주행을 시작한다 (기본: 중단)')
     ap.add_argument('--config', default=str(_ROOT / 'config' / 'params.yaml'))
     ap.add_argument('--replay', default=None,
                     help='jsonl 로그를 Comm 대신 소스로 사용 (VTD 불필요)')
@@ -156,7 +170,8 @@ class Runner:
 
         route_path = args.route
         if args.csv:
-            route_path = build_route_from_csv(args.csv, args.graph, args.route_out)
+            route_path = build_route_from_csv(args.csv, args.graph, args.route_out,
+                                              args.allow_route_warnings)
         if not route_path:
             raise SystemExit('--route 또는 --csv 를 줘야 한다')
 

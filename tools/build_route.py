@@ -34,6 +34,20 @@ _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 from vtd_adapter.lanegraph import LaneGraph, wrap
 
 LC_PENALTY = 25.0
+# 차선변경 회랑(연속 점선 길이)이 이 거리를 못 채우면 전이를 끝낼 수 없다.
+# route.py 의 LC_TRANSITION_M 과 같은 축 — 창이 짧아 LC 가 실패하면 헤딩오차·조향
+# 포화·도로이탈로 이어진다 (2026-08-21 실사고: 창 6.1 m, 헤딩오차 46°, courseRespawn).
+LC_MIN_CORRIDOR_M = 25.0
+# 부족분 1 m 당 비용 [m 환산]. 금지가 아니라 **비싸게** 매긴다 — 유일한 길이면
+# 여전히 고를 수 있어야 경로 자체가 실패하지 않는다. 20 이면 회랑 1.5 m 짜리가
+# 우회 495 m 와 맞먹어, 대안이 있으면 사실상 안 고른다.
+LC_SHORT_PENALTY_PER_M = 20.0
+
+
+def lc_cost(lg, key, side):
+    """차선변경 비용 [m 환산] — 회랑이 전이거리를 못 채울수록 급증."""
+    short = max(0.0, LC_MIN_CORRIDOR_M - lg.dashed_corridor_m(key, side))
+    return LC_PENALTY + LC_SHORT_PENALTY_PER_M * short
 # 같은 거리 층 안에서 목표 차로를 고를 때의 가중치 [비용/m] — 경유점에 가까운 쪽 우선
 TARGET_DIST_W = 5.0
 
@@ -246,7 +260,8 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
             k2 = lg.neighbor(key, side)
             L2 = lg.length(k2)
             s2 = min(s_enter, L2)
-            c_lc = cost - (r['length'] - s_enter) + LC_PENALTY  # 이 차로를 s_enter 에서 떠나는 비용으로 되돌림
+            # 이 차로를 s_enter 에서 떠나는 비용으로 되돌리고 + 차선변경 비용(회랑 반영)
+            c_lc = cost - (r['length'] - s_enter) + lc_cost(lg, key, side)
             if k2 in tgt and tgt[k2] >= s2:
                 heapq.heappush(heap, (c_lc + (tgt[k2] - s2), k2, s2, (key, s_enter), root, True))
             heapq.heappush(heap, (c_lc + (L2 - s2), k2, s2, (key, s_enter), root, False))
@@ -637,7 +652,13 @@ def report(lg, rt, radius, warn_dev=None):
         extra = ''
         if 'window_s0' in e:
             w = e['window_s1'] - e['window_s0']
-            extra = f"  window {e['window_s0']:.1f}-{e['window_s1']:.1f} m  ({w:.1f} m)"
+            # 회랑은 **떠나는 차로**(from_lane) 기준 — e['lane'] 은 창이 시작되는
+            # 차로라 뒤로 당겨진 결과이고, 탐색이 본 값과 축이 다르다.
+            fl = e.get('from_lane')
+            corr = (lg.dashed_corridor_m(fl, e['kind'].split('_')[-1])
+                    if fl in lg.lanes else None)
+            extra = (f"  window {e['window_s0']:.1f}-{e['window_s1']:.1f} m  ({w:.1f} m)"
+                     + (f"  회랑 {corr:.1f} m" if corr is not None else ''))
             if w < MIN_LC_WINDOW_M:
                 extra += (f'   <= [경고] 창이 {MIN_LC_WINDOW_M:.0f} m 미만 — '
                           f'전이거리(max(transition_s*v, transition_min_m))를 못 채운다')
