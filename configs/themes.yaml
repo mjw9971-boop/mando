@@ -61,7 +61,7 @@ routes:
   스쿨존:
     walk: {turns: [any], require: school_zone, tail_m: 80}
   연속교차로:
-    walk: {turns: [any, any, any, any, any, any], max_gap_m: 150, tail_m: 80}
+    walk: {turns: [any, any, any, any, any, any], tail_m: 80}
   속도전환:
     walk: {turns: [any, any], require: speed_change, tail_m: 100}
   직진신호:
@@ -77,7 +77,7 @@ themes:
   보행자집중:
     min_length_m: 400
     event: [pedestrian]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치, 보행속도, 신호, 트리거거리]
     start: 자유
     보행속도: [1.0, 1.5, 2.0]
@@ -94,7 +94,7 @@ themes:
   보행자사각:
     min_length_m: 400
     event: [ped_blind]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치, 보행속도, 트리거거리, 차폐물]
     start: 자유
     차폐물: [버스, 승용차]
@@ -102,14 +102,14 @@ themes:
   추월집중:
     min_length_m: 400
     event: [static_vehicle]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치, 차선, 대향차]
     start: 자유
 
   급정거집중:
     min_length_m: 400
     event: [lead_brake]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [감속강도, 발동거리, 재출발]
     감속강도: [3.0, 5.0, 7.0]
     start: 자유
@@ -117,23 +117,25 @@ themes:
   저속선행차:
     min_length_m: 400
     event: [slow_lead]
-    routes: [기본, 직진, 우회전]
+    routes: [직진, 우회전]
     vary: [간격]
     간격: [30, 50, 80]
     속도_kph: 15
     start: 자유
 
   대향차직진:
+    min_length_m: 400                # 이벤트 검증형 — 대향차 조우 1회 검증
     event: [oncoming]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치, 개수, 속도]
     개수: [2, 4, 6]
     속도: [30, 50]
     start: 자유
 
   교차로집중:
+    min_length_m: 400                # 이벤트 검증형 — 신호 대응 1회 검증
     event: [signal]
-    routes: [기본, 직진신호, 우회전신호, 좌회전신호]
+    routes: [직진신호, 우회전신호, 좌회전신호]
     vary: [신호]
     신호: [적60, 딜레마, 짧은녹색]
     start: 자유
@@ -142,22 +144,20 @@ themes:
     min_length_m: 3000
     event: [none]
     routes: [연속교차로]
-    vary: [경로변형]
-    경로변형: [1, 2, 3, 4, 5, 6]          # walk 시드만 다른 경로 변형
+    vary: []
     start: 자유
 
   속도구간집중:
     min_length_m: 3000
     event: [none]
     routes: [속도전환, 스쿨존]
-    vary: [경로변형]
-    경로변형: [1, 2, 3]
+    vary: []
     start: 자유
 
   연쇄장애물:
     min_length_m: 400
     event: [obstacle_chain]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치, 개수]
     개수: [3, 4, 6]
     start: 자유
@@ -165,7 +165,7 @@ themes:
   차로폭협착:
     min_length_m: 400
     event: [narrow]
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치, 침범폭]
     침범폭: [0.4, 0.7, 1.0]         # 양측 정차 차량이 차로 안으로 무는 폭 [m]
     start: 자유
@@ -174,7 +174,7 @@ themes:
     min_length_m: 400
     event: [pedestrian, lead_brake, static_vehicle, obstacle_chain]
     combine: 2
-    routes: [직진, 우회전]        # 기본 경로는 교차로 클러스터가 대부분이라 2개가 안 들어간다
+    routes: [직진, 우회전, 좌회전]
     vary: [위치]
     start: 자유
 
@@ -182,9 +182,8 @@ themes:
     min_length_m: 3000
     event: [none]
     start: 자유
-    routes: [기본, 직진, 우회전, 좌회전, 연속교차로, 속도전환]
-    vary: [경로변형]
-    경로변형: [1, 2, 3]
+    routes: [직진, 우회전, 좌회전, 속도전환]
+    vary: []
 
   전체회귀:
     min_length_m: 800
@@ -192,13 +191,14 @@ themes:
             static_vehicle, oncoming, signal, obstacle_chain, none]
     rotate: true
     start: 자유
-    routes: [기본, 직진]
+    routes: [직진]
     vary: [위치]
 
   랜덤카오스:
+    min_length_m: 800                # 이벤트 혼합 — 전체회귀와 같은 축
     event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
             static_vehicle, cut_in, oncoming, signal, obstacle_chain, narrow]
     random_axes: true
     start: 자유
-    routes: [기본, 직진, 우회전, 좌회전, 연속교차로]
+    routes: [직진, 우회전, 좌회전, 연속교차로]
     vary: [위치, 보행속도, 트리거거리, 감속강도, 발동거리, 개수, 속도, 차선, 신호]

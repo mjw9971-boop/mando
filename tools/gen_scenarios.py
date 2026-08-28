@@ -184,9 +184,16 @@ def _junction_options(lg, approach):
     return opts
 
 
+# 연장(min_length_m) 중단 사유 계측 — 3 km 도달률 진단·보고용 (실행 단위 누적)
+WALK_EXT_STATS: collections.Counter = collections.Counter()
+WALK_EXT_LENS: dict = collections.defaultdict(list)     # 사유 → 중단 시점 route_len
+
+
 def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
                min_len_m: float = 0.0, ext_max: int = 0,
-               used_roads: dict | None = None):
+               used_roads: dict | None = None,
+               ext_forward_max_m: float = 700.0,
+               exit_clear_cap_m: float = 0.0):
     """start 차로에서 turns 정책대로 걷는다. 성공 → (chain, waypoint rows), 실패 → None.
 
     · turns 소진 후 경로 길이가 min_len_m 미만이면 'any' 교차로 통과를 최대
@@ -213,10 +220,17 @@ def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
         elif route_len < min_len_m and ti - len(turns) < ext_max:
             want = 'any'                        # 목표 길이까지 연장
         else:
+            if min_len_m:
+                why = '목표 달성' if route_len >= min_len_m else 'ext_max 소진'
+                WALK_EXT_STATS[why] += 1
+                WALK_EXT_LENS[why].append(route_len)
             break
         ti += 1
-        # 다음 교차로까지 전진
-        ok = True
+        # 다음 교차로까지 전진. 700 m 상한은 "교차로를 못 찾고 헤매는 것"을
+        # 막는 가드다 — 필수 turns 구간에만 적용하고, 연장 구간은 별도 상한
+        # (walk_ext_forward_max_m)으로 풀어 긴 직선 회랑도 길이에 기여시킨다.
+        fwd_cap = 700.0 if required else ext_forward_max_m
+        fail = None
         guard = 0
         while guard < 60:
             guard += 1
@@ -234,30 +248,41 @@ def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
                 break
             nxts = [k for k in lg.successors(cur) if lg.lanes[k]['junction'] == -1]
             if not nxts:
-                ok = False
+                fail = '막다른 회랑(successor 없음)'
                 break
             cur = nxts[0]
             chain.append(cur)
             dist_since_exit += lg.length(cur)
             route_len += lg.length(cur)
-            if dist_since_exit > 700.0:
-                ok = False
+            if dist_since_exit > fwd_cap:
+                fail = '전방 상한'
                 break
         else:
-            ok = False
-        if ok and max_gap_m is not None and ti > 1 and dist_since_exit > max_gap_m:
-            ok = False
+            fail = 'guard 소진'
+        if fail is None and max_gap_m is not None and ti > 1 and dist_since_exit > max_gap_m:
+            fail = 'max_gap 위반'
         pick = []
-        if ok:
+        if fail is None:
             pick = ([o for o in opts if o[0] == want] if want != 'any'
                     else [o for o in opts if o[0] != 'uturn'])
-        if not pick:
+            if not pick:
+                fail = '옵션 없음(원하는 방향/비U턴 출구 부재)'
+        if fail is not None:
             if required:
                 return None
+            WALK_EXT_STATS[fail] += 1
+            WALK_EXT_LENS[fail].append(route_len)
             break                               # 연장 중단 — 필수 구간은 완성
         if want == 'any':
+            # 출구 가중 = 미방문(1/(1+방문)) × 전방 잔여 회랑 길이(정규화, cap 0=미사용)
+            def _w(o):
+                w = 1.0 / (1.0 + used_roads.get(o[3][0], 0))
+                if exit_clear_cap_m > 0:
+                    clear = _forward_clear_m(lg, o[3], exit_clear_cap_m)
+                    w *= max(clear, 1.0) / exit_clear_cap_m
+                return w
             kind, ap, jchain, exit_lane = max(
-                pick, key=lambda o: rng.random() ** (1.0 + used_roads.get(o[3][0], 0)))
+                pick, key=lambda o: rng.random() ** (1.0 / _w(o)))
         else:
             kind, ap, jchain, exit_lane = pick[rng.randrange(len(pick))]
         if ap is not cur and ap != cur:
@@ -632,7 +657,9 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
     order = _spatial_order(lg, cands, rng, used_cells)
     for start in order[:redraw_max]:
         res = _walk_once(lg, rng, start, turns, tail, max_gap,
-                         min_len_m=min_len, ext_max=ext_max, used_roads=used_roads)
+                         min_len_m=min_len, ext_max=ext_max, used_roads=used_roads,
+                         ext_forward_max_m=float(cov['walk_ext_forward_max_m']),
+                         exit_clear_cap_m=float(cov['walk_exit_clear_cap_m']))
         if res is None:
             continue
         chain, rows = res
