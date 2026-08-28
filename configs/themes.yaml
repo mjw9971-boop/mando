@@ -20,6 +20,10 @@
 #   combine: N  → 한 시나리오에 이벤트 N개 동시 배치 (다중이벤트)
 #   rotate: true → 시나리오마다 event 목록을 순환하며 하나씩 (전체회귀)
 #   random_axes: true → 축 값을 전수조합 대신 시드 난수로 뽑는다 (랜덤카오스)
+#   min_length_m: 주제의 walk 경로 목표 길이 [m] — routes 개별 지정보다 우선,
+#          미지정 시 params gen_coverage.walk_min_length_m (800).
+#          이벤트 검증형 400(검증 밀도 우선) / 주행 검증형 3000(대회 3 km 급,
+#          맵 회랑 한계로 보장이 아닌 최대 연장) — 2026-08-28 분류 확정.
 #   start: 고정|자유 → walk 경로의 시작점 모드. 고정(기본)이면 같은 경로 풀
 #          이름은 실행 내에서 주제가 달라도 같은 경로를 공유하고, 자유면 주제·
 #          경로변형마다 맵 전체 후보 풀에서 다른 시작점을 뽑는다 (맵 커버리지용).
@@ -71,6 +75,7 @@ routes:
 
 themes:
   보행자집중:
+    min_length_m: 400
     event: [pedestrian]
     routes: [기본, 직진]
     vary: [위치, 보행속도, 신호, 트리거거리]
@@ -79,6 +84,7 @@ themes:
     트리거거리: [15, 25, 35]
 
   무단횡단집중:
+    min_length_m: 400
     event: [jaywalk]
     routes: [직진]
     vary: [위치, 보행속도, 트리거거리, 지점]
@@ -86,6 +92,7 @@ themes:
     지점: [횡단보도, 도로중간]      # 신호 무시 + 횡단보도 밖 지점 포함
 
   보행자사각:
+    min_length_m: 400
     event: [ped_blind]
     routes: [기본, 직진]
     vary: [위치, 보행속도, 트리거거리, 차폐물]
@@ -93,12 +100,14 @@ themes:
     차폐물: [버스, 승용차]
 
   추월집중:
+    min_length_m: 400
     event: [static_vehicle]
     routes: [기본, 직진]
     vary: [위치, 차선, 대향차]
     start: 자유
 
   급정거집중:
+    min_length_m: 400
     event: [lead_brake]
     routes: [기본, 직진]
     vary: [감속강도, 발동거리, 재출발]
@@ -106,6 +115,7 @@ themes:
     start: 자유
 
   저속선행차:
+    min_length_m: 400
     event: [slow_lead]
     routes: [기본, 직진, 우회전]
     vary: [간격]
@@ -129,6 +139,7 @@ themes:
     start: 자유
 
   연속교차로:
+    min_length_m: 3000
     event: [none]
     routes: [연속교차로]
     vary: [경로변형]
@@ -136,6 +147,7 @@ themes:
     start: 자유
 
   속도구간집중:
+    min_length_m: 3000
     event: [none]
     routes: [속도전환, 스쿨존]
     vary: [경로변형]
@@ -143,6 +155,7 @@ themes:
     start: 자유
 
   연쇄장애물:
+    min_length_m: 400
     event: [obstacle_chain]
     routes: [기본, 직진]
     vary: [위치, 개수]
@@ -150,6 +163,7 @@ themes:
     start: 자유
 
   차로폭협착:
+    min_length_m: 400
     event: [narrow]
     routes: [기본, 직진]
     vary: [위치, 침범폭]
@@ -157,6 +171,7 @@ themes:
     start: 자유
 
   다중이벤트:
+    min_length_m: 400
     event: [pedestrian, lead_brake, static_vehicle, obstacle_chain]
     combine: 2
     routes: [직진, 우회전]        # 기본 경로는 교차로 클러스터가 대부분이라 2개가 안 들어간다
@@ -164,6 +179,7 @@ themes:
     start: 자유
 
   완주속도:
+    min_length_m: 3000
     event: [none]
     start: 자유
     routes: [기본, 직진, 우회전, 좌회전, 연속교차로, 속도전환]
@@ -171,6 +187,7 @@ themes:
     경로변형: [1, 2, 3]
 
   전체회귀:
+    min_length_m: 800
     event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
             static_vehicle, oncoming, signal, obstacle_chain, none]
     rotate: true

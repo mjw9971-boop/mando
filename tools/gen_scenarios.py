@@ -597,7 +597,8 @@ def polyline_gate(lg, rt, gen_cfg):
 
 
 def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
-               used_roads: dict | None = None) -> Route:
+               used_roads: dict | None = None,
+               min_length_m: float | None = None) -> Route:
     """walk 사양 → 검증까지 마친 Route. 실패는 GenError (무음 실패 금지).
 
     used_cells: 같은 실행에서 이미 시작점을 뽑은 격자 셀 → 사용 횟수. 공간
@@ -609,8 +610,9 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
     require = spec.get('require')
     max_gap = spec.get('max_gap_m')
     cov = cov_cfg()
-    # 경로 최소 길이 — routes 정의의 min_length_m 이 우선, 없으면 전역 기본
-    min_len = float(spec.get('min_length_m', cov['walk_min_length_m']))
+    # 경로 최소 길이 우선순위: 주제(min_length_m 인자) > routes 개별(spec) > 전역 기본
+    min_len = float(min_length_m if min_length_m is not None
+                    else spec.get('min_length_m', cov['walk_min_length_m']))
     ext_max = int(cov['walk_ext_turns_max'])
     if used_roads is None:
         used_roads = {}
@@ -674,13 +676,17 @@ class RoutePool:
         self.used_cells: dict = {}      # 같은 실행 내 시작 셀 사용 이력 (공간 분산)
         self.used_roads: dict = {}      # 같은 실행 내 방문 road 이력 ('any' 출구 가중)
 
-    def get(self, name: str, variant: int = 1, salt: str = '') -> Route:
+    def get(self, name: str, variant: int = 1, salt: str = '',
+            min_length_m: float | None = None) -> Route:
+        """min_length_m: 주제 지정 경로 최소 길이 — 우선순위는 주제 > routes
+        개별(spec) > gen_coverage 기본 (synth_walk 이 해석). 캐시 키에 포함해
+        같은 경로 이름이라도 주제 목표 길이가 다르면 따로 만든다."""
         if name not in self.defs:
             raise GenError(f'routes 풀에 "{name}" 이 없다 (configs/themes.yaml)')
         d = self.defs[name]
         if 'csv' in d:
-            variant, salt = 1, ''       # csv 는 시작점·변형이 파일에 고정
-        key = (name, variant, salt)
+            variant, salt, min_length_m = 1, '', None   # csv 는 파일에 고정
+        key = (name, variant, salt, min_length_m)
         if key in self.cache:
             cached = self.cache[key]
             if isinstance(cached, BaseException):   # GenError 는 SystemExit 계열이다
@@ -709,7 +715,8 @@ class RoutePool:
             rng = random.Random(seed_str)
             label = name if variant == 1 else f'{name}{variant}'
             r = synth_walk(self.lg, rng, label, d['walk'], self.gen_cfg,
-                           used_cells=self.used_cells, used_roads=self.used_roads)
+                           used_cells=self.used_cells, used_roads=self.used_roads,
+                           min_length_m=min_length_m)
         else:
             raise GenError(f'경로 {name}: csv 또는 walk 정의가 필요하다')
         self.cache[key] = r
@@ -1803,7 +1810,9 @@ def write_scenario(out_dir, theme, name, xml_text, sdef, rows):
 
 
 def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
-    route = pool.get(*variant['route'])
+    ml = cfg.get('min_length_m')
+    route = pool.get(*variant['route'],
+                     min_length_m=None if ml is None else float(ml))
     ev_list = []
     n_ev = len(variant['event'])
     for j, ev in enumerate(variant['event']):
@@ -2008,7 +2017,7 @@ class _FixedPool:
     def __init__(self, route: Route):
         self.route = route
 
-    def get(self, name, variant=1, salt=''):
+    def get(self, name, variant=1, salt='', **_kw):
         return self.route
 
 
