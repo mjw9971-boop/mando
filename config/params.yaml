@@ -129,6 +129,18 @@ route_end:
   latch_m: 12.0             # 종점에서 이 안쪽 + 저속이면 래치 (계획 정지점 d_end≈7.8)
   unlatch_m: 30.0           # d_end 가 다시 이보다 커지면(courseRespawn) 래치 해제
 
+signal:
+  # 방향지시등 (9910 turnSignal 0=OFF 1=LEFT 2=RIGHT). 채점 동적항목 "방향지시등
+  # n초 전 점등". 점등 구간은 route['events'](turn_* / lane_change_*)에서 시작 시
+  # 1회 계산하고, 매 틱 route_s 로 고른다 (team_code/kr_rules.py).
+  # 회전 선행 점등 [s] — SPEC §3.3 (연결로 진입 전).
+  turn_lead_s: 4.0
+  # 차선변경 선행 점등 [s] — 규정값 미확정(SPEC §7-2). 3.0 은 기존 가정값.
+  lc_lead_s: 3.0
+  # 저속·정지 시 하한 [m]. 시간 기준만 쓰면 v→0 에서 선행거리가 0 이 돼
+  # 적신호 대기 중 회전 지시등이 안 켜진다. 거리 하한으로 방어한다.
+  lead_min_m: 20.0
+
 batch:
   # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).
   # route_s 는 뒷축 기준이고 계획 정지점이 total − stop_gap − 앞범퍼 이므로

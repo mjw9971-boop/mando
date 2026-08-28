@@ -152,7 +152,37 @@ class VtdRoutePlanner:
 
         self.route_index = 0
         self.last_route_index = 0
+        self.lc_solid_warnings: list = []   # 점선 없는 차선변경 (경로 결함)
+        self.lc_clipped: list = []          # 점선 안으로 좁힌 차선변경 구간
         self._build()
+
+    def _clip_to_dashed(self, key, base: float, w0: float, w1: float,
+                        side: str) -> tuple:
+        """차선변경 블렌드 구간 [w0, w1](route_s)을 점선 구간 안으로 좁힌다.
+
+        같은 차로쌍 안에서 **넘는 위치만** 옮긴다 — 출발/도착 차로는 그대로라
+        경로가 달라지지 않는다. 전이거리(LC_TRANSITION_M)를 채우는 가장 이른
+        점선 구간을 고르고, 그런 구간이 없으면 가장 긴 것을 쓴다.
+        겹치는 점선이 아예 없으면(= 경로가 실선 횡단을 요구) 원본을 그대로 두고
+        경고만 남긴다 — 임의로 창을 옮기면 목표 차로에 못 닿는다.
+        """
+        runs = [(base + a, base + b) for a, b in self.lg.dashed_runs(key, side)]
+        overlaps = [(max(w0, a), min(w1, b)) for a, b in runs
+                    if min(w1, b) - max(w0, a) > 1e-6]
+        if not overlaps:
+            msg = (f'[route] ⚠ S2.2.05 실선 차선변경 — lane {key} {side} 구간 '
+                   f'{w0:.1f}~{w1:.1f} m 에 점선이 없다. 경로를 다시 만들 것 '
+                   f'(build_route 가 이 hop 을 만들었을 리 없다).')
+            print(msg, flush=True)
+            self.lc_solid_warnings.append({'lane': key, 'side': side,
+                                           'w0': w0, 'w1': w1})
+            return w0, w1
+        long_enough = [o for o in overlaps if o[1] - o[0] >= self.LC_TRANSITION_M]
+        pick = long_enough[0] if long_enough else max(overlaps, key=lambda o: o[1] - o[0])
+        if pick != (w0, w1):
+            self.lc_clipped.append({'lane': key, 'side': side,
+                                    'from': (w0, w1), 'to': pick})
+        return pick
 
     # ── 경로 재샘플 ───────────────────────────────────────────────────────
     def _build(self) -> None:
@@ -210,8 +240,15 @@ class VtdRoutePlanner:
                            and tuple(e['to_lane']) == nxt), None)
                 w0 = max(float(ev['window_s0']) if ev else rs, rs)
                 w1_cap = float(ev['window_s1']) if ev else cum_s[i] + L
+                left = nxt == lg.neighbor(key, 'left')
+                # S2.2.05 실선 차선변경 금지 — 넘는 자리를 점선 안으로 밀어 넣는다.
+                # build_route 가 이미 점선만 통과시키지만(has_broken/dashed_runs),
+                # 손으로 만든·옛 route.pkl 은 그 게이트를 안 탄다. 제어기가 마지막
+                # 관문이므로 여기서 한 번 더 본다.
+                w0, w1_cap = self._clip_to_dashed(
+                    key, cum_s[i], w0, w1_cap, 'left' if left else 'right')
                 w1 = min(w0 + self.LC_TRANSITION_M, w1_cap)
-                side = RoadOption.CHANGELANELEFT if nxt == lg.neighbor(key, 'left') \
+                side = RoadOption.CHANGELANELEFT if left \
                     else RoadOption.CHANGELANERIGHT
                 blend = (w0, max(w1, w0 + 1e-6), side)
                 s_end = min(L, w1 - cum_s[i])

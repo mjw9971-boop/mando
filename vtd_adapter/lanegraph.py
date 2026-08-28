@@ -63,6 +63,7 @@ class LaneGraph:
         self.kd_i = g['kd_i']
         self.kd_hdg = g['kd_hdg']
         self.kd = cKDTree(self.kd_pts)
+        self._corridor_cache: Dict[tuple, float] = {}
 
     # ── 기본 조회 ───────────────────────────────────────────────────────
     def lane(self, key: LaneKey) -> dict:
@@ -157,6 +158,90 @@ class LaneGraph:
             if s0 - 1e-6 <= s <= s1 + 1e-6:
                 return typ, col, ok
         return ('none', 'standard', False) if not segs else segs[-1][2:]
+
+    # 점선 구간 두 개가 이만큼 안쪽으로 붙어 있으면 하나로 잇는다 (샘플 경계 오차)
+    MARK_JOIN_M = 1e-6
+
+    def dashed_runs(self, key: LaneKey, side: str):
+        """side 방향 **연속 점선** 구간 [(s0, s1) ...]. 실선/none 에서 끊긴다.
+
+        차선변경이 물리적으로 허용되는 구간의 단일 출처다 — build_route(경로 생성)와
+        VtdRoutePlanner(제어기 블렌드)가 같은 답을 봐야 실선 위 차선변경(S2.2.05)이
+        한쪽에서만 걸러지는 일이 없다.
+        """
+        marks = self.lanes[key]['left_mark' if side == 'left' else 'right_mark']
+        segs = sorted((a, b) for a, b, typ, col, ok in marks if ok)
+        out: List[List[float]] = []
+        for a, b in segs:
+            if out and a - out[-1][1] <= self.MARK_JOIN_M:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return [(a, b) for a, b in out]
+
+    # 점선이 차로 끝에 닿았다고 볼 허용오차 [m] / 회랑 이어붙이기 상한
+    MARK_EDGE_M = 0.5
+    CORRIDOR_MAX_LANES = 12
+
+    def _corridor_extend(self, key: LaneKey, side: str, forward: bool) -> float:
+        """이웃 차로로 이어지는 점선 길이 [m]. 끊기거나 갈림길이면 멈춘다."""
+        total, cur, seen = 0.0, key, {key}
+        for _ in range(self.CORRIDOR_MAX_LANES):
+            links = self.successors(cur) if forward else self.predecessors(cur)
+            cand = [k for k in links if k not in seen and k in self.lanes
+                    and self.lanes[k]['junction'] == -1
+                    and self.neighbor(k, side) is not None]
+            if len(cand) != 1:
+                break                       # 갈림길·교차로·이웃 없음 → 여기까지
+            n = cand[0]
+            runs, L = self.dashed_runs(n, side), self.length(n)
+            if not runs:
+                break
+            if forward:
+                if runs[0][0] > self.MARK_EDGE_M:
+                    break                   # 차로 시작부터 실선 → 안 이어진다
+                total += runs[0][1]
+                if runs[0][1] < L - self.MARK_EDGE_M:
+                    break                   # 이 차로 안에서 끊긴다
+            else:
+                if runs[-1][1] < L - self.MARK_EDGE_M:
+                    break
+                total += L - runs[-1][0]
+                if runs[-1][0] > self.MARK_EDGE_M:
+                    break
+            seen.add(n)
+            cur = n
+        return total
+
+    def dashed_corridor_m(self, key: LaneKey, side: str) -> float:
+        """side 로 넘을 수 있는 **연속 점선 길이** [m] — 차로 경계를 넘어 이어붙인다.
+
+        laneSection 이 잘게 쪼개져 있어(이 맵 레코드 길이 중앙값 29 m, 20%가 10 m
+        미만) 차로 하나만 보면 실제로 넘을 수 있는 거리를 알 수 없다. 차선변경은
+        이 길이 안에서만 끝낼 수 있으므로, 전이거리와 비교하는 것이 "여기서 차선을
+        바꿀 수 있나" 의 실질적 판정이다.
+
+        방향은 **뒤쪽**이다 — build_route.lane_change_window 가 이 차로의 마지막
+        점선 조각 끝을 창의 끝으로 잡고 거기서 뒤로 거슬러 시작점을 당기기 때문이다.
+        앞쪽 점선은 넘고 난 뒤의 것이라 창에 쓸 수 없다.
+        """
+        ck = (tuple(key), side)
+        if ck in self._corridor_cache:
+            return self._corridor_cache[ck]
+        out = 0.0
+        if self.neighbor(key, side) is not None:
+            runs, L = self.dashed_runs(key, side), self.length(key)
+            if runs:
+                s0, s1 = runs[-1]
+                if s1 >= L - self.MARK_EDGE_M:          # 마지막 조각이 차로 끝에 닿는다
+                    out = L - s0
+                    if s0 <= self.MARK_EDGE_M:          # 차로 전체가 점선 → 뒤로 더
+                        out += self._corridor_extend(key, side, False)
+                else:
+                    out = s1 - s0                       # 차로 안에서 끝난다
+                out = max(out, max(b - a for a, b in runs))
+        self._corridor_cache[ck] = out
+        return out
 
     def lane_change_ok(self, key: LaneKey, s: float, side: str) -> bool:
         """이 지점에서 side 로 차선변경 가능? (점선 + 옆차로 존재)"""
