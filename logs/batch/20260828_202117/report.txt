@@ -1,2 +1,0 @@
-완주 판정: 로그 ego.route_s ≥ route_<name>.pkl 총길이 − 8.8 m (stop_gap+앞범퍼+여유, params.yaml 연동), 도달 후 v < 0.5 m/s 또는 10 s 유예. 추가 종료: stall / no_progress (params batch.*)
-시나리오  상태  완주  거리[m]  시간[s]  평균[km/h]  최소객체거리[m]  E_STOP  shield  위반  위반내역  비고
