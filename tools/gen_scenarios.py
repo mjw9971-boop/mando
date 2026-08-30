@@ -472,12 +472,20 @@ def _check_require(lg, chain, require) -> bool:
                 for k in chain if lg.lanes[k]['speed_limit'] is not None
                 or lg.lanes[k]['school_zone']}
         return len(vals) >= 2
-    if require == 'signalized':
-        # 교차로 앞 접근 차로에 신호가 매핑돼 있어야 한다
+    if require in ('signalized', 'signalized_slow', 'signalized_fast'):
+        # 교차로 앞 접근 차로에 신호가 매핑돼 있어야 한다.
+        # *_slow / *_fast 는 그 접근 차로의 제한속도까지 본다 — 정지선 정지
+        # 프로파일(speed.stop_profile_a)을 저속·고속 진입 양쪽에서 밟기 위한
+        # 변형이다 (2026-08-30, ④′ 검증).
         for i, k in enumerate(chain[:-1]):
             if lg.lanes[k]['junction'] == -1 and lg.lanes[chain[i + 1]]['junction'] != -1 \
                     and lg.lanes[k]['signals']:
-                return True
+                if require == 'signalized':
+                    return True
+                v = lg.lanes[k]['speed_limit']
+                slow = lg.lanes[k]['school_zone'] or (v is not None and v <= 30)
+                if (require == 'signalized_slow') == bool(slow):
+                    return True
         return False
     return True
 
@@ -806,6 +814,13 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
         cands = _upstream_starts(lg, lambda v: v['speed_limit'] == 30 or v['school_zone'])
     elif require == 'signalized':
         cands = _upstream_starts(lg, lambda v: bool(v['signals']))
+    elif require == 'signalized_slow':
+        cands = _upstream_starts(lg, lambda v: bool(v['signals']) and (
+            v['school_zone'] or (v['speed_limit'] is not None and v['speed_limit'] <= 30)))
+    elif require == 'signalized_fast':
+        cands = _upstream_starts(lg, lambda v: bool(v['signals'])
+                                 and not v['school_zone']
+                                 and (v['speed_limit'] or 0) >= 50)
     else:
         cands = start_pool(lg)          # 맵 전체 후보 풀(1회 수집)에서 시드 샘플링
     if not cands:

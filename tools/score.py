@@ -686,6 +686,59 @@ def detect_red_light(ticks: list[dict], t0: float, stop_speed: float) -> tuple[l
     return viol, right
 
 
+def stop_metrics(ticks: list[dict], t0: float, stop_speed: float = 0.5) -> list[dict]:
+    """정지선 정지 지표 — 이벤트별 (앞범퍼 slf, 감속 커맨드 방향 전환 횟수).
+
+    batch_run 이 report.txt/.json 에 실어 **로그가 지워져도 지표는 남긴다**
+    (2026-08-30: 정지 위치 산포를 추적하려는데 배치 로그가 지워져 재현이
+    불가능했던 일이 있었다).
+
+    · slf = world.stop_line_front_m — 앞범퍼→정지선 [m], 음수 = 선 앞.
+      계획값은 −(idm_red_light_minimum_distance − 앞범퍼) = −stop_gap_stopline_m.
+    · 전환 = 감속 커맨드(cmd.accel) 기울기의 부호 변화 수. 정지 프로파일이
+      단조면 1회, IDM 을 직접 따르면 브레이크를 풀었다 다시 걸어 3회 이상.
+    """
+    out = []
+    i = 0
+    while i < len(ticks):
+        if ticks[i]['ego']['speed'] >= stop_speed:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(ticks) and ticks[j + 1]['ego']['speed'] < stop_speed:
+            j += 1
+        if ticks[j]['t'] - ticks[i]['t'] >= 1.0 and i > 20:
+            seg = ticks[i:j + 1]
+            sl = [t['world'].get('stop_line_front_m') for t in seg
+                  if (t['world'] or {}).get('stop_line_front_m') is not None]
+            ctrl = next((t['world']['flags'].get('stop_ctrl_ids') for t in seg
+                         if (t['world'].get('flags') or {}).get('stop_ctrl_ids')), None)
+            if sl and ctrl and -8.0 < sorted(sl)[len(sl) // 2] < 4.0:
+                # 감속 개시 = 정지 직전 15 s 창에서 속도가 최대였던 지점
+                # (속도 추정 잡음 때문에 "단조 감소" 로 되짚으면 즉시 끊긴다)
+                lo = i
+                while lo > 1 and ticks[i]['t'] - ticks[lo]['t'] < 15.0:
+                    lo -= 1
+                k = max(range(lo, i + 1), key=lambda m: ticks[m]['ego']['speed'])
+                acc = [t['cmd']['accel'] for t in ticks[k:i + 1]]
+                rev = 0
+                if len(acc) > 2:
+                    d = [b - a for a, b in zip(acc, acc[1:])]
+                    rev = sum(1 for a, b in zip(d, d[1:]) if (a > 0) != (b > 0))
+                out.append({
+                    't': round(ticks[i]['t'] - t0, 1),
+                    'route_s': round(ticks[i]['ego']['route_s'], 1),
+                    'slf_m': round(sorted(sl)[len(sl) // 2], 2),
+                    'ctrl_ids': list(ctrl),
+                    'states': _ctrl_states(ticks[i]) or [],
+                    'approach_kph': round(max(t['ego']['speed'] for t in ticks[k:i + 1]) * 3.6, 1),
+                    'cmd_reversals': rev,
+                    'hold_s': round(ticks[j]['t'] - ticks[i]['t'], 1),
+                })
+        i = j + 1
+    return out
+
+
 def _ctrl_states(t: dict) -> list | None:
     """이 틱의 전방 정지선 controller 들의 신호 state 목록. 대조 불가면 None."""
     ctrl = t['world']['flags'].get('stop_ctrl_ids') or []

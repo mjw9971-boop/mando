@@ -477,9 +477,37 @@ class Runner:
             res['n_violations'] = rep['n_violations']
             res['violations'] = {k: d['count'] for k, d in rep['violations'].items()
                                  if d['count'] and k not in score_tool.INFO_KEYS}
+            # 정지선 정지 지표 — report 에 실어 **로그가 지워져도 남긴다**
+            ticks = score_tool.load_ticks(res['log'])
+            res['stops'] = score_tool.stop_metrics(ticks, ticks[0]['t']) if ticks else []
         except Exception as e:                          # noqa: BLE001
             res['n_violations'] = None
             res['collect_error'] = res.get('collect_error', '') + f' score:{e}'
+
+    # ── 정지 지표 (영구 기록) ──────────────────────────────────────────────
+    STOP_RULE = ('정지선 정지 지표: slf = 앞범퍼→정지선 [m] (음수 = 선 앞). '
+                 '계획값 = −speed.stop_gap_stopline_m. '
+                 '전환 = 감속 커맨드 방향 전환 수 (단조 감속이면 작다).')
+
+    def stop_report(self) -> str:
+        """정지 이벤트별 지표 표. 로그를 지워도 report.txt 에 남는다."""
+        rows = []
+        for r in self.results:
+            for st in (r.get('stops') or []):
+                rows.append([r['name'], st['t'], st['route_s'], st['slf_m'],
+                             st['approach_kph'], st['cmd_reversals'], st['hold_s'],
+                             ','.join(map(str, st['ctrl_ids'])),
+                             ','.join(map(str, st['states'])) or '-'])
+        if not rows:
+            return ''
+        slf = [x[3] for x in rows]
+        summ = ('  요약: n=%d  slf 평균 %+.2f  산포(p-p) %.2f  최대 %+.2f  최소 %+.2f  '
+                '전환 중앙값 %d' % (len(slf), sum(slf) / len(slf), max(slf) - min(slf),
+                                    max(slf), min(slf),
+                                    sorted(x[5] for x in rows)[len(rows) // 2]))
+        hdr = ['시나리오', 't[s]', 'route_s', 'slf[m]', '접근[km/h]', '전환',
+               '유지[s]', 'ctrl', '신호']
+        return self.STOP_RULE + '\n' + render_table(hdr, rows) + '\n' + summ
 
     # ── 표 ────────────────────────────────────────────────────────────────
     def report(self) -> str:
@@ -554,9 +582,13 @@ class Runner:
         print('\n' + '=' * 100)
         print(DONE_RULE.format(name='<name>', margin=self.margin))
         print(table)
+        stops = self.stop_report()
+        if stops:
+            print('\n' + stops)
         if not self.args.dry_run:
             (self.out_dir / 'report.txt').write_text(
-                DONE_RULE.format(name='<name>', margin=self.margin) + '\n' + table + '\n', encoding='utf-8')
+                DONE_RULE.format(name='<name>', margin=self.margin) + '\n' + table + '\n'
+                + ('\n' + stops + '\n' if stops else ''), encoding='utf-8')
             (self.out_dir / 'report.json').write_text(
                 json.dumps(self.results, ensure_ascii=False, indent=1), encoding='utf-8')
             print(f'\n리포트: {self.out_dir}/report.txt (.json, 개별 로그·score 전문 포함)')
