@@ -169,6 +169,10 @@ class KrRules:
         self.sl_hold_ticks = int(round(float(sp['stopline_hold_s'])
                                        * float(cfg['comm']['send_hz'])))
         self.sl_near_m = float(sp['stopline_hold_near_m'])
+        # 정지선 정지 프로파일 (④′). 0 이면 완전 비활성 — 되돌리는 스위치다.
+        self.stop_profile_a = float(sp.get('stop_profile_a', 0.0))
+        # ap.config 를 못 읽는 환경(목)에서만 쓰는 폴백 — 정상 경로는 PDM 값 사용
+        self.stop_gap_sl_fallback = float(sp.get('stop_gap_stopline_m', 1.5)) + self.front
         # 방향지시등 (SPEC §3.3). lc_lead_s 는 규정 미확정 가정값 (§7-2).
         sig = cfg['signal']
         self.turn_lead_s = float(sig['turn_lead_s'])
@@ -197,6 +201,7 @@ class KrRules:
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
+        self.last_stop_profile: float | None = None   # 이번 틱 정지 프로파일 상한 (로그용)
         self.sig_plan: list[dict] | None = None    # 회전 구간 (시작 시 1회)
         self.sig_on_ticks = 0                      # 켜진 뒤 지난 틱 (min_on 기준)
         self.sig_off_left = 0                      # 소등 지연 잔여 틱 (상한 있음)
@@ -451,6 +456,58 @@ class KrRules:
             return None
         return m.lane if m is not None else None
 
+    def _red_stopline_dist(self, planner) -> float | None:
+        """전방 정지선이 **적색**이면 뒷축→정지선 거리 [m], 아니면 None.
+
+        홀드(_stopline_hold)와 정지 프로파일(_stopline_profile)이 같은 판정을
+        쓰도록 한 곳에 모은다 — 신호 해석이 두 벌이 되면 갈라진다.
+        녹색·황색은 None 이다: 황색은 PDM 원문(Green 이 아니면 IDM 정지)이
+        그대로 맡고 여기서는 개입하지 않는다 (현행 취급 유지).
+        신호 정보가 없는 환경(목 플래너 등)에서도 None.
+        """
+        dists = getattr(planner, 'distances_to_next_traffic_lights', None)
+        tls = getattr(planner, 'next_traffic_lights', None)
+        if dists is None or tls is None:
+            return None
+        tl = tls[planner.route_index]
+        if tl is None or getattr(getattr(tl, 'state', None), 'name', None) != 'Red':
+            return None
+        return float(dists[planner.route_index])
+
+    def _stopline_profile(self, planner, ap) -> float | None:
+        """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
+
+        PDM 의 적신호 IDM 은 차간모형이라 정지 컨트롤러가 아니다: 평형이
+        s* (= s0 + vT + v²/2√(ab)) 라, 남은 거리가 s* 보다 조금만 커도 **가속을
+        요구한다** (실측 2026-08-30 실전주행: 접근 92틱 중 41틱이 v 보다 높은
+        목표, err/dt 최대 +10.5 m/s²). 종방향이 그 요구에 브레이크를 풀면
+        타행으로 2.5 m 를 먹고 정지선을 넘는다 (앞범퍼 −1.50 목표에 −0.12 착지).
+
+        여기서는 남은 거리로부터 **단조 감소하는 속도 상한**을 만들어 덧댄다:
+
+            d_stop  = 정지선거리 − s0        (s0 = PDM 과 동일값, 아래 참조)
+            v_allow = √(2 · a_stop · d_stop)
+
+        · 단조라 감속 커맨드에 부호 반전이 없다 → jerk 리미터가 되감을 일이
+          없다 (재제동 지연이 구조적으로 사라진다).
+        · d_stop → 0 에서 v_allow → 0 이라 점근 크립이 아니라 유한 시간 도달.
+          목표 0 은 종방향의 a_hold 분기(target<1e-5 ∧ v<0.2)로 자연 접속된다.
+        · 멀리서는 v_allow 가 제한속도보다 커서 min() 에 지므로 스스로 비활성
+          이다 (별도 발동 거리 상수를 두지 않는 이유).
+
+        s0 는 PDM 에 주입된 idm_red_light_minimum_distance 를 그대로 읽는다 —
+        run_agent.build_pdm_config 가 params 의 stop_gap_stopline_m + 앞범퍼로
+        채우는 값이라, 여기서 다시 계산하면 단일 출처가 깨진다.
+        """
+        if self.stop_profile_a <= 0.0:
+            return None
+        d_line = self._red_stopline_dist(planner)
+        if d_line is None:
+            return None
+        s0 = float(getattr(ap.config, 'idm_red_light_minimum_distance',
+                           self.stop_gap_sl_fallback))
+        return _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_line - s0))
+
     def _stopline_hold(self, planner, ego_speed: float) -> float | None:
         """적신호 정지선 정지의 최소 유지 (speed.stopline_hold_s) — 목표 0 후보.
 
@@ -463,14 +520,10 @@ class KrRules:
         if self.sl_hold_left > 0:
             self.sl_hold_left -= 1
             return 0.0
-        dists = getattr(planner, 'distances_to_next_traffic_lights', None)
-        tls = getattr(planner, 'next_traffic_lights', None)
-        if dists is None or tls is None:
+        d_line = self._red_stopline_dist(planner)
+        if d_line is None:
             return None
-        tl = tls[planner.route_index]
-        if tl is None or getattr(getattr(tl, 'state', None), 'name', None) != 'Red':
-            return None
-        d_front = float(dists[planner.route_index]) - self.front
+        d_front = d_line - self.front
         if d_front < self.sl_near_m and ego_speed < self.latch_v:
             self.sl_hold_left = max(0, self.sl_hold_ticks - 1)   # 이번 틱 포함
             return 0.0
@@ -492,6 +545,7 @@ class KrRules:
         d_end = self.stop_s - route_s
         ego_speed = ap._vehicle.get_velocity().length()
         self.last_candidate = None
+        self.last_stop_profile = None
         self.last_d_end = d_end
 
         # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
@@ -526,6 +580,13 @@ class KrRules:
                 s0=self.stop_gap,
                 T=self.T,
             ))
+
+        # 정지선 정지 프로파일 (④′) — 적색일 때만, min 으로 합류.
+        # route_end 는 대상이 아니다 (검증 통과 후 별건).
+        prof = self._stopline_profile(planner, ap)
+        self.last_stop_profile = prof
+        if prof is not None and (candidate is None or prof < candidate):
+            candidate = prof
 
         # 정지선 0.5 s 유지 홀드 — route_end 후보와 min 으로 합류
         hold = self._stopline_hold(planner, ego_speed)

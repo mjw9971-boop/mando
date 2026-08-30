@@ -689,9 +689,15 @@ class Runner:
             # deductions 를 직접 합산하면 미도달 구간 몫까지 더해진다 (score 만 None).
             s = rep.get('scoring') or {}
             res['deduction'] = -(int(s['max_possible']) - int(s['total'])) if s else None
+            # 정지선 정지 지표 — report 에 실어 **로그가 지워져도 남긴다**
+            # (위 ticks 는 raw 줄만 고른 것이라 다르다 — stop_metrics 는 전 틱이 필요)
+            stop_ticks = score_tool.load_ticks(res['log'])
+            res['stops'] = (score_tool.stop_metrics(stop_ticks, stop_ticks[0]['t'])
+                            if stop_ticks else [])
         except Exception as e:                          # noqa: BLE001
             res['n_violations'] = None
             res['deduction'] = None
+            res['stops'] = []
             res['collect_error'] = res.get('collect_error', '') + f' score:{e}'
         # 이벤트 조우 성립 (tools/event_check.py — 시나리오 기대값 vs 실주행 횡위치).
         # 밤샘 배치에서 "보행자가 지나간 뒤 건넜다" 류를 아침에 눈으로 못 잡는다.
@@ -706,6 +712,38 @@ class Runner:
         except Exception as e:                          # noqa: BLE001
             res['events_ok'] = res['events_total'] = res['events_unreached'] = None
             res['collect_error'] = res.get('collect_error', '') + f' events:{e}'
+
+    # ── 정지 지표 (영구 기록) ──────────────────────────────────────────────
+    STOP_RULE = ('정지선 정지 지표: slf = 앞범퍼→정지선 [m] (음수 = 선 앞). '
+                 '계획값 = −speed.stop_gap_stopline_m. '
+                 '전환 = 감속 커맨드 방향 전환 수 (단조 감속이면 작다).\n'
+                 '녹색후출발 = 녹색 전환 → v>0.3 m/s 까지 [s]. **관측 항목이지 '
+                 '판정 항목이 아니다** — _stopline_hold 리필 수정(보류, '
+                 'docs/BACKLOG.md) 재개 여부를 이 수치로 판단한다. 참고 기준 <0.3 s.')
+
+    def stop_report(self) -> str:
+        """정지 이벤트별 지표 표. 로그를 지워도 report.txt 에 남는다."""
+        rows = []
+        for r in self.results:
+            for st in (r.get('stops') or []):
+                rows.append([r['name'], st['t'], st['route_s'], st['slf_m'],
+                             st['approach_kph'], st['cmd_reversals'], st['hold_s'],
+                             '-' if st.get('green_delay_s') is None else st['green_delay_s'],
+                             ','.join(map(str, st['ctrl_ids'])),
+                             ','.join(map(str, st['states'])) or '-'])
+        if not rows:
+            return ''
+        slf = [x[3] for x in rows]
+        gd = [x[7] for x in rows if x[7] != '-']
+        summ = ('  판정: 침범(slf>0) %d건  slf 평균 %+.2f  산포(p-p) %.2f  최대 %+.2f\n'
+                '  관측: 전환 중앙값 %d  녹색후출발 %s'
+                % (sum(1 for v in slf if v > 0), sum(slf) / len(slf),
+                   max(slf) - min(slf), max(slf),
+                   sorted(x[5] for x in rows)[len(rows) // 2],
+                   ('평균 %.2f s (n=%d)' % (sum(gd) / len(gd), len(gd))) if gd else '—'))
+        hdr = ['시나리오', 't[s]', 'route_s', 'slf[m]', '접근[km/h]', '전환',
+               '유지[s]', '녹색후출발[s]', 'ctrl', '신호']
+        return self.STOP_RULE + '\n' + render_table(hdr, rows) + '\n' + summ
 
     # ── 표 ────────────────────────────────────────────────────────────────
     def report(self) -> str:
@@ -763,9 +801,14 @@ class Runner:
         # 판정 기준 설명문은 표 아래로 — 표가 첫 화면에 오도록.
         print('\n' + '=' * int(self.cfg['report']['table_width']))
         print(table)
+        stops = self.stop_report()
+        if stops:
+            print('\n' + stops)
         print('\n' + rule)
         if not self.args.dry_run:
-            (self.out_dir / 'report.txt').write_text(table + '\n\n' + rule + '\n', encoding='utf-8')
+            (self.out_dir / 'report.txt').write_text(
+                table + '\n' + ('\n' + stops + '\n' if stops else '')
+                + '\n' + rule + '\n', encoding='utf-8')
             (self.out_dir / 'report.json').write_text(
                 json.dumps(self.results, ensure_ascii=False, indent=1), encoding='utf-8')
             print(f'\n리포트: {self.out_dir}/report.txt (.json, 개별 로그·score 전문 포함)')

@@ -111,18 +111,18 @@ def test_hold_rearms_while_red():
 
 
 def test_no_hold_when_far_or_fast_or_green():
-    d_far = TOTAL - 200.0
+    """홀드 자체를 단언한다 — 최종 목표속도로 보면 다른 후보(정지선 정지
+    프로파일)와 섞인다. 멀거나/빠르거나/녹색이면 홀드는 걸리지 않는다."""
     # 멀다 (앞범퍼 기준 near 창 밖)
-    ap = make_ap(FakePlannerTL(d_tl=CFG['speed']['stopline_hold_near_m'] + FRONT + 1.0))
-    assert _apply(ap, d_far, v=0.3)[1] == pytest.approx(12.5)
+    p = FakePlannerTL(d_tl=CFG['speed']['stopline_hold_near_m'] + FRONT + 1.0)
+    assert make_ap(p).kr_rules._stopline_hold(p, 0.3) is None
     # 빠르다
-    ap = make_ap(FakePlannerTL(d_tl=GAP_SL + FRONT))
-    assert _apply(ap, d_far, v=3.0)[1] == pytest.approx(12.5)
+    p = FakePlannerTL(d_tl=GAP_SL + FRONT)
+    assert make_ap(p).kr_rules._stopline_hold(p, 3.0) is None
     # 녹색
     p = FakePlannerTL(d_tl=GAP_SL + FRONT)
     p.tl.state = TrafficLightState.Green
-    ap = make_ap(p)
-    assert _apply(ap, d_far, v=0.3)[1] == pytest.approx(12.5)
+    assert make_ap(p).kr_rules._stopline_hold(p, 0.3) is None
 
 
 def test_no_hold_without_traffic_light_info():

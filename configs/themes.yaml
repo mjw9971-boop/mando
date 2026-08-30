@@ -64,6 +64,18 @@ routes:
     walk: {turns: [any, any, any, any, any, any], tail_m: 80}
   속도전환:
     walk: {turns: [any, any], require: speed_change, tail_m: 100}
+  # 정지선 정지 프로파일(④′) 검증용 — 접근 속도만 다르게 같은 상황을 밟는다.
+  정지선저속:
+    walk:
+      turns: [straight]
+      require: signalized_slow
+      tail_m: 100
+  정지선고속:
+    walk:
+      turns: [straight]
+      require: signalized_fast
+      tail_m: 120
+
   직진신호:
     walk: {turns: [straight], require: signalized, tail_m: 100}
   우회전신호:
@@ -140,6 +152,15 @@ themes:
     vary: [위치, 개수, 속도]
     개수: [2, 4, 6]
     속도: [30, 50]
+    start: 자유
+
+  # ④′ 정지선 정지 프로파일 검증 (2026-08-30). 저속·고속 진입 각 1개.
+  정지선접근:
+    min_length_m: 400
+    event: [signal]
+    routes: [정지선저속, 정지선고속]
+    vary: [신호]
+    신호: [적60, 딜레마]
     start: 자유
 
   교차로집중:
