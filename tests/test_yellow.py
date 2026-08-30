@@ -39,7 +39,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'team_code'))
 
 from run_agent import build_pdm_config                              # noqa: E402
-from test_route_end import TOTAL, _apply                            # noqa: E402
+from test_route_end import FakePlanner, TOTAL, _apply               # noqa: E402
 from test_stop_profile import FRONT, S0, make_ap                    # noqa: E402
 from test_stopline_stop import FakePlannerTL                        # noqa: E402
 
@@ -211,3 +211,94 @@ def test_disabled_switch_leaves_yellow_to_pdm():
     ap.kr_rules._yellow_latch(p, 1.0, ap)
     assert ap.kr_rules.y_decision is None
     assert ap.kr_rules._stopline_profile(p, ap) is None              # 황색 후보 없음
+
+
+# ── 조기 반환 훅 (signal_release) — 발동 조건이 둘뿐임을 고정 ────────────
+#
+# kr_rules 는 min() 에 후보를 덧대기만 하므로, PDM 이 스스로 만드는 적신호
+# 감속을 없애려면 autopilot 의 조기 반환에 항을 붙이는 수밖에 없다. 그 훅이
+# 필요 이상으로 열리면 **적신호를 그냥 통과한다(항목7 중대)**. 그래서 참이 되는
+# 경우가 ① 황색 GO 래치 ② 교차로 통과 가드 **둘뿐**임을 여기서 못 박는다.
+
+def test_hook_true_only_for_yellow_go():
+    d = S0 + 8.0
+    p = yellow(d)
+    ap = make_ap(p)
+    ap.kr_rules._yellow_latch(p, v_allow(d, A_Y) + 3.0, ap)
+    assert ap.kr_rules.y_decision == 'go'
+    assert ap.kr_rules.signal_release(ap) is True
+
+
+def test_hook_true_only_for_cross_guard():
+    p = FakePlannerTL(d_tl=FRONT - 0.5)              # 앞범퍼가 정지선을 넘었다
+    ap = make_ap(p)
+    ap.kr_rules._stopline_profile(p, ap)             # 가드 진입
+    assert ap.kr_rules.cross_guard is True
+    assert ap.kr_rules.signal_release(ap) is True
+
+
+def test_hook_false_on_red_approach_and_stop():
+    """적신호 접근·정지 — 훅이 열리면 그냥 통과한다. 전 구간 거짓이어야 한다."""
+    for d in (S0 + 60.0, S0 + 20.0, S0 + 5.0, S0, FRONT + 0.2):
+        p = FakePlannerTL(d_tl=d)                    # 기본 Red
+        ap = make_ap(p)
+        for v in (12.0, 5.0, 0.5, 0.0):
+            _apply(ap, D_FAR, v=v)
+            assert ap.kr_rules.signal_release(ap) is False, (d, v)
+
+
+def test_hook_false_on_yellow_stop():
+    """황색 STOP 은 적색과 동일 취급 — 훅을 열면 안 된다."""
+    d = S0 + 15.0
+    p = yellow(d)
+    ap = make_ap(p)
+    ap.kr_rules._yellow_latch(p, 1.0, ap)
+    assert ap.kr_rules.y_decision == 'stop'
+    assert ap.kr_rules.signal_release(ap) is False
+
+
+def test_hook_false_on_green():
+    p = FakePlannerTL(d_tl=S0 + 10.0)
+    p.tl.state = TrafficLightState.Green
+    ap = make_ap(p)
+    _apply(ap, D_FAR, v=10.0)
+    assert ap.kr_rules.signal_release(ap) is False
+
+
+def test_hook_false_during_route_end_stop():
+    """route_end 유령차 정지 중 — 신호와 무관한 후보다. 훅은 거짓."""
+    p = FakePlannerTL(d_tl=S0 + 200.0)               # 신호는 멀다
+    ap = make_ap(p)
+    _c, ts = _apply(ap, d_end=5.0, v=0.3)            # 종점 래치
+    assert ts == pytest.approx(0.0)
+    assert ap.kr_rules.signal_release(ap) is False
+
+
+def test_hook_false_when_other_candidates_win():
+    """보행자·선행차처럼 kr_rules 밖에서 온 후보가 이겨도 훅은 거짓이다.
+
+    (kr_rules 는 그 후보들을 만들지 않는다 — PDM 의 min() 갈래다. 여기서는
+    'kr_rules 상태가 어떻든 훅은 래치 둘에만 반응한다'를 고정한다.)
+    """
+    p = FakePlannerTL(d_tl=S0 + 30.0)
+    ap = make_ap(p)
+    for target in (0.0, 1.0, 5.0):                   # 보행자·선행차가 낮춘 목표를 모사
+        _apply(ap, D_FAR, v=3.0, target=target)
+        assert ap.kr_rules.signal_release(ap) is False
+
+
+def test_hook_false_without_traffic_light_info():
+    p = FakePlanner()
+    ap = make_ap(p)
+    assert ap.kr_rules.signal_release(ap) is False
+
+
+def test_hook_false_after_go_latch_reset():
+    """GO 가 풀리면 훅도 닫힌다 (녹색 복귀 / courseRespawn)."""
+    d = S0 + 8.0
+    p = yellow(d)
+    ap = make_ap(p)
+    ap.kr_rules._yellow_latch(p, v_allow(d, A_Y) + 3.0, ap)
+    assert ap.kr_rules.signal_release(ap) is True
+    ap.kr_rules.on_reset()
+    assert ap.kr_rules.signal_release(ap) is False

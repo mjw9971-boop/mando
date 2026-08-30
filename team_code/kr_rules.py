@@ -209,6 +209,7 @@ class KrRules:
         self.y_decision: str | None = None            # None | 'stop' | 'go'
         self.y_ctrl: int | None = None                # 래치가 걸린 신호 id
         self.y_v_allow: float | None = None           # 판정 시 v_allow (로그용)
+        self.last_yellow: dict | None = None          # 판정 순간 1틱만 채운다 (로그용)
         # 교차로 통과 가드
         self.cross_guard = False
         self.cross_s: float | None = None
@@ -521,6 +522,13 @@ class KrRules:
         self.y_decision = 'stop' if ego_speed <= v_allow else 'go'
         self.y_ctrl = tl_id
         self.y_v_allow = v_allow
+        # 판정 **순간**만 기록한다 — 사후 분류(어느 접근이 STOP/GO 였나)의 근거.
+        # 매 틱 싣지 않는 이유: 판정은 접근당 1회고, 그 1틱이 조건을 다 담는다.
+        self.last_yellow = {'decision': self.y_decision, 'ctrl': tl_id,
+                            'v': round(float(ego_speed), 2),
+                            'v_allow': round(float(v_allow), 2),
+                            'd_line': round(float(d_line), 2),
+                            'a_judge': self.a_yellow}
 
     def _yellow_reset(self) -> None:
         self.y_decision = None
@@ -703,6 +711,7 @@ class KrRules:
         self.last_stop_profile = None
         self.last_d_end = d_end
         self._ap = ap
+        self.last_yellow = None
         # 황색 원샷 판정 — 프로파일·홀드보다 먼저 정해야 같은 틱에 반영된다
         self._yellow_latch(planner, ego_speed, ap)
 

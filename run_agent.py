@@ -287,7 +287,11 @@ class Runner:
         reasons = {'initial': initial, 'winner': winner, **cand,
                    'sig_src': self.kr.last_sig_src,
                    'sig_lead_s': (None if self.kr.last_sig_lead_s is None
-                                  else round(float(self.kr.last_sig_lead_s), 2))}
+                                  else round(float(self.kr.last_sig_lead_s), 2)),
+                   # 황색 원샷 판정 — 판정 틱에만 채워진다 (사후 분류 근거).
+                   # 이후 틱은 null 이므로 "이 접근의 판정" 을 찾으려면 이 필드가
+                   # non-null 인 틱을 고르면 된다.
+                   'yellow': self.kr.last_yellow}
         if reduced is not None and reduced[1] is not None:
             reasons['speed_reduced_by'] = {
                 'type': reduced[1], 'id': reduced[2],
