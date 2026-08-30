@@ -188,6 +188,18 @@ class KrRules:
                                              * float(cfg['comm']['send_hz'])))
         # 정적 장애물 회피 시프트 (SPEC §3.4 회피 — PDM 원문은 stub)
         ot = cfg['overtake']
+        self.hz = float(cfg['comm']['send_hz'])
+        # 규칙 1 — 신호 구역 억제
+        self.sup_m = float(ot.get('stopline_suppress_m', 30.0))
+        self.queue_gap_min_m = float(ot.get('queue_gap_min_m', 3.0))
+        self.queue_lat_max_m = float(ot.get('queue_lat_max_m', 1.5))
+        # 규칙 3 — 선제 회피
+        self.detect_max_m = float(ot.get('detect_max_m', 80.0))
+        self.shift_latest_m = float(ot.get('shift_latest_m', 10.0))
+        self.shift_k_s = float(ot.get('shift_k_s', 3.0))
+        self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
+        self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
+        self.obj_grace = int(ot.get('obj_grace_ticks', 10))
         self.ot_enabled = bool(ot['enabled'])
         self.ot_v_max = float(ot['blocker_speed_max'])
         self.ot_d_max = float(ot['blocker_dist_max'])
@@ -222,6 +234,10 @@ class KrRules:
         self.ot_blocked_ticks = 0                  # 막힌 채 정지한 틱
         self.ot_span: tuple | None = None          # 시프트한 인덱스 구간
         self.last_overtake: str | None = None      # 로그용 ('left'|'right'|사유)
+        self.last_avoid: dict | None = None        # 회피 진단 (reasons.avoid)
+        self.obj_ticks: dict = {}                  # 객체별 정지 지속 틱
+        self.obj_miss: dict = {}                   # 객체별 미관측 틱 (grace)
+        self._sl_all: list | None = None           # 경로상 전 정지선 route_s (1회)
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
         self.last_sig_lead_s: float | None = None  # 이벤트까지 남은 시간 [s]
@@ -341,6 +357,91 @@ class KrRules:
         return sig, src, lead
 
     # ── 정적 장애물 회피 시프트 ──────────────────────────────────────────
+    # ── 규칙 1: 신호 구역 억제 ───────────────────────────────────────────
+    def _all_stopline_s(self, planner) -> list:
+        """경로상 **모든** 정지선의 route_s (신호 유무 무관). 시작 시 1회.
+
+        planner.traffic_lights 는 신호 매핑된 정지선만 담는다 (route.py
+        collect_stops 게이트) — 지도 576개 중 245개가 미매핑이라 그것만 보면
+        무신호 정지선 앞 대기열을 놓친다. 여기서는 lanegraph 원본을 직접 읽는다.
+        """
+        if self._sl_all is not None:
+            return self._sl_all
+        out = []
+        lg = getattr(planner, 'lg', None)
+        route = getattr(planner, 'route', None) or {}
+        if lg is not None:
+            for i, k in enumerate(route.get('lanes') or []):
+                rec = lg.lanes.get(tuple(k))
+                if not rec:
+                    continue
+                for sl in rec.get('stop_lines', []):
+                    out.append(float(route['cum_s'][i]) + float(sl['s']))
+        self._sl_all = sorted(out)
+        return self._sl_all
+
+    def _signal_zone(self, planner, ap) -> tuple | None:
+        """신호 구역이면 (사유, 거리), 아니면 None — 회피 계열 전면 억제 게이트.
+
+        **대기열은 신호 앞에만 선다**는 것이 근거다. 신호 대기 차량을 정적
+        장애물로 오인해 비켜가면 신호 위반이 된다.
+
+        1차 키는 planner.distances_to_next_traffic_lights + 교차로 판정이다.
+        보조로 무신호 정지선까지 본다. 1차 키를 dist_stop_line(world.summ) 대신
+        쓰는 이유 — 실측 2026-08-30: dist_stop_line 은 27% 가 null 이고 실제
+        장애물 정지 지점에서도 null 이었다. 반면 이 배열은 inf 비율 1~2% 이고
+        같은 지점에서 214.8 m 를 정상으로 준다.
+        """
+        if bool(getattr(ap, 'junction', False)):
+            return ('junction', None)
+        try:
+            d = float(planner.distances_to_next_traffic_lights[planner.route_index])
+        except Exception:                                  # noqa: BLE001
+            d = float('inf')
+        if d < self.sup_m:
+            return ('signal', round(d, 1))
+        route_s = float(planner.route_s[planner.route_index])
+        for s_sl in self._all_stopline_s(planner):         # 보조: 무신호 정지선
+            if 0.0 <= s_sl - route_s < self.sup_m:
+                return ('stopline', round(s_sl - route_s, 1))
+        return None
+
+    # ── 물체별 정지 관찰 타이머 ──────────────────────────────────────────
+    def _update_obj_timers(self, ap) -> None:
+        """객체별 '정지 상태 지속 틱'. 매 틱 1회.
+
+        자차 상태 카운터(ot_blocked_ticks)와 달리 **물체마다** 센다 — 자차가
+        달리는 동안에도 관찰이 쌓여야 규칙 3(선제 회피)이 성립한다.
+        id 가 잠깐 빠져도 obj_grace_ticks 동안은 타이머를 유지한다 (GT 는
+        '가까운 순 30개' 제한이 있어 혼잡 시 밀릴 수 있다). 실측 2026-08-30
+        두 로그에서는 드롭아웃이 0회였지만 방어로 둔다.
+        """
+        try:
+            actors = list(ap._world.get_actors())
+        except Exception:                                  # noqa: BLE001
+            return
+        ego_id = ap._vehicle.id
+        seen = set()
+        for a in actors:
+            if a.id == ego_id:
+                continue
+            seen.add(a.id)
+            self.obj_miss[a.id] = 0
+            if float(getattr(a, 'speed', 0.0)) < self.ot_v_max:
+                self.obj_ticks[a.id] = self.obj_ticks.get(a.id, 0) + 1
+            else:
+                self.obj_ticks[a.id] = 0                   # 움직이면 즉시 리셋 (철회)
+        for oid in list(self.obj_ticks):
+            if oid in seen:
+                continue
+            self.obj_miss[oid] = self.obj_miss.get(oid, 0) + 1
+            if self.obj_miss[oid] > self.obj_grace:
+                self.obj_ticks.pop(oid, None)
+                self.obj_miss.pop(oid, None)
+
+    def _static_ok(self, actor) -> bool:
+        return self.obj_ticks.get(getattr(actor, 'id', None), 0) >= self.obj_static_ticks
+
     def _blocker(self, ap, planner):
         """앞을 막고 선 정적 장애물 → VtdActor. 없으면 None.
 
@@ -367,6 +468,74 @@ class KrRules:
             if best_d is None or d < best_d:
                 best, best_d = a, d
         return best
+
+    def _project(self, planner, x_carla, y_carla):
+        """CARLA 좌표 → (route_s, 횡오프셋). 전방 창에서만 찾는다."""
+        pts = planner.route_points
+        i0 = planner.route_index
+        ppm = int(getattr(planner, 'points_per_meter', 10))
+        hi = min(len(pts), i0 + int(self.detect_max_m * ppm))
+        seg = pts[i0:hi, :2]
+        if len(seg) < 2:
+            return None
+        q = np.array([x_carla, y_carla])
+        j = int(np.argmin(np.linalg.norm(seg - q, axis=1)))
+        tan = seg[min(j + 1, len(seg) - 1)] - seg[j]
+        n = float(np.linalg.norm(tan))
+        if n < 1e-9:
+            return None
+        tan = tan / n
+        dv = q - seg[j]
+        lat = float(tan[0] * dv[1] - tan[1] * dv[0])
+        return (float(planner.route_s[i0 + j]) - float(planner.route_s[i0]), lat)
+
+    def _corridor_blockers(self, ap, planner):
+        """전방 detect_max_m 안에서 **주행 회랑을 침범한 정지 객체** 목록.
+
+        반환: [(s_rel, lat, half_w, actor)] — s_rel 은 자차 기준 전방거리.
+        침범 판정은 선행차 판정([route.py] compute_leading_vehicles) 과 같은 축:
+        |lat| < 자차반폭 + 객체반폭 + obstacle_clearance_m.
+        """
+        try:
+            actors = list(ap._world.get_actors())
+        except Exception:                                  # noqa: BLE001
+            return []
+        ego_id = ap._vehicle.id
+        half_ego = float(self.cfg['vehicle']['width']) / 2.0
+        clr = float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
+        out = []
+        for a in actors:
+            if a.id == ego_id or not self._static_ok(a):
+                continue
+            loc = a.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None:
+                continue
+            s_rel, lat = pr
+            if not (0.5 < s_rel <= self.detect_max_m):
+                continue
+            hw = float(getattr(getattr(a, 'bounding_box', None), 'extent', None).y) \
+                if getattr(a, 'bounding_box', None) is not None else 0.9
+            if abs(lat) < half_ego + hw + clr:
+                out.append((s_rel, lat, hw, a))
+        out.sort(key=lambda z: z[0])
+        return out
+
+    def _is_queue(self, blockers) -> bool:
+        """정지 객체가 **종방향으로** 2대 이상 줄지어 있으면 대기열로 본다.
+
+        신호 구역 판정(_signal_zone)의 사각 보완이다 — 정지선 데이터가 없는
+        도로에서도 "줄 서 있으면 신호 대기"로 걸러낸다. 케이스 B(스태거드)와
+        구분되는 점: 대기열은 **횡 위치가 비슷하고 종방향으로 벌어져** 있다.
+        스태거드는 종방향으로 붙어 있고 횡으로 갈린다.
+        """
+        if len(blockers) < 2:
+            return False
+        n = 0
+        for (s1, l1, _h1, _a1), (s2, l2, _h2, _a2) in zip(blockers, blockers[1:]):
+            if (s2 - s1) > self.queue_gap_min_m and abs(l2 - l1) < self.queue_lat_max_m:
+                n += 1
+        return n >= 1
 
     def _side_is_clear(self, lg, planner, ap, target) -> bool:
         """목표 차로에 차가 없는가 (lc_clear 대용 — 아직 후방 추종차는 안 본다)."""
@@ -413,14 +582,50 @@ class KrRules:
         if not self.ot_enabled or self.ot_span is not None:
             return
 
-        blocked = ego_speed < self.latch_v and self._blocker(ap, planner) is not None
-        self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
-        if self.ot_blocked_ticks < self.ot_ticks:
+        # ── 규칙 1: 신호 구역 억제 (전 상태 공통 게이트) ──────────────────
+        zone = self._signal_zone(planner, ap)
+        if zone is not None:
+            self.ot_blocked_ticks = 0
+            self.last_avoid = {'state': 'SUPPRESS', 'suppress': zone[0],
+                               'sup_d': zone[1]}
             return
 
-        actor = self._blocker(ap, planner)
-        if actor is None:
+        corridor = self._corridor_blockers(ap, planner)
+        if self._is_queue(corridor):
+            self.ot_blocked_ticks = 0
+            self.last_avoid = {'state': 'SUPPRESS', 'suppress': 'queue',
+                               'n': len(corridor)}
             return
+
+        # ── 규칙 3: 선제 회피 — 정지 전에 비켜간다 ────────────────────────
+        actor = None
+        preempt = False
+        if corridor:
+            s_rel, lat, _hw, cand = corridor[0]
+            # 전이 길이는 속도 비례: 코사인 전이의 최대 횡가속
+            #   a_lat = v²·Δ·π²/(2L²)  →  L = v·√(Δπ²/(2·a_lat))
+            # Δ=3.0 m, a_lat=1.5 m/s² 이면 L ≈ 3.14·v → shift_k_s 3.0 의 근거.
+            need = max(self.shift_latest_m, self.shift_k_s * max(ego_speed, 0.1))
+            if s_rel <= need + self.shift_latest_m:
+                actor, preempt = cand, True
+                self.last_avoid = {'state': 'PREEMPT', 'blocker': cand.id,
+                                   's_rel': round(s_rel, 1), 'lat': round(lat, 2),
+                                   'obj_s': round(self.obj_ticks.get(cand.id, 0) / self.hz, 1),
+                                   'need_m': round(need, 1)}
+
+        # ── REACTIVE: 막힌 채 정지가 지속되면 (기존 경로) ─────────────────
+        if actor is None:
+            blocked = ego_speed < self.latch_v and self._blocker(ap, planner) is not None
+            self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
+            if self.ot_blocked_ticks < self.ot_ticks:
+                if corridor and self.last_avoid is None:
+                    self.last_avoid = {'state': 'WATCH', 'blocker': corridor[0][3].id,
+                                       's_rel': round(corridor[0][0], 1)}
+                return
+            actor = self._blocker(ap, planner)
+            if actor is None:
+                return
+            self.last_avoid = {'state': 'REACTIVE', 'blocker': actor.id}
         lg = getattr(planner, 'lg', None)
         ego_lane = getattr(ap, '_kr_ego_lane', None) or self._ego_lane(lg, ap)
         if lg is None or ego_lane is None:
@@ -441,16 +646,24 @@ class KrRules:
                 self.last_overtake = f'{side}:occupied'
                 continue
             ppm = float(getattr(planner, 'points_per_meter', 10))
+            # 전이 길이 속도 비례 (위 유도) — 정지 상태면 하한이 지배한다
+            trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
             span = planner.shift_route_around_actors(
                 actor,
                 obstacle_direction='right' if side == 'left' else 'left',
-                transition_length=self.ot_trans_m * ppm,
+                transition_length=trans_m * ppm,
                 extra_length_before=self.ot_before_m * ppm,
-                extra_length_after=self.ot_after_m * ppm)
+                extra_length_after=self.ot_after_m * ppm,
+                # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
+                # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
+                min_start_ahead=self.shift_ahead_m * ppm)
             planner._kd = _cKDTree(planner.route_points[:, :2])
             self.ot_span = span
             self.ot_blocked_ticks = 0
             self.last_overtake = side
+            (self.last_avoid or {}).update(
+                {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
+                 'preempt': preempt})
             print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
                   f'(id={actor.id}, 구간 {span[0]}~{span[1]})', flush=True)
             return
@@ -716,6 +929,8 @@ class KrRules:
         self._yellow_latch(planner, ego_speed, ap)
 
         # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
+        self.last_avoid = None
+        self._update_obj_timers(ap)
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
         self._try_overtake(ap, planner, ego_speed)
 

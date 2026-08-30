@@ -593,8 +593,16 @@ class VtdRoutePlanner:
     def shift_route_around_actors(self, first_actor, last_actor=None,
                                   obstacle_direction='right', transition_length=120.0,
                                   lane_transition_factor=1.0,
-                                  extra_length_before=0.0, extra_length_after=0.0):
-        """PDM 원문 — 액터 주위로 경로 시프트. 발동은 phase4 에서."""
+                                  extra_length_before=0.0, extra_length_after=0.0,
+                                  min_start_ahead=0):
+        """PDM 원문 — 액터 주위로 경로 시프트. 발동은 phase4 에서.
+
+        VTD 추가 min_start_ahead [경로점 수]: 전이 시작을 **자차보다 이만큼 앞**
+        으로 강제한다. 원문은 시작점을 액터에서 거꾸로 재므로, 코앞의 장애물에
+        정지한 상태에서 부르면 시작점이 자차 뒤로 가고 **현재 위치의 경로가 옆으로
+        밀린다** → 정지 상태에서 횡오차가 생겨 조향이 풀락된다 (2026-08-30
+        실전주행_01_연속교차로24 실측: 시프트 직후 steer +0.480 고정, 17.8 s 정지).
+        """
         tree = cKDTree(self.original_route_points[self.route_index:, :2])
         first_actor_location = np.array(
             [first_actor.get_location().x, first_actor.get_location().y])
@@ -614,6 +622,9 @@ class VtdRoutePlanner:
             shift_end_index = last_idx + int(
                 last_actor_extent * self.points_per_meter + transition_length + extra_length_after)
 
+        floor = self.route_index + int(min_start_ahead)
+        if shift_start_index < floor:                  # 자차 앞에서 시작 (위 참조)
+            shift_start_index = min(floor, shift_end_index - 1)
         shift_to_left_lane = obstacle_direction == 'right'
         self.shift_route_smoothly(shift_start_index, shift_end_index, shift_to_left_lane,
                                   transition_length=transition_length,
