@@ -152,6 +152,55 @@ def _lane_at_event(s: float, route, ticks: list):
     return tuple(t['ego']['lane']), float(t['ego']['s'])
 
 
+def traffic_metrics(ticks: list, planned: int, tc: dict) -> dict:
+    """동방향 교통류 **관측 지표** — 판정이 아니다.
+
+    조우 성립(보행자)과 달리 교통류는 "언제 만나야 한다" 는 기대 시점이 없다.
+    대신 배치한 대수가 실제로 로그에 나타났는지, 얼마나 가까웠는지를 남긴다.
+    이 훅이 없으면 교통류가 XML 에만 있고 실주행에 안 나타나도 리포트가 조용하다
+    — 2026-08-30 보행자 이벤트가 정확히 그렇게 실패했다.
+
+    planned 는 PulkDef Count(영역 내 유지 대수)다. PulkTraffic 은 영역을 벗어난
+    차량을 가장자리에 재배치하므로 observed 가 planned 를 넘을 수 있다 — 관측
+    지표지 판정이 아니라서 상한을 두지 않는다. 0 대만 경고 대상이다.
+
+    로그에는 객체 heading 이 없고 s_rel/on_route 는 PDM 이관 후 항상 None 이라
+    (run_agent._log_objects) ego 프레임 종·횡거리를 여기서 직접 계산한다.
+    '동방향 주행 차량' = cls 가 vehicle 이고, 한 번이라도 observe_moving_mps 이상
+    움직였고, 그때 |횡| 이 observe_corridor_m 안인 id. 정차 차량(narrow ·
+    static_vehicle 은 속도 0)과 회랑 밖 차량이 이 정의에서 빠진다.
+
+    min_lon_m 은 **부호 있는 종거리의 절댓값 최소** — 가장 가깝게 스친 순간이다
+    (+ 앞, − 뒤). 앞뒤를 각각 따로도 남긴다.
+    """
+    v_min = float(tc['observe_moving_mps'])
+    corr = float(tc['observe_corridor_m'])
+    seen, lon_min, ahead, behind = set(), None, None, None
+    for t in ticks:
+        e = t['ego']
+        ex, ey, yaw = float(e['x']), float(e['y']), float(e['yaw'])
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        for o in t.get('objects') or ():
+            if o.get('cls') != 'vehicle' or float(o.get('speed') or 0.0) < v_min:
+                continue
+            dx, dy = float(o['x']) - ex, float(o['y']) - ey
+            lon, lat = dx * cy + dy * sy, -dx * sy + dy * cy
+            if abs(lat) > corr:
+                continue
+            seen.add(int(o['id']))
+            if lon_min is None or abs(lon) < abs(lon_min):
+                lon_min = lon
+            if lon >= 0 and (ahead is None or lon < ahead):
+                ahead = lon
+            if lon < 0 and (behind is None or -lon < behind):
+                behind = -lon
+    return {'planned': planned, 'observed': len(seen),
+            'min_lon_m': None if lon_min is None else round(lon_min, 2),
+            'min_ahead_m': None if ahead is None else round(ahead, 2),
+            'min_behind_m': None if behind is None else round(behind, 2),
+            'corridor_m': corr, 'moving_mps': v_min}
+
+
 def check_scenario(yaml_path, log_path, cfg: dict | None = None,
                    lg=None, route=None) -> dict:
     """시나리오 yaml + 로그 → {total, ok, events[…]}. 보행자 이벤트가 없으면 total 0.
@@ -179,7 +228,13 @@ def check_scenario(yaml_path, log_path, cfg: dict | None = None,
                         't_meet_s': None})
             continue
         res.append(check_event(e, ticks, tol, exp))
+    # 교통류는 별도 키다 — events 에 섞으면 성립/전체 집계가 오염된다.
+    # 배치 대수의 출처는 시나리오 전역 속성 pulk.Count 다 (PulkTraffic). 교통류는
+    # 이벤트가 아니므로 events 목록에는 없다 (2026-08-30 ev_traffic 대체).
+    planned = int((sdef.get('pulk') or {}).get('Count') or 0)
+    traffic = traffic_metrics(ticks, planned, cfg['gen_traffic']) if planned else None
     return {'total': len(res), 'ok': sum(1 for r in res if r['verdict'] == OK),
+            'traffic': traffic,
             # 미도달은 "실패"와 구분해야 한다 — 미완주 런에서 도달조차 못 한
             # 이벤트를 성립 실패로 읽으면 원인 판단이 어긋난다.
             'unreached': sum(1 for r in res if r['verdict'] == NOREACH),
@@ -199,6 +254,14 @@ def render(rep: dict, name: str = '') -> str:
                 f'도착 {t[0]:.2f} s / 조우창 {t[1]:.2f}~{t[2]:.2f} s')
         L.append(f"  {r['kind']:<11} s={r['route_s']:>7.1f} m  {r['verdict']:<5} "
                  f"횡 {lat:>6} / 허용 {band:>6} m  (예상 {exp}, {when})")
+    tr = rep.get('traffic')
+    if tr:
+        def _m(x):
+            return '—' if x is None else f'{x:+.1f} m'
+        L.append(f"  교통류(관측)  배치 {tr['planned']}대 / 관측 {tr['observed']}대  "
+                 f"최근접 종거리 {_m(tr['min_lon_m'])} "
+                 f"(앞 {_m(tr['min_ahead_m'])} / 뒤 {_m(None if tr['min_behind_m'] is None else -tr['min_behind_m'])})"
+                 + ('   <= [경고] 배치했는데 한 대도 안 보였다' if tr['observed'] == 0 else ''))
     return '\n'.join(L)
 
 

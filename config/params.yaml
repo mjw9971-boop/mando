@@ -292,6 +292,57 @@ gen_events:
   # 계속한다. 최종 배치 수 < ceil(목표×이 비율) 이면 시나리오 폐기 → 백필.
   min_keep_ratio: 0.6
 
+gen_traffic:
+  # 교통류 **관측 지표** 전용 (tools/event_check.py traffic_metrics).
+  # 배치 상수는 여기 없다 — 교통류 생성은 VTD 네이티브 PulkTraffic 이고
+  # 그 상수는 아래 pulk.* 다. (2026-08-30 ev_traffic 제거)
+  #
+  # 로그에는 객체 heading 이 없고 s_rel/on_route 는 PDM 이관 후 항상 None 이다
+  # (run_agent._log_objects). 그래서 ego 프레임 종·횡거리를 여기서 직접 계산하고,
+  # "동방향 주행 차량" 을 아래 두 임계로 정의한다 — 정차 차량(narrow/static_vehicle,
+  # 속도 0)과 회랑 밖 차량을 빼기 위한 값이다.
+  observe_moving_mps: 0.5   # 이 속도 이상 움직인 적이 있어야 '주행 중'
+  observe_corridor_m: 6.0   # ego 프레임 |횡| 이 이 안일 때만 같은 진행 회랑으로 본다
+
+pulk:
+  # VTD 네이티브 교통류 <PulkTraffic><PulkDef/></PulkTraffic> — ego 주변
+  # 영역(타원)에 Count 대를 채우고, 영역을 벗어난 차량을 가장자리에 **재배치**한다.
+  #
+  # 왜 ev_traffic(Path01 고정 배치)을 버렸는가 (2026-08-30 실기 확인):
+  #   (1) 6대 × 45 m = 265 m 대역뿐이라 3 km 경로 전 구간을 못 채운다.
+  #   (2) ego 와 속도가 다르면 3 km 동안 수백 m 벌어져 후반부가 텅 빈다.
+  # PulkTraffic 은 재배치로 두 문제가 모두 사라진다. 이벤트가 아니라 시나리오
+  # 전역 속성이라 ctx.claim 도, event 목록 등록도 없다.
+  #
+  # 스펙 출처: Scenario Editor 2025.2 산출물 (실기 검증 완료).
+  # 비율은 전부 0~1 소수이고, 에디터가 두 합계를 검사한다 —
+  #   AreaF+AreaB+AreaL+AreaR = 1.0,  Cars+Vans+Buses+Trucks+Bikes = 1.0.
+  # gen_scenarios.pulk_def 가 생성 시점에 같은 검사를 하고 어긋나면 GenError 다.
+  # **자동 보정하지 않는다** — 조용히 고치면 시나리오마다 다른 값이 들어간다.
+  count: 20                 # 영역 내 유지 대수. 축 '교통류대수' 가 있으면 그 값이 이긴다
+  semi_major_m: 300.0       # 영역 장반경 [m]. semi_minor 와 같으면 Circle (별도 속성 없음)
+  semi_minor_m: 300.0       # 영역 단반경 [m]
+  inner_radius_m: 30.0      # ego 주변 이 반경 안에는 스폰하지 않는다 (스폰 즉시 충돌 방지)
+  center_offset_m: 50.0     # 영역 중심을 ego 전방으로 민 거리 [m]
+  # 영역 4분할 배분 [0~1] — 합 1.0. 전방을 두껍게 둬야 선행차 상황이 자주 잡히고,
+  # 좌우를 남겨야 "옆 차로가 비었는지" 판단할 대상이 생긴다.
+  area_f: 0.40
+  area_b: 0.30
+  area_l: 0.15
+  area_r: 0.15
+  own_side: 0.70            # 같은 진행방향 비율 [0~1]. 나머지가 대향류
+  # 차종 구성 [0~1] — 합 1.0
+  cars: 0.80
+  vans: 0.0
+  buses: 0.10
+  trucks: 0.10
+  bikes: 0.0
+  # 축 '교통류밀도' 프리셋 — 같은 Count 를 넓은 영역에 뿌릴수록 성기다.
+  # 비율(area_*/차종)은 건드리지 않는다: 두 합계 제약이 축과 무관하게 유지된다.
+  density:
+    조밀: {semi_major_m: 150.0, semi_minor_m: 150.0, inner_radius_m: 15.0}
+    보통: {semi_major_m: 300.0, semi_minor_m: 300.0, inner_radius_m: 30.0}
+    성김: {semi_major_m: 450.0, semi_minor_m: 450.0, inner_radius_m: 45.0}
 batch:
   # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).
   # route_s 는 뒷축 기준이고 계획 정지점이 total − stop_gap − 앞범퍼 이므로

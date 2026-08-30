@@ -239,6 +239,31 @@ themes:
     # params event_trigger.walk_speed_default.* 를 쓰고 트리거는 역산한다.
     vary: [감속강도, 발동거리, 개수, 속도, 차선]
 
+  실전주행_교통류:
+    # 실전주행 + VTD 네이티브 교통류(PulkTraffic). 기존 실전주행은 ego 앞 1대뿐이라
+    # "정적 장애물을 피하려는데 옆·뒤 차가 방해한다" 를 만들 수 없다 — 회피 판단은
+    # 옆 차로가 비었는지에 달려 있는데 그 조건을 만드는 이벤트가 없었다.
+    # 기존 실전주행 테마는 회귀 비교 기준이므로 손대지 않고 따로 세운다.
+    min_length_m: 3000
+    # oncoming/cut_in 은 UNSUPPORTED(대응 미구현)라 실전주행과 같이 제외.
+    event: [static_vehicle, obstacle_chain, narrow,
+            pedestrian, jaywalk, lead_brake, signal]
+    scale_events: true
+    random_axes: true
+    start: 자유
+    routes: [직진, 우회전, 좌회전, 연속교차로]
+    # 교통류는 **이벤트가 아니라 시나리오 전역 속성**이다 (2026-08-30 실기 확인 후
+    # ev_traffic 대체). PulkTraffic 은 ego 주변 영역을 벗어난 차량을 가장자리에
+    # 재배치하므로, 고정 배치(ev_traffic)의 두 한계 — 대역이 265 m 뿐인 것과
+    # 3 km 동안 ego 와 벌어져 후반부가 비는 것 — 이 모두 사라진다.
+    # 그래서 event 목록이 아니라 이 플래그로 켠다. 상수는 params pulk.*.
+    pulk: true
+    # 교통류대수 → PulkDef Count, 교통류밀도 → 영역 크기(반경 + 내부 반경) 프리셋.
+    # 시드가 바뀌면 이 두 축이 다시 뽑혀 교통류 밀도가 실제로 달라진다.
+    vary: [감속강도, 발동거리, 개수, 속도, 차선, 교통류대수, 교통류밀도]
+    교통류대수: [12, 20, 30]
+    교통류밀도: [조밀, 보통, 성김]
+
   전체회귀:
     min_length_m: 800               # 이벤트 순환형 — 여러 이벤트를 고루 담으려면 400보다 여유 필요
     event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
