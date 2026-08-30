@@ -210,3 +210,60 @@ def test_single_section_hand_computed_total():
                 'lane_departure': [ev(100, 2), ev(200, 3)],
                 'reset': [ev(120, 4, why={}), ev(220, 5, why={})]}, cfg)
     assert s['total'] == 79 and s['max_possible'] == 100
+
+
+# ── 건수 칸 = 실제 검출 횟수 (감점 1회 규칙과 무관) ──────────────────────
+def rendered(events_by_cat, cfg, peak=300.0, total=300.0, done=True):
+    """render 출력 + {항목 번호: (건수, 감점)} 파싱."""
+    rep = make_rep(events_by_cat, peak, total, done)
+    rep.update({'file': 'x.jsonl', 'ticks': 1, 'warnings': []})
+    rep['finish'].update({'finish_time_s': 100.0, 'time_limit_s': 300.0, 'wall_s': 100.0})
+    sc_mod.annotate_scoring(rep, cfg)
+    rep['scoring'] = sc_mod.score_run(rep, cfg)
+    out = sc_mod.render(rep)
+    table = {}
+    for no, key, _name in sc_mod.ITEMS:
+        if key is None:
+            continue
+        row = next(l for l in out.splitlines() if l.startswith(f'{no:>3}  '))
+        c, p = row.replace('  ←', '').split()[-2:]
+        table[no] = (int(c), int(p))
+    return out, table
+
+
+def test_count_column_is_raw_detection_count_not_deduction_count():
+    """건수는 검출 이벤트 수 그대로 — 감점만 (항목,구간)당 1회로 눌린다."""
+    cfg = base_cfg(single_section=True)
+    _out, t = rendered({'speed': [ev(10, 0, max_over_kph=5.0),
+                                  ev(20, 1, max_over_kph=6.0),
+                                  ev(30, 2, max_over_kph=7.0)],
+                        'lane_departure': [ev(40, 3), ev(50, 4), ev(60, 5), ev(70, 6)],
+                        'reset': [ev(80, 7, why={}), ev(90, 8, why={})]}, cfg)
+    assert t[1] == (3, -3)      # 경미 3회 검출 → 감점은 1회분 -3
+    assert t[3] == (4, -6)      # 차로유지 2회↑ 심화 → -6, 건수는 4 그대로
+    assert t[15] == (2, -6)     # 리스폰 2회 − 무료 1 → -6, 건수는 2 그대로
+
+
+def test_count_column_sums_across_sections():
+    """구간 모드에서도 건수는 전 구간 합계 — 구간별 감점과 따로 센다."""
+    cfg = base_cfg(section_bounds_s=[100.0])
+    _out, t = rendered({'lane_departure': [ev(10, 0), ev(20, 1),
+                                           ev(150, 2), ev(160, 3)]}, cfg)
+    assert t[3] == (4, -12)     # 구간0 -6 + 구간1 -6, 건수는 4건 전부
+
+
+def test_count_column_counts_zero_severity_events():
+    """감점 없는(severity none) 검출도 건수에는 남는다 — 검출/채점 분리."""
+    cfg = base_cfg(single_section=True)
+    _out, t = rendered({'speed': [ev(10, 0, max_over_kph=0.5),   # ≤1 허용 → none
+                                  ev(20, 1, max_over_kph=0.5)]}, cfg)
+    assert t[1] == (2, 0)
+
+
+def test_count_column_merges_absorbed_categories():
+    """정지선 침범·원거리 정지는 항목 7 로 흡수 — 건수도 합산된다."""
+    cfg = base_cfg(single_section=True)
+    _out, t = rendered({'red_light': [ev(10, 0)],
+                        'red_stop_far': [ev(20, 1, front_m=-3.0)],
+                        'stop_line_encroach': [ev(30, 2, front_m=0.5)]}, cfg)
+    assert t[7] == (3, -6)      # 3건 검출, 감점은 중대 1회
