@@ -725,7 +725,21 @@ def stop_metrics(ticks: list[dict], t0: float, stop_speed: float = 0.5) -> list[
                 if len(acc) > 2:
                     d = [b - a for a, b in zip(acc, acc[1:])]
                     rev = sum(1 for a, b in zip(d, d[1:]) if (a > 0) != (b > 0))
+                # 녹색 전환 → 출발까지 [s] — **관측 항목이지 판정 항목이 아니다**.
+                # _stopline_hold 리필(적색 동안 매 틱 재무장)이 남긴 잔여 홀드가
+                # 녹색 뒤에도 목표 0 을 유지한다 (실측 1.2 s). 리필 수정을
+                # 보류했으므로, 재개 여부를 이 수치로 판단한다 (docs/BACKLOG.md).
+                t_green = t_go = None
+                for m in range(i, min(len(ticks), j + 400)):
+                    st = _ctrl_states(ticks[m])
+                    if t_green is None and st and all(x in (GREEN, GREEN_LEFT) for x in st):
+                        t_green = ticks[m]['t']
+                    if t_green is not None and ticks[m]['ego']['speed'] > 0.3:
+                        t_go = ticks[m]['t']
+                        break
                 out.append({
+                    'green_delay_s': (None if (t_green is None or t_go is None)
+                                      else round(t_go - t_green, 2)),
                     't': round(ticks[i]['t'] - t0, 1),
                     'route_s': round(ticks[i]['ego']['route_s'], 1),
                     'slf_m': round(sorted(sl)[len(sl) // 2], 2),
