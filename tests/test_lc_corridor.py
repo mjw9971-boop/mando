@@ -21,7 +21,9 @@ from conftest import PARAMS_YAML  # noqa: F401  (경로 설정 목적)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE_PKL = ROOT / 'data' / 'route.pkl'
+# 테스트 기준은 tests/fixtures 에 고정 — data/route.pkl 은 사용자 작업용이라
+# 경로 시각화·대회 CSV 투입으로 언제든 바뀐다 (tests/fixtures/README.md).
+ROUTE_PKL = ROOT / 'tests' / 'fixtures' / 'route.pkl'
 
 D = lambda a, b: (a, b, 'broken', 'white', True)      # noqa: E731  점선
 S = lambda a, b: (a, b, 'solid', 'white', False)      # noqa: E731  실선

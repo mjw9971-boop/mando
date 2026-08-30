@@ -174,6 +174,15 @@ def lane_change_window(lg, lanes, cum, seq, i, side, target):
     return cum[j] + s0, cum[i] + w1, j, s0
 
 
+def route_check_cfg():
+    """params.yaml route_check.* — 검증 리포트 임계의 단일 출처.
+
+    키가 없으면 조용히 기본값으로 도는 대신 죽는다 (설정 두 벌 금지 규칙).
+    """
+    from vtd_adapter.config import load_params_yaml
+    return load_params_yaml()['route_check']
+
+
 def min_turn_radius_m():
     """차량 최소회전반경 [m] = 축거 / tan(최대조향). params.yaml 을 읽는다."""
     try:
@@ -542,7 +551,8 @@ def report(lg, rt, radius, warn_dev=None):
     검증 리포트. 대회날 경로를 받자마자 눈으로 확인하는 용도다.
     문제가 있으면 [경고] 로 표시하고, 경고 개수를 돌려준다.
     """
-    warn_dev = radius if warn_dev is None else warn_dev
+    rc = route_check_cfg()
+    hw_k = float(rc['wp_dev_halfwidth_k'])
     lanes, cum = rt['lanes'], rt['cum_s']
     warns = 0
 
@@ -551,19 +561,27 @@ def report(lg, rt, radius, warn_dev=None):
     print('=' * 72)
 
     # ── 1) seq 점이 경로에서 얼마나 떨어져 있나 ──────────────────────────
-    print(f"\n[1] 경유점 이탈 (허용 {warn_dev:g} m)")
+    # 허용치는 **매칭된 차로의 반폭** 이다 — 이걸 넘으면 옆 차로가 더 가까워져
+    # 조용히 옆 차로로 경로가 잡힐 수 있다. --radius(경유점 매칭 반경)는 이 판정과
+    # 무관한 별개 값이라 쓰지 않는다 (--warn-dev 로 고정 임계를 줄 수는 있다).
+    head = (f'허용 {warn_dev:g} m 고정 (--warn-dev)' if warn_dev is not None
+            else f'허용 = 매칭 차로 반폭 × {hw_k:g}')
+    print(f"\n[1] 경유점 이탈 ({head};  매칭 반경 --radius {radius:g} m 는 별개)")
     for wi, (x, y) in enumerate(rt['waypoints']):
         sq = rt['waypoint_seq'][wi]
-        best_d, best_s, best_lane = None, None, None
+        best_d, best_s, best_sp, best_lane = None, None, None, None
         for i, k in enumerate(lanes):
             s_p, _t, d_p, _ = lg.project(k, x, y)
             if best_d is None or d_p < best_d:
-                best_d, best_s, best_lane = d_p, cum[i] + s_p, k
+                best_d, best_s, best_sp, best_lane = d_p, cum[i] + s_p, s_p, k
+        half = 0.5 * lg.width_at(best_lane, best_sp)
+        lim = warn_dev if warn_dev is not None else hw_k * half
         flag = ''
-        if best_d > warn_dev:
-            flag = '   <= [경고] 경로가 이 지점을 스치지 않는다'
+        if best_d > lim:
+            flag = (f'   <= [경고] 차로 반폭 {half:.2f} m 를 벗어난다 — '
+                    f'옆 차로로 잡힐 수 있다')
             warns += 1
-        print(f"  seq {sq:>3}  ({x:9.2f},{y:9.2f})  이탈 {best_d:6.2f} m  "
+        print(f"  seq {sq:>3}  ({x:9.2f},{y:9.2f})  이탈 {best_d:6.2f} / 한계 {lim:4.2f} m  "
               f"경로 s={best_s:8.1f} m  lane={best_lane}{flag}")
 
     # ── 2) 짝(교차로) 구간 ───────────────────────────────────────────────
@@ -636,8 +654,21 @@ def report(lg, rt, radius, warn_dev=None):
     stops.sort()
     unsignalized = sum(1 for _s, ids in stops if not ids)
 
+    # 경유점을 직선으로 이은 길이 대비 실제 경로 길이. 옆 차로로 잘못 잡히면
+    # 되돌아오는 우회가 붙어 이 비율이 튄다 (실측: 정상 1.06~1.18 / 오선택 1.37).
+    wps = rt['waypoints']
+    straight = sum(math.hypot(wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1])
+                   for i in range(len(wps) - 1))
+    ratio = rt['total_length'] / straight if straight > 1e-9 else float('inf')
+    r_max = float(rc['length_ratio_max'])
+    r_flag = ''
+    if ratio > r_max:
+        r_flag = (f'   <= [경고] 임계 {r_max:g} 초과 — 옆 차로·먼 길로 잡혔을 수 있다')
+        warns += 1
+
     print(f"\n[3] 총계")
     print(f"  총 길이        {rt['total_length']:8.1f} m   차로 {len(lanes)}개")
+    print(f"  경유점 직선연결 {straight:8.1f} m   실제/직선 {ratio:.3f}{r_flag}")
     print(f"  좌회전 {n_l}회 / 우회전 {n_r}회 / 차선변경 {n_lc}회")
     print(f"  정지선 {len(stops)}개 (신호 없는 정지선 {unsignalized}개)")
     if zones:

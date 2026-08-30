@@ -38,7 +38,9 @@ from vtd_adapter.carla_types import VehicleControl  # noqa: E402
 CFG = load_params_yaml(PARAMS_YAML)
 OT = CFG['overtake']
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE_PKL = ROOT / 'data' / 'route.pkl'
+# 테스트 기준은 tests/fixtures 에 고정 — data/route.pkl 은 사용자 작업용이라
+# 경로 시각화·대회 CSV 투입으로 언제든 바뀐다 (tests/fixtures/README.md).
+ROUTE_PKL = ROOT / 'tests' / 'fixtures' / 'route.pkl'
 # 평범한 직진 구간 — 차선변경 블렌드 밖이어야 한다 (블렌드 위에 놓으면
 # 장애물이 목표 차로로 매칭돼 clear 게이트가 잘못 걸린다).
 IDX = 1250                   # lane (72,2,-2), 좌 이웃 (72,2,-1), 점선 회랑 105.7 m

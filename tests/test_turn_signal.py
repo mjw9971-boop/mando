@@ -38,7 +38,9 @@ SIG = CFG['signal']
 PPM = 10
 TOTAL = 400.0
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-ROUTE_PKL = ROOT / 'data' / 'route.pkl'
+# 테스트 기준은 tests/fixtures 에 고정 — data/route.pkl 은 사용자 작업용이라
+# 경로 시각화·대회 CSV 투입으로 언제든 바뀐다 (tests/fixtures/README.md).
+ROUTE_PKL = ROOT / 'tests' / 'fixtures' / 'route.pkl'
 
 
 class FakeLaneGraph:

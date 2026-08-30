@@ -99,6 +99,15 @@ class GenError(SystemExit):
     """생성 실패 — 어디서 왜 막혔는지 메시지에 담는다 (무음 실패 금지)."""
 
 
+class EventUnfeasible(GenError):
+    """이 지점에서 이 이벤트가 기하적으로 성립하지 않는다.
+
+    resolve_events 가 위치를 옮겨 재시도하고, 그래도 안 되면 (min_keep 가 있는
+    주제에서) **그 이벤트만** 버린다. 시나리오째 죽이지 않는다 — 성립 안 하는
+    이벤트를 억지로 넣는 것보다 하나 적게 넣는 편이 낫다 (2026-08-30 결정).
+    """
+
+
 def fnum(v: float) -> str:
     return f'{float(v):.4f}'
 
@@ -500,6 +509,17 @@ def ev_cfg() -> dict:
         from vtd_adapter.config import load_params_yaml
         _EV_CFG = load_params_yaml()['gen_events']
     return _EV_CFG
+
+
+_TRG_CFG = None      # params.yaml event_trigger 캐시 (보행자 트리거 역산 상수)
+
+
+def trg_cfg() -> dict:
+    global _TRG_CFG
+    if _TRG_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _TRG_CFG = load_params_yaml()['event_trigger']
+    return _TRG_CFG
 
 
 _COV_CFG = None      # params.yaml gen_coverage 캐시 (후보 선별·추첨 상수의 단일 출처)
@@ -1280,10 +1300,11 @@ def _crossing_shape(ctx, s, from_side, extra=0.0):
     """s 지점을 가로지르는 보행 경로점들과 진행방향. from_side: 우측→좌측 / 좌측→우측."""
     lg, rt = ctx.lg, ctx.route.rt
     left, right = road_width_at(lg, rt, s)
+    m = float(trg_cfg()['ped_start_margin_m'])     # 역산(ped_trigger)과 같은 값이어야 한다
     if from_side == '우측':
-        t0, t1 = -(right + 1.5 + extra), left + 1.5
+        t0, t1 = -(right + m + extra), left + m
     else:
-        t0, t1 = left + 1.5 + extra, -(right + 1.5)
+        t0, t1 = left + m + extra, -(right + m)
     pts = []
     for u in np.linspace(0.0, 1.0, 4):
         t = t0 + (t1 - t0) * float(u)
@@ -1293,18 +1314,115 @@ def _crossing_shape(ctx, s, from_side, extra=0.0):
     return pts
 
 
-def _add_ped(ctx, s, walk_speed, trig_d, from_side, tag):
+def ped_walk_speed(v, kind):
+    """보행속도 [m/s] — 축(vary 보행속도)이 있으면 그 값, 없으면 이벤트별 기본값.
+
+    무단횡단(jaywalk/ped_blind)은 뛰어서 건너므로 정상 횡단(pedestrian)보다 빠르다.
+    기본값은 params event_trigger.walk_speed_default.* 가 단일 출처다.
+    """
+    if '보행속도' in v:
+        return float(v['보행속도'])
+    return float(trg_cfg()['walk_speed_default'][kind])
+
+
+def ped_trigger(ctx, s, walk_speed, from_side, kind):
+    """보행자 트리거 거리를 조우가 성립하도록 역산한다 (params event_trigger.*).
+
+    고정 트리거거리(옛 25 m)는 도로 폭에 따라 필요값이 27~87 m 로 변해 성립하지
+    않았다 — 2026-08-30 실측: 보행자가 ego 통과 4 s 뒤에 차로 진입, 무반응 통과.
+
+    ego 가 이벤트 지점 s 에 닿는 순간 보행자가 **차로 근접 가장자리를 lead_s 만큼
+    지난** 위치에 오도록 잡는다. 조우 창은 차로폭/보행속도(1~2 s)뿐이라 lead_s 를
+    크게 잡으면 반대로 이미 건너가 버린다.
+
+        t_near = (횡시작거리 − 차로반폭) / 보행속도      # 근접 가장자리 도달
+        t_far  = (횡시작거리 + 차로반폭) / 보행속도      # 차로 이탈
+        trig_d = v_exp × (t_near + lead_s) − radius_m   # 반경만큼 일찍 터진다
+
+    trig_d 가 [trig_min_m, trig_max_m] 를 벗어나면 보행속도를
+    [walk_speed_min_mps, walk_speed_max_mps] 안에서 자동 조정해 성립시키고,
+    그래도 안 되면 GenError — 호출자가 그 이벤트만 버린다(min_keep_ratio).
+
+    반환 dict 는 그대로 시나리오 yaml 에 실려 검증(tools/event_check.py)의
+    기대값이 된다.
+    """
+    et = trg_cfg()
+    lg, rt = ctx.lg, ctx.route.rt
+    left, right = road_width_at(lg, rt, s)
+    lat = (right if from_side == '우측' else left) + float(et['ped_start_margin_m'])
+    _, k, sl = lane_at(rt, s)
+    half = 0.5 * float(lg.width_at(k, sl))
+    lim = lg.lanes[k]['speed_limit'] or float(et['default_limit_kph'])
+    v_exp = float(lim) / 3.6 * float(et['speed_factor'])
+    lead, rad = float(et['lead_s']), float(et['radius_m'])
+    lo, hi = float(et['trig_min_m']), float(et['trig_max_m'])
+    ws_lo, ws_hi = float(et['walk_speed_min_mps']), float(et['walk_speed_max_mps'])
+    if lat <= half:
+        raise EventUnfeasible(f'{kind}: 보행자 시작점이 이미 차로 안이다 (횡 {lat:.1f} m)')
+
+    def trig_of(ws):
+        return v_exp * ((lat - half) / ws + lead) - rad
+
+    # 보행속도를 상·하한 안에서 조정해 trig_d 를 [lo, hi] 로 넣는다.
+    #   trig_d ≤ hi  ⟺  ws ≥ (lat−half) / ((hi+rad)/v_exp − lead)
+    #   trig_d ≥ lo  ⟺  ws ≤ (lat−half) / ((lo+rad)/v_exp − lead)
+    ws = float(walk_speed)
+    for bound, want_fast in ((hi, True), (lo, False)):
+        budget = (bound + rad) / v_exp - lead
+        if budget <= 0:
+            raise EventUnfeasible(
+                f'{kind}: 트리거 한계 {bound:.0f} m 가 lead_s 를 못 넘는다 '
+                f'(제한 {lim:.0f} kph)')
+        need = (lat - half) / budget
+        if want_fast and ws < need:
+            ws = need                     # (b) 자동 상향
+        if (not want_fast) and ws > need:
+            ws = need                     # 하한 미달 — 보행속도를 낮춰 트리거를 늘린다
+    if not (ws_lo - 1e-9 <= ws <= ws_hi + 1e-9):
+        why = ('너무 빨라야' if ws > ws_hi else
+               '너무 느려야')          # 느림 = 트리거가 하한보다 짧아진다
+        raise EventUnfeasible(
+            f'{kind}: 조우가 성립하려면 보행속도가 {why} 한다 ({ws:.2f} m/s, 허용 '
+            f'[{ws_lo:g}, {ws_hi:g}]) — 횡 {lat:.1f} m, 차로 {2 * half:.1f} m, '
+            f'제한 {lim:.0f} kph')
+    trig_d = trig_of(ws)
+    if not (lo - 1e-6 <= trig_d <= hi + 1e-6):
+        raise EventUnfeasible(f'{kind}: 트리거 거리 {trig_d:.0f} m 가 [{lo:g}, {hi:g}] 밖이다')
+    if s - trig_d < float(et['trig_min_route_s_m']):
+        raise EventUnfeasible(
+            f'{kind}: 트리거 지점 route_s {s - trig_d:.0f} m 가 경로 앞부분이라 스폰 즉시 '
+            f'발동한다 (이벤트 s={s:.0f}, trig_d={trig_d:.0f})')
+
+    t_near, t_far = (lat - half) / ws, (lat + half) / ws
+    return {'walk_speed': round(ws, 3), 'trigger_d': round(trig_d, 2),
+            'lat_start_m': round(lat, 2), 'lane_w_m': round(2 * half, 2),
+            'v_exp_mps': round(v_exp, 2), 'limit_kph': round(float(lim), 1),
+            't_cross_s': round(lat / ws, 2),
+            't_near_s': round(t_near, 2), 't_far_s': round(t_far, 2),
+            # ego 도착 순간의 보행자 횡위치 (차로 중심 기준, + = 아직 출발측)
+            'meet_lat_m': round(half - ws * lead, 2),
+            'trigger_radius_m': rad}
+
+
+def ped_claim(ctx, s, trg, kind):
+    """보행자 이벤트 점유 구간 — 트리거 지점까지 잡아야 다른 이벤트가 안 낀다."""
+    et = trg_cfg()
+    ctx.claim(s - trg['trigger_d'] - float(et['claim_back_m']),
+              s + float(et['claim_fwd_m']), kind)
+
+
+def _add_ped(ctx, s, trg, from_side, tag):
     pts = _crossing_shape(ctx, s, from_side)
     sid = ctx.next_shape()
     name = ctx.next_name('Ped')
-    tx, ty, _, _ = route_pt(ctx.lg, ctx.route.rt, max(1.0, s - trig_d))
+    tx, ty, _, _ = route_pt(ctx.lg, ctx.route.rt, s - trg['trigger_d'])
     ctx.moving.append(blk_pathshape(sid, f'{name}Path', pts))
     ctx.moving.append(blk_character(name, pts[0][0], pts[0][1], pts[0][2], pts[0][3]))
-    ctx.moving.append(blk_character_actions(name, tx, ty, 10.0, walk_speed, sid))
+    ctx.moving.append(blk_character_actions(name, tx, ty, trg['trigger_radius_m'],
+                                            trg['walk_speed'], sid))
     cx, cy, _, _ = route_pt(ctx.lg, ctx.route.rt, s)
     ctx.checks.append((cx, cy, tag))
-    return {'ped': name, 'route_s': round(s, 2), 'walk_speed': walk_speed,
-            'trigger_d': trig_d, 'from': from_side}
+    return {'ped': name, 'route_s': round(s, 2), 'from': from_side, **trg}
 
 
 def _crosswalk_list(ctx):
@@ -1337,8 +1455,10 @@ def ev_pedestrian(ctx, v):
         raise GenError('경로에 횡단보도가 없다 — pedestrian 이벤트 불가')
     idx = round(v['위치'] * (len(cws) - 1))
     s = cws[idx]
-    ctx.claim(s - 40, s + 20, 'pedestrian')
-    out = _add_ped(ctx, s, v['보행속도'], v['트리거거리'], v.get('방향', '우측'), 'ego_lane')
+    side = v.get('방향', '우측')
+    trg = ped_trigger(ctx, s, ped_walk_speed(v, 'pedestrian'), side, 'pedestrian')
+    ped_claim(ctx, s, trg, 'pedestrian')
+    out = _add_ped(ctx, s, trg, side, 'ego_lane')
     out['kind'] = 'pedestrian'
     if v.get('신호') == '적색':
         appr = [(j, ss, cc) for j, ss, cc in
@@ -1359,8 +1479,10 @@ def ev_jaywalk(ctx, v):
             s = pick_s(ctx.spans, v['위치'])
     else:
         s = pick_s(ctx.spans, v['위치'])
-    ctx.claim(s - 40, s + 20, 'jaywalk')
-    out = _add_ped(ctx, s, v['보행속도'], v['트리거거리'], v.get('방향', '우측'), 'ego_lane')
+    side = v.get('방향', '우측')
+    trg = ped_trigger(ctx, s, ped_walk_speed(v, 'jaywalk'), side, 'jaywalk')
+    ped_claim(ctx, s, trg, 'jaywalk')
+    out = _add_ped(ctx, s, trg, side, 'ego_lane')
     out.update(kind='jaywalk', spot=v.get('지점', '도로중간'))
     return out
 
@@ -1368,19 +1490,24 @@ def ev_jaywalk(ctx, v):
 def ev_ped_blind(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
     s = pick_s(ctx.spans, v['위치'], need=40.0)
-    ctx.claim(s - 40, s + 40, 'ped_blind')
     bus = v.get('차폐물', '버스') == '버스'
     vtype, vlen = (BUS, BUS_LEN) if bus else (CAR, CAR_LEN)
     _, k, sl = lane_at(rt, s)
     w = lg.width_at(k, sl)
     t_block = -(w / 2.0 + 1.1)                      # 차로 우측 가장자리 바깥에 정차
+    # 보행자 트리거를 먼저 역산해야 점유 구간(트리거점 ~ 차폐물 뒤)을 한 번에 잡는다.
+    ped_s0 = s + vlen / 2.0 + 2.0
+    trg = ped_trigger(ctx, ped_s0, ped_walk_speed(v, 'ped_blind'), '우측', 'ped_blind')
+    et = trg_cfg()
+    ctx.claim(min(s - 40.0, ped_s0 - trg['trigger_d'] - float(et['claim_back_m'])),
+              max(s + 40.0, ped_s0 + float(et['claim_fwd_m'])), 'ped_blind')
     bx, by, bz, bh = route_pt(lg, rt, s, t_block)
     name = ctx.next_name('Blocker')
     ctx.players.append(blk_vehicle_posabs(name, vtype, bx, by, bz, bh))
     ctx.actions.append(blk_stay_action(name, bx, by))
     # 보행자: 차폐물 앞머리 쪽에서 우→좌 횡단 (가려져 있다가 출현)
     ped_s = s + vlen / 2.0 + 2.0
-    out = _add_ped(ctx, ped_s, v['보행속도'], v['트리거거리'], '우측', 'ego_lane')
+    out = _add_ped(ctx, ped_s, trg, '우측', 'ego_lane')
     out.update(kind='ped_blind', blocker=vtype, blocker_s=round(s, 2))
     return out
 
@@ -1810,7 +1937,8 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                 (np_, na, nm, ctx.signals, ctx.checks, ctx.occupied,
                  ctx.shape_seq, ctx.player_seq) = snap
                 del ctx.players[np_:], ctx.actions[na:], ctx.moving[nm:]
-                if '겹친다' not in msg and '부족하다' not in msg:
+                if not isinstance(e, EventUnfeasible) and \
+                        '겹친다' not in msg and '부족하다' not in msg:
                     raise
                 last = e
         if last is not None:
@@ -2081,8 +2209,10 @@ def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
                                      for k in (0.15, -0.15, 0.3, -0.3)]
         v.setdefault('위치', 0.5)
         v.setdefault('발동거리', v['위치'])
-        v.setdefault('보행속도', 1.5)
-        v.setdefault('트리거거리', 25)
+        # 보행속도 기본값은 여기서 주입하지 않는다 — 이벤트별로 다르고
+        # (jaywalk/ped_blind 2.5 vs pedestrian 1.5) params 가 단일 출처다.
+        # ped_walk_speed 가 "축에 있으면 축, 없으면 params" 로 고른다.
+        v.setdefault('트리거거리', 25)      # cut_in 트리거 반경 (보행자와 무관)
         v.setdefault('감속강도', 5.0)
         if '속도_kph' in cfg:
             v['_속도_kph'] = float(cfg['속도_kph'])

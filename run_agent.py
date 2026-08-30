@@ -40,6 +40,7 @@ from vtd_adapter.logger import Logger                      # noqa: E402
 from vtd_adapter.map import VtdMap                         # noqa: E402
 from vtd_adapter.route import VtdRoutePlanner              # noqa: E402
 from vtd_adapter.types import Command, Decision, TrackedObject  # noqa: E402
+from vtd_adapter.logger import Probe                       # noqa: E402
 from vtd_adapter.world import VtdWorld                     # noqa: E402
 
 from autopilot import AutoPilot                            # noqa: E402  (team_code)
@@ -184,6 +185,15 @@ class Runner:
         self.pdm_config = build_pdm_config(self.cfg)
         self.tracker = EgoTracker(self.lg, self.route, self.cfg)
         self.world = VtdWorld(self.cfg)
+        # 프리즈 진단 계측 (관측 전용 — 동작 불변). params log.probe_*
+        self.probe = Probe(self.cfg)
+        self.loop_iters = 0            # while 루프 반복 수 — 공백 원인 판별의 핵심
+        self._stale_since: float | None = None
+        self._stale_logged = 0.0
+        self._gap_iters0 = 0
+        self._gap_rx0 = 0.0
+        _lg = self.cfg.get('log', {})
+        self._gap_every = float(_lg.get('gap_log_every_s', 5.0))
         self.vmap = VtdMap(self.lg)
         self.planner = VtdRoutePlanner(self.lg, self.route, self.cfg,
                                        config=self.pdm_config)
@@ -256,7 +266,11 @@ class Runner:
 
         decision = self._build_decision()
         world_state.objects = self._log_objects()
-        self.logger.write(pkt, world_state, decision, cmd)
+        self.logger.write(pkt, world_state, decision, cmd,
+                          timing=self.probe.sample(self.loop_iters))
+        long_gc = self.probe.take_long_gc()
+        if long_gc is not None:
+            self.logger.gc_pause(long_gc, tick=self.ticks, loop_iters=self.loop_iters)
         self._maybe_print(world_state, decision, cmd)
         return cmd
 
@@ -335,6 +349,47 @@ class Runner:
             flush=True,
         )
 
+    # ── 무수신 구간 기록 (계측 전용) ──────────────────────────────────────
+    def _gap_mark(self) -> None:
+        """stale 상태가 이어지는 동안 공백을 로그에 남긴다.
+
+        패킷이 온 틱만 기록하던 탓에, 수신이 끊긴 구간은 로그가 통째로 비어
+        "루프가 멈춘 것"과 "안 온 것"을 사후에 못 가렸다 (2026-08-30 14.95 s 공백).
+        """
+        now = time.monotonic()
+        if self._stale_since is None:
+            self._stale_since = now
+            self._gap_iters0 = self.loop_iters
+            self._gap_rx0 = self.source.last_rx
+            self._stale_logged = now
+            self.logger.gap('gap_open', tick=self.ticks, loop_iters=self.loop_iters,
+                            since_rx_s=round(now - self.source.last_rx, 3))
+            return
+        if self._gap_every > 0 and now - self._stale_logged >= self._gap_every:
+            self._stale_logged = now
+            self.logger.gap('gap', tick=self.ticks,
+                            elapsed_s=round(now - self._stale_since, 3),
+                            loop_iters=self.loop_iters,
+                            iters_in_gap=self.loop_iters - self._gap_iters0)
+
+    def _gap_close(self) -> None:
+        """수신 복구 — 공백 길이와 **그 동안의 루프 반복 수**를 남긴다.
+
+        iters_in_gap 이 공백 길이 × 20 Hz 에 가까우면 루프는 살아 있었다(수신 끊김),
+        1 에 가까우면 프로세스가 멈춰 있었다(GC·스왑·OS 정지).
+        """
+        if self._stale_since is None:
+            return
+        now = time.monotonic()
+        # elapsed_s 는 stale 감지(=watchdog_s 경과) 시점부터다 — 마지막 수신부터의
+        # 총 공백은 since_rx_s 를 쓴다 (gap_open 의 since_rx_s 와 같은 축).
+        self.logger.gap('gap_close', tick=self.ticks,
+                        elapsed_s=round(now - self._stale_since, 3),
+                        since_rx_s=round(now - self._gap_rx0, 3),
+                        loop_iters=self.loop_iters,
+                        iters_in_gap=self.loop_iters - self._gap_iters0)
+        self._stale_since = None
+
     # ── 루프 ──────────────────────────────────────────────────────────────
     def run(self) -> int:
         if hasattr(self.source, 'connect') and not self.args.replay:
@@ -346,9 +401,11 @@ class Runner:
                 if self.args.max_ticks and self.ticks >= self.args.max_ticks:
                     break
 
+                self.loop_iters += 1
                 pkt = self.source.recv()
 
                 if pkt is not None:
+                    self._gap_close()
                     try:
                         self.last_cmd = self.tick(pkt)
                         self.error_streak = 0
@@ -362,6 +419,7 @@ class Runner:
                     break                                     # 로그 끝
                 elif self.source.stale():
                     # 패킷 수신 여부로만 판단한다 (정지 중이어도 재시작 금지)
+                    self._gap_mark()
                     self.last_cmd = SAFE_STOP
                     if not self.source.connected:
                         self.source.reconnect()
