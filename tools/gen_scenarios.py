@@ -189,11 +189,111 @@ WALK_EXT_STATS: collections.Counter = collections.Counter()
 WALK_EXT_LENS: dict = collections.defaultdict(list)     # 사유 → 중단 시점 route_len
 
 
+# ── 목표 길이 탐색 (백트랙 DFS) — 주행 검증형 연장 구간 전용 ──────────────
+
+def _corridor_ahead(lg, lane, fwd_cap: float):
+    """lane 에서 교차로 옵션이 나올 때까지 비교차로 successor 로 강제 전진.
+
+    → (지나온 차로들[lane 제외], 추가 길이, 끝 차로, 비 U턴 교차로 옵션들)
+    옵션이 빈 목록이면 막다른 회랑이다. 이동 모델은 _walk_once 의 전진 루프와
+    같다 — 이웃(같은 방향 driving) 접근도 옵션 수집에 포함한다."""
+    passed, add = [], 0.0
+    cur = lane
+    for _ in range(60):
+        approaches = [cur]
+        for side in ('left', 'right'):
+            nb = lg.neighbor(cur, side)
+            if nb is not None and lg.lanes[nb]['dir'] == lg.lanes[cur]['dir'] \
+                    and lg.lanes[nb]['type'] == 'driving':
+                approaches.append(nb)
+        opts = []
+        for ap in approaches:
+            opts += _junction_options(lg, ap)
+        opts = [o for o in opts if o[0] != 'uturn']     # U턴 배제 (대회 최단거리 기준)
+        if opts:
+            return passed, add, cur, opts
+        nxts = [k for k in lg.successors(cur) if lg.lanes[k]['junction'] == -1]
+        if not nxts or add > fwd_cap:
+            return passed, add, cur, []
+        cur = nxts[0]
+        passed.append(cur)
+        add += lg.length(cur)
+    return passed, add, cur, []
+
+
+def _visit_roads(visited: set, prev_road, roads):
+    """road 순서열을 단순 경로 규칙으로 반영 → (새 visited, 새 prev).
+
+    연속된 같은 road 는 한 번의 통과로 본다 (같은 도로의 다음 섹션으로 전진하는
+    것은 재방문이 아니다 — 이 구분이 없으면 존재율이 0%로 나온다). 이미 떠난
+    road 로 되돌아오면 위반 → (None, None)."""
+    v, p, added = visited, prev_road, []
+    for r in roads:
+        if r == p:
+            continue
+        if r in v or r in added:
+            return None, None
+        added.append(r)
+        p = r
+    return (v | set(added)) if added else v, p
+
+
+def _search_walk(lg, rng, start, turns, start_len, min_len_m, used_roads,
+                 budget, fwd_cap, max_depth, max_gap_m=None):
+    """start 에서 필수 turns 를 만족시키며 목표 길이까지 잇는 단순 경로 탐색.
+
+    막다른 회랑을 만나면 직전 교차로로 되돌아가 다른 출구를 시도한다 — 앞만
+    보고 걷는 그리디가 3 km 를 못 채우던 원인(2026-08-29 실측: 미달 24건 전부
+    막다른 회랑)을 해소한다. 필수 turns 는 탐색의 접두 제약으로 들어가므로
+    그 구간에서도 재방문·막다름이 생기지 않는다.
+
+    출구 시도 순서는 그리디와 같은 미방문 road 가중(Efraimidis-Spirakis:
+    u^(1+방문횟수) 내림차순)이다 — 커버리지 지렛대를 탐색에서도 유지한다.
+    → (crossings[(ap, jchain, exit)…], 최종 길이, 끝 차로, chain 추가분) 또는 None
+    """
+    exp = [0]
+
+    def rec(lane, length, vis, prev, crossings, extra, depth, gap_base):
+        if exp[0] >= budget or depth > max_depth:
+            return None
+        exp[0] += 1
+        passed, add, end_lane, opts = _corridor_ahead(lg, lane, fwd_cap)
+        vis2, prev2 = _visit_roads(vis, prev, [k[0] for k in passed])
+        if vis2 is None:
+            return None                     # 강제 회랑이 재방문 — 이 가지 폐기
+        length2 = length + add
+        extra2 = extra + passed
+        if depth >= len(turns) and length2 >= min_len_m:
+            return crossings, length2, end_lane, extra2
+        if not opts:
+            return None                     # 막다른 회랑 — 호출자가 다른 출구를 시도
+        if max_gap_m is not None and depth > 0 and gap_base + add > max_gap_m:
+            return None
+        want = turns[depth] if depth < len(turns) else 'any'
+        pick = opts if want == 'any' else [o for o in opts if o[0] == want]
+        for kind, ap, jchain, ex in sorted(
+                pick, reverse=True,
+                key=lambda o: rng.random() ** (1.0 + used_roads.get(o[3][0], 0))):
+            vis3, prev3 = _visit_roads(vis2, prev2, [k[0] for k in jchain] + [ex[0]])
+            if vis3 is None:
+                continue
+            r = rec(ex, length2 + sum(lg.length(k) for k in jchain) + lg.length(ex),
+                    vis3, prev3, crossings + [(ap, jchain, ex)],
+                    extra2 + ([ap] if ap != end_lane else []) + jchain + [ex],
+                    depth + 1, lg.length(ex))
+            if r is not None:
+                return r
+        return None
+
+    return rec(start, start_len, {start[0]}, start[0], [], [], 0, 0.0)
+
+
 def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
                min_len_m: float = 0.0, ext_max: int = 0,
                used_roads: dict | None = None,
                ext_forward_max_m: float = 700.0,
-               exit_clear_cap_m: float = 0.0):
+               exit_clear_cap_m: float = 0.0,
+               search: dict | None = None):
     """start 차로에서 turns 정책대로 걷는다. 성공 → (chain, waypoint rows), 실패 → None.
 
     · turns 소진 후 경로 길이가 min_len_m 미만이면 'any' 교차로 통과를 최대
@@ -202,18 +302,38 @@ def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
     · 'any' 의 교차로 출구는 균등이 아니라 **미방문 road 가중**으로 뽑는다
       (실행 내 방문 횟수 n → 가중 1/(1+n), Efraimidis-Spirakis 1개 추첨) —
       used_roads 는 RoutePool 이 실행 단위로 유지·기록한다.
+    · search 가 주어지면(주행 검증형: min_length_m ≥ search_min_length_m) 필수
+      turns 이후의 연장을 그리디 대신 **백트랙 탐색**(_search_extend)으로 한다 —
+      막다른 회랑에서 되돌아 나올 수 있어 3 km 도달률이 오른다. 필수 turns
+      구간은 기존 로직 그대로다.
     · 비교차로 전진의 successors[0] 은 실측상 아무것도 버리지 않는다
       (2026-08-28 전수: 일반도로 lane 의 비교차로 successor 는 0 또는 1개)."""
     if used_roads is None:
         used_roads = {}
     chain = [start]
     s0 = min(8.0, lg.length(start) * 0.2)
+    visited_roads = None    # 탐색 모드에서만 채운다 — 꼬리 주행의 재방문 가드
     entries = []            # (entry_lane, exit_lane)
     cur = start
     dist_since_exit = lg.length(start) - s0
     route_len = dist_since_exit
     ti = 0
     while True:
+        if search is not None:
+            # 주행 검증형: 필수 turns + 연장을 한 번의 백트랙 탐색으로 만든다
+            res = _search_walk(lg, rng, start, turns, route_len, min_len_m,
+                               used_roads, int(search['expand_max']),
+                               ext_forward_max_m, int(search['max_depth']), max_gap_m)
+            if res is None:
+                WALK_EXT_STATS['탐색 실패(목표 길이 단순 경로 없음)'] += 1
+                return None                  # 다른 출발 후보로 재시도
+            crossings, route_len, cur, extra = res
+            chain += extra
+            entries += [(ap, ex) for ap, _jc, ex in crossings]
+            visited_roads = {start[0]} | {k[0] for k in extra}
+            WALK_EXT_STATS['탐색 목표 달성'] += 1
+            WALK_EXT_LENS['탐색 목표 달성'].append(route_len)
+            break
         required = ti < len(turns)
         if required:
             want = turns[ti]
@@ -301,8 +421,13 @@ def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
         nxts = [k for k in lg.successors(cur) if lg.lanes[k]['junction'] == -1]
         if not nxts:
             break
+        if visited_roads is not None and nxts[0][0] != cur[0] \
+                and nxts[0][0] in visited_roads:
+            break                            # 꼬리가 지나온 도로로 되돌아간다 — 중단
         cur = nxts[0]
         chain.append(cur)
+        if visited_roads is not None:
+            visited_roads.add(cur[0])
         tail -= lg.length(cur)
     end_s = max(lg.length(cur) - max(5.0, min(15.0, lg.length(cur) * 0.2)), lg.length(cur) * 0.5)
     # 경유점 rows: 시작 + (진입, 진출)*N + 종료
@@ -358,6 +483,17 @@ def _check_require(lg, chain, require) -> bool:
 
 
 _START_POOL_CACHE: dict = {}
+_EV_CFG = None       # params.yaml gen_events 캐시 (장거리 다중이벤트 배치 상수)
+
+
+def ev_cfg() -> dict:
+    global _EV_CFG
+    if _EV_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _EV_CFG = load_params_yaml()['gen_events']
+    return _EV_CFG
+
+
 _COV_CFG = None      # params.yaml gen_coverage 캐시 (후보 선별·추첨 상수의 단일 출처)
 
 
@@ -385,31 +521,54 @@ def _forward_clear_m(lg, k, need: float) -> float:
     return acc
 
 
+def _quad4(h: float) -> int:
+    """heading [rad] → 4분면 인덱스 (0=E, 1=N, 2=W, 3=S) — 셀 키의 방향 축."""
+    return int(((math.degrees(h) % 360.0) + 45.0) // 90.0) % 4
+
+
 def _cell_of(lg, k, cell_m: float) -> tuple:
-    x, y, _, _ = lg.point_at(k, 0.0)
-    return (int(x // cell_m), int(y // cell_m))
+    """시작 후보의 추첨 셀 키 = (격자 x, 격자 y, 시작 heading 4분면).
+
+    방향 축이 없으면 같은 회랑의 역방향 쌍둥이(2026-08-28 실측: pool 426개 중
+    반대차로 쌍 323, 그중 190쌍이 같은 200 m 셀)가 셀 감쇠에 함께 눌려,
+    실행 내에서 도로당 한 방향만 뽑혔다 (60건 중 양방향 사용 도로 3/30개).
+    방향을 키에 넣어 사용 이력 가중을 방향별로 분리한다 — 같은 위치라도
+    미사용 방향은 감쇠 없이 우선 추첨된다."""
+    x, y, _, h = lg.point_at(k, 0.0)
+    return (int(x // cell_m), int(y // cell_m), _quad4(h))
 
 
 def _spatial_order(lg, cands, rng, used_cells: dict) -> list:
-    """공간 분산 추첨 순서 — 맵을 격자 셀로 나눠 셀을 먼저 뽑고 셀 안에서 추첨.
+    """공간·방향 분산 추첨 순서 — 맵을 (격자 셀 × 방향 4분면)으로 나눠 셀을
+    먼저 뽑고 셀 안에서 추첨.
 
     셀 순열은 라운드마다 가중 무작위(Efraimidis-Spirakis: u^(1/w) 내림차순,
     같은 실행에서 이미 쓴 셀은 w=1/(1+사용횟수) 로 감쇠). 게이트 폐기 후
     재시도는 이 순서를 따라가므로 자연히 "풀 전체 재추첨"이다 — 인접 후보로
     밀리며 편향이 쌓이는 일이 없다."""
     cell_m = float(cov_cfg()['grid_cell_m'])
+    boost = float(cov_cfg()['reverse_dir_boost'])
     by: dict = {}
     for k in cands:
         by.setdefault(_cell_of(lg, k, cell_m), []).append(k)
     for lst in by.values():
         rng.shuffle(lst)
+
+    def _exp(c):
+        # E-S 가중 u^(1/w): 지수 = 1/w. 기본 w=1/(1+사용횟수) → 지수 1+사용횟수.
+        # 미사용 셀인데 같은 격자의 역방향 셀이 사용됐으면 w=reverse_dir_boost
+        # — 방문 회랑의 미사용 방향을 능동 우선한다 (2026-08-28, 방향 편향 해소).
+        u = used_cells.get(c, 0)
+        if u == 0 and used_cells.get((c[0], c[1], (c[2] + 2) % 4), 0) > 0:
+            return 1.0 / boost
+        return 1.0 + u
+
     order = []
     while True:
         live = [c for c in by if by[c]]
         if not live:
             return order
-        keyed = sorted(live, reverse=True,
-                       key=lambda c: rng.random() ** (1.0 + used_cells.get(c, 0)))
+        keyed = sorted(live, reverse=True, key=lambda c: rng.random() ** _exp(c))
         for c in keyed:
             order.append(by[c].pop())
 
@@ -654,12 +813,18 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
     if used_cells is None:
         used_cells = {}
     redraw_max = int(cov_cfg()['redraw_max'])
+    # 주행 검증형(목표 길이 ≥ search_min_length_m)만 연장을 탐색으로 — 짧은
+    # 경로에 탐색 비용을 쓸 이유가 없고, 이벤트형은 그리디로 이미 충족된다
+    search = ({'expand_max': cov['search_expand_max'],
+               'max_depth': cov['search_max_depth']}
+              if min_len >= float(cov['search_min_length_m']) else None)
     order = _spatial_order(lg, cands, rng, used_cells)
     for start in order[:redraw_max]:
         res = _walk_once(lg, rng, start, turns, tail, max_gap,
                          min_len_m=min_len, ext_max=ext_max, used_roads=used_roads,
                          ext_forward_max_m=float(cov['walk_ext_forward_max_m']),
-                         exit_clear_cap_m=float(cov['walk_exit_clear_cap_m']))
+                         exit_clear_cap_m=float(cov['walk_exit_clear_cap_m']),
+                         search=search)
         if res is None:
             continue
         chain, rows = res
@@ -1598,16 +1763,23 @@ def timeout_for(route_len: float) -> int:
 
 
 def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
-                   name: str, seed_key: str):
-    """이벤트 목록 → (xml_text, def_dict, warnings)."""
+                   name: str, seed_key: str, min_keep: int | None = None):
+    """이벤트 목록 → (xml_text, def_dict, warnings).
+
+    min_keep 이 주어지면(실전주행 scale_events) 개별 이벤트의 배치 실패
+    (겹침/공간 부족이 fracs 재시도로도 해소 안 됨)는 그 이벤트만 버리고
+    계속한다 — 단 최종 배치 수가 min_keep 미만이면 시나리오째 폐기(GenError)
+    → 호출자가 다른 경로로 백필한다."""
     ctx = Ctx(lg, route, random.Random(seed_key), ctrl_map)
     resolved = []
+    dropped = []
     for ev, v in events:
         if ev not in EVENTS:
             raise GenError(f'{name}: 모르는 이벤트 "{ev}"')
         # 구간 겹침/부족은 위치를 옮겨가며 재시도한다 (다중이벤트 대비).
         # 이벤트가 블록을 일부 추가하고 실패할 수 있으므로 스냅숏 후 복원한다.
-        fracs = [v.get('위치', 0.5)] + [0.15, 0.35, 0.55, 0.75, 0.9]
+        fracs = [v.get('위치', 0.5)] + list(v.get('_retry_fracs')
+                                            or [0.15, 0.35, 0.55, 0.75, 0.9])
         last = None
         for attempt, frac in enumerate(fracs):
             snap = (len(ctx.players), len(ctx.actions), len(ctx.moving),
@@ -1627,7 +1799,13 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                     raise
                 last = e
         if last is not None:
+            if min_keep is not None:
+                dropped.append(ev)          # 이 이벤트만 포기하고 계속 (min_keep 가드)
+                continue
             raise last
+    if min_keep is not None and len(resolved) < min_keep:
+        raise GenError(f'{name}: 이벤트 배치 {len(resolved)}/{len(events)}건 '
+                       f'(최소 {min_keep}) — 공간 부족, 시나리오 폐기')
     doc = XmlDoc(TEMPLATE)
     rt = route.rt
     doc.set_path(path_waypoints(lg, rt))
@@ -1648,6 +1826,8 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                    # 커버리지 누적용: 시작점 + 지나간 도로/교차로/회전 요약
                    **route_summary(lg, route)},
          'axes': axes, 'events': resolved,
+         **({'events_planned': len(events), 'events_dropped': dropped}
+            if min_keep is not None else {}),
          'est_s': round(est_seconds(rt['total_length']), 1),
          'timeout_s': timeout_for(rt['total_length'])}
     return xml_text, d, bad
@@ -1840,14 +2020,50 @@ def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
     ml = cfg.get('min_length_m')
     route = pool.get(*variant['route'],
                      min_length_m=None if ml is None else float(ml))
+    events = list(variant['event'])
+    scale = bool(cfg.get('scale_events'))
+    min_keep = None
+    if scale:
+        # 실전주행: 이벤트 개수 = 경로 길이 비례 (params gen_events.per_route_m),
+        # 상한 = 가용 구간 길이 / 최소 간격 (usable_spans 재사용 — 새 배치기 없음).
+        # 종류는 시나리오 시드로 무작위(중복 허용) — from-yaml 재생성도 같은
+        # 시드라 같은 목록이 나온다.
+        ge = ev_cfg()
+        flat = sum(b - a for a, b in usable_spans(lg, route.rt))
+        n = max(1, round(route.rt['total_length'] / float(ge['per_route_m'])))
+        n = min(n, max(1, int(flat // float(ge['min_gap_m']))))
+        rng_e = random.Random(f'{seed}:{theme}:{name}:events')
+        # 동행형(slow_lead/lead_brake — ego 기준 발동이라 위치 슬롯으로 분산되지
+        # 않는다)과 전역형(signal — 신호 타이밍 설정이라 중복이 덮어쓰기일 뿐)은
+        # 경로당 1회로 제한 — 실측(2026-08-30): 무제한이면 한 경로에 signal×3,
+        # 선행차 5대가 나와 원인 분리가 안 된다. 앵커형은 중복 무방(슬롯 분산).
+        unique_evs = {'slow_lead', 'lead_brake', 'signal'}
+        pool_all = list(cfg['event'])
+        events = []
+        for _ in range(int(n)):
+            avail = [e for e in pool_all
+                     if e not in unique_evs or e not in events]
+            events.append(rng_e.choice(avail))
+        min_keep = max(1, math.ceil(n * float(ge['min_keep_ratio'])))
     ev_list = []
-    n_ev = len(variant['event'])
-    for j, ev in enumerate(variant['event']):
+    n_ev = len(events)
+    for j, ev in enumerate(events):
         v = dict(variant)
         if n_ev > 1:                    # 다중이벤트: 위치 슬롯을 나눠 겹침 방지
-            slots = [0.3, 0.65, 0.9]
+            # scale_events 는 개수가 가변이라 균등 슬롯 — pick_s 가 가용 구간
+            # 이어붙인 길이축의 비율이므로 균등 비율 = 가용축 등간격(≥ min_gap).
+            # 기존 다중이벤트(combine)는 슬롯 고정 유지 (산출물 불변).
+            slots = ([(j2 + 0.5) / n_ev for j2 in range(n_ev)] if scale
+                     else [0.3, 0.65, 0.9])
             v['위치'] = slots[j % len(slots)]
             v['발동거리'] = slots[j % len(slots)]
+            if scale:
+                # 겹침 재시도를 자기 슬롯 근방으로 제한 — 전역 fracs 로 옮기면
+                # 다른 슬롯 이벤트와 붙어 min_gap_m 이 깨진다 (실측: 89 m).
+                # ±0.15/n, ±0.3/n 은 슬롯 반간격(0.5/n)의 30/60% — 이웃 불침범.
+                s0, d = v['위치'], 1.0 / n_ev
+                v['_retry_fracs'] = [min(0.98, max(0.02, s0 + k * d))
+                                     for k in (0.15, -0.15, 0.3, -0.3)]
         v.setdefault('위치', 0.5)
         v.setdefault('발동거리', v['위치'])
         v.setdefault('보행속도', 1.5)
@@ -1861,8 +2077,8 @@ def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
                                          {k: v for k, v in variant.items()
                                           if k not in ('route', 'event')} |
                                          {'route': list(variant['route']),
-                                          'event': variant['event']},
-                                         name, seed_key)
+                                          'event': events},
+                                         name, seed_key, min_keep=min_keep)
     return route, xml_text, sdef, bad
 
 
@@ -1940,6 +2156,19 @@ def main(argv=None) -> int:
             raise GenError(f'모르는 주제 "{th}" — 가능한 주제: {", ".join(themes)}')
 
     pool = RoutePool(lg, route_defs, a.seed, gen_cfg)
+    # 커버리지 이력 지속 (2026-08-28): 매 실행이 독립이면 같은 도로·방향을
+    # 반복 추첨한다 — 방문 이력(used_roads/used_cells)을 out_dir 단위 파일로
+    # 이어받아 실행 간에도 미방문 도로·방향을 우선한다. 같은 out_dir 반복
+    # 실행은 이력에 의존하는 게 의도다; 같은 seed 재현이 필요하면 새 out_dir
+    # 을 쓰거나 이 파일을 지울 것 (테스트도 새 out_dir 기준).
+    hist_path = pathlib.Path(a.out_dir) / 'coverage_history.json'
+    if hist_path.exists():
+        hist = json.loads(hist_path.read_text(encoding='utf-8'))
+        pool.used_roads.update({int(k): int(v) for k, v in hist['used_roads'].items()})
+        pool.used_cells.update({tuple(int(t) for t in k.split(',')): int(v)
+                                for k, v in hist['used_cells'].items()})
+        print(f'커버리지 이력 이어받음: 방문 도로 {len(pool.used_roads)}개, '
+              f'시작 셀 {len(pool.used_cells)}개 ({hist_path})')
     combos = {th: expand_theme(th, themes[th], a.seed, route_defs) for th in a.themes}
 
     def route_len(route_key):
@@ -1956,11 +2185,26 @@ def main(argv=None) -> int:
         n_ok = 0
         est_total = 0.0
         target = len(chosen[th])
-        # 실패한 변형은 선택되지 않은 나머지 조합으로 백필해 개수를 채운다
+        # 실패한 변형은 선택되지 않은 나머지 조합으로 백필해 개수를 채운다.
+        # start: 자유 주제는 조합이 소진돼도 새 순번(=새 시작점의 walk)으로
+        # 이어서 백필한다 — 조합 수 == target 이면 실패 1건이 곧 개수 미달이던
+        # 문제(2026-08-28 실측: 다중이벤트 17/20) 방지. 상한 3×target.
         picked = {id(c) for c in chosen[th]}
         queue = list(chosen[th]) + [c for c in combos[th] if id(c) not in picked]
-        for variant in queue:
-            if n_ok >= target:
+        free_mode = bool(combos[th] and combos[th][0]['route'][2])
+        next_rv = max((c['route'][1] for c in combos[th]), default=0) + 1
+        extra_used, qi = 0, 0
+        while n_ok < target:
+            if qi < len(queue):
+                variant = queue[qi]
+                qi += 1
+            elif free_mode and extra_used < 3 * target:
+                base = combos[th][extra_used % len(combos[th])]
+                variant = dict(base)
+                variant['route'] = (base['route'][0], next_rv, base['route'][2])
+                next_rv += 1
+                extra_used += 1
+            else:
                 break
             name = f'{th}_{n_ok + 1:02d}_{variant["route"][0]}'
             if variant['route'][1] != 1 and 'walk' in route_defs.get(variant['route'][0], {}):
@@ -1992,6 +2236,11 @@ def main(argv=None) -> int:
 
     # ── batch 목록: 디스크(<주제>/*.yaml)가 단일 출처 — 매번 전체 재생성 ──
     out_dir.mkdir(parents=True, exist_ok=True)
+    hist_path.write_text(json.dumps(
+        {'used_roads': {str(k): v for k, v in sorted(pool.used_roads.items())},
+         'used_cells': {','.join(map(str, k)): v
+                        for k, v in sorted(pool.used_cells.items())}},
+        indent=1), encoding='utf-8')
     n_all, n_themes = rebuild_batch_lists(out_dir, a.vtd_dir)
 
     # ── 요약 ─────────────────────────────────────────────────────────────

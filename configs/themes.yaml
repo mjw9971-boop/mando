@@ -77,7 +77,8 @@ themes:
   보행자집중:
     min_length_m: 400
     event: [pedestrian]
-    routes: [직진]
+    # 회전 경로 포함 — 회전 중 이벤트 대응이 더 까다롭고 커버리지도 늘어난다 (2026-08-28 확정)
+    routes: [직진, 우회전, 좌회전]
     vary: [위치, 보행속도, 신호, 트리거거리]
     start: 자유
     보행속도: [1.0, 1.5, 2.0]
@@ -86,7 +87,8 @@ themes:
   무단횡단집중:
     min_length_m: 400
     event: [jaywalk]
-    routes: [직진]
+    # 회전 경로 포함 — 회전 중 이벤트 대응 검증 (2026-08-28 확정)
+    routes: [직진, 우회전, 좌회전]
     vary: [위치, 보행속도, 트리거거리, 지점]
     start: 자유
     지점: [횡단보도, 도로중간]      # 신호 무시 + 횡단보도 밖 지점 포함
@@ -94,7 +96,8 @@ themes:
   보행자사각:
     min_length_m: 400
     event: [ped_blind]
-    routes: [직진]
+    # 회전 경로 포함 — 회전 중 이벤트 대응 검증 (2026-08-28 확정)
+    routes: [직진, 우회전, 좌회전]
     vary: [위치, 보행속도, 트리거거리, 차폐물]
     start: 자유
     차폐물: [버스, 승용차]
@@ -102,14 +105,17 @@ themes:
   추월집중:
     min_length_m: 400
     event: [static_vehicle]
-    routes: [직진]
+    # 회전 추가는 보류 후보 — 회전 구간은 차선변경 공간이 좁아 회피가 성립하지
+    # 않을 수 있어 폐기율 실측으로 판단한다 (2026-08-28)
+    routes: [직진, 우회전, 좌회전]
     vary: [위치, 차선, 대향차]
     start: 자유
 
   급정거집중:
     min_length_m: 400
     event: [lead_brake]
-    routes: [직진]
+    # 회전 경로 포함 — 회전 중 이벤트 대응 검증 (2026-08-28 확정)
+    routes: [직진, 우회전, 좌회전]
     vary: [감속강도, 발동거리, 재출발]
     감속강도: [3.0, 5.0, 7.0]
     start: 자유
@@ -157,7 +163,8 @@ themes:
   연쇄장애물:
     min_length_m: 400
     event: [obstacle_chain]
-    routes: [직진]
+    # 회전 경로 포함 — 회전 중 이벤트 대응 검증 (2026-08-28 확정)
+    routes: [직진, 우회전, 좌회전]
     vary: [위치, 개수]
     개수: [3, 4, 6]
     start: 자유
@@ -175,7 +182,9 @@ themes:
     event: [pedestrian, lead_brake, static_vehicle, obstacle_chain]
     combine: 2
     routes: [직진, 우회전, 좌회전]
-    vary: [위치]
+    # 위치 축 제거 (2026-08-28 실측): combine>1 이면 gen_one 이 위치를 슬롯
+    # (0.3/0.65/0.9)으로 강제해 값을 바꿔도 XML 이 동일했다
+    vary: []
     start: 자유
 
   완주속도:
@@ -185,8 +194,25 @@ themes:
     routes: [직진, 우회전, 좌회전, 속도전환]
     vary: []
 
+  실전주행:
+    # 대회 실전형 — 3 km 단일 경로에 이벤트를 길이 비례로 분산 배치.
+    # 개수·간격·실패 처리는 params gen_events.* (500 m 당 1건, 최소 간격 150 m,
+    # 60% 미만 배치 시 폐기). 종류는 시나리오마다 무작위 조합(중복 허용) —
+    # 랜덤카오스의 random_axes 방식. 백트랙 탐색(작업2)으로 3 km 가 안정적으로
+    # 나오면서 성립한 주제 (2026-08-30).
+    min_length_m: 3000
+    event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
+            static_vehicle, obstacle_chain, signal, narrow]
+    scale_events: true
+    random_axes: true
+    start: 자유
+    routes: [직진, 우회전, 좌회전, 연속교차로]
+    # 위치 축 없음 — scale_events 가 균등 슬롯으로 강제. 신호 축 없음 —
+    # signal 이벤트는 기본 적60 (랜덤카오스와 같은 이유, 2026-08-28).
+    vary: [보행속도, 트리거거리, 감속강도, 발동거리, 개수, 속도, 차선]
+
   전체회귀:
-    min_length_m: 800
+    min_length_m: 800               # 이벤트 순환형 — 여러 이벤트를 고루 담으려면 400보다 여유 필요
     event: [pedestrian, jaywalk, ped_blind, lead_brake, slow_lead,
             static_vehicle, oncoming, signal, obstacle_chain, none]
     rotate: true
@@ -201,4 +227,7 @@ themes:
     random_axes: true
     start: 자유
     routes: [직진, 우회전, 좌회전, 연속교차로]
-    vary: [위치, 보행속도, 트리거거리, 감속강도, 발동거리, 개수, 속도, 차선, 신호]
+    # 신호 축 제거 (2026-08-28 실측): 값 풀이 이벤트별로 상충 — signal 이벤트는
+    # 적60/딜레마/짧은녹색만 유효해서 랜덤 조합의 기본/적색이 폐기를 유발했다.
+    # signal 은 기본값 적60 으로 생성되고, 보행자 적색 변형은 보행자집중이 커버.
+    vary: [위치, 보행속도, 트리거거리, 감속강도, 발동거리, 개수, 속도, 차선]
