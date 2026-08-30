@@ -92,6 +92,8 @@ AXIS_DEFAULTS = {
     '침범폭': [0.4, 0.7, 1.0],
     '경로변형': [1, 2],
     '방향': ['우측', '좌측'],
+    '교통류대수': [12, 20, 30],
+    '교통류밀도': ['조밀', '보통', '성김'],
 }
 
 
@@ -520,6 +522,17 @@ def trg_cfg() -> dict:
         from vtd_adapter.config import load_params_yaml
         _TRG_CFG = load_params_yaml()['event_trigger']
     return _TRG_CFG
+
+
+_PULK_CFG = None     # params.yaml pulk 캐시 (VTD 네이티브 교통류 PulkDef 상수)
+
+
+def pulk_cfg() -> dict:
+    global _PULK_CFG
+    if _PULK_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _PULK_CFG = load_params_yaml()['pulk']
+    return _PULK_CFG
 
 
 _COV_CFG = None      # params.yaml gen_coverage 캐시 (후보 선별·추첨 상수의 단일 출처)
@@ -1138,6 +1151,18 @@ class XmlDoc:
         body = ''.join('\n' + b.rstrip() for b in blocks)
         self.text = self.text.replace(
             anchor, f'    <MovingObjectsControl>{body}\n    </MovingObjectsControl>', 1)
+
+    def set_pulk(self, attrs: str):
+        """빈 <PulkTraffic/> 을 <PulkTraffic><PulkDef …/></PulkTraffic> 로 채운다.
+
+        대회 제공 XML 11행에 이미 빈 태그가 있으므로 **삽입이 아니라 치환**이다
+        — 새로 붙이면 태그가 둘이 된다. _sub1 이 일치 1개를 강제하므로 중복
+        생성도, 앵커 실종도 조용히 지나가지 않는다.
+        """
+        self._sub1(r'<PulkTraffic\s*/>|<PulkTraffic>.*?</PulkTraffic>',
+                   '<PulkTraffic>\n'
+                   f'        <PulkDef {attrs}/>\n'
+                   '    </PulkTraffic>', 'PulkTraffic 채우기')
 
     def set_signal(self, ctrl_id: int, go: float, attention: float, stop: float):
         m = re.search(rf'<SignalController Id="{ctrl_id}" [^>]*>.*?</SignalController>',
@@ -1904,14 +1929,79 @@ def timeout_for(route_len: float) -> int:
     return max(180, int(route_len / AVG_SPEED_MPS * 1.8 + 90))
 
 
+# ── VTD 네이티브 교통류 (PulkTraffic) ────────────────────────────────────
+
+# PulkDef 속성 순서 — 실기 검증된 Scenario Editor 2025.2 산출물과 같은 순서로
+# 낸다. (params 키, 서식) 쌍이라 상수는 전부 params pulk.* 다.
+_PULK_ATTRS = (
+    ('SemiMajorAxis', 'semi_major_m', 'len'), ('SemiMinorAxis', 'semi_minor_m', 'len'),
+    ('InnerRadius', 'inner_radius_m', 'len'), ('CenterOffset', 'center_offset_m', 'len'),
+    ('AreaF', 'area_f', 'ratio'), ('AreaB', 'area_b', 'ratio'),
+    ('AreaL', 'area_l', 'ratio'), ('AreaR', 'area_r', 'ratio'),
+    ('OwnSide', 'own_side', 'ratio'),
+    ('Cars', 'cars', 'ratio'), ('Vans', 'vans', 'ratio'), ('Buses', 'buses', 'ratio'),
+    ('Trucks', 'trucks', 'ratio'), ('Bikes', 'bikes', 'ratio'),
+)
+_PULK_SUMS = (('Area(F/B/L/R)', ('area_f', 'area_b', 'area_l', 'area_r')),
+              ('Vehicle Classes', ('cars', 'vans', 'buses', 'trucks', 'bikes')))
+
+
+def pulk_def(axes: dict) -> dict:
+    """축 값 + params pulk.* → PulkDef 속성 dict. 이벤트가 아니라 시나리오 전역이다.
+
+    왜 이벤트가 아닌가: PulkTraffic 은 경로의 한 구간이 아니라 **ego 를 따라다니는
+    영역**이다. 구간 배타 모델(ctx.claim)에 넣으면 다른 이벤트를 전부 밀어내고,
+    event 목록에 넣으면 배치 실패·슬롯 분배 같은 구간 이벤트 논리를 타게 된다.
+
+    축 연동 (시드 → 값): '교통류대수' → Count, '교통류밀도' → 영역 크기 프리셋
+    (semi_major/minor + inner_radius). 축이 없으면 params 기본값. 밀도 프리셋은
+    비율을 건드리지 않으므로 축이 어떻게 뽑혀도 아래 두 합계는 유지된다.
+
+    두 합계(Area 4개, 차종 5개)를 여기서 검증하고 1.0 에서 벗어나면 GenError 다.
+    **자동 보정하지 않는다** — 조용히 고치면 시나리오마다 다른 값이 들어가고,
+    에디터가 나중에 같은 검사로 거부할 때 원인을 되짚을 수 없다.
+    """
+    pc = pulk_cfg()
+    vals = {k: pc[k] for _, k, _ in _PULK_ATTRS}
+    dens = axes.get('교통류밀도')
+    if dens is not None:
+        presets = pc['density']
+        if dens not in presets:
+            raise GenError(f'pulk: 모르는 교통류밀도 "{dens}" — '
+                           f'params pulk.density 에 {", ".join(presets)} 만 있다')
+        vals.update(presets[dens])
+    for what, keys in _PULK_SUMS:
+        tot = sum(float(vals[k]) for k in keys)
+        if abs(tot - 1.0) > 1e-6:
+            raise GenError(f'pulk: {what} 합이 {tot:.4f} 다 (1.0 이어야 한다) — '
+                           f'params pulk.{"/".join(keys)} 를 고칠 것')
+    count = int(axes.get('교통류대수') or pc['count'])
+    if count < 1:
+        raise GenError(f'pulk: Count 가 {count} 다 (1 이상이어야 한다)')
+    out = {'CentralPlayer': 'Ego', 'Count': count, 'FillAtStart': 'true'}
+    for attr, key, kind in _PULK_ATTRS:
+        # 서식 고정 = 같은 축 값이면 바이트 동일. len 은 정수형(300), 비율은 0.40.
+        out[attr] = f'{float(vals[key]):g}' if kind == 'len' else f'{float(vals[key]):.2f}'
+    out['VisibleInArea'] = '-1'
+    return out
+
+
+def pulk_attrs(d: dict) -> str:
+    return ' '.join(f'{k}="{v}"' for k, v in d.items())
+
+
 def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
-                   name: str, seed_key: str, min_keep: int | None = None):
+                   name: str, seed_key: str, min_keep: int | None = None,
+                   pulk: dict | None = None):
     """이벤트 목록 → (xml_text, def_dict, warnings).
 
     min_keep 이 주어지면(실전주행 scale_events) 개별 이벤트의 배치 실패
     (겹침/공간 부족이 fracs 재시도로도 해소 안 됨)는 그 이벤트만 버리고
     계속한다 — 단 최종 배치 수가 min_keep 미만이면 시나리오째 폐기(GenError)
-    → 호출자가 다른 경로로 백필한다."""
+    → 호출자가 다른 경로로 백필한다.
+
+    pulk 는 pulk_def 결과 — 이벤트가 아니라 시나리오 전역 속성이라 events 와
+    별도 인자로 받아 <PulkTraffic> 에 그대로 쓴다."""
     ctx = Ctx(lg, route, random.Random(seed_key), ctrl_map)
     resolved = []
     dropped = []
@@ -1954,6 +2044,8 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
     doc.set_path(path_waypoints(lg, rt))
     doc.set_ego(rt['start_s_in_lane'], rt['start_s_in_lane'] + rt['total_length'],
                 _start_lane_id(rt))
+    if pulk:
+        doc.set_pulk(pulk_attrs(pulk))
     doc.add_players(ctx.players)
     doc.add_player_actions(ctx.actions)
     doc.add_moving(ctx.moving)
@@ -1969,6 +2061,7 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                    # 커버리지 누적용: 시작점 + 지나간 도로/교차로/회전 요약
                    **route_summary(lg, route)},
          'axes': axes, 'events': resolved,
+         **({'pulk': dict(pulk)} if pulk else {}),
          **({'events_planned': len(events), 'events_dropped': dropped}
             if min_keep is not None else {}),
          'est_s': round(est_seconds(rt['total_length']), 1),
@@ -2218,12 +2311,15 @@ def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
             v['_속도_kph'] = float(cfg['속도_kph'])
         ev_list.append((ev, v))
     seed_key = f'{seed}:{theme}:{name}'
-    xml_text, sdef, bad = build_scenario(lg, ctrl_map, route, ev_list,
-                                         {k: v for k, v in variant.items()
-                                          if k not in ('route', 'event')} |
-                                         {'route': list(variant['route']),
-                                          'event': events},
-                                         name, seed_key, min_keep=min_keep)
+    axes = {k: v for k, v in variant.items() if k not in ('route', 'event')} | \
+        {'route': list(variant['route']), 'event': events}
+    # 교통류는 이벤트가 아니라 시나리오 전역 속성 — event 목록이 아니라 테마의
+    # pulk 플래그로 켠다. 축 값(교통류대수·교통류밀도)은 axes 에 이미 들어 있어
+    # --from-yaml 재생성도 같은 PulkDef 를 낸다.
+    pulk = pulk_def(axes) if cfg.get('pulk') else None
+    xml_text, sdef, bad = build_scenario(lg, ctrl_map, route, ev_list, axes,
+                                         name, seed_key, min_keep=min_keep,
+                                         pulk=pulk)
     return route, xml_text, sdef, bad
 
 

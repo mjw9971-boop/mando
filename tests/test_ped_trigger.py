@@ -166,48 +166,51 @@ def tick(route_s, ped_lat=None, yaw=0.0, ex=0.0, ey=0.0, side='우측'):
 
 EV = {'kind': 'jaywalk', 'route_s': 100.0, 'lane_w_m': 3.0, 'from': '우측',
       'meet_lat_m': 0.5}
+# 판정에 쓰는 기대값 — 허용대는 lane_w_m 에서 나오고 나머지는 표시용이다.
+EXP = {'lane_w_m': 3.0, 'meet_lat_m': 0.5,
+       't_near_s': 3.2, 't_far_s': 5.2, 't_meet_s': 3.6}
 
 
 def test_verdict_ok_when_pedestrian_in_lane():
     ts = [tick(90.0, 3.0), tick(100.0, 0.5), tick(110.0, -2.0)]
-    assert ec.check_event(EV, ts, 1.0)['verdict'] == ec.OK
+    assert ec.check_event(EV, ts, 1.0, EXP)['verdict'] == ec.OK
 
 
 def test_verdict_late_reproduces_the_real_failure():
     """실사고 재현: ego 통과 시 보행자가 아직 5.8 m 밖 (옛 고정 25 m 의 양상)."""
-    r = ec.check_event(EV, [tick(100.0, 5.82)], 1.0)
+    r = ec.check_event(EV, [tick(100.0, 5.82)], 1.0, EXP)
     assert r['verdict'] == ec.LATE and r['lat_m'] == 5.82
 
 
 def test_verdict_early_when_already_crossed():
-    assert ec.check_event(EV, [tick(100.0, -6.0)], 1.0)['verdict'] == ec.EARLY
+    assert ec.check_event(EV, [tick(100.0, -6.0)], 1.0, EXP)['verdict'] == ec.EARLY
 
 
 def test_verdict_no_pedestrian_object():
-    assert ec.check_event(EV, [tick(100.0, None)], 1.0)['verdict'] == ec.NOSEE
+    assert ec.check_event(EV, [tick(100.0, None)], 1.0, EXP)['verdict'] == ec.NOSEE
 
 
 def test_verdict_not_reached():
-    assert ec.check_event(EV, [tick(40.0, 1.0)], 1.0)['verdict'] == ec.NOREACH
+    assert ec.check_event(EV, [tick(40.0, 1.0)], 1.0, EXP)['verdict'] == ec.NOREACH
 
 
 def test_band_is_half_lane_plus_tolerance():
-    r = ec.check_event(EV, [tick(100.0, 2.4)], 1.0)
+    r = ec.check_event(EV, [tick(100.0, 2.4)], 1.0, EXP)
     assert r['band_m'] == pytest.approx(2.5) and r['verdict'] == ec.OK
-    assert ec.check_event(EV, [tick(100.0, 2.6)], 1.0)['verdict'] == ec.LATE
+    assert ec.check_event(EV, [tick(100.0, 2.6)], 1.0, EXP)['verdict'] == ec.LATE
 
 
 def test_left_side_sign_convention():
     ev = dict(EV, **{'from': '좌측'})
-    assert ec.check_event(ev, [tick(100.0, 0.5, side='좌측')], 1.0)['verdict'] == ec.OK
-    assert ec.check_event(ev, [tick(100.0, 5.8, side='좌측')], 1.0)['verdict'] == ec.LATE
+    assert ec.check_event(ev, [tick(100.0, 0.5, side='좌측')], 1.0, EXP)['verdict'] == ec.OK
+    assert ec.check_event(ev, [tick(100.0, 5.8, side='좌측')], 1.0, EXP)['verdict'] == ec.LATE
 
 
 def test_verdict_holds_under_rotated_heading():
     """판정이 ego 헤딩과 무관해야 한다 (좌표 변환 검증)."""
     for yaw in (0.0, 1.0, -2.5, math.pi):
-        assert ec.check_event(EV, [tick(100.0, 5.82, yaw=yaw)], 1.0)['verdict'] == ec.LATE
-        assert ec.check_event(EV, [tick(100.0, 0.5, yaw=yaw)], 1.0)['verdict'] == ec.OK
+        assert ec.check_event(EV, [tick(100.0, 5.82, yaw=yaw)], 1.0, EXP)['verdict'] == ec.LATE
+        assert ec.check_event(EV, [tick(100.0, 0.5, yaw=yaw)], 1.0, EXP)['verdict'] == ec.OK
 
 
 def test_check_scenario_counts_unreached(tmp_path):
@@ -223,3 +226,101 @@ def test_check_scenario_counts_unreached(tmp_path):
     rep = ec.check_scenario(str(y), str(log))
     assert (rep['total'], rep['ok'], rep['unreached']) == (3, 1, 2)
     assert '미도달2' in ec.render(rep)
+
+
+# ── 기대값 산출 (expectation) ────────────────────────────────────────────
+# 2026-08-30: 구 생성기 산출물(트리거 고정 25 m)의 보행자 4건이 전부 '기대없음'
+# 으로 나와 판정이 통째로 비었다. yaml 에 기대값이 없으면 지도에서 다시 잰다.
+LEGACY_EV = {'kind': 'jaywalk', 'route_s': 473.04, 'from': '우측',
+             'walk_speed': 1.5, 'trigger_d': 25}      # lane_w_m·meet_lat_m 없음
+
+
+class EdgeLG(FakeLG):
+    """expectation 이 보는 최소 LaneGraph — 차로폭·제한속도·차도 가장자리."""
+
+    def __init__(self, lane_w, limit_kph, left, right):
+        super().__init__(lane_w, limit_kph)
+        self._edges = (left, right)
+
+    def roadway_edges(self, _k, _s):
+        return self._edges
+
+
+KEY = ('r', 0, -1)
+
+
+def test_expectation_none_without_map_or_yaml_values():
+    """지도도 yaml 값도 없으면 판정 불가 — 조용히 통과시키지 않는다."""
+    assert ec.expectation(LEGACY_EV, et()) is None
+
+
+def test_expectation_measured_from_map_when_yaml_lacks_it():
+    """실사고 재현 — 지도로 재면 옛 고정 25 m 가 왜 못 만나는지가 수치로 나온다.
+
+    ego 도착(2.24 s)이 보행자의 조우 창(5.21~7.28 s)보다 훨씬 이르다.
+    """
+    c = et()
+    exp = ec.expectation(LEGACY_EV, c, EdgeLG(3.101, None, 11.26, 7.863), KEY, 48.5)
+    v_exp = float(c['default_limit_kph']) / 3.6 * float(c['speed_factor'])
+    lat0 = 7.863 + float(c['ped_start_margin_m'])
+    t_meet = (25 + float(c['radius_m'])) / v_exp
+    assert exp['lane_w_m'] == 3.1
+    assert exp['t_meet_s'] == pytest.approx(t_meet, abs=0.01)
+    assert exp['meet_lat_m'] == pytest.approx(lat0 - 1.5 * t_meet, abs=0.01)
+    assert exp['t_near_s'] < exp['t_far_s']
+    assert exp['t_meet_s'] < exp['t_near_s']          # 보행자가 차로에 닿기 전에 도착
+
+
+def test_expectation_reproduces_generator_for_new_scenarios(patched):
+    """같은 공식 하나 — 역산이 남긴 yaml 을 그대로 읽으면 생성기 값과 일치한다."""
+    ctx = patched(FakeCtx(lane_w=3.3, limit_kph=30, road_right=5.0))
+    trg = gs.ped_trigger(ctx, 500.0, 1.5, '우측', 'pedestrian')
+    ev = {'kind': 'pedestrian', 'route_s': 500.0, 'from': '우측', **trg}
+    exp = ec.expectation(ev, et())                     # 지도 없이 yaml 만으로
+    assert exp['lane_w_m'] == trg['lane_w_m']
+    assert exp['meet_lat_m'] == trg['meet_lat_m']
+    assert (exp['t_near_s'], exp['t_far_s']) == (trg['t_near_s'], trg['t_far_s'])
+
+
+def test_expectation_prefers_yaml_over_recomputation():
+    """yaml 값이 곧 xml 이 만들어진 값 — 반올림된 입력으로 다시 계산하지 않는다."""
+    ev = dict(LEGACY_EV, lane_w_m=3.0, lat_start_m=6.48, v_exp_mps=7.5,
+              meet_lat_m=0.11, t_near_s=0.22, t_far_s=0.33)
+    exp = ec.expectation(ev, et())
+    assert (exp['meet_lat_m'], exp['t_near_s'], exp['t_far_s']) == (0.11, 0.22, 0.33)
+
+
+def test_legacy_scenario_gets_real_verdict_not_placeholder(tmp_path):
+    """구 시나리오도 지도만 있으면 성립/늦음/… 로 판정된다 (옛 '기대없음' 제거)."""
+    import yaml as _yaml
+    y = tmp_path / 's.yaml'
+    y.write_text(_yaml.safe_dump({'events': [dict(LEGACY_EV, route_s=100.0)]},
+                                 allow_unicode=True), encoding='utf-8')
+    log = tmp_path / 'r.jsonl'
+    log.write_text(''.join(
+        json.dumps({**tick(s, 5.82), 'raw': {}, 'ego': dict(tick(s, 5.82)['ego'],
+                                                            lane=list(KEY), s=48.5)}) + '\n'
+        for s in (50.0, 100.0, 150.0)), encoding='utf-8')
+    rep = ec.check_scenario(str(y), str(log), None,
+                            EdgeLG(3.101, None, 11.26, 7.863))
+    assert rep['events'][0]['verdict'] == ec.LATE
+    assert ec.LEGACY not in ec.render(rep)
+
+
+def test_unreached_events_still_counted_before_expectation(tmp_path):
+    """미도달 판정이 기대값 유무보다 앞선다 — 옛 코드는 '기대없음'이 이걸 가렸다."""
+    import yaml as _yaml
+    y = tmp_path / 's.yaml'
+    y.write_text(_yaml.safe_dump({'events': [dict(LEGACY_EV, route_s=900.0)]},
+                                 allow_unicode=True), encoding='utf-8')
+    log = tmp_path / 'r.jsonl'
+    log.write_text(json.dumps({**tick(100.0, 1.0), 'raw': {},
+                               'ego': dict(tick(100.0, 1.0)['ego'],
+                                           lane=list(KEY), s=48.5)}) + '\n',
+                   encoding='utf-8')
+    rep = ec.check_scenario(str(y), str(log), None,
+                            EdgeLG(3.101, None, 11.26, 7.863),
+                            route={'lanes': [KEY], 'cum_s': [0.0], 'lengths': [1000.0],
+                                   'total_length': 1000.0})
+    assert (rep['unreached'], rep['events'][0]['verdict']) == (1, ec.NOREACH)
+    assert rep['events'][0]['expect_lat_m'] is not None      # 못 갔어도 기대값은 낸다
