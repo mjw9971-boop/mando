@@ -200,6 +200,16 @@ class KrRules:
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
         self.obj_grace = int(ot.get('obj_grace_ticks', 10))
+        # 규칙 2 — 데드락 해제 (BREAKOUT)
+        self.BO_CREEP = 4                                  # 크립이 켜지는 단계
+        self.bo_enabled = bool(ot.get('breakout_enabled', False))
+        self.bo_eps = float(ot.get('stuck_eps', 0.2))
+        self.bo_hard_ticks = int(round(float(ot.get('stuck_hard_s', 10.0)) * self.hz))
+        self.bo_esc_ticks = int(round(float(ot.get('escalate_s', 2.0)) * self.hz))
+        self.bo_fail_ticks = int(round(float(ot.get('creep_fail_s', 6.0)) * self.hz))
+        self.bo_creep_v = float(ot.get('creep_v', 1.0))
+        self.bo_progress_m = float(ot.get('progress_m', 2.0))
+        self.bo_creep_eps_m = float(ot.get('creep_progress_eps_m', 0.3))
         self.ot_enabled = bool(ot['enabled'])
         self.ot_v_max = float(ot['blocker_speed_max'])
         self.ot_d_max = float(ot['blocker_dist_max'])
@@ -238,6 +248,15 @@ class KrRules:
         self.obj_ticks: dict = {}                  # 객체별 정지 지속 틱
         self.obj_miss: dict = {}                   # 객체별 미관측 틱 (grace)
         self._sl_all: list | None = None           # 경로상 전 정지선 route_s (1회)
+        # BREAKOUT 상태
+        self.bo_state: str | None = None           # None | 'BREAKOUT' | 'CREEP_FAIL'
+        self.bo_level = 0
+        self.bo_stuck_ticks = 0
+        self.bo_lvl_ticks = 0
+        self.bo_stall_ticks = 0
+        self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
+        self.bo_ref_s: float | None = None         # 마지막 진전 route_s (무진전 판정)
+        self.bo_exit: str | None = None
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
         self.last_sig_lead_s: float | None = None  # 이벤트까지 남은 시간 [s]
@@ -537,6 +556,125 @@ class KrRules:
                 n += 1
         return n >= 1
 
+    # ── 규칙 2: 데드락 해제 (BREAKOUT) ──────────────────────────────────
+    def _obstacle_cause(self, planner, ap) -> bool:
+        """지금 정지 원인이 **장애물 계열**인가. 하나라도 아니면 거짓.
+
+        BREAKOUT 은 제약을 풀고 전진을 강제하므로, 원인이 신호·보행자·종점
+        이면 **절대 발동하면 안 된다**. PDM 이 매 틱 세우는 hazard 플래그와
+        kr_rules 자신의 래치를 모두 본다.
+        """
+        if getattr(ap, 'traffic_light_hazard', False):
+            return False
+        if getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False):
+            return False
+        if getattr(ap, 'stop_sign_hazard', False):
+            return False
+        if self.latched or self.sl_hold_left > 0:          # 종점 래치 / 정지선 홀드
+            return False
+        if self.y_decision is not None or self.cross_guard:  # 황색 래치 / 통과 가드
+            return False
+        if self.last_d_end is not None and self.last_d_end <= self.active_m:
+            return False                                   # route_end 유령차 사정권
+        if self._signal_zone(planner, ap) is not None:     # 규칙 1
+            return False
+        return self._blocker(ap, planner) is not None      # 실제로 앞이 막혀 있을 것
+
+    def _breakout_reset(self, why=None) -> None:
+        if why and self.bo_state == 'BREAKOUT':
+            self.bo_exit = why
+        self.bo_state = None
+        self.bo_level = 0
+        self.bo_lvl_ticks = 0
+        self.bo_stall_ticks = 0
+        self.bo_entry_s = None
+        self.bo_ref_s = None
+
+    def breakout_creep(self) -> bool:
+        """크립 훅 — autopilot 이 선행차·OBB 후보를 무효화할지 묻는다.
+
+        참이 되는 경우는 **BREAKOUT 최종 단계(L4) 단독**이다. 그 외 어떤
+        상태에서도 거짓이어야 한다 — 열리면 앞차·장애물을 그대로 들이받는다.
+        """
+        return bool(self.bo_state == 'BREAKOUT' and self.bo_level >= self.BO_CREEP)
+
+    def _breakout_tick(self, planner, ap, ego_speed: float) -> None:
+        """데드락 상태기계. apply() 가 매 틱 부른다.
+
+        NORMAL ──장애물 원인 정지 stuck_hard_s──> BREAKOUT L1
+          L1 제약 완화(1회 제한·회랑 하한·측방 반경)
+          L2 실선 허용            ← reasons 에 단계·사유 기록
+          L3 여유폭 축소
+          L4 크립 강제 (훅)
+        진전(route_s +progress_m) 감지 시 NORMAL 복귀.
+        L4 에서 무진전이 creep_fail_s 지속되면 CREEP_FAIL — 정지 유지, 기록만.
+        **접촉은 실패 조건이 아니다**: 진전이 있는 한 계속한다.
+        """
+        route_s = float(planner.route_s[planner.route_index])
+        if self.bo_state == 'CREEP_FAIL':
+            if not self._obstacle_cause(planner, ap):
+                self._breakout_reset('cause_gone')
+                self.bo_state = None
+            return
+
+        if not self._obstacle_cause(planner, ap):
+            self.bo_stuck_ticks = 0
+            if self.bo_state is not None:
+                self._breakout_reset('cause_gone')
+            return
+
+        moving = ego_speed >= self.bo_eps
+        self.bo_stuck_ticks = 0 if moving else self.bo_stuck_ticks + 1
+
+        if self.bo_state is None:
+            if self.bo_stuck_ticks >= self.bo_hard_ticks:
+                self.bo_state = 'BREAKOUT'
+                self.bo_level = 1
+                self.bo_lvl_ticks = 0
+                self.bo_stall_ticks = 0
+                self.bo_entry_s = route_s
+                self.bo_ref_s = route_s
+                self.ot_span = None                        # L1: 1회 제한 해제
+                print('[kr_rules] 데드락 해제 진입 — BREAKOUT L1 '
+                      f'(정지 {self.bo_stuck_ticks / self.hz:.1f} s)', flush=True)
+            return
+
+        # 진전 감지 → 정상 복귀. 기준은 **진입 시점**이다 — 무진전 판정의
+        # bo_ref_s 와 겹쳐 쓰면 조금씩 계속 나아갈 때 기준이 따라 올라가
+        # 복귀가 영영 안 걸린다 (테스트가 잡은 결함).
+        if self.bo_entry_s is not None and route_s - self.bo_entry_s >= self.bo_progress_m:
+            print('[kr_rules] 데드락 해제 — 진전 %.1f m, 정상 복귀'
+                  % (route_s - self.bo_entry_s), flush=True)
+            self._breakout_reset('progress')
+            self.bo_stuck_ticks = 0
+            return
+
+        # 무진전 누적 (진전이 조금이라도 있으면 리셋 — 접촉 여부는 보지 않는다)
+        if route_s - (self.bo_ref_s or route_s) > self.bo_creep_eps_m:
+            self.bo_stall_ticks = 0
+            self.bo_ref_s = route_s
+        else:
+            self.bo_stall_ticks += 1
+
+        if self.bo_level >= self.BO_CREEP:
+            if self.bo_stall_ticks >= self.bo_fail_ticks:
+                self.bo_state = 'CREEP_FAIL'
+                print('[kr_rules] ⚠ 크립 실패 — %.1f s 무진전. 정지 유지 '
+                      '(리스폰 대기·유도는 미구현)' % (self.bo_stall_ticks / self.hz),
+                      flush=True)
+            return
+
+        self.bo_lvl_ticks += 1
+        if self.bo_lvl_ticks >= self.bo_esc_ticks:
+            self.bo_level += 1
+            self.bo_lvl_ticks = 0
+            self.ot_span = None                            # 각 단계에서 재시도 허용
+            if self.bo_level >= self.BO_CREEP:
+                # 크립 실패 창은 **크립 중** 무진전을 재야 한다. L1~L3 동안 쌓인
+                # 정지 시간을 그대로 쓰면 L4 진입 즉시 실패로 떨어진다.
+                self.bo_stall_ticks = 0
+            print('[kr_rules] BREAKOUT 단계 상승 → L%d' % self.bo_level, flush=True)
+
     def _side_is_clear(self, lg, planner, ap, target) -> bool:
         """목표 차로에 차가 없는가 (lc_clear 대용 — 아직 후방 추종차는 안 본다)."""
         ego = ap._vehicle
@@ -639,10 +777,16 @@ class KrRules:
             target = lg.neighbor(ego_lane, side)
             if target is None:
                 continue
-            if lg.dashed_corridor_m(ego_lane, side) < self.ot_min_corridor:
+            # BREAKOUT 사다리: L1 회랑 하한·측방 반경 완화, L2 실선 허용
+            lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
+            min_corr = 0.0 if lvl >= 1 else self.ot_min_corridor
+            if lg.dashed_corridor_m(ego_lane, side) < min_corr:
                 self.last_overtake = f'{side}:solid'
                 continue
-            if not self._side_is_clear(lg, planner, ap, target):
+            if lvl < 2 and lg.dashed_corridor_m(ego_lane, side) <= 0.0:
+                self.last_overtake = f'{side}:solid'       # L2 미만은 실선 금지
+                continue
+            if lvl < 1 and not self._side_is_clear(lg, planner, ap, target):
                 self.last_overtake = f'{side}:occupied'
                 continue
             ppm = float(getattr(planner, 'points_per_meter', 10))
@@ -931,6 +1075,8 @@ class KrRules:
         # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
         self.last_avoid = None
         self._update_obj_timers(ap)
+        if self.bo_enabled:
+            self._breakout_tick(planner, ap, ego_speed)
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
         self._try_overtake(ap, planner, ego_speed)
 
@@ -963,6 +1109,10 @@ class KrRules:
                 T=self.T,
             ))
 
+        # BREAKOUT 크립 — 훅이 PDM 후보를 무효화한 뒤, 상한은 여전히 min() 이다.
+        if self.breakout_creep() and (candidate is None or self.bo_creep_v < candidate):
+            candidate = self.bo_creep_v
+
         # 정지선 정지 프로파일 (④′) — 적색일 때만, min 으로 합류.
         # route_end 는 대상이 아니다 (검증 통과 후 별건).
         prof = self._stopline_profile(planner, ap)
@@ -988,6 +1138,19 @@ class KrRules:
                 control.accel = accel
                 control.throttle = accel
                 control.brake = float(brake)
+
+        if self.bo_state is not None:
+            self.last_avoid = dict(self.last_avoid or {}, **{
+                'state': self.bo_state, 'level': self.bo_level,
+                'stall_s': round(self.bo_stall_ticks / self.hz, 1),
+                'creep': self.breakout_creep(),
+                # L2 이상은 감점 가능한 완화다 — 단계와 사유를 반드시 남긴다
+                'relax': ({1: 'corridor+side', 2: 'solid_line',
+                           3: 'clearance', 4: 'creep'}.get(self.bo_level)
+                          if self.bo_level >= 2 else None)})
+        elif self.bo_exit:
+            self.last_avoid = dict(self.last_avoid or {}, exit=self.bo_exit)
+            self.bo_exit = None
 
         self.last_target = float(target_speed)
         return control, target_speed

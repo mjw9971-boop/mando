@@ -1055,6 +1055,17 @@ class AutoPilot:                                             # VTD: leaderboard 
             nearby_pedestrian_ids,
         )
 
+        # VTD: BREAKOUT 크립 (kr_rules 규칙2) — 데드락 탈출의 마지막 단계다.
+        # kr_rules 는 min() 에 후보를 덧대기만 하므로 "전진 하한" 을 만들 수
+        # 없다: 0 을 만드는 것은 PDM 자신의 선행차 IDM(leading)과 OBB forecast
+        # (vehicle/bicycle)다. 그래서 이 규칙만 예외적으로 판단(kr_rules)과
+        # 소비(여기 두 줄)가 분리된다 — 황색 GO 훅과 같은 선례다.
+        # **보행자 후보(target_speed_pedestrian)는 건드리지 않는다.**
+        # 발동은 BREAKOUT 최종 단계(L4) 단독이고, 그 게이팅은 kr_rules 가 한다.
+        if self.kr_rules.breakout_creep():
+            target_speed_leading = initial_target_speed
+            target_speed_bicycle = target_speed_vehicle = initial_target_speed
+
         # Compute the target speed with respect to the red light
         target_speed_red_light = self.ego_agent_affected_by_red_light(
             ego_vehicle_location,

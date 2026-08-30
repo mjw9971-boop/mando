@@ -97,6 +97,17 @@ class Planner:
         self.route = {'lanes': [], 'cum_s': [], 'total_length': n * 0.1}
         self._stop_lines = list(stop_lines)
 
+    def compute_leading_vehicles(self, vehicles, ego_id):
+        """경로(x 축)에 붙어 전방에 있는 객체 id — 실물 판정의 최소 모사."""
+        out = []
+        for v in vehicles:
+            if v.id == ego_id:
+                continue
+            loc = v.get_location()
+            if loc.x > 0.0 and abs(loc.y) < 2.5:
+                out.append(v.id)
+        return out
+
 
 class Ap:
     def __init__(self, planner, actors=(), junction=False):
@@ -273,3 +284,185 @@ def test_detect_disabled_when_static_time_unreachable():
     ap = Ap(p, [Box(1, 20.0, 0.0)])
     tick(kr, ap, p, 200)
     assert kr._corridor_blockers(ap, p) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 규칙 2 — 데드락 해제 (BREAKOUT) / 크립 훅
+#
+# 크립 훅은 PDM 의 선행차·OBB 후보를 **무효화**한다. 필요 이상으로 열리면
+# 앞차·장애물을 그대로 들이받는다. 그래서 참이 되는 경우가 **BREAKOUT
+# 최종 단계(L4) 단독**임을 아래에서 못 박는다.
+# ══════════════════════════════════════════════════════════════════════════
+BO = OT
+HARD_TICKS = int(round(BO['stuck_hard_s'] * HZ))
+ESC_TICKS = int(round(BO['escalate_s'] * HZ))
+FAIL_TICKS = int(round(BO['creep_fail_s'] * HZ))
+
+
+def blocked_rig(cfg=CFG, d_tl=float('inf'), junction=False):
+    """장애물이 코앞에 정지해 있고 자차도 정지 — BREAKOUT 조건을 만드는 목."""
+    kr, p = make(cfg, d_tl=d_tl)
+    ap = Ap(p, [Box(1, 8.0, 0.0, half_w=0.9)], junction=junction)
+    ap.traffic_light_hazard = ap.walker_hazard = ap.walker_close = False
+    ap.stop_sign_hazard = False
+    tick(kr, ap, p, STATIC_TICKS)
+    kr.last_d_end = 1e6                      # 종점 사정권 밖
+    return kr, p, ap
+
+
+def drive(kr, p, ap, n, v=0.0):
+    for _ in range(n):
+        kr._update_obj_timers(ap)
+        kr._breakout_tick(p, ap, v)
+
+
+# ── 정상 발동 ───────────────────────────────────────────────────────────
+def test_breakout_enters_after_stuck_hard_s():
+    kr, p, ap = blocked_rig()
+    drive(kr, p, ap, HARD_TICKS - 1)
+    assert kr.bo_state is None
+    drive(kr, p, ap, 1)
+    assert (kr.bo_state, kr.bo_level) == ('BREAKOUT', 1)
+
+
+def test_levels_escalate_and_creep_only_at_L4():
+    kr, p, ap = blocked_rig()
+    drive(kr, p, ap, HARD_TICKS)
+    for expect in (2, 3, 4):
+        assert kr.breakout_creep() is False, kr.bo_level      # L1~L3 은 거짓
+        drive(kr, p, ap, ESC_TICKS)
+        assert kr.bo_level == expect
+    assert kr.bo_level == kr.BO_CREEP
+    assert kr.breakout_creep() is True                        # L4 에서만 참
+
+
+def test_progress_returns_to_normal():
+    kr, p, ap = blocked_rig()
+    drive(kr, p, ap, HARD_TICKS + ESC_TICKS)
+    assert kr.bo_state == 'BREAKOUT'
+    p.set_route_s = lambda rs: None                           # 목엔 없음
+    p.route_index = int(round((kr.bo_ref_s + BO['progress_m'] + 0.5) / 0.1))
+    drive(kr, p, ap, 1, v=1.0)
+    assert kr.bo_state is None
+
+
+def test_creep_fail_after_no_progress_and_holds_stop():
+    """접촉은 실패 조건이 아니다 — 무진전 지속으로만 판정한다."""
+    kr, p, ap = blocked_rig()
+    drive(kr, p, ap, HARD_TICKS + ESC_TICKS * 3)
+    assert kr.breakout_creep() is True
+    drive(kr, p, ap, FAIL_TICKS)
+    assert kr.bo_state == 'CREEP_FAIL'
+    assert kr.breakout_creep() is False                       # 포기 후 크립 종료
+
+
+def test_creep_continues_while_progressing():
+    """조금씩이라도 나아가면 실패로 보지 않는다."""
+    kr, p, ap = blocked_rig()
+    drive(kr, p, ap, HARD_TICKS + ESC_TICKS * 3)
+    for _ in range(FAIL_TICKS + 40):
+        p.route_index += 10                                   # 매 틱 1 m 전진
+        kr._update_obj_timers(ap)
+        kr._breakout_tick(p, ap, 1.0)
+        if kr.bo_state is None:
+            break
+    assert kr.bo_state != 'CREEP_FAIL'
+
+
+# ── 크립 훅 부정 테스트 (지시 8종) ───────────────────────────────────────
+def _to_creep(kr, p, ap):
+    drive(kr, p, ap, HARD_TICKS + ESC_TICKS * 3)
+
+
+def test_hook_false_initially():
+    kr, p, ap = blocked_rig()
+    assert kr.breakout_creep() is False
+
+
+@pytest.mark.parametrize('flag', ['traffic_light_hazard', 'walker_hazard',
+                                  'walker_close', 'stop_sign_hazard'])
+def test_hook_false_on_pdm_hazard(flag):
+    """light / walker / stop_sign 원인이면 BREAKOUT 자체가 안 선다."""
+    kr, p, ap = blocked_rig()
+    setattr(ap, flag, True)
+    _to_creep(kr, p, ap)
+    assert kr.bo_state is None
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_on_route_end_latch():
+    kr, p, ap = blocked_rig()
+    kr.latched = True
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_on_route_end_ghost_range():
+    kr, p, ap = blocked_rig()
+    kr.last_d_end = kr.active_m - 1.0                         # 종점 유령차 사정권
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_on_stopline_hold():
+    kr, p, ap = blocked_rig()
+    kr.sl_hold_left = 5
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is False
+
+
+@pytest.mark.parametrize('dec', ['stop', 'go'])
+def test_hook_false_on_yellow_latch(dec):
+    kr, p, ap = blocked_rig()
+    kr.y_decision = dec
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_on_cross_guard():
+    kr, p, ap = blocked_rig()
+    kr.cross_guard = True
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_in_signal_zone():
+    """규칙 1 억제 구역 — BREAKOUT 도 서지 않는다."""
+    kr, p, ap = blocked_rig(d_tl=SUP_M - 5.0)
+    _to_creep(kr, p, ap)
+    assert kr.bo_state is None
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_inside_junction():
+    kr, p, ap = blocked_rig(junction=True)
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is False
+
+
+def test_hook_false_during_preempt_and_reactive():
+    """PREEMPT·REACTIVE 는 BREAKOUT 이 아니다 — 훅이 열리면 안 된다."""
+    kr, p, ap = blocked_rig()
+    for st in ('PREEMPT', 'REACTIVE', 'WATCH'):
+        kr.last_avoid = {'state': st}
+        assert kr.breakout_creep() is False
+    drive(kr, p, ap, HARD_TICKS)                              # L1
+    assert kr.bo_level == 1 and kr.breakout_creep() is False
+
+
+def test_hook_false_when_cause_disappears():
+    kr, p, ap = blocked_rig()
+    _to_creep(kr, p, ap)
+    assert kr.breakout_creep() is True
+    ap._world = World([])                                     # 장애물 사라짐
+    drive(kr, p, ap, kr.obj_grace + 2, v=0.0)
+    assert kr.breakout_creep() is False
+
+
+def test_disabled_switch_never_arms():
+    cfg = copy.deepcopy(CFG)
+    cfg['overtake']['breakout_enabled'] = False
+    kr, p, ap = blocked_rig(cfg)
+    # apply 를 타지 않는 목이므로 _breakout_tick 을 직접 부르지 않는 경로를 모사
+    assert kr.bo_enabled is False
+    assert kr.breakout_creep() is False
