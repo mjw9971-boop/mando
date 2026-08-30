@@ -260,3 +260,66 @@ def test_real_route_lat_shift_marks_only_lane_changes():
     ends = np.flatnonzero(runs == -1)
     for a, b in zip(starts, ends):
         assert abs(lat[b] - lat[a]) > CFG['vehicle']['width'], (a, b)
+
+
+# ── 차선변경 시점: 도로 진입로부터 3초 안에 ──────────────────────────────
+@pytest.mark.skipif(not (GRAPH.exists() and ROUTE_PKL.exists()),
+                    reason='lane_graph.pkl / route.pkl 없음')
+def test_lc_ramp_starts_at_road_entry_and_lasts_move_time():
+    """진출로가 회전이면 회전 차로에 **미리** 붙어 있어야 한다.
+
+    램프 시작 = max(도로 진입로, 창 시작)  — 점선이 허용하는 가장 이른 지점
+    램프 길이 = 계획 속도 x route.lc_move_s (하한·상한 클램프)
+    그리고 회전 전에 **여유를 두고 끝난다** (종전엔 회전 직전 17 m 에 몰렸다).
+    """
+    from vtd_adapter.lanegraph import LaneGraph
+    from vtd_adapter.route import VtdRoutePlanner
+
+    with open(ROUTE_PKL, 'rb') as f:
+        route = pickle.load(f)
+    pl = VtdRoutePlanner(LaneGraph(str(GRAPH)), route, CFG, config=GlobalConfig())
+    lanes, cum = route['lanes'], route['cum_s']
+    lens = [float(v) for v in route['lengths']]
+    lc = [dict(e) for e in route['events'] if e['kind'].startswith('lane_change')]
+    turns = [e['s'] for e in route['events'] if e['kind'].startswith('turn_')]
+    ramps = pl._build_lc_ramps(lanes, cum, lens, lc)
+    assert len(ramps) == len(lc)
+
+    for i_hop, r in ramps.items():
+        frm = tuple(lanes[i_hop])
+        ev = next(e for e in lc if tuple(e['from_lane']) == frm)
+        want0 = max(float(ev['window_s0']), pl._road_entry_s(lanes, cum, i_hop))
+        assert r['w0'] == pytest.approx(want0), (frm, r['w0'], want0)
+        assert r['w1'] - r['w0'] == pytest.approx(pl._lc_move_len(frm), abs=0.2)
+        nxt = min([t for t in turns if t >= r['w1']], default=None)
+        if nxt is not None:
+            assert nxt - r['w1'] > 20.0, f'회전 {nxt:.1f} 직전에 몰렸다 (램프 끝 {r["w1"]:.1f})'
+
+
+def test_lc_move_length_scales_with_speed_limit():
+    """길이가 시간 기준이다 — 제한속도가 높으면 길고, 낮으면 짧다 (클램프 안)."""
+    from vtd_adapter.route import VtdRoutePlanner
+
+    pl = object.__new__(VtdRoutePlanner)
+    pl.cfg = CFG
+    pl.lc_move_s = CFG['route']['lc_move_s']
+    pl.lc_move_min_m = CFG['route']['lc_move_min_m']
+    pl.lc_move_max_m = CFG['route']['lc_move_max_m']
+
+    class LG:
+        def __init__(self, kph):
+            self.kph = kph
+
+        def speed_limit_at(self, key):
+            return self.kph, False
+
+    margin = CFG['speed']['margin_kph']
+    pl.lg = LG(50.0)
+    fast = pl._lc_move_len((1, 0, -1))
+    pl.lg = LG(30.0)
+    slow = pl._lc_move_len((1, 0, -1))
+    assert fast > slow
+    assert fast == pytest.approx(min(pl.lc_move_max_m,
+                                     (50.0 - margin) / 3.6 * pl.lc_move_s), abs=0.1)
+    pl.lg = LG(5.0)
+    assert pl._lc_move_len((1, 0, -1)) == pytest.approx(pl.lc_move_min_m)

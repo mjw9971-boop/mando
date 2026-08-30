@@ -152,6 +152,10 @@ class VtdRoutePlanner:
         self.extra_route_length = int(g('extra_route_length', 50))
         # 테이퍼 꼬리 블렌드 (params 가 단일 출처 — 없으면 KeyError 로 죽는 게 맞다)
         self.taper_blend_m = float(cfg['route']['taper_blend_m'])
+        rt_cfg = cfg['route']
+        self.lc_move_s = float(rt_cfg['lc_move_s'])
+        self.lc_move_min_m = float(rt_cfg['lc_move_min_m'])
+        self.lc_move_max_m = float(rt_cfg['lc_move_max_m'])
         self.veh_width = float(cfg['vehicle']['width'])
         # 정적 장애물 인식 (compute_leading_vehicles) — params 가 단일 출처
         self.obstacle_speed_max = float(cfg['percep']['obstacle_speed_max'])
@@ -189,13 +193,36 @@ class VtdRoutePlanner:
             rs += step
         return True
 
-    def _build_lc_ramps(self, lanes, cum_s, lens, lc_events) -> dict:
-        """차선변경 램프를 **창 앞쪽**에 배치한다 → {hop_index: ramp}.
+    def _road_entry_s(self, lanes, cum_s, i_hop) -> float:
+        """hop 차로가 속한 **도로에 route 가 진입한 지점** [route_s].
 
-        창은 넓은데(실측 93 m) 종전에는 hop 차로 안에서만 블렌드해서 회전 직전
-        17 m 에 몰려 있었다 — 우회전을 위해 오른쪽으로 붙어야 하는데 차선변경과
-        회전이 겹쳤다. 길이(LC_TRANSITION_M)는 그대로 두고 **시작만 창 앞으로**
-        옮기면, 옮겨탄 뒤 남은 거리를 목표 차로에서 주행한다.
+        laneSection 은 도로 안에서만 쪼개지므로 road_id 가 같은 동안 뒤로 거슬러
+        올라가면 그 도로의 진입로가 나온다.
+        """
+        road = tuple(lanes[i_hop])[0]
+        k = i_hop
+        while k > 0 and tuple(lanes[k - 1])[0] == road:
+            k -= 1
+        return float(cum_s[k])
+
+    def _lc_move_len(self, key) -> float:
+        """차선변경에 쓸 거리 [m] = 계획 속도 x lc_move_s (하한·상한 클램프)."""
+        kph, _sc = self.lg.speed_limit_at(key)
+        kph = float(kph) if kph is not None else float(self.cfg.get('default_speed_kph', 50.0))
+        v = max(0.0, kph - float(self.cfg.get('speed', {}).get('margin_kph', 0.0))) / 3.6
+        return min(self.lc_move_max_m, max(self.lc_move_min_m, v * self.lc_move_s))
+
+    def _build_lc_ramps(self, lanes, cum_s, lens, lc_events) -> dict:
+        """차선변경 램프 → {hop_index: ramp}.
+
+        **도로에 진입하면 곧바로, lc_move_s 안에 옮겨탄다.** 진출로가 회전이면
+        회전 차로에 미리 붙어 있어야 하는데, 종전에는 hop 차로 안에서만 블렌드해
+        회전 직전 17 m 에 몰렸다 (실측: 창 93 m 중 뒤 17 m 만 사용, 차선변경과
+        회전이 겹침).
+
+        시작 = max(도로 진입로, 창 시작) — 점선이 허용하는 가장 이른 지점.
+        길이 = 계획 속도 x lc_move_s (지시등 선행 signal.lc_lead_s 와 같은 축).
+        옮겨탄 뒤 남은 거리는 그 차로에서 그대로 주행한다.
         """
         ramps: dict = {}
         for ev in lc_events:
@@ -206,9 +233,11 @@ class VtdRoutePlanner:
                 continue
             left = to == self.lg.neighbor(frm, 'left')
             side = 'left' if left else 'right'
-            w0 = float(ev.get('window_s0', cum_s[i_hop]))
             w1_cap = float(ev.get('window_s1', cum_s[i_hop]))
-            w1 = min(w0 + self.LC_TRANSITION_M, w1_cap)
+            # 도로 진입로부터 — 단 점선이 허용하는 가장 이른 지점 이후여야 한다
+            w0 = max(float(ev.get('window_s0', cum_s[i_hop])),
+                     self._road_entry_s(lanes, cum_s, i_hop))
+            w1 = min(w0 + self._lc_move_len(frm), w1_cap)
             if w1 - w0 > 1e-6 and self._ramp_is_dashed(lanes, cum_s, lens, w0, w1, side):
                 ramps[i_hop] = {'w0': w0, 'w1': w1, 'side': side,
                                 'sign': 1.0 if left else -1.0, 'i_hop': i_hop}
@@ -216,7 +245,7 @@ class VtdRoutePlanner:
                 # 확인 실패 → 기존 동작(hop 차로 안에서 블렌드 + 점선 클립)으로 폴백
                 w0f = max(float(ev.get('window_s0', cum_s[i_hop])), cum_s[i_hop])
                 w0f, w1f = self._clip_to_dashed(frm, cum_s[i_hop], w0f, w1_cap, side)
-                ramps[i_hop] = {'w0': w0f, 'w1': min(w0f + self.LC_TRANSITION_M, w1f),
+                ramps[i_hop] = {'w0': w0f, 'w1': min(w0f + self._lc_move_len(frm), w1f),
                                 'side': side, 'sign': 1.0 if left else -1.0,
                                 'i_hop': i_hop, 'fallback': True}
         return ramps
