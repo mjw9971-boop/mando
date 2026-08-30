@@ -1426,6 +1426,10 @@ class AutoPilot:                                             # VTD: leaderboard 
         if (
             next_traffic_light is None
             or next_traffic_light.state == carla.TrafficLightState.Green
+            # VTD: 황색 GO 래치 / 교차로 통과 가드 (kr_rules) — "감속하지 말 것"이
+            # 요지라 후보 덧대기로는 표현할 수 없다. 녹색일 때와 같은 메커니즘으로
+            # 건너뛴다. 아래 IDM 본문은 무수정.
+            or self.kr_rules.signal_release(self, distance_to_traffic_light)
         ):
             # No traffic light or green light, continue with the current target speed
             return target_speed

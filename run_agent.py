@@ -241,6 +241,9 @@ class Runner:
             cx, cy = frame.to_carla_xy(world_state.ego.x, world_state.ego.y)
             self.planner.reset_index([cx, cy])
             self.agent._turn_controller.error_history = []
+            # 황색 GO 래치·교차로 가드도 버린다 — 정지선 뒤로 되돌아간 채
+            # GO 가 살아 있으면 적신호를 그대로 통과한다 (항목7 중대)
+            self.kr.on_reset()
             self.longc._prev_accel = 0.0
 
         self.world.update(pkt, world_state.ego)

@@ -61,7 +61,8 @@ def v_allow(d_line):
 
 
 # ── 수식 ────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize('d_line', [S0 + 40.0, S0 + 12.0, S0 + 3.0, S0 + 0.5, S0, S0 - 2.0])
+# S0 − x 는 앞범퍼가 정지선을 넘은 상태라 교차로 가드가 잡는다 (아래 별도 테스트)
+@pytest.mark.parametrize('d_line', [S0 + 40.0, S0 + 12.0, S0 + 3.0, S0 + 0.5, S0])
 def test_profile_matches_formula(d_line):
     p = FakePlannerTL(d_tl=d_line)
     ap = make_ap(p)
@@ -154,11 +155,49 @@ def test_terminal_still_braking_above_hold_speed():
     assert control.accel < 0.0
 
 
-def test_past_the_planned_point_still_commands_zero():
-    """계획 정지점을 넘겼으면 (d < s0) 음수 제곱근이 아니라 0 이어야 한다."""
-    p = FakePlannerTL(d_tl=S0 - 3.0)
+def test_between_planned_point_and_line_commands_zero():
+    """계획 정지점을 지났지만 앞범퍼가 아직 선 앞이면 0 을 명령한다
+    (음수 제곱근이 아니라 0). 가드는 아직 걸리지 않는다."""
+    d = FRONT + 0.2                       # 앞범퍼가 선 0.2 m 앞 → d − FRONT > 0
+    p = FakePlannerTL(d_tl=d)
     ap = make_ap(p)
+    assert d < S0                          # 계획 정지점은 이미 지났다
     assert ap.kr_rules._stopline_profile(p, ap) == pytest.approx(0.0)
+
+
+def test_cross_guard_suppresses_candidate_once_bumper_passes_line():
+    """앞범퍼가 정지선을 넘으면 신호·정지선 유래 후보를 만들지 않는다 —
+    넘은 뒤에 제동해 봐야 걸친 채로 서기만 한다. 교차로를 벗어나야 푼다."""
+    p = FakePlannerTL(d_tl=FRONT - 0.5)    # 앞범퍼 0.5 m 통과
+    ap = make_ap(p)
+    assert ap.kr_rules._stopline_profile(p, ap) is None
+    assert ap.kr_rules.cross_guard is True
+    assert ap.kr_rules._stopline_hold(p, 0.1) is None      # 홀드도 같은 판정
+
+
+def test_cross_guard_releases_after_leaving_junction():
+    """교차로 진입이 관측된 뒤 벗어나면 가드가 풀린다."""
+    p = FakePlannerTL(d_tl=FRONT - 0.5)
+    ap = make_ap(p)
+    ap.kr_rules._stopline_profile(p, ap)
+    assert ap.kr_rules.cross_guard is True
+    ap.junction = True                                     # 교차로 안
+    ap.kr_rules._stopline_profile(p, ap)
+    assert ap.kr_rules.cross_guard is True
+    ap.junction = False                                    # 벗어남
+    ap.kr_rules._stopline_profile(p, ap)
+    assert ap.kr_rules.cross_guard is False
+
+
+def test_cross_guard_releases_by_distance_cap_without_junction():
+    """교차로 진입이 관측되지 않아도 yellow_guard_max_m 를 지나면 푼다 (고착 방지)."""
+    p = FakePlannerTL(d_tl=FRONT - 0.5)
+    ap = make_ap(p)
+    ap.kr_rules._stopline_profile(p, ap)
+    assert ap.kr_rules.cross_guard is True
+    p.set_route_s(ap.kr_rules.cross_s + CFG['speed']['yellow_guard_max_m'] + 1.0)
+    ap.kr_rules._stopline_profile(p, ap)
+    assert ap.kr_rules.cross_guard is False
 
 
 # ── 정지선 한정 (route_end 비대상) ───────────────────────────────────────

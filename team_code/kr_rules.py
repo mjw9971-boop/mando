@@ -171,6 +171,9 @@ class KrRules:
         self.sl_near_m = float(sp['stopline_hold_near_m'])
         # 정지선 정지 프로파일 (④′). 0 이면 완전 비활성 — 되돌리는 스위치다.
         self.stop_profile_a = float(sp.get('stop_profile_a', 0.0))
+        # 황색 딜레마 원샷 판정 (C). 0 이면 비활성 = 황색을 PDM 원문에만 맡긴다.
+        self.a_yellow = float(sp.get('a_yellow', 0.0))
+        self.y_guard_max_m = float(sp.get('yellow_guard_max_m', 60.0))
         # ap.config 를 못 읽는 환경(목)에서만 쓰는 폴백 — 정상 경로는 PDM 값 사용
         self.stop_gap_sl_fallback = float(sp.get('stop_gap_stopline_m', 1.5)) + self.front
         # 방향지시등 (SPEC §3.3). lc_lead_s 는 규정 미확정 가정값 (§7-2).
@@ -202,6 +205,15 @@ class KrRules:
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
         self.last_stop_profile: float | None = None   # 이번 틱 정지 프로파일 상한 (로그용)
+        # 황색 원샷 판정 래치 (접근당 1회, 번복 금지)
+        self.y_decision: str | None = None            # None | 'stop' | 'go'
+        self.y_ctrl: int | None = None                # 래치가 걸린 신호 id
+        self.y_v_allow: float | None = None           # 판정 시 v_allow (로그용)
+        # 교차로 통과 가드
+        self.cross_guard = False
+        self.cross_s: float | None = None
+        self.cross_junction_seen = False
+        self._ap = None                               # 홀드가 _stop_target 을 부르려면 필요
         self.sig_plan: list[dict] | None = None    # 회전 구간 (시작 시 1회)
         self.sig_on_ticks = 0                      # 켜진 뒤 지난 틱 (min_on 기준)
         self.sig_off_left = 0                      # 소등 지연 잔여 틱 (상한 있음)
@@ -456,23 +468,167 @@ class KrRules:
             return None
         return m.lane if m is not None else None
 
-    def _red_stopline_dist(self, planner) -> float | None:
-        """전방 정지선이 **적색**이면 뒷축→정지선 거리 [m], 아니면 None.
+    def _next_stopline(self, planner):
+        """전방 신호 정지선 → (뒷축거리 [m], 상태명, 신호 id). 없으면 None.
 
-        홀드(_stopline_hold)와 정지 프로파일(_stopline_profile)이 같은 판정을
-        쓰도록 한 곳에 모은다 — 신호 해석이 두 벌이 되면 갈라진다.
-        녹색·황색은 None 이다: 황색은 PDM 원문(Green 이 아니면 IDM 정지)이
-        그대로 맡고 여기서는 개입하지 않는다 (현행 취급 유지).
-        신호 정보가 없는 환경(목 플래너 등)에서도 None.
+        색을 가리지 않고 그대로 준다 — 색 해석은 호출자 한 곳
+        (_stop_target)에서만 한다.
         """
         dists = getattr(planner, 'distances_to_next_traffic_lights', None)
         tls = getattr(planner, 'next_traffic_lights', None)
         if dists is None or tls is None:
             return None
         tl = tls[planner.route_index]
-        if tl is None or getattr(getattr(tl, 'state', None), 'name', None) != 'Red':
+        if tl is None:
             return None
-        return float(dists[planner.route_index])
+        return (float(dists[planner.route_index]),
+                getattr(getattr(tl, 'state', None), 'name', None),
+                getattr(tl, 'id', None))
+
+    def _yellow_latch(self, planner, ego_speed: float, ap) -> None:
+        """황색 원샷 판정 — 접근당 1회 STOP/GO 를 정하고 래치한다.
+
+        대회 채점표 편향이 **STOP 우선**을 강제한다: 황색 정지를 감점하는 항목이
+        없고(항목8 5 s 카운트는 녹색 틱만 센다), 반대로 적색 통과·걸침은 항목7
+        중대다. 게다가 score.detect_red_light 는 **통과 순간의 신호**로 판정하므로
+        GO 로 나갔다가 적색에 걸리면 그대로 중대가 된다 (실측 2026-08-30
+        실전주행_02: 적신호 통과 2 + 정지선 침범 2 = 항목7 4건).
+
+        그래서 판정 감속은 **확실히 실행 가능한 최대**(speed.a_yellow, 기본
+        a_dec_max 와 같은 4.0)를 쓴다 — STOP 영역을 최대화하고 GO 는 물리적으로
+        설 수 없는 영역에만 남긴다.
+
+            v ≤ √(2·a_yellow·(d − s0))  → STOP (적색과 동일 취급)
+            그 외                        → GO   (신호·정지선 유래 후보 미생성)
+
+        래치는 접근당 유지한다. GO 중 적색으로 바뀌어도 번복하지 않는다 —
+        번복하면 교차로 한복판 급제동이 된다. 해제는 ① 다른 신호로 넘어감
+        ② 녹색 복귀 ③ 교차로 통과 가드 종료.
+        """
+        nxt = self._next_stopline(planner)
+        if nxt is None:
+            self._yellow_reset()
+            return
+        d_line, state, tl_id = nxt
+        if self.y_ctrl is not None and tl_id != self.y_ctrl:
+            self._yellow_reset()                      # 다음 교차로
+        if state == 'Green':
+            self._yellow_reset()                      # 녹색 복귀
+            return
+        if self.a_yellow <= 0.0 or self.y_decision is not None or state != 'Yellow':
+            return                                    # 비활성 / 이미 래치 / 황색 아님
+        v_allow = _math.sqrt(2.0 * self.a_yellow * max(0.0, d_line - self._s0(ap)))
+        self.y_decision = 'stop' if ego_speed <= v_allow else 'go'
+        self.y_ctrl = tl_id
+        self.y_v_allow = v_allow
+
+    def _yellow_reset(self) -> None:
+        self.y_decision = None
+        self.y_ctrl = None
+        self.y_v_allow = None
+
+    def on_reset(self) -> None:
+        """courseRespawn — 순간이동 전 래치는 전부 무효 (run_agent 가 부른다).
+
+        특히 GO 래치를 살려 두면, 리스폰으로 정지선 **뒤로** 되돌아간 뒤에도
+        "이미 가기로 했다"가 유지돼 적신호를 그대로 통과한다 (항목7 중대).
+        """
+        self._yellow_reset()
+        self.cross_guard = False
+        self.cross_s = None
+        self.cross_junction_seen = False
+        self.sl_hold_left = 0
+        self.latched = False
+
+    def _s0(self, ap) -> float:
+        """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
+        return float(getattr(ap.config, 'idm_red_light_minimum_distance',
+                             self.stop_gap_sl_fallback))
+
+    def _cross_guard(self, planner, ap, d_line) -> bool:
+        """교차로 통과 가드 — 앞범퍼가 정지선을 넘은 뒤 교차로를 벗어날 때까지
+        **신호·정지선 유래 정지 후보를 만들지 않는다** (보행자·선행차 후보는
+        min() 의 다른 갈래라 그대로 산다).
+
+        가드가 없으면 교차로 한복판에서 뒤쪽 정지선을 향해 제동하거나, 바로
+        다음 정지선에 성급히 반응한다. 해제는 교차로를 벗어났을 때, 또는 진입이
+        관측되지 않은 채 yellow_guard_max_m 를 지났을 때(상한 — 고착 방지).
+        """
+        route_s = float(planner.route_s[planner.route_index])
+        if not self.cross_guard and d_line is not None and (d_line - self.front) <= 0.0:
+            self.cross_guard = True                   # 앞범퍼가 정지선을 넘었다
+            self.cross_s = route_s
+            self.cross_junction_seen = False
+        if not self.cross_guard:
+            return False
+        in_j = bool(getattr(ap, 'junction', False))
+        if in_j:
+            self.cross_junction_seen = True
+        elif self.cross_junction_seen or (
+                self.cross_s is not None       # 0.0 은 falsy — or 로 폴백하면 안 된다
+                and route_s - self.cross_s > self.y_guard_max_m):
+            self.cross_guard = False
+            self.cross_s = None
+            self._yellow_reset()
+            return False
+        return True
+
+    def signal_release(self, ap, _distance_to_traffic_light=None) -> bool:
+        """PDM 의 적신호 IDM 을 이번 틱 건너뛸 것인가 — autopilot 조기 반환 조건.
+
+        kr_rules 는 min() 에 후보를 **덧대기만** 하므로 PDM 이 스스로 만드는
+        적신호 감속을 없앨 수 없다. 황색 GO 와 교차로 통과 가드는 "감속하지
+        말 것"이 요지라, 이 규칙만 예외적으로 판단(여기)과 소비(autopilot 한 줄)가
+        분리된다. 녹색일 때 IDM 을 건너뛰는 것과 같은 메커니즘이고 IDM 본문은
+        무수정이다.
+
+        참이 되는 경우는 둘뿐이다:
+          · 황색 GO 래치 — 접근당 1회 판정으로 "설 수 없다" 가 확정된 상태.
+            여기서 PDM 이 감속하면 어중간히 늦춰 정지선에 걸친다 (실측 2026-08-30
+            실전주행_02: 황색 3 s 동안 IDM 이 가속↔감속을 오가다 slf=+1.35).
+          · 교차로 통과 가드 — 앞범퍼가 이미 정지선을 넘었다. 여기서 제동하면
+            걸친 채로 선다.
+        보행자·선행차 후보는 min() 의 다른 갈래라 그대로 살아 있다.
+        """
+        return bool(self.y_decision == 'go' or self.cross_guard)
+
+    def _stop_target(self, planner, ap) -> tuple | None:
+        """정지 후보를 만들 대상이면 (뒷축거리, 실행 감속 a_eff), 아니면 None.
+
+        색 해석의 **단일 출처**다 — 프로파일과 홀드가 같은 판정을 본다.
+          · 적색            → (d, stop_profile_a)
+          · 황색 + STOP 래치 → (d, stop_profile_a)  적색과 **완전히 동일** 취급
+          · 황색 + GO 래치   → None
+          · 녹색 / 신호 없음 → None
+
+        판정(a_yellow=4.0)과 실행(stop_profile_a=3.0)의 상수가 **다른 것이
+        의도다**. 같게 두면(초기 설계안 B) STOP 판정의 정의상 진입 시
+        v ≤ v_allow 라 프로파일이 느슨하고, v_allow 가 v 밑으로 내려올 때까지
+        구속하지 못한다. 그 시점엔 최대 감속을 여유 0 으로 요구해 jerk 램프인에
+        진다 — 폐루프 12조건에서 걸침 6건. 실행 상수를 작게 두면 진입 즉시
+        구속되고 a_dec_max 까지 여유가 남는다 (같은 12조건에서 걸침 0건,
+        전부 −1.52~−0.97). 2026-08-30 검증.
+        교차로 통과 가드가 걸려 있으면 무조건 None.
+        """
+        nxt = self._next_stopline(planner)
+        d_line = nxt[0] if nxt else None
+        if self._cross_guard(planner, ap, d_line):
+            return None
+        if nxt is None:
+            return None
+        d_line, state, _tl_id = nxt
+        if state == 'Red' and self.y_decision != 'go':
+            return (d_line, self.stop_profile_a)
+        if state == 'Yellow' and self.y_decision == 'stop':
+            return (d_line, self.stop_profile_a)
+        return None
+
+    def _red_stopline_dist(self, planner) -> float | None:
+        """구 인터페이스 — 적색이면 뒷축거리. 색 해석은 _stop_target 이 한다."""
+        nxt = self._next_stopline(planner)
+        if nxt is None or nxt[1] != 'Red':
+            return None
+        return nxt[0]
 
     def _stopline_profile(self, planner, ap) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
@@ -499,14 +655,13 @@ class KrRules:
         run_agent.build_pdm_config 가 params 의 stop_gap_stopline_m + 앞범퍼로
         채우는 값이라, 여기서 다시 계산하면 단일 출처가 깨진다.
         """
-        if self.stop_profile_a <= 0.0:
+        tgt = self._stop_target(planner, ap)
+        if tgt is None:
             return None
-        d_line = self._red_stopline_dist(planner)
-        if d_line is None:
+        d_line, a_eff = tgt
+        if a_eff <= 0.0:
             return None
-        s0 = float(getattr(ap.config, 'idm_red_light_minimum_distance',
-                           self.stop_gap_sl_fallback))
-        return _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_line - s0))
+        return _math.sqrt(2.0 * a_eff * max(0.0, d_line - self._s0(ap)))
 
     def _stopline_hold(self, planner, ego_speed: float) -> float | None:
         """적신호 정지선 정지의 최소 유지 (speed.stopline_hold_s) — 목표 0 후보.
@@ -520,10 +675,10 @@ class KrRules:
         if self.sl_hold_left > 0:
             self.sl_hold_left -= 1
             return 0.0
-        d_line = self._red_stopline_dist(planner)
-        if d_line is None:
+        tgt = self._stop_target(planner, self._ap)
+        if tgt is None:
             return None
-        d_front = d_line - self.front
+        d_front = tgt[0] - self.front
         if d_front < self.sl_near_m and ego_speed < self.latch_v:
             self.sl_hold_left = max(0, self.sl_hold_ticks - 1)   # 이번 틱 포함
             return 0.0
@@ -547,6 +702,9 @@ class KrRules:
         self.last_candidate = None
         self.last_stop_profile = None
         self.last_d_end = d_end
+        self._ap = ap
+        # 황색 원샷 판정 — 프로파일·홀드보다 먼저 정해야 같은 틱에 반영된다
+        self._yellow_latch(planner, ego_speed, ap)
 
         # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
