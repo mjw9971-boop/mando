@@ -280,20 +280,28 @@ def disp_w(s) -> int:
     return sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in str(s))
 
 
-def _pad(s, w: int) -> str:
-    return str(s) + ' ' * max(0, w - disp_w(s))
+def _pad(s, w: int, right: bool = False) -> str:
+    pad = ' ' * max(0, w - disp_w(s))
+    return pad + str(s) if right else str(s) + pad
 
 
-def render_table(hdr: list, rows: list) -> str:
+def render_table(hdr: list, rows: list, align_right=()) -> str:
     """폭 정렬 텍스트 표. 컬럼 폭은 실제 내용의 최대 표시폭에 동적으로 맞춘다.
 
     셀은 자르지 않는다 — 폭 상한이 필요한 열은 호출자가 clip() 으로 미리
     줄여서 넘긴다 (표가 총폭 상한을 넘지 않도록 예산을 배분하는 쪽이 안다).
+
+    align_right: 우측 정렬할 **열 이름** 목록 (params.yaml report.align_right).
+    정렬은 헤더와 셀에 똑같이 적용한다 — 한쪽만 맞추면 헤더가 값 위에 안 온다.
+    숫자 열을 좌측 정렬하면 자릿수가 안 맞아 표가 어긋나 보이므로 우측으로 둔다.
+    열 이름으로 고르는 이유: 값만 보고 판정하면 '2:05'(시간)·'0/4'(이벤트)처럼
+    숫자인지 아닌지 애매한 칸에서 표마다 정렬이 흔들린다.
     """
+    right = [h in align_right for h in hdr]
     widths = [max(disp_w(h), *(disp_w(r[i]) for r in rows)) if rows else disp_w(h)
               for i, h in enumerate(hdr)]
-    lines = ['  '.join(_pad(c, widths[i]) for i, c in enumerate(hdr)).rstrip()]
-    lines += ['  '.join(_pad(c, widths[i]) for i, c in enumerate(row)).rstrip()
+    lines = ['  '.join(_pad(c, widths[i], right[i]) for i, c in enumerate(hdr)).rstrip()]
+    lines += ['  '.join(_pad(c, widths[i], right[i]) for i, c in enumerate(row)).rstrip()
               for row in rows]
     return '\n'.join(lines)
 
@@ -431,7 +439,8 @@ def render_report(results: list, rcfg: dict) -> str:
         budget = max(width - fixed - 2 * last, disp_w(REPORT_HDR[last]))
         for row in rows:
             row[last] = clip(row[last], budget)
-    return summary_line(results, rcfg) + '\n' + render_table(REPORT_HDR, rows)
+    return (summary_line(results, rcfg) + '\n'
+            + render_table(REPORT_HDR, rows, rcfg['align_right']))
 
 
 class Runner:
@@ -703,7 +712,10 @@ class Runner:
         # 밤샘 배치에서 "보행자가 지나간 뒤 건넜다" 류를 아침에 눈으로 못 잡는다.
         try:
             import event_check
-            ev = event_check.check_scenario(res['scenario_yaml'], res['log'], load_cfg())
+            # lg·route 를 넘긴다 — 구 생성기 산출물(기대값 없는 yaml)도 지도에서
+            # 다시 재서 판정하고, ego 가 못 간 이벤트도 미도달로 제대로 센다.
+            ev = event_check.check_scenario(res['scenario_yaml'], res['log'],
+                                            load_cfg(), lg, route)
             (self.out_dir / f"{res['name']}.events.txt").write_text(
                 event_check.render(ev, res['name']), encoding='utf-8')
             res['events_ok'], res['events_total'] = ev['ok'], ev['total']
@@ -743,7 +755,9 @@ class Runner:
                    ('평균 %.2f s (n=%d)' % (sum(gd) / len(gd), len(gd))) if gd else '—'))
         hdr = ['시나리오', 't[s]', 'route_s', 'slf[m]', '접근[km/h]', '전환',
                '유지[s]', '녹색후출발[s]', 'ctrl', '신호']
-        return self.STOP_RULE + '\n' + render_table(hdr, rows) + '\n' + summ
+        return (self.STOP_RULE + '\n'
+                + render_table(hdr, rows, self.cfg['report']['align_right'])
+                + '\n' + summ)
 
     # ── 표 ────────────────────────────────────────────────────────────────
     def report(self) -> str:

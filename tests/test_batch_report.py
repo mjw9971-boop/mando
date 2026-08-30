@@ -14,7 +14,8 @@ from vtd_adapter.config import load_params_yaml
 
 RCFG = {'table_width': 100, 'name_w': 24, 'top_violations': 3,
         'violation_label_w': 12,
-        'exclude_violations': ['not_finished', 'stall', 'off_route']}
+        'exclude_violations': ['not_finished', 'stall', 'off_route'],
+        'align_right': ['거리[m]', '시간', '평균[km/h]', '감점']}
 
 
 def res(name, status='완주', deduction=0, violations=None, dist=100.0, t=60.0, kph=20.0,
@@ -224,3 +225,52 @@ def test_summary_line_omits_unreached_when_zero():
 
 def test_summary_line_omits_events_when_none():
     assert '이벤트' not in br.summary_line([res('a', events=(0, 0)), res('b')], RCFG)
+
+
+# ── 열 정렬 (헤더 = 셀) ──────────────────────────────────────────────────
+# 정렬은 눈으로 보는 게 전부라 기대 출력을 통째로 박는다 — 칸 하나만 밀려도 깨진다.
+def test_render_table_right_aligns_header_and_cells_together():
+    """우측 정렬 열은 헤더와 값의 **오른쪽 끝**이 같은 칸에 온다."""
+    out = br.render_table(['이름', '감점'], [['a', -18], ['b', 0]], align_right=['감점'])
+    assert out == ('이름  감점\n'
+                   'a      -18\n'
+                   'b        0')
+
+
+def test_render_table_left_aligns_columns_not_listed():
+    """목록에 없는 열은 종전대로 좌측 — 헤더도 값도 왼쪽 끝이 같다."""
+    out = br.render_table(['이름', '비고'], [['a', 'xx'], ['bbbb', 'y']], align_right=['감점'])
+    assert out == ('이름  비고\n'
+                   'a     xx\n'
+                   'bbbb  y')
+
+
+def test_render_table_alignment_is_per_column_name():
+    """같은 표에서 열마다 다른 규칙 — align_right 에 든 이름만 우측."""
+    out = br.render_table(['상태', '감점'], [['blocked', -18], ['완주', 0]],
+                          align_right=['감점'])
+    assert out == ('상태     감점\n'
+                   'blocked   -18\n'
+                   '완주        0')
+
+
+def test_render_report_columns_line_up():
+    """요약 표 — 숫자 열(거리·시간·평균·감점)이 헤더 아래 자릿수까지 맞을 것."""
+    rows = [res('실전주행_01_좌회전16', status='blocked', deduction=-18,
+                dist=854.1, t=125.0, kph=24.6, events=(0, 4)),
+            res('실전주행_02_직진28', status='blocked', deduction=0,
+                dist=201.4, t=36.0, kph=20.3, events=(0, 1, 1)),
+            res('c', deduction=-9, dist=1234.5, t=600.0, kph=9.0)]
+    assert br.render_report(rows, RCFG).splitlines()[1:] == [
+        '시나리오              상태     거리[m]   시간  평균[km/h]  감점  이벤트         주요위반',
+        '실전주행_01_좌회전16  blocked    854.1   2:05        24.6   -18  0/4            -',
+        '실전주행_02_직진28    blocked    201.4   0:36        20.3     0  0/1 (미도달1)  -',
+        'c                     완주      1234.5  10:00         9.0    -9  -              -']
+
+
+def test_params_yaml_align_right_covers_numeric_columns():
+    """yaml 이 단일 출처 — 요약 표의 숫자 열이 목록에서 빠지면 좌측으로 돌아간다."""
+    ar = load_params_yaml()['report']['align_right']
+    for col in br.REPORT_HDR:
+        want = col in ('거리[m]', '시간', '평균[km/h]', '감점')
+        assert (col in ar) is want, col

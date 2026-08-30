@@ -336,6 +336,14 @@ report:
   # 주요위반에서 뺄 검출 키 (tools/score.py LABEL 키) — 상태 칸과 중복이라
   # 정작 봐야 할 위반을 상위 3개 밖으로 밀어낸다.
   exclude_violations: [not_finished, stall, off_route]
+  # 우측 정렬할 열 이름 — 헤더와 값에 **똑같이** 적용된다 (요약 표 + 정지 지표 표
+  # 공통, 목록에 없는 열은 좌측). 숫자 열을 좌측에 두면 자릿수가 안 맞아 헤더와
+  # 어긋나 보인다. 값이 아니라 열 이름으로 고른다 — '2:05'(시간)·'0/4'(이벤트)는
+  # 값만 보면 숫자인지 애매해서 표마다 정렬이 흔들린다.
+  # 좌측 유지: 시나리오·상태·이벤트·주요위반·ctrl·신호 (문자 또는 목록)
+  align_right: ['거리[m]', '시간', '평균[km/h]', '감점',
+                't[s]', 'route_s', 'slf[m]', '접근[km/h]', '전환', '유지[s]',
+                '녹색후출발[s]']
 
 event_trigger:
   # tools/gen_scenarios.py 보행자 이벤트(pedestrian/jaywalk/ped_blind)의 트리거
