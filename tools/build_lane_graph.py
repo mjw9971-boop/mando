@@ -751,7 +751,44 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
                     hit.append((road['id'], i, lid))
             if not hit:
                 hit = lanes_of_dir_at(lanes, road, min(max(sc, 0.0), road['length']), d)
+                stats['stop_lane_fallback'] += 1
+            # ── 위생 검사 (관측만 — 배정은 위에서 이미 끝났다) ──────────────
+            # 1차 판정은 **절대 t**: 정지선 t 가 그 도로 어떤 차로의 t 범위도
+            # 벗어나면 좌표가 깨진 것이다. |t|/L 비율을 1차로 쓰면 짧은 도로에서
+            # 정상 정지선을 오탐하고(L=6.09 에 t=7.5 인 3차선 중심), 반대로
+            # L=13~20 m 손상 레코드는 |t|/L 이 1.03 까지 벌어져 놓친다
+            # (2026-09-01 실측: 비율 0.99~1.01 창은 24개 중 19개만 잡았다).
+            lo_all = min(min(tin, tout) for tin, tout, _ in b.values()) - 1.6
+            hi_all = max(max(tin, tout) for tin, tout, _ in b.values()) + 1.6
+            out_t = [t for t in ts if not (lo_all <= t <= hi_all)]
+            if out_t:
+                L = road['length']
+                ratio = max(abs(t) / L for t in out_t) if L > 0 else float('inf')
+                # s==0 + |t|≈L 은 s/t 가 서로 뒤바뀐 손상 패턴이다. 종방향은
+                # s_true=min(|t|,L) 로 복원되지만 횡방향(t)은 파일에 없다.
+                # s 는 클러스터 **평균**이라 정상 레코드와 병합되면 0 에서 밀린다
+                # (road 1043: 정상 s=0.15 3개 + 손상 s=0.0 2개 → 평균 0.09).
+                # 그래서 원본 s 목록(ss)을 본다.
+                kind = ('s/t 손상 의심' if any(s0 == 0.0 for s0 in ss)
+                        and any(abs(abs(t) - L) < 0.05 * L for t in out_t)
+                        else 't 범위 이탈')
+                warnings.append(
+                    f"stopline road {road['id']} dir {d}: {kind} — "
+                    f"t={[round(x, 2) for x in out_t]} 가 차로 t 범위 "
+                    f"[{lo_all:.2f}, {hi_all:.2f}] 밖 (s={sc:.2f}, L={L:.2f}, |t|/L={ratio:.4f})")
+                stats['stop_t_out_of_range'] += 1
             entry = {'dir': d, 's': sc, 'lanes': [k for k in hit if k in lanes], 'signal_ids': []}
+            if not entry['lanes']:
+                # 여기서 조용히 사라진다 — 아래 'lane 기록' 루프가 c['lanes'] 를
+                # 순회하므로 빈 리스트면 어느 차로에도 안 남고 통계에도 안 잡혔다.
+                # 실측(2026-09-01): road 2819 는 일방통행(주행차로 전부 dir=+1)인데
+                # 손상 레코드의 hdg 가 dir=-1 을 가리켜 폴백까지 공집합이 됐고,
+                # controller 217 적신호를 무감속 통과했다.
+                warnings.append(
+                    f"stopline road {road['id']} dir {d} s {sc:.2f}: 배정된 차로가 없다 "
+                    f"— 이 정지선은 그래프에서 사라진다 (그 방향 주행차로 "
+                    f"{len(lanes_of_dir_at(lanes, road, min(max(sc, 0.0), road['length']), d))}개)")
+                stats['stop_no_lane'] += 1
             road['_stop_clusters'].append(entry)
             stats['stop_clusters'] += 1
 
@@ -892,6 +929,17 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
         rec['arrows'].sort()
         rec['speed_marks'].sort()
         rec['markings'].sort()
+
+    # 신호는 붙었는데 정지선이 없는 차로 — 정지선이 없으면 route.collect_stops 가
+    # traffic_lights 를 만들지 않아 next_traffic_light 이 None 이 되고, 제어기의
+    # 적신호 IDM 이 **호출조차 되지 않는다**. 채점기의 stop_ctrl_ids 도 비어
+    # 항목 7 판정이 함께 죽는다. 그래서 별도 지표로 요약에 올린다.
+    orphan = [k for k, rec in lanes.items()
+              if rec['signals'] and not rec['stop_lines']]
+    stats['lanes_signal_no_stopline'] = len(orphan)
+    for k in sorted(orphan)[:20]:
+        warnings.append(f'lane {k}: 신호 {len(lanes[k]["signals"])}개가 붙었으나 정지선 없음 '
+                        f'— 이 차로에서는 적신호 감속이 발동하지 않는다')
     return stats
 
 
