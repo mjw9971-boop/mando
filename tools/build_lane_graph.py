@@ -723,21 +723,116 @@ def lanes_of_dir_at(lanes, road, s, d):
     return out
 
 
+def _lane_t_span(road, s):
+    """도로 s 에서 전체 차로가 덮는 t 범위 (양끝 ±1.6 여유). 차로가 없으면 None."""
+    _, b = lane_bounds_at(road, min(max(s, 0.0), road['length']))
+    if not b:
+        return None
+    lo = min(min(tin, tout) for tin, tout, _ in b.values()) - 1.6
+    hi = max(max(tin, tout) for tin, tout, _ in b.values()) + 1.6
+    return lo, hi
+
+
+def stopline_damaged(road, o) -> bool:
+    """이 정지선 레코드의 s/t 가 깨졌는가.
+
+    조건은 **절대 t** 다: s == 0.0 이면서 |t| 가 그 도로 어떤 차로의 t 범위도
+    벗어나면 s 와 t 가 서로 뒤바뀐 것이다 (|t| ≈ 도로 길이).
+    |t|/L 비율을 조건으로 쓰면 안 된다 — 짧은 도로의 정상 정지선을 오탐하고
+    (L=6.09 에 t=7.5 가 3차선 중심), L=13~20 m 손상 레코드는 |t|/L 이 1.03 까지
+    벌어져 놓친다 (2026-09-01 실측: 비율 0.99~1.01 창은 24개 중 19개만 잡았다).
+    """
+    if o['s'] != 0.0:
+        return False
+    span = _lane_t_span(road, 0.0)
+    return span is not None and not (span[0] <= o['t'] <= span[1])
+
+
+def repair_stopline_dir(lanes, road, covered, warnings):
+    """손상 정지선의 진행방향 — hdg 는 쓰지 않는다.
+
+    hdg 는 이 레코드들에서 못 믿는다: road 2819 는 주행차로가 전부 dir=+1 인
+    일방통행인데 손상 6건의 hdg 가 모두 dir=-1 을 가리켰다. 그래서 폴백
+    (lanes_of_dir_at)까지 공집합이 돼 정지선이 그래프에서 사라졌고, controller
+    217 적신호를 무감속 통과했다 (2026-09-01).
+
+    판정 우선순위 — 0·1 만으로 실측 24/24 가 결정된다:
+      0) 이미 정상 정지선이 덮은 방향은 배제 (손상분은 반대편이다)
+      1) 일방통행 배제 (그 방향에 주행차로가 없으면 반대로 확정)
+    2·3 은 **교차 검증 전용**이다. 불일치해도 보정하지 않고 경고만 남긴다:
+      2) 같은 방향 신호의 road_s (s≈L 이면 dir=+1)
+      3) L-4.00 화살표 t 부호 (음수 t = 우측차로 = dir=+1)
+    """
+    L = road['length']
+    avail = {d: bool(lanes_of_dir_at(lanes, road, min(max(L, 0.0), L), d)) or
+                bool(lanes_of_dir_at(lanes, road, 0.0, d)) for d in (1, -1)}
+    d0 = None
+    if covered == {-1} and avail[1]:
+        d0 = 1
+    elif covered == {1} and avail[-1]:
+        d0 = -1
+    d1 = 1 if (avail[1] and not avail[-1]) else (-1 if (avail[-1] and not avail[1]) else None)
+    d = d0 if d0 is not None else d1
+    # ── 교차 검증 (보정하지 않는다) ──────────────────────────────────────
+    sig_s = sorted({sg['s'] for sg in road['signals']})
+    at_L = any(abs(s - L) < 0.5 for s in sig_s)
+    at_0 = any(abs(s) < 0.5 for s in sig_s)
+    d2 = 1 if (at_L and not at_0) else (-1 if (at_0 and not at_L) else None)
+    arrow_t = [o['t'] for o in road['objects']
+               if o['name'] in ARROWS and abs(o['s'] - (L - 4.0)) < 1.5]
+    neg = sum(1 for x in arrow_t if x < 0)
+    d3 = (1 if neg > len(arrow_t) - neg else
+          (-1 if len(arrow_t) - neg > neg else None)) if arrow_t else None
+    for tag, dx in (('신호 road_s', d2), ('화살표 t', d3)):
+        if d is not None and dx is not None and dx != d:
+            warnings.append(
+                f"stopline road {road['id']}: 방향 교차검증 불일치 — 판정 {d:+d} 인데 "
+                f"{tag} 는 {dx:+d} (보정은 판정대로, 확인 필요)")
+    return d
+
+
 def assign_objects(lanes, roads, warnings, sig2ctrl=None):
     stats = collections.Counter()
+    repaired = []          # (road, s_orig, t_orig, dir_hdg, s_true, dir_fixed)
     for road in roads.values():
         # 정지선 클러스터 (방향별, s 3m 이내)
+        # 좌표가 깨진 정지선 보정 (2026-09-01). 종방향은 s_true = min(|t|, L) 로
+        # 복원된다 — 13 road 전부에서 도로 끝을 집고, 같은 방향 신호 s 와 일치한다.
+        # **횡방향(t)은 복원 불가**다: s=0.0 이라 t 정보가 파일에 없고 부호도 차로
+        # 좌우와 무관하다(road 2819: 실제 +2/-4, 기록 +3/-3). t 가 어떤 차로에도
+        # 안 들어가므로 아래 배정에서 폴백(방향 전체 차로)을 타게 된다 — 이미
+        # 383개 클러스터 중 186개가 그렇게 동작하던 경로다.
+        stop_objs = [o for o in road['objects'] if STOP_NAME in o['name']]
+        dmg_ids = {id(o) for o in stop_objs if stopline_damaged(road, o)}
+        rep_d = None
+        if dmg_ids:
+            covered = {dir_from_hdg(o['hdg']) for o in stop_objs if id(o) not in dmg_ids}
+            rep_d = repair_stopline_dir(lanes, road, covered, warnings)
+            if rep_d is None:
+                warnings.append(f"stopline road {road['id']}: 손상 {len(dmg_ids)}건의 "
+                                f"방향을 정할 수 없다 — 보정하지 않고 원본대로 둔다")
+                stats['stop_repair_undecided'] += len(dmg_ids)
+
         clusters = []  # [dir, s_list, t_list]
-        for o in road['objects']:
-            if STOP_NAME in o['name']:
+        for o in stop_objs:
+            if id(o) in dmg_ids and rep_d is not None:
+                d = rep_d
+                s_o = min(abs(o['t']), road['length'])
+                repaired.append({'road': road['id'], 'road_length': round(road['length'], 4),
+                                 's_orig': round(o['s'], 4), 't_orig': round(o['t'], 4),
+                                 'dir_hdg': dir_from_hdg(o['hdg']),
+                                 's_true': round(s_o, 4), 'dir_fixed': d})
+                stats['stop_repaired'] += 1
+            else:
                 d = dir_from_hdg(o['hdg'])
-                for c in clusters:
-                    if c[0] == d and abs(c[1][0] - o['s']) < 3.0:
-                        c[1].append(o['s'])
-                        c[2].append(o['t'])
-                        break
-                else:
-                    clusters.append([d, [o['s']], [o['t']]])
+                s_o = o['s']
+            for c in clusters:
+                if c[0] == d and abs(c[1][0] - s_o) < 3.0:
+                    c[1].append(s_o)
+                    c[2].append(o['t'])
+                    break
+            else:
+                clusters.append([d, [s_o], [o['t']]])
         road['_stop_clusters'] = []
         for d, ss, ts in clusters:
             sc = float(np.mean(ss))
@@ -934,13 +1029,22 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
     # traffic_lights 를 만들지 않아 next_traffic_light 이 None 이 되고, 제어기의
     # 적신호 IDM 이 **호출조차 되지 않는다**. 채점기의 stop_ctrl_ids 도 비어
     # 항목 7 판정이 함께 죽는다. 그래서 별도 지표로 요약에 올린다.
+    if repaired:
+        # 보정 내역은 **전건**을 남긴다 — 무음 보정 금지. 어느 레코드를 어떻게
+        # 옮겼는지 사후에 되짚을 수 없으면 오보정을 발견할 방법이 없다.
+        print(f'[fix  ] 정지선 좌표 보정 {len(repaired)}건 '
+              f"(road {len({r['road'] for r in repaired})}개)")
+        for r in sorted(repaired, key=lambda x: (x['road'], x['t_orig'])):
+            print(f"         road {r['road']:<5} s {r['s_orig']:>6.2f}→{r['s_true']:>7.2f}  "
+                  f"dir {r['dir_hdg']:+d}→{r['dir_fixed']:+d}  "
+                  f"(t={r['t_orig']:+.2f} 복원 불가, 방향 전체 차로에 배정)")
     orphan = [k for k, rec in lanes.items()
               if rec['signals'] and not rec['stop_lines']]
     stats['lanes_signal_no_stopline'] = len(orphan)
     for k in sorted(orphan)[:20]:
         warnings.append(f'lane {k}: 신호 {len(lanes[k]["signals"])}개가 붙었으나 정지선 없음 '
                         f'— 이 차로에서는 적신호 감속이 발동하지 않는다')
-    return stats
+    return stats, repaired
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -965,7 +1069,7 @@ def build(xodr_path, ds=0.5):
 
     st = link_lanes(lanes, roads, junctions, warnings)
     print('[link ]', dict(st))
-    so = assign_objects(lanes, roads, warnings, sig2ctrl)
+    so, repairs = assign_objects(lanes, roads, warnings, sig2ctrl)
     print('[objs ]', dict(so))
 
     # KD-tree 용 전역 인덱스
@@ -1025,6 +1129,12 @@ def build(xodr_path, ds=0.5):
                 '9910 light_id == xodr <controller> id (NOT signal id); stop_lines carry controller_ids',
                 'sidewalk_left_m/right_m: driver-frame lateral distance from lane center to nearest sidewalk inner edge (None if absent on that side; left crosses opposite carriageway)',
             ],
+            # 정지선 좌표 보정 내역 — 무음 보정 금지. 어느 레코드를 어떻게 옮겼는지
+            # 산출물 안에 남겨야 오보정을 사후에 찾을 수 있다.
+            'stop_repairs': repairs,
+            'stop_repaired': so.get('stop_repaired', 0),
+            'stop_repair_undecided': so.get('stop_repair_undecided', 0),
+            'lanes_signal_no_stopline': so.get('lanes_signal_no_stopline', 0),
             'n_controllers': len(ctrl2sig),
             'n_signals_controlled': len(sig2ctrl),
             'warnings': warnings[:200],
