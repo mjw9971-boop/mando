@@ -76,6 +76,13 @@ routes:
       require: signalized_fast
       tail_m: 120
 
+  # 적색점멸(항목 9) 검증용 — 이 맵의 점멸 신호는 controller 117 하나뿐이라
+  # (junction 60 / road 2312 접근로) 경로가 반드시 그곳을 지나야 한다.
+  # require: blink 가 출발 후보를 그 접근로 상류로 한정하고, 정지선 차로가
+  # 점멸을 실제로 수신하는 3·4 인지까지 검사한다 (gen_scenarios.BLINK_LANE_IDS).
+  적색점멸:
+    walk: {turns: [straight], require: blink, tail_m: 100}
+
   직진신호:
     walk: {turns: [straight], require: signalized, tail_m: 100}
   우회전신호:
@@ -263,6 +270,26 @@ themes:
     vary: [감속강도, 발동거리, 개수, 속도, 차선, 교통류대수, 교통류밀도]
     교통류대수: [12, 20, 30]
     교통류밀도: [조밀, 보통, 성김]
+
+  적색점멸집중:
+    # 대회 항목 9(적색점멸 일시정지) 대응 검증. 점멸 신호는 정지선에서 **일시정지
+    # 후 통과**가 규정이라, 적신호(항목 7)와 달리 통과 자체가 아니라 "통과 전에
+    # 섰는가" 를 본다 (tools/score.py detect_blink_stop).
+    #
+    # 신호 조건이 하나로 고정(controller 117 적색점멸)이므로 변이를 **접근 조건**
+    # 에서 잡는다: 진입 속도(속도) · 선행차 유무(event) · 접근 감속 여지(감속강도).
+    # 정지선까지의 잔여 거리는 축을 두지 않는다 — min_length_m/tail_m 이 만드는
+    # 경로 길이 분산(541~578 m)이 이미 그 역할을 한다 (2026-09-01 실측).
+    min_length_m: 400            # 실측: 400 이면 변형 12/12 생성·고유 경로 7.
+                                 # 600 이상은 7/12 로 떨어진다 (맵 회랑 한계)
+    # signal 을 넣으면 안 된다: ev_signal → set_signal(117) 이 blink 페이즈를
+    # go/attention/stop 으로 치환하려다 GenError 로 시나리오째 죽는다.
+    # 여기서는 신호를 건드리지 않으므로 117 의 blink 가 원본 그대로 보존된다.
+    event: [none, slow_lead, lead_brake]
+    routes: [적색점멸]
+    start: 자유
+    random_axes: true
+    vary: [속도, 감속강도]
 
   전체회귀:
     min_length_m: 800               # 이벤트 순환형 — 여러 이벤트를 고루 담으려면 400보다 여유 필요
