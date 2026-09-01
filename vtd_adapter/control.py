@@ -44,6 +44,9 @@ class VtdLongitudinalController:
         self.jerk_dec_mult = float(c['jerk_dec_mult'])
         self.jerk_max = float(s['jerk_max'])
         self.a_hold = float(s['a_hold'])
+        # B-2 좁은 패치 (params 참조). release_eps 0 이면 비활성.
+        self.release_eps = float(c.get('release_eps', 0.0))
+        self.release_v = float(c.get('release_v', 0.5))
         self.dt = 1.0 / float(cfg['comm']['send_hz'])
         self._prev_accel = 0.0
         self._undo_accel = 0.0
@@ -67,6 +70,18 @@ class VtdLongitudinalController:
         if (hazard_brake or target_speed < 1e-5) and current_speed < 0.2:
             self._prev_accel = self.a_hold
             return self.a_hold, True
+
+        # ── B-2 좁은 패치 ────────────────────────────────────────────────
+        # 정지 후보가 하나도 없고(hazard=False, 목표 > release_v) 자차가 사실상
+        # 서 있는데 제동 명령이 남아 있으면, 램프를 태우지 않고 즉시 턴다.
+        # 실측 2026-09-01 t=414.1~417.1: winner=none·v_target=8.33 인데 직전
+        # 급제동의 잔량(−4.0)이 +0.1/틱으로만 풀려 3.00 s 를 더 서 있었다.
+        # 목표 0(홀드·④′ 종단)은 위 a_hold 분기가 먼저 반환하므로 여기 안 온다.
+        if (self.release_eps > 0.0 and not hazard_brake
+                and float(target_speed) > self.release_v
+                and float(current_speed) < self.release_eps
+                and self._prev_accel < 0.0):
+            self._prev_accel = 0.0
 
         target = 0.0 if hazard_brake else float(target_speed)
         accel = self._raw_accel(target, float(current_speed))
