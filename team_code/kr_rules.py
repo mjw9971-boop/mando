@@ -212,6 +212,9 @@ class KrRules:
         # WAIT — 앞차 출발 기회
         self.wait_s = float(ot.get('wait_before_shift_s', 6.0))
         self.ot_dash_slack_m = float(ot.get('dash_slack_m', 2.0))
+        # 시프트 전이 횡가속 상한 (P1). 0 이면 비활성.
+        self.a_lat_max = float(ot.get('a_lat_max', 0.0))
+        self.shift_cap_min_v = float(ot.get('shift_cap_min_v', 1.0))
         # 규칙 2 — 데드락 해제 (BREAKOUT)
         self.BO_CREEP = 4                                  # 크립이 켜지는 단계
         self.bo_enabled = bool(ot.get('breakout_enabled', False))
@@ -638,6 +641,80 @@ class KrRules:
             key, s0 = nxt[0], 0.0
         return cover
 
+    def _is_center_mark(self, lg, ego_lane, side, s) -> bool:
+        """side 쪽 차선 표식이 **중앙선**인가 — 색으로 본다 (황색 = 중앙선).
+
+        `_dashed_ahead_m` 은 마크의 **종류**(실선/점선)만 보고 색을 읽지 않는다.
+        그래서 BREAKOUT L2 의 '실선 허용' 완화가 황색 중앙선까지 통과시킨다
+        (2026-09-01 코드 확인). 중앙선 침범은 항목4 **중대**이고, 대향 차로
+        진입은 L5(대향차 TTC 게이트) 소관인데 **미구현**이다 — 그러므로 지금은
+        단계와 무관하게 **절대 불가**로 자른다. 여기서 걸러야 `lvl >= 2` 가
+        dashed 게이트를 건너뛰어도 중앙선을 넘지 않는다.
+        """
+        if lg is None or ego_lane is None:
+            return False
+        try:
+            _typ, col, _ok = lg.mark_at(ego_lane, float(s), side)
+        except Exception:                                  # noqa: BLE001
+            return False
+        return str(col) == 'yellow'
+
+    def _shift_speed_cap(self, planner, ego_speed: float) -> float | None:
+        """진행 중인 회피 시프트의 전이 곡률에서 나오는 **속도 상한** — min() 후보.
+
+        `transition_m` 은 시프트를 **만든 시점**의 속도로 정해진다
+        (`trans_m = max(transition_m, shift_k_s·v)`). 정지 중 생성되면 12 m 로
+        굳는데, 적신호 SHIFT_HOLD 로 21 s 를 서 있다 6.5 m/s 로 통과하면
+        요구 횡가속이 4.34 m/s² 가 된다 — 실측 2026-09-01 t=112.4: 조향이 양방향
+        풀락(±0.480)으로 포화하고 경로 대비 1.45 m 오버슛, 황색 중앙선을 0.94 m
+        물었다 (0.60 s 지속 = 항목4 중대 임계).
+
+        **경로를 다시 밀지 않는다** — 진행 중인 시프트를 재생성하면 현재 위치의
+        경로가 옆으로 튀어 급조향이 된다 (`shift_route_around_actors` 의
+        `min_start_ahead` 주석과 같은 사고). 대신 속도를 낮춰 같은 기하를 통과
+        가능하게 만든다:
+
+            κ = |d²(lat_shift)/ds²|            (전이의 횡곡률)
+            a_lat = κ·v²  ≤  a_lat_max   →   v ≤ √(a_lat_max / κ)
+
+        · `lat_shift − _lat_build` 를 미분한다 — **회피 시프트 성분만** 본다.
+          `lat_shift` 자체에는 계획 차선변경 블렌드와 테이퍼 보정이 함께 실려
+          있어, 그대로 미분하면 이미 검증된 계획 기하의 곡률까지 세서 평지
+          구간에서도 상한이 하한(shift_cap_min_v)까지 내려간다 (실측: replay
+          t=108.5~110.5 에서 cap 1.00). 전이 길이·형상은 가정하지 않는다.
+        · 평지(plateau)와 span 밖에서는 κ = 0 이라 스스로 비활성이다.
+        · 0.5 m 스텐실 — `lat_shift` 는 블렌드로 만든 해석적 배열이라 잡음이
+          없고, 폭을 넓히면 전이 경계(κ 가 최대인 지점)에서 평지 쪽을 섞어
+          **과소평가**한다. 실측 비교(코사인 Δ=3.0): 2 m 폭은 L=12 에서 상한을
+          7 %, L=8 에서 14 % 느슨하게 냈고 0.5 m 폭은 각각 0.5 % / 1.1 % 다.
+        · 미리보기는 standoff 와 같은 축(`max(shift_latest_m, shift_k_s·v)`)이다 —
+          전이에 **닿기 전에** 감속이 시작돼야 한다.
+        · 하한 `shift_cap_min_v` — 전이 한복판에서 완전히 서면 빠져나올 수 없다.
+        """
+        if self.a_lat_max <= 0.0 or self.ot_span is None:
+            return None
+        lat = getattr(planner, 'lat_shift', None)
+        if lat is None or len(lat) == 0:
+            return None
+        arr = np.asarray(lat, dtype=float)
+        base = getattr(planner, '_lat_build', None)
+        if base is not None and len(base) == len(arr):
+            arr = arr - np.asarray(base, dtype=float)       # 회피 시프트 성분만
+        i = int(getattr(planner, 'route_index', 0))
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        look = max(self.shift_latest_m, self.shift_k_s * max(ego_speed, 0.1))
+        h = max(1, int(round(0.5 * ppm)))                  # 0.5 m 스텐실 (위 참조)
+        j0 = max(i, int(self.ot_span[0]), h)
+        j1 = min(len(arr) - 1 - h, int(self.ot_span[1]), i + int(look * ppm))
+        if j1 <= j0:
+            return None
+        hs = h / ppm
+        d2 = np.abs(arr[j0 + h:j1 + h + 1] - 2.0 * arr[j0:j1 + 1] + arr[j0 - h:j1 - h + 1])
+        kappa = float(d2.max()) / (hs * hs)
+        if kappa <= 1e-6:
+            return None
+        return max(self.shift_cap_min_v, _math.sqrt(self.a_lat_max / kappa))
+
     def _ego_local_s(self, lg, ap) -> float:
         loc = ap._vehicle.get_location()
         vx, vy = frame.from_carla_xy(loc.x, loc.y)
@@ -998,9 +1075,15 @@ class KrRules:
             self.last_overtake = 'junction'
             return
 
+        local_s = self._ego_local_s(lg, ap)
         for side in ('left', 'right'):                     # 좌측 추월 우선
             target = lg.neighbor(ego_lane, side)
             if target is None:
+                continue
+            # 중앙선(황색)은 **어느 BREAKOUT 단계에서도** 넘지 않는다 (_is_center_mark).
+            if self._is_center_mark(lg, ego_lane, side, local_s):
+                self.last_overtake = f'{side}:center_line'
+                (self.last_avoid or {}).update({'reject': f'{side}:center_line'})
                 continue
             # BREAKOUT 사다리: L1 측방 반경 완화, L2 이상만 실선 허용
             lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
@@ -1022,7 +1105,6 @@ class KrRules:
                     {'reject': 'span_into_zone', 'span_end': round(span_end, 1),
                      'zone_lo': round(zone_lo, 1)})
                 continue
-            local_s = self._ego_local_s(lg, ap)
             cover = self._dashed_ahead_m(lg, ego_lane, side, local_s, span_m)
             if lvl < 2 and cover < span_m - self.ot_dash_slack_m:
                 self.last_overtake = f'{side}:solid'
@@ -1459,6 +1541,13 @@ class KrRules:
         so = self._standoff_profile(ego_speed)
         if so is not None and (candidate is None or so < candidate):
             candidate = so
+
+        # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
+        cap = self._shift_speed_cap(planner, ego_speed)
+        if cap is not None and (candidate is None or cap < candidate):
+            candidate = cap
+        if cap is not None:
+            self.last_avoid = dict(self.last_avoid or {}, shift_cap=round(cap, 2))
 
         # BREAKOUT 크립 — 훅이 PDM 후보를 무효화한 뒤, 상한은 여전히 min() 이다.
         if self.breakout_creep() and (candidate is None or self.bo_creep_v < candidate):
