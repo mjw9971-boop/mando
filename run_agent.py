@@ -297,6 +297,11 @@ class Runner:
             low = min(cand, key=cand.get)
             if initial is None or cand[low] < initial - 1e-6:
                 winner = _HAZARD_NAME[low]
+        # kr 후보는 한 슬롯('route_end')을 공유한다 — 이긴 원인이 보행자 의도
+        # 후보면 이름을 walker 로 바로잡는다 (score 의 GREEN_EXEMPT_WINNERS·
+        # 사후 분류가 원인별로 갈리도록).
+        if winner == 'route_end' and (self.kr.last_ped or {}).get('wins'):
+            winner = 'walker'
 
         reasons = {'initial': initial, 'winner': winner, **cand,
                    'sig_src': self.kr.last_sig_src,
@@ -306,6 +311,9 @@ class Runner:
                    # 이후 틱은 null 이므로 "이 접근의 판정" 을 찾으려면 이 필드가
                    # non-null 인 틱을 고르면 된다.
                    'yellow': self.kr.last_yellow,
+                   # 보행자 의도 후보 (P4) — 후보가 산 틱에만 채워진다.
+                   # wins/emergency 로 "이겼나 / 비상 우회였나" 를 함께 남긴다.
+                   'ped': self.kr.last_ped,
                    # 회피 진단 — 상태/기각·억제 사유. 이게 없어서 이전에는
                    # 기각 이유를 알려면 리플레이를 계측해야 했다 (2026-08-30).
                    'avoid': self.kr.last_avoid}

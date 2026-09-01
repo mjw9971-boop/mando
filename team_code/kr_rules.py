@@ -173,6 +173,11 @@ class KrRules:
         self.stop_profile_a = float(sp.get('stop_profile_a', 0.0))
         # 황색 딜레마 원샷 판정 (C). 0 이면 비활성 = 황색을 PDM 원문에만 맡긴다.
         self.a_yellow = float(sp.get('a_yellow', 0.0))
+        # 보행자 의도 감지 (P4). 0 이면 비활성 = PDM forecast_walkers 에만 맡긴다.
+        self.ped_intent_v = float(sp.get('ped_intent_v', 0.0))
+        self.ped_emg_ratio = float(sp.get('ped_emergency_ratio', 0.0))
+        self.a_emergency = float(sp.get('a_emergency', -8.0))
+        self.a_dec_max = abs(float(cfg['control']['a_dec_max']))
         self.y_guard_max_m = float(sp.get('yellow_guard_max_m', 60.0))
         # ap.config 를 못 읽는 환경(목)에서만 쓰는 폴백 — 정상 경로는 PDM 값 사용
         self.stop_gap_sl_fallback = float(sp.get('stop_gap_stopline_m', 1.5)) + self.front
@@ -254,6 +259,12 @@ class KrRules:
         self.last_avoid: dict | None = None        # 회피 진단 (reasons.avoid)
         self.obj_ticks: dict = {}                  # 객체별 정지 지속 틱
         self.obj_miss: dict = {}                   # 객체별 미관측 틱 (grace)
+        # 보행자 의도 감지 상태 (P4)
+        self.ped_static: set = set()               # '정지 관찰' 을 마친 보행자 id
+        self.ped_lat: dict = {}                    # id → 직전 틱의 경로 횡거리
+        self.ped_intent: set = set()               # 의도 래치가 걸린 id
+        self.last_ped: dict | None = None          # 이번 틱 진단 (reasons.ped)
+        self.ped_emergency = False                 # 이번 틱 비상 제동 우회 여부
         self._sl_all: list | None = None           # 경로상 전 정지선 route_s (1회)
         # BREAKOUT 상태
         self.bo_state: str | None = None           # None | 'BREAKOUT' | 'CREEP_FAIL'
@@ -1233,6 +1244,86 @@ class KrRules:
             return None
         return nxt[0]
 
+    def _ped_intent(self, planner, ap, ego_speed: float):
+        """정지 관찰 중이던 보행자가 **경로 쪽으로** 걸어나오는 순간의 정지 후보.
+
+        반환 `(v_allow, a_req, ped_id)` 또는 None.
+
+        왜 PDM 예측을 못 기다리는가 — `forecast_walkers` 는 등속 2 s 직선 예측이고
+        속도는 `min_walker_speed` (0.5) 로만 하한을 둔다. 예측 도달거리가
+        `v_ped·2 + pedestrian_minimum_extent(1.5)` 라, 서 있는 보행자는 2.5 m 밖에
+        못 뻗는다. 실측 2026-09-01 실전주행_교통류_01 id7: 횡 6.35 m 에서 걸어나오는
+        데 v_ped 가 1.70 m/s 가 되어서야(0.5 s 뒤) 회랑에 닿았고, 그 사이 필요
+        감속이 3.31 → 4.29 m/s² 로 올라 `a_dec_max` (4.0) 를 넘겨 접촉했다.
+
+        여기서는 교차를 기다리지 않고 **경로 횡거리의 감소율**로 의도를 읽는다.
+        횡거리는 경로 기하에 대한 값이라 자차 운동과 무관하다 (자차 프레임 횡거리와
+        다르다 — 자차가 돌면 서 있는 보행자도 움직이는 것처럼 보인다).
+
+        게이트 (모두 만족해야 래치):
+          · `obj_static_s` 이상 정지 관찰을 마친 id (`ped_static`)
+          · 보행자 자신의 속도 ≥ `ped_intent_v`
+          · **경로 쪽** 횡속도 = −d|lat|/dt ≥ `ped_intent_v`
+            → 멀어지는 방향(+)·경로와 나란한 이동(≈0)은 부호/크기에서 걸러진다
+          · 전방 (`0 < s_rel ≤ detect_max_m`)
+
+        래치는 보행자가 지나가면(뒤로 감) 또는 관측이 끊기면 풀린다. 정지 목표는
+        보행자의 **횡단 지점**이고 gap 은 PDM 주입값
+        `idm_pedestrian_minimum_distance` 를 그대로 읽는다 (단일 출처).
+        """
+        if self.ped_intent_v <= 0.0 or self.stop_profile_a <= 0.0:
+            return None
+        try:
+            walkers = list(ap._world.get_actors().filter('*walker*'))
+        except Exception:                                  # noqa: BLE001
+            return None
+        live = set()
+        best = None
+        s0 = float(getattr(getattr(ap, 'config', None),
+                           'idm_pedestrian_minimum_distance', 4.0))
+        for w in walkers:
+            wid = getattr(w, 'id', None)
+            if wid is None:
+                continue
+            live.add(wid)
+            loc = w.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None:
+                self.ped_lat.pop(wid, None)
+                continue
+            s_rel, lat = pr
+            prev = self.ped_lat.get(wid)
+            self.ped_lat[wid] = lat
+            if self._static_ok(w):
+                self.ped_static.add(wid)               # 정지 관찰 완료 (지속 기억)
+            if not (0.0 < s_rel <= self.detect_max_m):
+                self.ped_intent.discard(wid)           # 지나갔거나 범위 밖
+                continue
+            if wid not in self.ped_intent:
+                if wid not in self.ped_static or prev is None:
+                    continue
+                # 경로 쪽 횡속도 — |lat| 이 줄어드는 속도. 멀어지면 음수다.
+                v_toward = (abs(prev) - abs(lat)) * self.hz
+                if (float(getattr(w, 'speed', 0.0)) < self.ped_intent_v
+                        or v_toward < self.ped_intent_v):
+                    continue
+                self.ped_intent.add(wid)
+            d_eff = s_rel - self.front - s0
+            v_allow = _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_eff))
+            # 분모 하한 0.5 m — d_eff→0 에서 a_req 가 발산해 로그가 못 쓰게 된다.
+            # 판정(임계 초과 여부)에는 영향이 없다: 하한을 써도 이미 임계 위다.
+            a_req = ego_speed * ego_speed / (2.0 * max(d_eff, 0.5))
+            if best is None or v_allow < best[0]:
+                best = (v_allow, a_req, wid)
+        # 관측이 끊긴 id 정리 (obj_ticks 의 grace 와 별개 — 여기선 즉시)
+        for wid in list(self.ped_intent):
+            if wid not in live:
+                self.ped_intent.discard(wid)
+        for wid in list(self.ped_static):
+            if wid not in live and wid not in self.obj_ticks:
+                self.ped_static.discard(wid)
+        return best
+
     def _standoff_profile(self, ego_speed: float) -> float | None:
         """WAIT/관찰 중 **장애물 앞 standoff 에 서도록** 하는 속도 상한 — min() 후보.
 
@@ -1321,6 +1412,8 @@ class KrRules:
         self.last_d_end = d_end
         self._ap = ap
         self.last_yellow = None
+        self.last_ped = None
+        self.ped_emergency = False
         # 황색 원샷 판정 — 프로파일·홀드보다 먼저 정해야 같은 틱에 반영된다
         self._yellow_latch(planner, ego_speed, ap)
 
@@ -1383,19 +1476,48 @@ class KrRules:
         if hold is not None and (candidate is None or hold < candidate):
             candidate = hold
 
+        # 보행자 의도 후보 (P4) — PDM 예측선 교차를 기다리지 않는다.
+        ped = self._ped_intent(planner, ap, ego_speed)
+        ped_bind = False
+        if ped is not None:
+            v_allow, a_req, wid = ped
+            # '구속' = 이 후보가 min() 의 최저값이다 (동률 포함). 동률까지 세는
+            # 이유는 PDM 의 walker 후보가 뒤늦게 같은 값에 도달했을 때도 비상
+            # 우회가 이어져야 하기 때문이다.
+            ped_bind = candidate is None or v_allow <= candidate + 1e-9
+            if candidate is None or v_allow < candidate:
+                candidate = v_allow
+            self.last_ped = {'id': int(wid), 'v_allow': round(float(v_allow), 2),
+                             'a_req': round(float(a_req), 2), 'wins': bool(ped_bind)}
+
+        # 보행자 비상 우회 — **보행자 후보가 최종 목표를 구속하는 틱 한정**이다.
+        # 선행차·신호·종점·크립 후보가 이긴 틱에서는 절대 발동하지 않는다.
+        final_t = target_speed if candidate is None else min(target_speed, candidate)
+        emg = bool(ped_bind and self.ped_emg_ratio > 0.0
+                   and ped[1] > self.ped_emg_ratio * self.a_dec_max
+                   and final_t <= ped[0] + 1e-9)
+        if emg:
+            self.ped_emergency = True
+            if self.last_ped is not None:
+                self.last_ped['emergency'] = True
+
         if candidate is not None:
             self.last_candidate = candidate
-            if candidate < target_speed:
+        if (candidate is not None and candidate < target_speed) or emg:
+            if candidate is not None and candidate < target_speed:
                 target_speed = candidate
-                # 종방향 재계산 — 본류가 이번 틱 이미 호출했으므로 되감고 다시
-                # (되감지 않으면 두 호출이 jerk 창을 나눠 갖는 핑퐁 — rewind_last 참고)
-                hazard = target_speed < 1e-5
-                ap._longitudinal_controller.rewind_last()
+            # 종방향 재계산 — 본류가 이번 틱 이미 호출했으므로 되감고 다시
+            # (되감지 않으면 두 호출이 jerk 창을 나눠 갖는 핑퐁 — rewind_last 참고)
+            hazard = target_speed < 1e-5
+            ap._longitudinal_controller.rewind_last()
+            if emg:
+                accel, brake = ap._longitudinal_controller.emergency()
+            else:
                 accel, brake = ap._longitudinal_controller.get_throttle_and_brake(
                     hazard, target_speed, ego_speed)
-                control.accel = accel
-                control.throttle = accel
-                control.brake = float(brake)
+            control.accel = accel
+            control.throttle = accel
+            control.brake = float(brake)
 
         if self.q_reject:
             self.last_avoid = dict(self.last_avoid or {}, queue_reject=self.q_reject)

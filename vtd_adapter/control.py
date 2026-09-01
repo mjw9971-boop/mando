@@ -44,6 +44,7 @@ class VtdLongitudinalController:
         self.jerk_dec_mult = float(c['jerk_dec_mult'])
         self.jerk_max = float(s['jerk_max'])
         self.a_hold = float(s['a_hold'])
+        self.a_emergency = float(s['a_emergency'])
         # B-2 좁은 패치 (params 참조). release_eps 0 이면 비활성.
         self.release_eps = float(c.get('release_eps', 0.0))
         self.release_v = float(c.get('release_v', 0.5))
@@ -71,6 +72,12 @@ class VtdLongitudinalController:
             self._prev_accel = self.a_hold
             return self.a_hold, True
 
+        # 비상 제동(a_emergency)에서 빠져나오는 틱 — jerk 창의 기준을 정상 축
+        # (a_dec_max)까지 끌어올린다. 안 그러면 −8.0 → 0 복귀에 4 s 가 걸린다.
+        # 비상이 계속 필요하면 kr_rules 가 emergency() 로 다시 덮는다.
+        if self._prev_accel < self.a_dec_max:
+            self._prev_accel = self.a_dec_max
+
         # ── B-2 좁은 패치 ────────────────────────────────────────────────
         # 정지 후보가 하나도 없고(hazard=False, 목표 > release_v) 자차가 사실상
         # 서 있는데 제동 명령이 남아 있으면, 램프를 태우지 않고 즉시 턴다.
@@ -91,6 +98,21 @@ class VtdLongitudinalController:
                        self._prev_accel + self.jerk_max * self.dt)
         self._prev_accel = accel
         return accel, bool(hazard_brake or target_speed < 1e-5)
+
+    def emergency(self, accel: float | None = None) -> tuple[float, bool]:
+        """jerk 램프를 건너뛰고 즉시 accel 을 낸다 — **보행자 비상 한정**.
+
+        kr_rules 가 보행자 의도 후보의 필요 감속이 |a_dec_max|·ped_emergency_ratio
+        를 넘을 때만 부른다. 실측 2026-09-01: 후보 생성 뒤 −4.0 에 도달하기까지
+        1.00 s 가 걸려 그 사이 12.1 m 를 갔고, 그 1 초가 정지/접촉을 갈랐다.
+
+        `_prev_accel` 을 그대로 덮으므로 다음 틱의 jerk 기준도 이 값이다. 비상이
+        풀리면 get_throttle_and_brake 가 기준을 a_dec_max 로 끌어올려 복귀한다.
+        """
+        a = self.a_emergency if accel is None else float(accel)
+        self._undo_accel = self._prev_accel
+        self._prev_accel = a
+        return a, True
 
     def rewind_last(self) -> None:
         """직전 get_throttle_and_brake 호출을 무효화한다 (jerk 기준 복원).
