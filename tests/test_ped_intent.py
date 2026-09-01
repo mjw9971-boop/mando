@@ -275,3 +275,31 @@ def test_emergency_switch_off():
     assert kr.last_ped is not None
     assert kr.ped_emergency is False
     assert ctrl.accel > A_EMG
+
+
+# ── 리스폰 / 누수 ────────────────────────────────────────────────────────
+def test_on_reset_drops_intent_state():
+    """courseRespawn 후 직전 횡거리는 무효 — 가짜 의도 래치를 만들면 안 된다."""
+    kr, p = make()
+    w = Walker(7, 22.0, -6.0)
+    ap = Ap(p, actors=[w])
+    observe_static(kr, ap, p=p)
+    walk(kr, ap, p, w, dy=+0.5 / HZ, ticks=1)
+    assert kr.ped_intent and kr.ped_lat
+    kr.on_reset()
+    assert not kr.ped_intent and not kr.ped_lat and not kr.ped_static
+    # 리스폰 직후 보행자가 순간이동해도(투영 불연속) 그 1틱으로는 안 걸린다
+    w._y = -1.0
+    assert kr._ped_intent(p, ap, 12.0) is None
+
+
+def test_lat_history_does_not_leak():
+    """관측이 끊긴 보행자의 횡거리 이력은 남지 않는다."""
+    kr, p = make()
+    w = Walker(7, 22.0, -6.0)
+    ap = Ap(p, actors=[w])
+    observe_static(kr, ap, p=p)
+    assert 7 in kr.ped_lat
+    ap._world._a.remove(w)                                 # 목록에서 사라짐
+    kr._ped_intent(p, ap, 12.0)
+    assert 7 not in kr.ped_lat

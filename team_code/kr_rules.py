@@ -1238,7 +1238,14 @@ class KrRules:
         self.cross_s = None
         self.cross_junction_seen = False
         self.sl_hold_left = 0
+        self.sl_stopped = False                       # 정지 연속성도 끊긴다 (B-1)
+        self.sl_stop_ticks = 0
         self.latched = False
+        # 보행자 의도 (P4) — 자차가 순간이동하면 경로 투영이 불연속이 되어
+        # 직전 횡거리와의 차분이 가짜 '경로 쪽 횡속도' 를 만든다. 전부 버린다.
+        self.ped_lat.clear()
+        self.ped_intent.clear()
+        self.ped_static.clear()
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -1408,6 +1415,9 @@ class KrRules:
         for wid in list(self.ped_static):
             if wid not in live and wid not in self.obj_ticks:
                 self.ped_static.discard(wid)
+        for wid in list(self.ped_lat):
+            if wid not in live:
+                self.ped_lat.pop(wid, None)
         return best
 
     def _standoff_profile(self, ego_speed: float) -> float | None:
