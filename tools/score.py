@@ -85,7 +85,7 @@ ITEMS = [
     (6, 'solid_lane_change', '실선 차로 변경'),
     (7, 'red_light', '적색신호 정지'),
     (8, 'green_stall', '녹색신호 통과'),
-    (9, None, '적색점멸 일시정지'),
+    (9, 'blink_stop', '적색점멸 일시정지'),
     (10, 'ped_response', '보행자 대응'),
     (11, 'collision', '장애물 대응'),
     (12, None, '횡단보도 정차 금지'),
@@ -107,6 +107,13 @@ RED = 1                    # 9910 신호 state (logger.py 주석: 1=적 3=녹 4=
 GREEN = 3
 LEFT_ARROW = 4
 GREEN_LEFT = 5
+# 6 = 점멸. 이 맵의 점멸 컨트롤러는 117 하나뿐이고 적색으로 확정됐다 —
+# 대회 배포본 7개 전부 blink=117, Signal 373(type 1000020=적) LightState
+# ['true','false'], 실기 육안도 적색 점멸 (2026-09-01). 채점표에 황색점멸
+# 항목이 없으므로 색 판정 없이 6 을 적색점멸로 취급한다.
+# **지속 플래그다** — 램프 on/off 위상은 9910 에 실리지 않는다 (실측: 629틱
+# 35.7 s 동안 6 고정, 전이 0회). 그래서 주기 토글을 찾지 않는다.
+BLINK = 6
 
 # 녹색 정차 면책으로 인정하는 decision.reasons.winner (run_agent _HAZARD_NAME).
 # 'light'(신호 오인)·'none'(원인 기록 없음)은 면책이 아니다 — 그게 항목 8이다.
@@ -822,6 +829,74 @@ def detect_red_stop(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
     return ok, far, enc
 
 
+def _tick_blink(t: dict) -> bool:
+    """이 틱에서 전방 정지선의 신호가 점멸(state 6)인가.
+
+    _ctrl_states 를 쓰므로 **ego 가 접근 중인 정지선을 규율하는** controller 로
+    자동 한정된다 — id 화이트리스트가 필요 없는 이유다. 정지선이 없거나
+    9910 이 그 controller 를 안 주면 None → False.
+    """
+    got = _ctrl_states(t)
+    return got is not None and any(s == BLINK for s in got)
+
+
+def detect_blink_stop(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
+                      merge_gap_s: float = 0.0) -> list:
+    """적색점멸 일시정지 위반 (대회 항목 9).
+
+    점멸 신호는 정지선에서 **일시정지 후 통과**가 규정이다. 적신호(항목 7)와
+    달리 "정지 후 진행" 이 정상이므로, 통과 자체가 아니라 **통과 전에 섰는가**
+    만 본다. 6 은 지속 플래그라 통과 순간의 색을 볼 필요도 없다.
+
+    에피소드 = 점멸이 켜져 있는 연속 틱 구간. 그 안에서
+      · 앞범퍼가 정지선 stop_ok_m 안까지 접근한 적이 있고        (판정 대상)
+      · 선을 넘기 전에 v<stop_speed 가 stop_hold_s 이상 지속되지 않았으면  → 위반
+    두 임계는 항목 7(detect_red_stop)이 쓰는 것과 같은 값이다 — 정지의 정의가
+    항목마다 다르면 같은 주행이 항목별로 다르게 판정된다.
+
+    정지는 **선을 넘기 전(front_m ≤ 0)** 것만 인정한다. 선을 넘어 선 것은
+    일시정지가 아니다 (그건 항목 7 의 stop_line_encroach 소관).
+    reset 틱은 제외 — 순간이동은 주행이 아니다.
+    """
+    ok_m = float(sc['stop_ok_m'])
+    hold_s = float(sc['stop_hold_s'])
+    mask = [_tick_blink(t) and not t['world']['flags'].get('reset') for t in ticks]
+    merged = []
+    for r in _runs(mask):
+        if merged and ticks[r[0]]['t'] - ticks[merged[-1][1]]['t'] <= merge_gap_s:
+            merged[-1] = (merged[-1][0], r[1], True)
+        else:
+            merged.append(r)
+    out = []
+    for i0, i1, _ in merged:
+        def front(i):
+            return ticks[i]['world'].get('stop_line_front_m')
+        rng = range(i0, i1 + 1)
+        near = [i for i in rng if front(i) is not None and front(i) >= -ok_m]
+        if not near:
+            continue                       # 정지선까지 못 갔다 — 판정 대상이 아니다
+        # 선을 넘기 전 구간에서 정지했는가 (hold_s 이상 연속 저속)
+        before = [i for i in rng if front(i) is not None and front(i) <= 0.0]
+        stopped = False
+        if before:
+            b0, b1 = before[0], before[-1]
+            sub = [ticks[i]['ego']['speed'] < stop_speed for i in range(b0, b1 + 1)]
+            for s0, s1, _v in _runs(sub):
+                if ticks[b0 + s1]['t'] - ticks[b0 + s0]['t'] >= hold_s:
+                    stopped = True
+                    break
+        if stopped:
+            continue
+        closest = min(near, key=lambda i: abs(front(i)))
+        vmin = min(ticks[i]['ego']['speed'] for i in near)
+        out.append(_ev(ticks, t0, i0, i1,
+                       ctrl_ids=ticks[closest]['world']['flags'].get('stop_ctrl_ids') or [],
+                       front_m=round(float(front(closest)), 2),
+                       min_v_kph=round(vmin * 3.6, 1),
+                       v_kph=round(ticks[closest]['ego']['speed'] * 3.6, 1)))
+    return out
+
+
 def _tick_green(t: dict) -> bool:
     """전방 정지선 신호가 녹색(직진 가능)인가 — GREEN/GREEN_LEFT 이고 적색 아님."""
     got = _ctrl_states(t)
@@ -1128,6 +1203,8 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
         return 'major' if float(ev.get('dur_s', 0.0)) >= float(sc['green_major_s']) else 'minor'
     if cat == 'red_light':
         return 'major'
+    if cat == 'blink_stop':
+        return 'major'          # 항목 7 의 적신호 무정차 통과와 같은 등급
     if cat in ('stop_line_encroach', 'red_stop_far'):
         return 'minor'
     if cat == 'collision':
@@ -1281,6 +1358,9 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     V['red_stop_ok'] = {'count': 0, 'events': rs_ok}
     V['red_stop_far'] = {'count': 0, 'events': rs_far}
     V['stop_line_encroach'] = {'count': 0, 'events': rs_enc}
+    V['blink_stop'] = {'count': 0, 'events': detect_blink_stop(
+        span, t0, stop_speed, cfg['scoring'],
+        float(cfg['score'].get('merge_gap_s', 0.0)))}
     V['green_stall'] = {'count': 0, 'events': detect_green_stall(
         span, t0, stop_speed, cfg['scoring'],
         float(cfg['score'].get('merge_gap_s', 0.0)))}
@@ -1365,7 +1445,7 @@ LABEL = {
     'sidewalk': '보도 침범', 'ped_response': '보행자 대응',
     'red_light': '적신호 통과', 'red_right_turn': '적신호 우회전(정보)',
     'red_stop_ok': '적신호 정지 정상(정보)', 'red_stop_far': '적신호 원거리 정지',
-    'green_stall': '녹색신호 정차',
+    'green_stall': '녹색신호 정차', 'blink_stop': '적색점멸 무정차',
     'stop_line_encroach': '정지선 침범', 'off_route': '경로 이탈',
     'reset': '리셋(courseRespawn)', 'collision': '충돌', 'near_miss': '근접 경고(정보)',
     'not_finished': '미완주', 'overtime': '시간 초과(정보)', 'stall': '정지 고착',
@@ -1386,6 +1466,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'red_stop_far': ('front_m',),
     'stop_line_encroach': ('front_m', 'encroach_m'),
     'green_stall': ('front_m', 'winner'),
+    'blink_stop': ('ctrl_ids', 'front_m', 'min_v_kph', 'v_kph'),
     'off_route': ('max_dist_m',),
     'reset': ('why',),
     'collision': ('obj_id', 'obj_cls', 'min_gap_m', 'v_kph'),
