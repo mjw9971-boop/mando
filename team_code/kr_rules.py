@@ -169,6 +169,8 @@ class KrRules:
         self.sl_hold_ticks = int(round(float(sp['stopline_hold_s'])
                                        * float(cfg['comm']['send_hz'])))
         self.sl_near_m = float(sp['stopline_hold_near_m'])
+        self.sl_min_ticks = int(round(float(sp.get('stopline_hold_min_s', 0.0))
+                                      * float(cfg['comm']['send_hz'])))
         # 정지선 정지 프로파일 (④′). 0 이면 완전 비활성 — 되돌리는 스위치다.
         self.stop_profile_a = float(sp.get('stop_profile_a', 0.0))
         # 황색 딜레마 원샷 판정 (C). 0 이면 비활성 = 황색을 PDM 원문에만 맡긴다.
@@ -238,6 +240,8 @@ class KrRules:
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
         self.sl_hold_left = 0                      # 정지선 홀드 잔여 틱
+        self.sl_stopped = False                    # 정지 연속성 (B-1 재무장 판정)
+        self.sl_stop_ticks = 0                     # 현재 정지의 지속 틱
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
@@ -1456,21 +1460,46 @@ class KrRules:
     def _stopline_hold(self, planner, ego_speed: float) -> float | None:
         """적신호 정지선 정지의 최소 유지 (speed.stopline_hold_s) — 목표 0 후보.
 
-        다음 신호 정지선이 적색이고 앞범퍼가 stopline_hold_near_m 안에서
-        저속(latch_v — 기존 래치 관례 재사용)이 되면 홀드 시작. 홀드 중에는
-        신호가 녹색으로 바뀌어도 잔여 틱을 채운다 (규정 "0.5 s 이상 정지" —
-        실측 0.4 s 재출발이 감점 대상). 신호 정보가 없는 환경(목 플래너 등)
-        에서는 개입하지 않는다.
+        규정은 "0.5 s 이상 정지" 다 (실측 0.4 s 재출발이 감점 대상이라 도입).
+
+        **B-1 확정 스펙 (2026-09-01)** — 옛 동작은 적색·근접·저속인 동안 잔여를
+        **매 틱 다시 채웠다.** 그래서 녹색이 되는 순간 항상 최대 stopline_hold_s
+        만큼 잔여가 남아 출발이 그만큼 늦었다 (실측 잔여 0.30 / 1.00 / 1.10 /
+        1.15 s). 지금은:
+
+          1. **연속 정지 중 리필 금지** — 한 번의 정지에 대해 무장은 1회다.
+          2. **정지 연속성이 깨질 때만 재무장** — 굴러갔다(latch_v 이상) 다시
+             서면 그것은 새 정지이므로 다시 채운다. 적색이 지속되는 동안 목표 0 을
+             유지하는 일은 홀드가 아니라 ④′ 프로파일(_stopline_profile)의 몫이다.
+          3. **녹색 전환 시 잔여 클리어** — 단 그 정지가 아직 최소 시간
+             (stopline_hold_min_s) 을 못 채웠으면 모자란 만큼만 남긴다.
+
+        신호 정보가 없는 환경(목 플래너 등)에서는 개입하지 않는다.
         """
+        tgt = self._stop_target(planner, self._ap)
+        stopped = ego_speed < self.latch_v
+        near = tgt is not None and (tgt[0] - self.front) < self.sl_near_m
+
+        if stopped:
+            if near and not self.sl_stopped:        # 이 정지에 대한 1회 무장
+                self.sl_stopped = True
+                self.sl_stop_ticks = 0
+                self.sl_hold_left = self.sl_hold_ticks
+        else:                                       # 연속성이 깨졌다 — 다음 정지에 재무장
+            self.sl_stopped = False
+            self.sl_stop_ticks = 0
+
+        # 정지 대상 소멸(녹색 전환·통과) — 최소 시간 미충족분만 남긴다.
+        # sl_stop_ticks 는 **이번 틱을 세기 전** 값이라, 남기는 수가 곧 "앞으로 더
+        # 서 있어야 할 틱" 이 된다 (여기서 세고 빼면 1틱 모자란다).
+        if tgt is None and self.sl_hold_left > 0:
+            self.sl_hold_left = min(self.sl_hold_left,
+                                    max(0, self.sl_min_ticks - self.sl_stop_ticks))
+        if stopped:
+            self.sl_stop_ticks += 1
+
         if self.sl_hold_left > 0:
             self.sl_hold_left -= 1
-            return 0.0
-        tgt = self._stop_target(planner, self._ap)
-        if tgt is None:
-            return None
-        d_front = tgt[0] - self.front
-        if d_front < self.sl_near_m and ego_speed < self.latch_v:
-            self.sl_hold_left = max(0, self.sl_hold_ticks - 1)   # 이번 틱 포함
             return 0.0
         return None
 
