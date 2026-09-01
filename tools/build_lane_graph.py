@@ -791,9 +791,68 @@ def repair_stopline_dir(lanes, road, covered, warnings):
     return d
 
 
+# 신호 재귀속 (2026-09-02) — 대향(far-side) 설치 신호가 접근로가 아니라 교차로
+# 내부 연결로의 객체로 기록된 경우를 바로잡는다.
+SIG_REHOME_RADIUS_M = 40.0    # 정지선 ↔ 대향 신호 거리 상한 (실측 24.4 / 26.3 m)
+SIG_REHOME_HDG_DEG = 10.0     # 절대방향 vs 진행방향 허용 오차 (실측 0.9 / 0.4 deg)
+
+
+def _road_xy(road, s, t=0.0):
+    """도로 (s, t) 의 월드 좌표와 그 s 의 기준선 heading."""
+    s = min(max(s, 0.0), road['length'])
+    xx, yy, hh = ref_line(road['geoms'], np.array([s], dtype=float))
+    return (float(xx[0] - t * math.sin(hh[0])), float(yy[0] + t * math.cos(hh[0])), float(hh[0]))
+
+
+def rehome_signal(sg, road, roads):
+    """hOffset 이 자기 도로 진행방향과 어긋난 신호를 실제 관장 접근로로 되돌린다.
+
+    근거 (2026-09-02 실측): 정상 신호 640개에서 **신호 절대방향(도로 hdg + hOffset)
+    은 그 신호가 관장하는 차량의 진행방향과 같다** — hOffset 0 → +s 진행,
+    pi → -s 진행. 이 규칙이 자기 도로와 어긋나는(hOffset = 3pi/2) 신호는 지도
+    전체에서 6개뿐이다: road 556 의 30·31·34, road 791 의 965·966·967. 둘 다
+    교차로 내부 연결로이고, 절대방향은 각각 road 30 dir+1(오차 0.4 deg)·
+    road 190 dir-1(오차 0.9 deg) 의 진행방향과 일치한다. 그 두 접근로는
+    정지선만 있고 신호가 0개였다 — 정확히 뒤집힌 짝이다.
+
+    t 부호 폴백으로 두면 신호가 교차로 내부 차로에 붙어 정지선을 못 만나고
+    (sig_no_stopline), 상류 접근로는 무신호로 남는다. road 2819 가 controller
+    217 적신호를 무감속 통과한 것과 같은 실패다 (2026-09-01).
+
+    후보는 **정확히 1개일 때만** 채택한다. 오귀속은 엉뚱한 접근로에 적신호를
+    만들어 급정거를 부르므로, 애매하면 재귀속하지 않고 현행 폴백에 맡긴다.
+
+    반환: (host_road, cluster, dir, lane_keys, hdg_err_deg, dist_m) 또는 None.
+    """
+    sx, sy, _ = _road_xy(road, sg['s'], sg['t'])
+    _, _, rh = _road_xy(road, sg['s'], 0.0)
+    sig_hdg = wrap(rh + sg['hOffset'])
+    tol = math.radians(SIG_REHOME_HDG_DEG)
+    out = []
+    for cand in roads.values():
+        for c in cand.get('_stop_clusters') or ():
+            if not c['lanes']:
+                continue
+            cx, cy, ch = _road_xy(cand, c['s'], 0.0)
+            th = wrap(ch + (0.0 if c['dir'] == 1 else math.pi))
+            err = wrap(sig_hdg - th)
+            if abs(err) > tol:
+                continue
+            dx, dy = sx - cx, sy - cy
+            dist = math.hypot(dx, dy)
+            if dist > SIG_REHOME_RADIUS_M:
+                continue
+            # 대향 설치이므로 신호는 정지선보다 **진행 전방**에 선다.
+            if dx * math.cos(th) + dy * math.sin(th) <= 0.0:
+                continue
+            out.append((cand, c, c['dir'], list(c['lanes']), math.degrees(err), dist))
+    return out[0] if len(out) == 1 else None
+
+
 def assign_objects(lanes, roads, warnings, sig2ctrl=None):
     stats = collections.Counter()
     repaired = []          # (road, s_orig, t_orig, dir_hdg, s_true, dir_fixed)
+    reassigned = []        # 대향 신호 재귀속 내역 (무음 보정 금지)
     for road in roads.values():
         # 정지선 클러스터 (방향별, s 3m 이내)
         # 좌표가 깨진 정지선 보정 (2026-09-01). 종방향은 s_true = min(|t|, L) 로
@@ -887,10 +946,14 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
             road['_stop_clusters'].append(entry)
             stats['stop_clusters'] += 1
 
-        # 신호등
+    # ── 신호등 ────────────────────────────────────────────────────────────
+    # 정지선 클러스터가 **모든 도로에서** 끝난 뒤에 돈다. 재귀속(rehome_signal)이
+    # 다른 도로의 클러스터를 봐야 하기 때문이다.
+    for road in roads.values():
         for sg in road['signals']:
             s = min(max(sg['s'], 0.0), road['length'])
             explicit = sg['validity'] is not None
+            host, host_c, lk = road, None, None   # host = 정지선을 찾을 도로
             if explicit:
                 lo, hi = sorted(sg['validity'])
                 d = 1 if lo < 0 else -1
@@ -907,15 +970,32 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
                 elif abs(h - math.pi) < 0.5:
                     d = -1
                 else:
-                    d = 1 if math.copysign(1.0, sg['t']) < 0 else -1
-                    warnings.append(f"signal {sg['id']} road {road['id']}: side ambiguous (hOffset {h:.2f}), used t sign → dir {d}")
-                lk = lanes_of_dir_at(lanes, road, s, d)
+                    # hOffset 이 자기 도로 진행방향과 어긋난다 = 대향 신호가 엉뚱한
+                    # 도로에 기록됐다. 실제 관장 접근로로 되돌린다.
+                    rh = rehome_signal(sg, road, roads)
+                    if rh is None:
+                        d = 1 if math.copysign(1.0, sg['t']) < 0 else -1
+                        warnings.append(f"signal {sg['id']} road {road['id']}: side ambiguous "
+                                        f"(hOffset {h:.2f}), 재귀속 후보가 유일하지 않다 → t 부호로 dir {d}")
+                    else:
+                        host, host_c, d, lk, err, dist = rh
+                        reassigned.append({'signal': sg['id'], 'from_road': road['id'],
+                                           'from_s': round(sg['s'], 4), 'from_t': round(sg['t'], 4),
+                                           'hOffset': round(sg['hOffset'], 4),
+                                           'to_road': host['id'], 'to_dir': d,
+                                           'stop_s': round(host_c['s'], 4),
+                                           'lanes': [list(k) for k in lk],
+                                           'hdg_err_deg': round(err, 2), 'dist_m': round(dist, 2)})
+                        stats['signal_reassigned'] += 1
+                if lk is None:
+                    lk = lanes_of_dir_at(lanes, road, s, d)
             # 정지선: 같은 방향 클러스터 중 가장 가까운 것 (20m 이내)
-            best = None
-            for c in road['_stop_clusters']:
-                if c['dir'] == d and abs(c['s'] - s) < 20.0:
-                    if best is None or abs(c['s'] - s) < abs(best['s'] - s):
-                        best = c
+            best = host_c
+            if best is None:
+                for c in host['_stop_clusters']:
+                    if c['dir'] == d and abs(c['s'] - s) < 20.0:
+                        if best is None or abs(c['s'] - s) < abs(best['s'] - s):
+                            best = c
             stop_s = best['s'] if best else s
             if best:
                 best['signal_ids'].append(sg['id'])
@@ -926,6 +1006,8 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
                 rec['signals'].append({'id': sg['id'], 'stop_s': road_s_to_travel(rec, stop_s),
                                        'explicit': explicit, 'type': sg['type'], 'subtype': sg['subtype']})
             stats['signals'] += 1
+
+    for road in roads.values():
 
         # 정지선 → lane 기록 (신호 id 포함)
         for c in road['_stop_clusters']:
@@ -1038,13 +1120,20 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
             print(f"         road {r['road']:<5} s {r['s_orig']:>6.2f}→{r['s_true']:>7.2f}  "
                   f"dir {r['dir_hdg']:+d}→{r['dir_fixed']:+d}  "
                   f"(t={r['t_orig']:+.2f} 복원 불가, 방향 전체 차로에 배정)")
+    if reassigned:
+        # 무음 보정 금지 — 어느 신호를 어디로 옮겼는지 전건을 남긴다.
+        print(f'[sig  ] 대향 신호 재귀속 {len(reassigned)}건')
+        for r in sorted(reassigned, key=lambda x: (x['from_road'], x['signal'])):
+            print(f"         sig {r['signal']:<5} road {r['from_road']} -> road {r['to_road']} "
+                  f"dir {r['to_dir']:+d}  정지선 s={r['stop_s']:.2f}  "
+                  f"(방향오차 {r['hdg_err_deg']:+.2f}deg, 거리 {r['dist_m']:.1f}m, 차로 {len(r['lanes'])}개)")
     orphan = [k for k, rec in lanes.items()
               if rec['signals'] and not rec['stop_lines']]
     stats['lanes_signal_no_stopline'] = len(orphan)
     for k in sorted(orphan)[:20]:
         warnings.append(f'lane {k}: 신호 {len(lanes[k]["signals"])}개가 붙었으나 정지선 없음 '
                         f'— 이 차로에서는 적신호 감속이 발동하지 않는다')
-    return stats, repaired
+    return stats, repaired, reassigned
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1069,7 +1158,7 @@ def build(xodr_path, ds=0.5):
 
     st = link_lanes(lanes, roads, junctions, warnings)
     print('[link ]', dict(st))
-    so, repairs = assign_objects(lanes, roads, warnings, sig2ctrl)
+    so, repairs, resigs = assign_objects(lanes, roads, warnings, sig2ctrl)
     print('[objs ]', dict(so))
 
     # KD-tree 용 전역 인덱스
@@ -1132,9 +1221,14 @@ def build(xodr_path, ds=0.5):
             # 정지선 좌표 보정 내역 — 무음 보정 금지. 어느 레코드를 어떻게 옮겼는지
             # 산출물 안에 남겨야 오보정을 사후에 찾을 수 있다.
             'stop_repairs': repairs,
+            # 대향 신호 재귀속 내역 (2026-09-02) — 교차로 내부 연결로에 잘못 기록된
+            # 신호를 실제 접근로로 되돌린 건. junction_ctrl_map.json 은 이 결과에서
+            # 파생되므로 그래프를 바꾸면 함께 재생성해야 한다.
+            'signal_reassigned': resigs,
             'stop_repaired': so.get('stop_repaired', 0),
             'stop_repair_undecided': so.get('stop_repair_undecided', 0),
             'lanes_signal_no_stopline': so.get('lanes_signal_no_stopline', 0),
+            'sig_no_stopline': so.get('sig_no_stopline', 0),
             'n_controllers': len(ctrl2sig),
             'n_signals_controlled': len(sig2ctrl),
             'warnings': warnings[:200],
