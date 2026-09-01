@@ -267,6 +267,7 @@ class KrRules:
         self.q_ticks = 0                           # 대기열 판정 지속 틱 (시한 철회)
         self.q_reject: str | None = None           # 대기열 기각 사유 (진단)
         self.wait_target_d: float | None = None    # 관찰 감속 목표 (장애물까지 거리)
+        self.bo_paused = False                     # 적색·황색STOP 중 일시정지
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
         self.last_sig_lead_s: float | None = None  # 이벤트까지 남은 시간 [s]
@@ -479,7 +480,7 @@ class KrRules:
         return None
 
     # ── 물체별 정지 관찰 타이머 ──────────────────────────────────────────
-    def _update_obj_timers(self, ap) -> None:
+    def _update_obj_timers(self, ap, paused: bool = False) -> None:
         """객체별 '정지 상태 지속 틱'. 매 틱 1회.
 
         자차 상태 카운터(ot_blocked_ticks)와 달리 **물체마다** 센다 — 자차가
@@ -499,10 +500,13 @@ class KrRules:
                 continue
             seen.add(a.id)
             self.obj_miss[a.id] = 0
-            if float(getattr(a, 'speed', 0.0)) < self.ot_v_max:
-                self.obj_ticks[a.id] = self.obj_ticks.get(a.id, 0) + 1
-            else:
+            if float(getattr(a, 'speed', 0.0)) >= self.ot_v_max:
                 self.obj_ticks[a.id] = 0                   # 움직이면 즉시 리셋 (철회)
+            elif not paused:
+                self.obj_ticks[a.id] = self.obj_ticks.get(a.id, 0) + 1
+            # paused(적색·황색STOP) 이면 **증가도 리셋도 안 한다** — 신호 대기
+            # 시간이 '정지 관찰' 로 쌓이면 녹색이 되자마자 회피가 터진다.
+            # 움직임 감지(철회)만은 신호와 무관하므로 위에서 먼저 본다.
         for oid in list(self.obj_ticks):
             if oid in seen:
                 continue
@@ -624,20 +628,20 @@ class KrRules:
         return cover
 
     def _ego_local_s(self, lg, ap) -> float:
+        loc = ap._vehicle.get_location()
+        vx, vy = frame.from_carla_xy(loc.x, loc.y)
         try:
-            loc = ap._vehicle.get_location()
-            vx, vy = frame.from_carla_xy(loc.x, loc.y)
             m = lg.locate(vx, vy)
-            return float(m.s) if m else 0.0
         except Exception:                                   # noqa: BLE001
             return 0.0
+        return float(m.s) if m else 0.0
 
     def _lane_width(self, lg, ego_lane, ap) -> float:
         if lg is None or ego_lane is None:
             return 3.0
+        loc = ap._vehicle.get_location()
+        vx, vy = frame.from_carla_xy(loc.x, loc.y)
         try:
-            loc = ap._vehicle.get_location()
-            vx, vy = frame.from_carla_xy(loc.x, loc.y)
             m = lg.locate(vx, vy)
             return float(lg.width_at(ego_lane, m.s if m else 0.0))
         except Exception:                                   # noqa: BLE001
@@ -763,7 +767,8 @@ class KrRules:
         참이 되는 경우는 **BREAKOUT 최종 단계(L4) 단독**이다. 그 외 어떤
         상태에서도 거짓이어야 한다 — 열리면 앞차·장애물을 그대로 들이받는다.
         """
-        return bool(self.bo_state == 'BREAKOUT' and self.bo_level >= self.BO_CREEP)
+        return bool(self.bo_state == 'BREAKOUT' and self.bo_level >= self.BO_CREEP
+                    and not self.bo_paused)          # 적색 중에는 행동 금지
 
     def _breakout_tick(self, planner, ap, ego_speed: float) -> None:
         """데드락 상태기계. apply() 가 매 틱 부른다.
@@ -783,6 +788,14 @@ class KrRules:
                 self._breakout_reset('cause_gone')
                 self.bo_state = None
             return
+
+        # 적색·황색 STOP 중에는 **일시정지**한다 — 카운터·단계를 그대로 두고
+        # 행동(진입·상승·크립)만 멈춘다. 리셋하면 녹색이 짧은 교차로에서
+        # BREAKOUT 이 영영 안 서고, 앞차가 고장 나 있어도 탈출이 안 걸린다.
+        if self._red_ahead(planner) is not None:
+            self.bo_paused = True
+            return
+        self.bo_paused = False
 
         if not self._obstacle_cause(planner, ap):
             self.bo_stuck_ticks = 0
@@ -1034,17 +1047,18 @@ class KrRules:
 
     @staticmethod
     def _ego_lane(lg, ap):
-        """자차가 선 차로. 위치를 못 읽는 환경(목 등)에서는 None.
+        """자차가 선 차로. 지도에서 못 찾으면 None.
 
-        회피 게이트가 이 값을 **이른 시점에** 묻게 되면서(대기열 통과폭 판정),
-        get_location 이 없는 목에서도 안전해야 한다 — 여기서 터지면 지시등 등
-        무관한 경로까지 같이 죽는다.
+        None 이 되는 **실제** 경로는 lg.locate 뿐이다 — courseRespawn 이나 이탈로
+        자차가 레인그래프 밖에 있으면 매칭이 없다. get_location 은 감싸지 않는다:
+        프로덕션 VtdEgo 는 항상 가지고 있고, 없으면 그건 조립 오류라 조용히
+        삼키면 안 된다.
         """
         if lg is None:
             return None
+        loc = ap._vehicle.get_location()
+        vx, vy = frame.from_carla_xy(loc.x, loc.y)
         try:
-            loc = ap._vehicle.get_location()
-            vx, vy = frame.from_carla_xy(loc.x, loc.y)
             m = lg.locate(vx, vy)
         except Exception:                                  # noqa: BLE001
             return None
@@ -1312,7 +1326,8 @@ class KrRules:
 
         # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
         self.last_avoid = None
-        self._update_obj_timers(ap)
+        red_pause = self._red_ahead(planner) is not None
+        self._update_obj_timers(ap, paused=red_pause)
         if self.bo_enabled:
             self._breakout_tick(planner, ap, ego_speed)
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
@@ -1387,6 +1402,7 @@ class KrRules:
         if self.bo_state is not None:
             self.last_avoid = dict(self.last_avoid or {}, **{
                 'state': self.bo_state, 'level': self.bo_level,
+                'paused': self.bo_paused,
                 'stall_s': round(self.bo_stall_ticks / self.hz, 1),
                 'creep': self.breakout_creep(),
                 # L2 이상은 감점 가능한 완화다 — 단계와 사유를 반드시 남긴다

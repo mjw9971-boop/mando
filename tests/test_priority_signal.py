@@ -192,3 +192,96 @@ def test_planned_stop_is_inside_the_scoring_band():
     """계획 정지점 slf = −stop_gap_stopline_m 는 −2.0 ≤ slf ≤ −0.3 밴드 안."""
     slf = FRONT - S0
     assert -2.0 <= slf <= -0.3
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 녹색 누적 · 적색 일시정지
+#
+# 카운터를 적색마다 **리셋**하면 녹색이 stuck_hard_s 보다 짧은 교차로에서
+# BREAKOUT 이 영영 서지 않는다 — 앞차가 고장 나 서 있어도 탈출이 안 걸린다.
+# 그래서 적색·황색STOP 중에는 카운터·단계를 **그대로 두고 행동만 멈춘다**.
+# 불변식(신호 > 회피)은 '행동 금지' 로 지키고, '기억 삭제' 로 지키지 않는다.
+# ══════════════════════════════════════════════════════════════════════════
+def set_state(p, state):
+    p.next_traffic_lights = [TL(state)] * len(p.next_traffic_lights)
+
+
+def cycle(kr, p, ap, green_s, red_s, cycles, v=0.0):
+    """녹/적을 번갈아 돌린다. 각 틱마다 타이머·상태기계를 실제 순서로 돌린다."""
+    g, r = int(green_s * HZ), int(red_s * HZ)
+    for _ in range(cycles):
+        set_state(p, TrafficLightState.Green)
+        for _ in range(g):
+            kr._update_obj_timers(ap, paused=kr._red_ahead(p) is not None)
+            kr._breakout_tick(p, ap, v)
+        set_state(p, TrafficLightState.Red)
+        for _ in range(r):
+            kr._update_obj_timers(ap, paused=kr._red_ahead(p) is not None)
+            kr._breakout_tick(p, ap, v)
+
+
+def test_breakout_enters_across_two_green_phases():
+    """녹색 7 s 주기 — 한 주기로는 stuck_hard_s(10 s)를 못 채우지만
+    **두 주기에 걸쳐 누적**되어 진입한다."""
+    kr, p, ap = rig(state=TrafficLightState.Green)
+    cycle(kr, p, ap, green_s=7.0, red_s=5.0, cycles=1)
+    assert kr.bo_state is None, '한 주기(7 s)로는 아직 아니다'
+    assert kr.bo_stuck_ticks >= int(7.0 * HZ) - 2, '카운터가 리셋되지 않았다'
+    cycle(kr, p, ap, green_s=7.0, red_s=5.0, cycles=1)
+    assert kr.bo_state == 'BREAKOUT', '두 주기 누적으로 진입해야 한다'
+
+
+def test_counter_pauses_not_resets_during_red():
+    kr, p, ap = rig(state=TrafficLightState.Green)
+    for _ in range(int(5.0 * HZ)):
+        kr._update_obj_timers(ap)
+        kr._breakout_tick(p, ap, 0.0)
+    held = kr.bo_stuck_ticks
+    assert held >= int(5.0 * HZ) - 2
+    set_state(p, TrafficLightState.Red)
+    for _ in range(int(8.0 * HZ)):
+        kr._update_obj_timers(ap, paused=True)
+        kr._breakout_tick(p, ap, 0.0)
+    assert kr.bo_stuck_ticks == held, '적색 중 카운터가 변하면 안 된다'
+    assert kr.bo_state is None, '적색 중 진입 금지'
+
+
+def test_no_level_escalation_or_creep_during_red():
+    """적색 중에는 단계 상승도 크립도 없다 (행동 금지)."""
+    kr, p, ap = rig(state=TrafficLightState.Green)
+    drive(kr, p, ap, HARD_TICKS + ESC_TICKS)              # L2 까지 올려둔다
+    lvl = kr.bo_level
+    assert kr.bo_state == 'BREAKOUT' and lvl >= 2
+    set_state(p, TrafficLightState.Red)
+    for _ in range(int(10.0 * HZ)):
+        kr._update_obj_timers(ap, paused=True)
+        kr._breakout_tick(p, ap, 0.0)
+    assert kr.bo_level == lvl, '적색 중 단계가 오르면 안 된다'
+    assert kr.bo_paused is True
+    assert kr.breakout_creep() is False, '적색 중 크립 금지'
+    assert kr.bo_state == 'BREAKOUT', '상태는 유지 (리셋 금지)'
+
+
+def test_object_static_timer_pauses_during_red():
+    """신호 대기 시간이 '정지 관찰' 로 쌓이면 녹색이 되자마자 회피가 터진다."""
+    kr, p, ap = rig(state=TrafficLightState.Red)
+    kr.obj_ticks.clear()
+    for _ in range(int(10.0 * HZ)):
+        kr._update_obj_timers(ap, paused=True)
+    assert kr.obj_ticks.get(1, 0) == 0, '적색 중 관찰이 쌓이면 안 된다'
+    set_state(p, TrafficLightState.Green)
+    for _ in range(STATIC_TICKS):
+        kr._update_obj_timers(ap, paused=False)
+    assert kr.obj_ticks.get(1, 0) >= STATIC_TICKS         # 녹색에서만 누적
+
+
+def test_object_moving_resets_even_during_red():
+    """움직임 감지(철회)는 신호와 무관하다 — 적색 중에도 즉시 리셋."""
+    kr, p, ap = rig(state=TrafficLightState.Green)
+    for _ in range(STATIC_TICKS):
+        kr._update_obj_timers(ap)
+    assert kr.obj_ticks[1] >= STATIC_TICKS
+    ap._world.get_actors()[0].speed = 3.0
+    set_state(p, TrafficLightState.Red)
+    kr._update_obj_timers(ap, paused=True)
+    assert kr.obj_ticks[1] == 0

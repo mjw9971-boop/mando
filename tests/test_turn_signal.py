@@ -70,6 +70,12 @@ class FakePlanner:
 class FakeEgo:
     def __init__(self):
         self.speed = 0.0
+        self.id = 0
+
+    def get_location(self):
+        """kr_rules 회피 게이트가 자차 차로를 묻는다 — 프로덕션 VtdEgo 에는
+        항상 있는 표면이라 목도 가져야 한다 (없으면 조립 오류다)."""
+        return type('L', (), {'x': 0.0, 'y': 0.0, 'z': 0.0})()
 
     def get_velocity(self):
         ego = self
