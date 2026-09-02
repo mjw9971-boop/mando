@@ -1093,19 +1093,35 @@ class KrRules:
             else:
                 self.last_avoid = dict(base, state='WAIT')  # 앞차 출발 기회를 준다
 
+        # ── '막힌 채 정지' 회계 (B-10) ───────────────────────────────────
+        # **자차 상태만으로** 센다. 예전에는 이 회계가 아래 `if actor is None:`
+        # 안에 있어서, 회랑 후보가 있어 PREEMPT/WAIT_EXPIRED 로 들어오면
+        # (actor 가 None 이 아니므로) 카운터가 아예 증가하지 않았다. 그래서
+        # side 루프 게이트(no_neighbor / span_into_zone / solid / occupied /
+        # center_line / kappa)가 기각하면 매 틱 같은 일을 반복하고 **REACTIVE 가
+        # 영원히 무장되지 않았다** (replay 실측: 기각 10틱 동안 ot_blocked_ticks 0,
+        # REACTIVE 0, BREAKOUT 0).
+        # 시프트에 성공하면 아래에서 0 으로 리셋하는 기존 관례는 그대로다.
+        blocked = ego_speed < self.latch_v and self._blocker(ap, planner) is not None
+        self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
+
         # ── REACTIVE: 막힌 채 정지가 지속되면 (기존 경로) ─────────────────
+        # 회랑 후보(PREEMPT/WAIT_EXPIRED)가 있어도 **무장한다**. 회계만 밖으로
+        # 빼면 상태 배정이 여전히 `actor is None` 에 갇혀 REACTIVE 가 서지
+        # 않는다 — ot_ticks 를 넘겼다는 건 "그 후보로는 못 빠져나갔다" 는 뜻이므로
+        # 대상을 **가장 가까운 차단물**로 바꾼다. _blocker 는 blocker_dist_max
+        # (20 m) 안만 보므로 span 이 짧아져 게이트를 통과할 여지가 생긴다.
+        # (시프트에 성공하면 아래에서 ot_blocked_ticks 를 0 으로 리셋한다.)
+        if self.ot_blocked_ticks >= self.ot_ticks:
+            stuck = self._blocker(ap, planner)
+            if stuck is not None:
+                actor, preempt = stuck, False
+                self.last_avoid = {'state': 'REACTIVE', 'blocker': actor.id}
         if actor is None:
-            blocked = ego_speed < self.latch_v and self._blocker(ap, planner) is not None
-            self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
-            if self.ot_blocked_ticks < self.ot_ticks:
-                if corridor and self.last_avoid is None:
-                    self.last_avoid = {'state': 'WATCH', 'blocker': corridor[0][3].id,
-                                       's_rel': round(corridor[0][0], 1)}
-                return
-            actor = self._blocker(ap, planner)
-            if actor is None:
-                return
-            self.last_avoid = {'state': 'REACTIVE', 'blocker': actor.id}
+            if corridor and self.last_avoid is None:
+                self.last_avoid = {'state': 'WATCH', 'blocker': corridor[0][3].id,
+                                   's_rel': round(corridor[0][0], 1)}
+            return
         if lg is None or ego_lane is None:
             self.last_overtake = 'no_lane'
             return

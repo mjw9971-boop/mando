@@ -466,3 +466,61 @@ def test_disabled_switch_never_arms():
     # apply 를 타지 않는 목이므로 _breakout_tick 을 직접 부르지 않는 경로를 모사
     assert kr.bo_enabled is False
     assert kr.breakout_creep() is False
+
+
+# ── B-10: '막힌 채 정지' 회계는 회랑 후보 유무와 무관하다 ────────────────
+def _blocked_ap(kr, p, oid=2, x=6.0):
+    """코앞에 정지 차량 하나 — _blocker 가 잡는 배치."""
+    b = Box(oid, x, 0.0, 0.0)
+    ap = Ap(p, actors=[b])
+    for _ in range(STATIC_TICKS + 2):
+        kr._update_obj_timers(ap)
+    return ap
+
+
+def test_blocked_ticks_accumulate_while_corridor_candidate_exists():
+    """PREEMPT/WAIT_EXPIRED 로 들어와 side 루프가 기각해도 카운터는 쌓인다.
+
+    옛 동작은 회계가 `if actor is None:` 안에 있어 회랑 후보(=actor)가 있으면
+    한 틱도 증가하지 않았다 → REACTIVE 가 영원히 무장되지 않았다 (B-10).
+    여기서는 lg 를 주지 않아 side 루프 직전에 빠지므로(no_lane) '기각과 같은
+    경로' 를 만든다.
+    """
+    kr, p = make(d_tl=float('inf'))
+    ap = _blocked_ap(kr, p)
+    assert kr.ot_blocked_ticks == 0
+    for n in range(1, 6):
+        kr._try_overtake(ap, p, ego_speed=0.0)          # 정지 + 전방 차단
+        assert kr.ot_blocked_ticks == n                  # 매 틱 증가한다
+    assert (kr.last_avoid or {}).get('state') in ('PREEMPT', 'WAIT', 'WAIT_EXPIRED')
+
+
+def test_reactive_arms_after_trigger_s_even_under_preempt():
+    """기각이 계속돼도 trigger_s 를 넘기면 REACTIVE 가 무장된다."""
+    kr, p = make(d_tl=float('inf'))
+    ap = _blocked_ap(kr, p)
+    for _ in range(kr.ot_ticks + 1):
+        kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_blocked_ticks >= kr.ot_ticks
+    assert kr.last_overtake == 'no_lane'                 # side 루프 직전까지 갔다
+    assert (kr.last_avoid or {}).get('state') == 'REACTIVE'
+
+
+def test_blocked_ticks_reset_when_moving():
+    """굴러가고 있으면 '막힌 채 정지' 가 아니다 — 0 으로 리셋."""
+    kr, p = make(d_tl=float('inf'))
+    ap = _blocked_ap(kr, p)
+    for _ in range(4):
+        kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_blocked_ticks == 4
+    kr._try_overtake(ap, p, ego_speed=5.0)               # 주행 중
+    assert kr.ot_blocked_ticks == 0
+
+
+def test_blocked_ticks_reset_when_nothing_blocks():
+    """전방에 막는 것이 없으면 카운터가 쌓이지 않는다."""
+    kr, p = make(d_tl=float('inf'))
+    ap = Ap(p, actors=[])
+    for _ in range(5):
+        kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_blocked_ticks == 0
