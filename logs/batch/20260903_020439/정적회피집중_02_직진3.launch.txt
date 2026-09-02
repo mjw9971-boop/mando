@@ -1,0 +1,78 @@
+[comm] 연결 성공 192.168.10.1:9910
+[kr_rules] finish_xy 출처: route.pkl(CSV 마지막 행)
+t=   0.1  road/lane=   1222/1  s_route=    0.5m  v= 0.00→ 1.20 m/s  steer=-0.041  accel=+0.10  light
+t=   1.1  road/lane=   1222/1  s_route=    0.7m  v= 0.47→ 1.67 m/s  steer=-0.044  accel=+0.96  light
+t=   2.2  road/lane=   1222/1  s_route=    1.9m  v= 1.42→ 2.62 m/s  steer=-0.059  accel=+0.96  light
+t=   3.2  road/lane=   1222/1  s_route=    4.1m  v= 2.43→ 3.62 m/s  steer=-0.069  accel=+0.96  light
+t=   4.2  road/lane=   1222/1  s_route=    7.2m  v= 3.38→ 4.57 m/s  steer=-0.055  accel=+0.95  light
+t=   5.2  road/lane=   1222/1  s_route=   11.2m  v= 4.22→ 5.39 m/s  steer=-0.031  accel=+0.94  light
+t=   6.3  road/lane=   1222/1  s_route=   16.8m  v= 5.23→ 6.37 m/s  steer=-0.010  accel=+0.91  light
+t=   7.3  road/lane=   1222/2  s_route=   22.7m  v= 6.31→ 7.39 m/s  steer=+0.008  accel=+0.87  light
+t=   8.3  road/lane=   1222/2  s_route=   29.6m  v= 7.17→ 8.19 m/s  steer=+0.024  accel=+0.82  light
+t=   9.4  road/lane=   1222/2  s_route=   37.6m  v= 7.81→ 8.77 m/s  steer=+0.019  accel=+0.77  light
+t=  10.4  road/lane=   1222/2  s_route=   46.1m  v= 8.74→ 9.58 m/s  steer=-0.008  accel=+0.67  light
+t=  11.5  road/lane=   1222/2  s_route=   56.5m  v= 9.47→10.19 m/s  steer=-0.001  accel=+0.58  light
+t=  12.5  road/lane=   1222/2  s_route=   66.8m  v=10.04→10.66 m/s  steer=-0.001  accel=+0.49  light
+t=  13.6  road/lane=   1222/2  s_route=   77.6m  v=10.52→11.03 m/s  steer=+0.000  accel=+0.41  light
+t=  14.6  road/lane=   1222/2  s_route=   88.4m  v=10.90→11.32 m/s  steer=+0.001  accel=+0.34  light
+t=  15.7  road/lane=   1222/2  s_route=  100.8m  v=11.30→12.50 m/s  steer=-0.000  accel=+0.96  none
+t=  16.7  road/lane=   1222/2  s_route=  113.2m  v=12.04→12.50 m/s  steer=-0.000  accel=+0.37  none
+t=  17.8  road/lane=   1222/2  s_route=  126.0m  v=12.37→12.35 m/s  steer=-0.000  accel=-0.54  lead
+t=  18.8  road/lane=   1222/2  s_route=  138.1m  v=12.07→12.12 m/s  steer=-0.000  accel=+0.04  lead
+t=  19.8  road/lane=   1222/2  s_route=  150.1m  v=11.58→ 8.33 m/s  steer=-0.000  accel=-3.20  none
+t=  20.8  road/lane=   1222/2  s_route=  159.8m  v= 8.53→ 8.33 m/s  steer=-0.000  accel=-3.90  none
+t=  21.8  road/lane=   1222/2  s_route=  166.0m  v= 5.12→ 8.33 m/s  steer=+0.000  accel=-2.20  none
+t=  22.9  road/lane=   1222/2  s_route=  169.4m  v= 2.85→ 8.33 m/s  steer=+0.000  accel=-0.40  none
+t=  23.9  road/lane=   1222/2  s_route=  172.2m  v= 2.85→ 8.33 m/s  steer=+0.000  accel=+1.30  none
+t=  24.9  road/lane=  1241/-1  s_route=  176.2m  v= 4.52→ 8.33 m/s  steer=-0.002  accel=+2.00  none
+t=  25.9  road/lane=  1241/-1  s_route=  182.1m  v= 6.50→ 8.33 m/s  steer=-0.004  accel=+1.47  none
+t=  27.0  road/lane=  1241/-1  s_route=  189.9m  v= 7.83→ 8.33 m/s  steer=+0.000  accel=+0.41  none
+t=  28.0  road/lane=  1241/-1  s_route=  198.0m  v= 8.16→ 8.33 m/s  steer=+0.000  accel=+0.14  none
+t=  29.1  road/lane=  1241/-1  s_route=  207.2m  v= 7.97→ 8.33 m/s  steer=-0.000  accel=-0.13  none
+t=  30.1  road/lane=  1241/-1  s_route=  215.3m  v= 7.99→ 8.33 m/s  steer=-0.000  accel=+0.18  none
+t=  31.1  road/lane=  1241/-1  s_route=  223.9m  v= 8.11→ 8.33 m/s  steer=+0.020  accel=-0.16  none
+t=  32.2  road/lane=    173/1  s_route=  231.9m  v= 6.96→ 6.94 m/s  steer=-0.007  accel=-3.80  none
+t=  33.3  road/lane=    173/1  s_route=  236.7m  v= 3.21→ 6.94 m/s  steer=+0.006  accel=-2.10  none
+t=  34.3  road/lane=    173/1  s_route=  238.6m  v= 1.61→ 6.94 m/s  steer=+0.009  accel=-0.50  none
+t=  35.3  road/lane=    173/1  s_route=  239.9m  v= 1.29→ 6.94 m/s  steer=+0.011  accel=+1.20  none
+t=  36.4  road/lane=    173/1  s_route=  242.2m  v= 2.87→ 6.94 m/s  steer=+0.012  accel=+2.00  none
+t=  37.5  road/lane=    173/1  s_route=  247.2m  v= 5.19→ 6.94 m/s  steer=+0.010  accel=+1.48  none
+t=  38.5  road/lane=    173/2  s_route=  253.5m  v= 6.42→ 6.94 m/s  steer=+0.032  accel=+0.42  none
+t=  39.5  road/lane=    173/2  s_route=  260.2m  v= 6.64→ 6.94 m/s  steer=+0.100  accel=-0.11  none
+t=  40.6  road/lane=    173/3  s_route=  267.3m  v= 6.67→ 6.77 m/s  steer=+0.002  accel=+0.08  lead
+t=  41.7  road/lane=    173/2  s_route=  274.9m  v= 6.70→ 6.77 m/s  steer=+0.027  accel=+0.05  lead
+t=  42.7  road/lane=    173/2  s_route=  281.6m  v= 6.73→ 6.20 m/s  steer=+0.063  accel=-0.87  route_end
+t=  43.7  road/lane=    173/2  s_route=  287.5m  v= 4.67→ 0.00 m/s  steer=+0.037  accel=-4.00  vehicle
+t=  44.7  road/lane=    173/2  s_route=  289.4m  v= 0.68→ 0.00 m/s  steer=+0.031  accel=-4.00  route_end
+t=  45.8  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  46.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  47.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  48.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  49.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  vehicle
+t=  50.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  52.0  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  53.1  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  54.1  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  55.1  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  56.2  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  57.3  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  58.3  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  59.3  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  60.3  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  61.3  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  62.4  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  63.5  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  64.5  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  65.6  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  66.7  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  67.7  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  68.7  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  69.8  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  70.8  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  71.8  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  72.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  73.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+t=  74.9  road/lane=    173/2  s_route=  289.4m  v= 0.00→ 0.00 m/s  steer=+0.031  accel=-1.00  route_end
+
+[main] 중단
+[main] 틱 1513회 종료
