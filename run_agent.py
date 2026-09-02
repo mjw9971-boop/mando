@@ -305,7 +305,10 @@ class Runner:
                    # 황색 원샷 판정 — 판정 틱에만 채워진다 (사후 분류 근거).
                    # 이후 틱은 null 이므로 "이 접근의 판정" 을 찾으려면 이 필드가
                    # non-null 인 틱을 고르면 된다.
-                   'yellow': self.kr.last_yellow}
+                   'yellow': self.kr.last_yellow,
+                   # 회피 진단 — 상태/기각·억제 사유. 이게 없어서 이전에는
+                   # 기각 이유를 알려면 리플레이를 계측해야 했다 (2026-08-30).
+                   'avoid': self.kr.last_avoid}
         if reduced is not None and reduced[1] is not None:
             reasons['speed_reduced_by'] = {
                 'type': reduced[1], 'id': reduced[2],
