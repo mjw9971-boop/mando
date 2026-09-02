@@ -218,6 +218,9 @@ class KrRules:
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
+        # standoff 대상 정지 카운터 (B-5) — 신호와 무관하게 센다. 0 이면 이전 동작
+        # (standoff 대상 = 정지 관찰을 마친 회랑 객체).
+        self.standoff_stop_ticks = int(round(float(ot.get('standoff_stop_s', 1.5)) * self.hz))
         self.obj_grace = int(ot.get('obj_grace_ticks', 10))
         # 대기열 판별기 (3중 교정)
         self.q_clear_m = float(ot.get('queue_min_clear_m', 0.3))
@@ -292,8 +295,10 @@ class KrRules:
         self.last_overtake: str | None = None      # 로그용 ('left'|'right'|사유@p{n})
         self.ot_pass_solid = False                 # 1바퀴에 solid 기각이 있었나 (B-3)
         self.last_avoid: dict | None = None        # 회피 진단 (reasons.avoid)
-        self.obj_ticks: dict = {}                  # 객체별 정지 지속 틱
+        self.obj_ticks: dict = {}                  # 객체별 정지 지속 틱 (신호 중 일시정지)
+        self.obj_stop_ticks: dict = {}             # 객체별 정지 지속 틱 (신호 무관, B-5)
         self.obj_miss: dict = {}                   # 객체별 미관측 틱 (grace)
+        self.standoff_id = None                    # 이번 틱 standoff 대상 id (진단)
         # 보행자 의도 감지 상태 (P4)
         self.ped_static: set = set()               # '정지 관찰' 을 마친 보행자 id
         self.ped_lat: dict = {}                    # id → 직전 틱의 경로 횡거리
@@ -554,7 +559,13 @@ class KrRules:
                 continue
             seen.add(a.id)
             self.obj_miss[a.id] = 0
-            if float(getattr(a, 'speed', 0.0)) >= self.ot_v_max:
+            moving = float(getattr(a, 'speed', 0.0)) >= self.ot_v_max
+            # 신호 무관 정지 카운터 (B-5) — standoff 대상 선정용. obj_ticks 는
+            # 적색 중 멈추므로 녹색 직후 앞에 선 차량이 '정적' 이 되기까지 3 s
+            # 가 더 걸리고 그동안 standoff 감속이 없다. 이 카운터는 pause 와
+            # 무관하게 세되 PREEMPT/WAIT 판정에는 쓰지 않는다 (그건 obj_ticks).
+            self.obj_stop_ticks[a.id] = 0 if moving else self.obj_stop_ticks.get(a.id, 0) + 1
+            if moving:
                 self.obj_ticks[a.id] = 0                   # 움직이면 즉시 리셋 (철회)
             elif not paused:
                 self.obj_ticks[a.id] = self.obj_ticks.get(a.id, 0) + 1
@@ -567,10 +578,15 @@ class KrRules:
             self.obj_miss[oid] = self.obj_miss.get(oid, 0) + 1
             if self.obj_miss[oid] > self.obj_grace:
                 self.obj_ticks.pop(oid, None)
+                self.obj_stop_ticks.pop(oid, None)
                 self.obj_miss.pop(oid, None)
 
     def _static_ok(self, actor) -> bool:
         return self.obj_ticks.get(getattr(actor, 'id', None), 0) >= self.obj_static_ticks
+
+    def _stop_ok(self, actor) -> bool:
+        """standoff 대상 조건 (B-5) — 신호 무관 정지가 standoff_stop_s 이상."""
+        return self.obj_stop_ticks.get(getattr(actor, 'id', None), 0) >= self.standoff_stop_ticks
 
     def _blocker(self, ap, planner):
         """앞을 막고 선 정적 장애물 → VtdActor. 없으면 None.
@@ -619,23 +635,27 @@ class KrRules:
         lat = float(tan[0] * dv[1] - tan[1] * dv[0])
         return (float(planner.route_s[i0 + j]) - float(planner.route_s[i0]), lat)
 
-    def _corridor_blockers(self, ap, planner):
+    def _corridor_blockers(self, ap, planner, static_ok=None):
         """전방 detect_max_m 안에서 **주행 회랑을 침범한 정지 객체** 목록.
 
         반환: [(s_rel, lat, half_w, actor)] — s_rel 은 자차 기준 전방거리.
         침범 판정은 선행차 판정([route.py] compute_leading_vehicles) 과 같은 축:
         |lat| < 자차반폭 + 객체반폭 + obstacle_clearance_m.
+        static_ok: '정지' 판정 함수. 기본 _static_ok(정지 관찰 3 s, 신호 중 일시정지).
+        standoff 대상은 _stop_ok(신호 무관 1.5 s) 로 따로 뽑는다 (B-5).
         """
         try:
             actors = list(ap._world.get_actors())
         except Exception:                                  # noqa: BLE001
             return []
+        if static_ok is None:
+            static_ok = self._static_ok
         ego_id = ap._vehicle.id
         half_ego = float(self.cfg['vehicle']['width']) / 2.0
         clr = float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
         out = []
         for a in actors:
-            if a.id == ego_id or not self._static_ok(a):
+            if a.id == ego_id or not static_ok(a):
                 continue
             loc = a.get_location()
             pr = self._project(planner, loc.x, loc.y)
@@ -1138,12 +1158,24 @@ class KrRules:
         # 이면 더 못 기다리므로 즉시 시프트한다. 아니면 최대 wait 까지 관찰.
         actor = None
         preempt = False
+        # standoff 대상 (B-5) — 회랑 조건은 같되 '정지' 는 신호 무관 카운터로
+        # 본다. 가장 가까운 대상의 s_rel 이 관찰 감속(standoff 상한)의 기준이다.
+        # PREEMPT/WAIT 판정은 아래 corridor(_static_ok) 그대로다. standoff_stop_s
+        # 가 0 이면 이전 동작(corridor[0]). 적색 중에는 위의 억제 반환이 먼저라
+        # 여기 오지 않는다 — C 에서 활성.
         self.wait_target_d = None
+        self.standoff_id = None
+        if self.standoff_stop_ticks > 0:
+            so_objs = self._corridor_blockers(ap, planner, static_ok=self._stop_ok)
+            if so_objs:
+                self.wait_target_d = so_objs[0][0]
+                self.standoff_id = so_objs[0][3].id
+        elif corridor:
+            self.wait_target_d = corridor[0][0]
         if corridor:
             s_rel, lat, _hw, cand = corridor[0]
             obj_s = self.obj_ticks.get(cand.id, 0) / self.hz
             standoff = max(self.shift_latest_m, self.shift_k_s * max(ego_speed, 0.1))
-            self.wait_target_d = s_rel                      # 관찰 감속 (standoff 상한)
             t_left = (s_rel - standoff) / max(ego_speed, 0.1)
             budget = self.wait_s - obj_s
             base = {'blocker': cand.id, 's_rel': round(s_rel, 1), 'lat': round(lat, 2),
@@ -1829,6 +1861,10 @@ class KrRules:
         so = self._standoff_profile(ego_speed)
         if so is not None and (candidate is None or so < candidate):
             candidate = so
+        if so is not None:
+            self.last_avoid = dict(self.last_avoid or {'state': 'STANDOFF'},
+                                   standoff_d=round(float(self.wait_target_d), 1),
+                                   standoff_id=self.standoff_id, standoff_v=round(so, 2))
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)

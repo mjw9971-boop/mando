@@ -328,6 +328,12 @@ overtake:
   shift_ahead_m: 5.0
   # 객체가 이 시간 이상 정지로 관찰돼야 '정적' [s] (물체별 타이머)
   obj_static_s: 3.0
+  # standoff(관찰 감속) 대상 정지 시간 [s] (B-5) — obj_static_s 와 달리 **신호와
+  # 무관하게** 센다. obj_ticks 는 적색 중 멈춰 녹색 직후 앞에 선 차량이 '정적'
+  # 이 되기까지 3 s 가 더 걸리고 그동안 standoff 감속이 없었다. 회랑 조건(침범·
+  # 전방)은 같고, 이 시간 이상 정지한 가장 가까운 객체까지의 거리가 standoff
+  # 상한의 기준이 된다. PREEMPT/WAIT 판정은 여전히 obj_static_s. 0 = 이전 동작.
+  standoff_stop_s: 1.5
   # id 가 잠깐 빠져도 타이머를 유지할 틱 수 (GT '가까운 순 30개' 제한 대비)
   obj_grace_ticks: 10
 
@@ -823,3 +829,12 @@ debug:
   print_hz: 1.0
 
 default_speed_kph: 50.0
+
+# PDM GlobalConfig 오버라이드 — run_agent.build_pdm_config 가 주입한다.
+# config.py(원문)는 손대지 않는다. 값이 원문과 같으면 동작 불변.
+pdm:
+  # 선행차 IDM 목표 시간간격 [s] (원문 0.25). 배치 비교용 (B-6, 2026-09-02):
+  # 0.25 / 0.5 / 1.0 을 정적회피집중·실전주행_교통류 에서 비교해 케이스 3
+  # (선행차 정지 시 범퍼 간격 0.45 m)의 정지 거리·추종 중 최소 간격·완주 시간을
+  # 본 뒤 확정한다. 확정 전까지 0.25 = 동작 불변.
+  idm_leading_vehicle_time_headway: 0.25
