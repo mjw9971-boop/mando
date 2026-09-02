@@ -166,3 +166,82 @@ def test_missing_lane_graph_is_not_center_line():
     kr = KrRules(CFG)
     assert kr._is_center_mark(None, (1, 0, -1), 'left', 0.0) is False
     assert kr._is_center_mark(Lg('yellow'), None, 'left', 0.0) is False
+
+
+# ── 시프트 기하 계단 검사 (B-7 임시 가드) ────────────────────────────────
+K_REJECT = OT['shift_kappa_reject']
+K_STEP_M = OT['shift_kappa_step_m']
+
+
+class StepPlanner(Planner):
+    """plan_shift_span / planned_lateral_offsets 만 있는 최소 목.
+
+    offsets 는 '이웃 차로까지의 부호 있는 횡오프셋' 이다 — 정상이면 차로폭
+    부근에서 거의 상수이고, 결함이면 한 점에서 계단이 생긴다.
+    """
+
+    def __init__(self, offsets, span=(100, 200)):
+        super().__init__()
+        self._off = np.asarray(offsets, dtype=float)
+        self._span = span
+
+    def plan_shift_span(self, actor, last_actor=None, obstacle_direction='right',
+                        transition_length=0.0, extra_length_before=0.0,
+                        extra_length_after=0.0, min_start_ahead=0):
+        return self._span[0], self._span[1], obstacle_direction == 'right'
+
+    def planned_lateral_offsets(self, a, b, left, step_pts=10):
+        return self._off
+
+
+def kappa_of(kr, offsets):
+    p = StepPlanner(offsets)
+    return kr._planned_shift_kappa(p, actor=None, side='right', trans_m=12.0)
+
+
+def test_flat_neighbour_offset_has_zero_kappa():
+    """이웃 차로가 나란하면 κ = 0 — 정상 회피의 기본 형태다."""
+    kr = KrRules(CFG)
+    assert kappa_of(kr, [3.0] * 40) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_measured_normal_shifts_are_far_below_reject():
+    """실측 정상 4건(κ_raw 0.0002~0.0095)은 어떤 합리적 임계에도 안 걸린다."""
+    kr = KrRules(CFG)
+    for k_meas in (0.0002, 0.0025, 0.0095, 0.0008):
+        # 같은 κ 를 내는 2차 곡선 오프셋: d[i] = k/2 · (i·h)²
+        h = K_STEP_M
+        off = [0.5 * k_meas * (i * h) ** 2 for i in range(40)]
+        assert kappa_of(kr, off) == pytest.approx(k_meas, rel=1e-6)
+        assert kappa_of(kr, off) < 1.0                     # 권고 임계 1.0 아래
+
+
+def test_step_discontinuity_is_detected():
+    """실측 계단(2.854 m/점)은 κ ≈ 2.85 로 나온다 (간격 1 m)."""
+    kr = KrRules(CFG)
+    off = [3.0] * 20 + [3.0 - 2.854] * 20
+    got = kappa_of(kr, off)
+    assert got == pytest.approx(2.854 / K_STEP_M ** 2, rel=0.01)
+    assert got > 1.0
+
+
+def test_reject_is_off_by_default():
+    """기본 params 는 계측만 한다 — 기각하지 않는다 (B-7 가드 미활성)."""
+    assert K_REJECT == 0.0
+    assert KrRules(CFG).shift_k_reject == 0.0
+
+
+def test_reject_threshold_separates_measured_cases():
+    """임계 1.0 은 실측 정상 최대(0.0095)와 계단(2.977) 사이에 있다."""
+    cfg = copy.deepcopy(CFG)
+    cfg['overtake']['shift_kappa_reject'] = 1.0
+    kr = KrRules(cfg)
+    assert kr.shift_k_reject == 1.0
+    assert kappa_of(kr, [0.5 * 0.0095 * (i * K_STEP_M) ** 2 for i in range(40)]) < kr.shift_k_reject
+    assert kappa_of(kr, [3.0] * 20 + [3.0 - 2.854] * 20) > kr.shift_k_reject
+
+
+def test_kappa_is_none_when_planner_lacks_api():
+    """구형 플래너(목 포함)에서는 None — 게이트가 조용히 통과한다."""
+    kr = KrRules(CFG)
+    assert kr._planned_shift_kappa(Planner(), actor=None, side='right', trans_m=12.0) is None

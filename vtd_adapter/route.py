@@ -590,18 +590,15 @@ class VtdRoutePlanner:
                     self.route_points[idx][:2] - self.original_route_points[idx][:2]))
                 self.lat_shift[idx] = self._lat_build[idx] + (d if shift_to_left_lane else -d)
 
-    def shift_route_around_actors(self, first_actor, last_actor=None,
-                                  obstacle_direction='right', transition_length=120.0,
-                                  lane_transition_factor=1.0,
-                                  extra_length_before=0.0, extra_length_after=0.0,
-                                  min_start_ahead=0):
-        """PDM 원문 — 액터 주위로 경로 시프트. 발동은 phase4 에서.
+    def plan_shift_span(self, first_actor, last_actor=None,
+                        obstacle_direction='right', transition_length=120.0,
+                        extra_length_before=0.0, extra_length_after=0.0,
+                        min_start_ahead=0):
+        """시프트 구간 인덱스만 계산한다 — **경로를 건드리지 않는다**.
 
-        VTD 추가 min_start_ahead [경로점 수]: 전이 시작을 **자차보다 이만큼 앞**
-        으로 강제한다. 원문은 시작점을 액터에서 거꾸로 재므로, 코앞의 장애물에
-        정지한 상태에서 부르면 시작점이 자차 뒤로 가고 **현재 위치의 경로가 옆으로
-        밀린다** → 정지 상태에서 횡오차가 생겨 조향이 풀락된다 (2026-08-30
-        실전주행_01_연속교차로24 실측: 시프트 직후 steer +0.480 고정, 17.8 s 정지).
+        shift_route_around_actors 의 앞부분을 그대로 뗀 것이다. 적용 전에
+        기하를 검사하려면(kr_rules 의 계단 불연속 계측) 같은 인덱스가 필요한데,
+        계산을 복제하면 두 곳이 어긋난다. 반환은 (시작, 끝, 좌측시프트여부).
         """
         tree = cKDTree(self.original_route_points[self.route_index:, :2])
         first_actor_location = np.array(
@@ -623,9 +620,61 @@ class VtdRoutePlanner:
                 last_actor_extent * self.points_per_meter + transition_length + extra_length_after)
 
         floor = self.route_index + int(min_start_ahead)
-        if shift_start_index < floor:                  # 자차 앞에서 시작 (위 참조)
+        if shift_start_index < floor:                  # 자차 앞에서 시작 (아래 참조)
             shift_start_index = min(floor, shift_end_index - 1)
-        shift_to_left_lane = obstacle_direction == 'right'
+        return shift_start_index, shift_end_index, obstacle_direction == 'right'
+
+    def planned_lateral_offsets(self, start_index, end_index, shift_to_left_lane,
+                                step_pts=10):
+        """적용 전, 이웃 차로 중심까지의 **부호 있는 횡오프셋**을 성긴 간격으로.
+
+        shift_route_smoothly 가 각 점에서 목표로 삼는 `get_left_lane()/
+        get_right_lane()` 위치를, 경로를 건드리지 않고 step_pts 간격으로만 읽는다.
+        전 해상도(0.1 m)로 읽으면 span 하나에 30 ms 가 넘어 틱 예산을 먹는다
+        (실측 2026-09-02: 적용+원복 왕복 36.1 ms = 예산의 72%). 1 m 간격이면
+        1.7~5.2 ms 이고, 찾으려는 **계단 불연속**(2.9 m/점)은 성기게 떠도 그대로
+        보인다.
+
+        전이 계수는 곱하지 않는다 — 계수는 코사인이라 매끄럽고, 여기서 보려는
+        것은 **목표 차로가 튀는가** 뿐이다. 계수를 빼면 정상 전이의 곡률이
+        빠지므로 판별이 오히려 깨끗해진다 (실측 정상 κ 0.0002~0.0095 대
+        계단 2.977).
+        """
+        out = []
+        n = len(self.original_route_points)
+        for i in range(int(start_index), min(int(end_index), n), max(1, int(step_pts))):
+            w = self.route_waypoints[i]
+            nb = w.get_left_lane() if shift_to_left_lane else w.get_right_lane()
+            if nb is None:
+                out.append(0.0)
+                continue
+            loc = nb.transform.location
+            bx, by = self.original_route_points[i, :2]
+            j = min(i + 1, n - 1)
+            tx, ty = self.original_route_points[j, :2] - self.original_route_points[i, :2]
+            d = _math.hypot(tx, ty) or 1.0
+            out.append((tx * (loc.y - by) - ty * (loc.x - bx)) / d)
+        return np.asarray(out, dtype=float)
+
+    def shift_route_around_actors(self, first_actor, last_actor=None,
+                                  obstacle_direction='right', transition_length=120.0,
+                                  lane_transition_factor=1.0,
+                                  extra_length_before=0.0, extra_length_after=0.0,
+                                  min_start_ahead=0):
+        """PDM 원문 — 액터 주위로 경로 시프트. 발동은 phase4 에서.
+
+        VTD 추가 min_start_ahead [경로점 수]: 전이 시작을 **자차보다 이만큼 앞**
+        으로 강제한다. 원문은 시작점을 액터에서 거꾸로 재므로, 코앞의 장애물에
+        정지한 상태에서 부르면 시작점이 자차 뒤로 가고 **현재 위치의 경로가 옆으로
+        밀린다** → 정지 상태에서 횡오차가 생겨 조향이 풀락된다 (2026-08-30
+        실전주행_01_연속교차로24 실측: 시프트 직후 steer +0.480 고정, 17.8 s 정지).
+
+        구간 계산은 plan_shift_span 이 한다 (적용 전 검사와 같은 인덱스를 쓰려고
+        뗐다). 아래 shift_route_smoothly 호출이 PDM 원문 그대로다.
+        """
+        shift_start_index, shift_end_index, shift_to_left_lane = self.plan_shift_span(
+            first_actor, last_actor, obstacle_direction, transition_length,
+            extra_length_before, extra_length_after, min_start_ahead)
         self.shift_route_smoothly(shift_start_index, shift_end_index, shift_to_left_lane,
                                   transition_length=transition_length,
                                   lane_transition_factor=lane_transition_factor)

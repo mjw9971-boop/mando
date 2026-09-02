@@ -217,6 +217,9 @@ class KrRules:
         # 시프트 전이 횡가속 상한 (P1). 0 이면 비활성.
         self.a_lat_max = float(ot.get('a_lat_max', 0.0))
         self.shift_cap_min_v = float(ot.get('shift_cap_min_v', 1.0))
+        # 시프트 기하 계단 검사 (B-7 임시 가드). 0 이면 계측만, 기각 없음.
+        self.shift_k_reject = float(ot.get('shift_kappa_reject', 0.0))
+        self.shift_k_step_m = float(ot.get('shift_kappa_step_m', 1.0))
         # 규칙 2 — 데드락 해제 (BREAKOUT)
         self.BO_CREEP = 4                                  # 크립이 켜지는 단계
         self.bo_enabled = bool(ot.get('breakout_enabled', False))
@@ -662,6 +665,37 @@ class KrRules:
         except Exception:                                  # noqa: BLE001
             return False
         return str(col) == 'yellow'
+
+    def _planned_shift_kappa(self, planner, actor, side, trans_m):
+        """적용 **전** 시프트 목표 기하의 횡곡률 최대값 κ [1/m]. 못 재면 None.
+
+        찾는 것은 곡률이 아니라 **계단 불연속**이다 (B-7). 실측 2026-09-01
+        실전주행_교통류_01 의 시프트 span [6033,6465] 은 경로점 6362 에서
+        목표 이웃 차로가 2.854 m 튄다 — laneSection 경계에서 get_right_lane()
+        이 가리키는 차로가 바뀌기 때문으로 보인다. 자차가 그 계단을 추종하려다
+        조향이 양방향 풀락으로 포화했고, 그것이 황색 중앙선 0.94 m 침범의
+        더 깊은 뿌리다.
+
+        전이 계수를 곱하지 않은 **날 오프셋**을 본다 — 계수는 코사인이라
+        매끄러워서 빼면 정상 전이의 곡률이 함께 빠지고 판별이 깨끗해진다.
+        실측 (간격 1.0 m): 정상 4건 0.0002~0.0095, 계단 1건 2.977 → 313 배.
+        """
+        try:
+            ppm = float(getattr(planner, 'points_per_meter', 10))
+            a, b, left = planner.plan_shift_span(
+                actor, obstacle_direction='right' if side == 'left' else 'left',
+                transition_length=trans_m * ppm,
+                extra_length_before=self.ot_before_m * ppm,
+                extra_length_after=self.ot_after_m * ppm,
+                min_start_ahead=self.shift_ahead_m * ppm)
+            step = max(1, int(round(self.shift_k_step_m * ppm)))
+            d = planner.planned_lateral_offsets(a, b, left, step_pts=step)
+        except Exception:                                  # noqa: BLE001
+            return None
+        if len(d) < 3:
+            return None
+        h = step / ppm
+        return float(np.abs(d[2:] - 2.0 * d[1:-1] + d[:-2]).max()) / (h * h)
 
     def _shift_speed_cap(self, planner, ego_speed: float) -> float | None:
         """진행 중인 회피 시프트의 전이 곡률에서 나오는 **속도 상한** — min() 후보.
@@ -1120,6 +1154,17 @@ class KrRules:
                 self.last_overtake = f'{side}:occupied'
                 continue
             ppm = float(getattr(planner, 'points_per_meter', 10))
+            # ⑤ 기하 계단 검사 (B-7 임시 가드) — 다른 게이트를 다 통과한 뒤에만
+            # 잰다 (읽기 전용이지만 span 하나에 1.7~5.2 ms 든다). 상태를 남기지
+            # 않으므로 기각은 **그 시점 그 경로 한정**이고 다음 틱에 다시 시도한다.
+            kap = self._planned_shift_kappa(planner, actor, side, trans_m)
+            if kap is not None:
+                (self.last_avoid or {}).update({'shift_kappa': round(kap, 4)})
+            if (self.shift_k_reject > 0.0 and kap is not None
+                    and kap > self.shift_k_reject):
+                self.last_overtake = f'{side}:kappa'
+                (self.last_avoid or {}).update({'reject': f'{side}:kappa'})
+                continue
             span = planner.shift_route_around_actors(
                 actor,
                 obstacle_direction='right' if side == 'left' else 'left',
