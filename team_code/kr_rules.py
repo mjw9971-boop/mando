@@ -222,6 +222,9 @@ class KrRules:
         self.shift_k_step_m = float(ot.get('shift_kappa_step_m', 1.0))
         # 계획 LC 중첩 검사 (B-11). 0 이면 계측만, 기각 없음.
         self.lc_overlap_m = float(ot.get('shift_lc_overlap_m', 0.0))
+        # 시프트 기하 완성 게이트 (B-12). false 면 완전 비활성 = 이전 동작.
+        self.geom_gate = bool(ot.get('shift_geom_gate_enable', False))
+        self.geom_margin_m = float(ot.get('shift_geom_margin_m', 0.0))
         # 규칙 2 — 데드락 해제 (BREAKOUT)
         self.BO_CREEP = 4                                  # 크립이 켜지는 단계
         self.bo_enabled = bool(ot.get('breakout_enabled', False))
@@ -1165,6 +1168,28 @@ class KrRules:
             # 76.4 반환 → span 84.1 m 가 전 구간 실선 위에 얹혔다).
             trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
             span_m = 2.0 * trans_m + self.ot_before_m + self.ot_after_m
+            # ⑥ 기하 완성 게이트 (B-12) — **전이가 장애물 도달 전에 끝나는가**.
+            # 전이는 자차 앞 shift_ahead_m 에서 시작해 trans_m 만큼 간다. 그
+            # 끝점이 장애물보다 뒤면 장애물 지점의 횡이동이 거의 0 이다 (실측
+            # s_rel 5.3 m 에서 3.0 m 중 0.0046 m = 0.15 %).
+            # 여기 두는 이유: 뺄셈 하나뿐이라 7게이트 중 가장 싸다. 뒤쪽
+            # solid(successor 순회)·kappa/lc_overlap(cKDTree ≈4.6 ms)보다 먼저
+            # 걸러야 값싼 게이트 우선 원칙에 맞는다.
+            # 거리는 **선택된 actor 기준**으로 잰다 — REACTIVE 경로에서 actor 가
+            # _blocker 로 바뀌므로 corridor[0] 의 거리와 다를 수 있다.
+            if self.geom_gate:
+                pr = self._project(planner, actor.get_location().x,
+                                   actor.get_location().y)
+                need = trans_m + self.shift_ahead_m + self.geom_margin_m
+                # pr is None = 전방 창에서 투영 실패. 판단 근거가 없으므로
+                # 기각하지 않는다 (다른 게이트의 '못 재면 통과' 관례와 같다).
+                if pr is not None and need > pr[0]:
+                    self.last_overtake = f'{side}:geom'
+                    (self.last_avoid or {}).update(
+                        {'reject': f'{side}:geom', 'need_geom': round(need, 1),
+                         's_rel_actor': round(pr[0], 1),
+                         'margin': round(pr[0] - need, 1)})
+                    continue
             # ② 시프트 기하 게이트 — 나가는 전이 + 복귀 전이 span 전체가
             # 정지선 억제 구역(stopline_suppress_m) **밖에서 끝나야** 시작한다.
             # 시프트 도중에 억제 구역으로 들어가면 되돌릴 수 없다(급조향 금지).

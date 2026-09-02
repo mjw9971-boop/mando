@@ -404,6 +404,28 @@ overtake:
   # 임계는 배치 전수 분포를 더 모은 뒤 확정한다. 켤 때 권고값 1.0.
   # 켜면 B-10 의 폴백 경로를 함께 봐야 한다 (기각 → REACTIVE 무장 여부).
   shift_lc_overlap_m: 0.0
+  # ── 시프트 기하 완성 게이트 (B-12) ──────────────────────────────────
+  # 전이가 **장애물 도달 전에 끝나는가**. 안 끝나면 그 side 를 기각한다.
+  #   need = trans_m + shift_ahead_m + shift_geom_margin_m  ≤  s_rel(actor)
+  #
+  # 왜 필요한가 — side 루프의 기존 7게이트(no_neighbor / center_line /
+  # span_into_zone / solid / occupied / kappa / lc_overlap)에 이 검사가 없다.
+  # 간접 방어인 PREEMPT 의 t_left = (s_rel − standoff)/v 는 저속·근접에서
+  # **음수로 크게 벌어져 오히려 더 확실히 발동하는 역방향** 구조다.
+  #
+  # 실측 2026-09-02, 20260902_131600 실전주행_교통류_01_좌회전24 t=214.85:
+  #   s_rel 5.3 m, v 0.00 → standoff 10.0, t_left −47.0 → PREEMPT 통과
+  #   trans_m 12.0 + shift_ahead_m 5.0 = 17.0 m 필요, margin = −11.7 m
+  #   → 장애물 지점의 경로 횡이동이 3.0 m 중 **0.0046 m (0.15 %)**.
+  #     사실상 시프트 없이 경로만 흔들고 접촉(min_gap 0.0) 33.4 s, 미완주.
+  #   같은 조건으로 BREAKOUT L1~L3 이 3회 더 재생성했다 (총 4틱, 전부 미완).
+  #
+  # 임계 근거 (같은 로그 side 루프 진입 5틱 + WAIT 56틱의 margin):
+  #   정상 계열 +33.91 ~ +39.20   /   불가 계열 −11.70   → 간극 45.6 m
+  # 간극이 넓어 작은 값으로 충분하고, 중간 영역 실측이 없어 큰 값을 정당화할
+  # 데이터가 없다. 2.0 은 전이 길이 12 m 의 약 1/6.
+  shift_geom_gate_enable: true
+  shift_geom_margin_m: 2.0
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오
