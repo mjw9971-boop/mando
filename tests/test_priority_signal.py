@@ -225,23 +225,26 @@ def cycle(kr, p, ap, green_s, red_s, cycles, v=0.0):
 
 
 def test_breakout_enters_across_two_green_phases():
-    """녹색 7 s 주기 — 한 주기로는 stuck_hard_s(10 s)를 못 채우지만
-    **두 주기에 걸쳐 누적**되어 진입한다."""
+    """녹색이 stuck_hard_s 의 0.7 배인 주기 — 한 주기로는 못 채우지만
+    **두 주기에 걸쳐 누적**되어 진입한다. (stuck_hard_s 가 바뀌어도 성립하도록
+    비율로 잡는다 — E-3 에서 10 → 4 s.)"""
+    g = 0.7 * OT['stuck_hard_s']
     kr, p, ap = rig(state=TrafficLightState.Green)
-    cycle(kr, p, ap, green_s=7.0, red_s=5.0, cycles=1)
-    assert kr.bo_state is None, '한 주기(7 s)로는 아직 아니다'
-    assert kr.bo_stuck_ticks >= int(7.0 * HZ) - 2, '카운터가 리셋되지 않았다'
-    cycle(kr, p, ap, green_s=7.0, red_s=5.0, cycles=1)
+    cycle(kr, p, ap, green_s=g, red_s=5.0, cycles=1)
+    assert kr.bo_state is None, '한 주기로는 아직 아니다'
+    assert kr.bo_stuck_ticks >= int(g * HZ) - 2, '카운터가 리셋되지 않았다'
+    cycle(kr, p, ap, green_s=g, red_s=5.0, cycles=1)
     assert kr.bo_state == 'BREAKOUT', '두 주기 누적으로 진입해야 한다'
 
 
 def test_counter_pauses_not_resets_during_red():
+    n = int(0.5 * OT['stuck_hard_s'] * HZ)                # 진입 전까지만 쌓는다
     kr, p, ap = rig(state=TrafficLightState.Green)
-    for _ in range(int(5.0 * HZ)):
+    for _ in range(n):
         kr._update_obj_timers(ap)
         kr._breakout_tick(p, ap, 0.0)
     held = kr.bo_stuck_ticks
-    assert held >= int(5.0 * HZ) - 2
+    assert held >= n - 2
     set_state(p, TrafficLightState.Red)
     for _ in range(int(8.0 * HZ)):
         kr._update_obj_timers(ap, paused=True)

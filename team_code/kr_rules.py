@@ -287,6 +287,8 @@ class KrRules:
         self.zone_extend_max_m = float(ot.get('zone_extend_max_m', 120.0))
         self.zone_exit_margin_m = float(ot.get('zone_exit_margin_m', 5.0))
         self.zone_junction_gap_m = float(ot.get('zone_junction_gap_m', 5.0))
+        # E-3 BREAKOUT 시계를 첫 기각부터 (주행 중 포함).
+        self.bo_reject_clock = bool(ot.get('breakout_reject_clock_enable', False))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -335,6 +337,8 @@ class KrRules:
         self.bo_state: str | None = None           # None | 'BREAKOUT' | 'CREEP_FAIL'
         self.bo_level = 0
         self.bo_stuck_ticks = 0
+        self.bo_stop_ticks = 0                     # 순수 정지(v<eps) 지속 틱 (E-3 안전 가드)
+        self.ot_reject_ticks = 0                   # 회피 시도가 양쪽 다 기각된 연속 틱 (E-3)
         self.bo_lvl_ticks = 0
         self.bo_stall_ticks = 0
         self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
@@ -1135,7 +1139,14 @@ class KrRules:
                 return False
         elif self._tick_queue:                             # 큐 뒤에 선 것은 데드락이 아니다 (C-5)
             return False
-        return self._blocker(ap, planner) is not None      # 실제로 앞이 막혀 있을 것
+        if self._blocker(ap, planner) is not None:         # 실제로 앞이 막혀 있을 것
+            return True
+        # E-3: 회랑 후보가 있는데 양쪽 다 기각된 채면 30 m 밖이라도 장애물 원인이다
+        return self._reject_pending()
+
+    def _reject_pending(self) -> bool:
+        """E-3 시계 입력 — 직전 틱 회피 시도가 양쪽 다 기각됐나 (스위치 꺼지면 거짓)."""
+        return self.bo_reject_clock and self.ot_reject_ticks > 0
 
     def _breakout_reset(self, why=None) -> None:
         if why and self.bo_state == 'BREAKOUT':
@@ -1190,13 +1201,20 @@ class KrRules:
             return
         self.bo_paused = False
 
+        # 순수 정지 틱 — E-3 의 안전 가드(occupied 완화·크립은 정지 stuck_hard_s
+        # 경과를 요구) 전용. 원인·상태와 무관하게 자차 속도만 본다.
+        self.bo_stop_ticks = 0 if ego_speed >= self.bo_eps else self.bo_stop_ticks + 1
+
         if not self._obstacle_cause(planner, ap):
             self.bo_stuck_ticks = 0
             if self.bo_state is not None:
                 self._breakout_reset('cause_gone')
             return
 
-        moving = ego_speed >= self.bo_eps
+        # E-3: '막힘' = 정지 **또는** 직전 틱 회피 시도 양쪽 기각 (주행 중 포함).
+        # 스위치가 꺼지면 reject_pending 은 항상 거짓 = 정지만 센다 (이전 동작).
+        rejected = self._reject_pending()
+        moving = ego_speed >= self.bo_eps and not rejected
         self.bo_stuck_ticks = 0 if moving else self.bo_stuck_ticks + 1
 
         if self.bo_state is None:
@@ -1209,13 +1227,18 @@ class KrRules:
                 self.bo_ref_s = route_s
                 self.ot_span = None                        # L1: 1회 제한 해제
                 print('[kr_rules] 데드락 해제 진입 — BREAKOUT L1 '
-                      f'(정지 {self.bo_stuck_ticks / self.hz:.1f} s)', flush=True)
+                      f'({"기각" if rejected else "정지"} {self.bo_stuck_ticks / self.hz:.1f} s)',
+                      flush=True)
             return
 
         # 진전 감지 → 정상 복귀. 기준은 **진입 시점**이다 — 무진전 판정의
         # bo_ref_s 와 겹쳐 쓰면 조금씩 계속 나아갈 때 기준이 따라 올라가
         # 복귀가 영영 안 걸린다 (테스트가 잡은 결함).
-        if self.bo_entry_s is not None and route_s - self.bo_entry_s >= self.bo_progress_m:
+        # E-3: 기각이 이어지는 동안은 주행 진전을 복귀로 보지 않는다 — 주행 중
+        # 시계로 들어온 BREAKOUT 이 다음 틱 2 m 진전으로 바로 풀리면 사다리가
+        # 영영 못 오른다. 시프트에 성공하면 기각이 끊겨 그때 진전으로 복귀한다.
+        if (not rejected and self.bo_entry_s is not None
+                and route_s - self.bo_entry_s >= self.bo_progress_m):
             print('[kr_rules] 데드락 해제 — 진전 %.1f m, 정상 복귀'
                   % (route_s - self.bo_entry_s), flush=True)
             self._breakout_reset('progress')
@@ -1239,6 +1262,12 @@ class KrRules:
 
         self.bo_lvl_ticks += 1
         if self.bo_lvl_ticks >= self.bo_esc_ticks:
+            # E-3 안전 가드: 크립(L4)은 IDM·OBB 를 끄므로 주행 중 시계로는 열지
+            # 않는다 — 정지 stuck_hard_s 가 지나야 오른다 (L3 에서 대기).
+            if (self.bo_level + 1 >= self.BO_CREEP and self.bo_reject_clock
+                    and self.bo_stop_ticks < self.bo_hard_ticks):
+                self.bo_lvl_ticks = self.bo_esc_ticks       # 포화 — 정지가 차면 즉시
+                return
             self.bo_level += 1
             self.bo_lvl_ticks = 0
             self.ot_span = None                            # 각 단계에서 재시도 허용
@@ -1300,7 +1329,17 @@ class KrRules:
         게이트: 목표 차로 존재 · 교차로 아님 · 점선 회랑 충분(S2.2.05) · 측방 비어 있음.
         시프트는 나갔다 돌아오는 프로파일이라(양 끝 전이계수 0) 복귀는 자동이고,
         지나가면 경로를 원상 복구해 다음 장애물에 다시 쓸 수 있게 한다.
+
+        E-3 회계: 본문(_try_overtake_inner)이 "후보가 있었는데 양쪽 다 기각" 이면
+        참을 돌려주고, 여기서 연속 기각 틱을 센다. BREAKOUT 시계가 이 값을 읽는다.
         """
+        rejected = self._try_overtake_inner(ap, planner, ego_speed)
+        self.ot_reject_ticks = self.ot_reject_ticks + 1 if rejected else 0
+        if rejected and self.last_avoid is not None:
+            self.last_avoid['reject_s'] = round(self.ot_reject_ticks / self.hz, 1)
+
+    def _try_overtake_inner(self, ap, planner, ego_speed: float) -> bool:
+        """_try_overtake 본문. 반환 = 이번 틱 회피 시도가 전부 기각됐나 (E-3)."""
         # 시프트 진행 중 억제 구역에 걸렸다면 — **원복하지 않는다**.
         # 횡위치를 유지하고 종방향은 정지 후보(④′ 프로파일·홀드)에 맡긴다.
         # 급조향으로 차로 중앙에 복귀하려 들면 정지선 앞에서 조향이 튄다.
@@ -1309,7 +1348,7 @@ class KrRules:
         if self.ot_span is not None and self._red_ahead(planner) is not None:
             self.last_avoid = {'state': 'SHIFT_HOLD', 'suppress': 'red_ahead',
                                'span': list(self.ot_span)}
-            return
+            return False
 
         # 지나갔으면 원복 (다음 장애물용)
         if self.ot_span is not None and planner.route_index > self.ot_span[1]:
@@ -1320,9 +1359,9 @@ class KrRules:
             planner._kd = _cKDTree(planner.route_points[:, :2])
             self.ot_span = None
             self.last_overtake = 'restored'
-            return
+            return False
         if not self.ot_enabled:
-            return
+            return False
         if self.ot_span is not None:
             # 시프트 활성 중 (B-9 (5)) — **생성**만 건너뛴다. 회랑(밀린 경로 기준)·
             # standoff·막힘 회계는 계속 돈다: 복귀 전이 위에 다음 장애물이 있으면
@@ -1335,7 +1374,7 @@ class KrRules:
                 self.last_avoid = {'state': 'SHIFT_ACTIVE', 'span': list(self.ot_span),
                                    'blocker': corridor[0][3].id if corridor else None,
                                    's_rel': round(corridor[0][0], 1) if corridor else None}
-            return
+            return False
 
         lg = getattr(planner, 'lg', None)
         ego_lane = getattr(ap, '_kr_ego_lane', None) or self._ego_lane(lg, ap)
@@ -1351,7 +1390,7 @@ class KrRules:
                 self.wait_target_d = None
                 self.last_avoid = {'state': 'SUPPRESS', 'suppress': 'red_ahead',
                                    'sup_d': round(d_red, 1)}
-                return
+                return False
 
             # ── 규칙 1: 신호 구역 억제 (전 상태 공통 게이트) ──────────────
             zone = self._signal_zone(planner, ap)
@@ -1359,7 +1398,7 @@ class KrRules:
                 self.ot_blocked_ticks = 0
                 self.last_avoid = {'state': 'SUPPRESS', 'suppress': zone[0],
                                    'sup_d': zone[1]}
-                return
+                return False
 
         corridor = self._corridor_blockers(ap, planner)
         if self.suppress_mode == 'legacy':
@@ -1367,7 +1406,7 @@ class KrRules:
                 self.ot_blocked_ticks = 0
                 self.last_avoid = {'state': 'SUPPRESS', 'suppress': 'queue',
                                    'n': len(corridor), 'q_s': round(self.q_ticks / self.hz, 1)}
-                return
+                return False
         else:
             # queue_only (C-4): standoff 는 큐와 무관하게 **항상** 산출한다 — 큐 뒤에도
             # 25 m 앞에 서는 것이 설계다. 억제는 캐시된 큐 판정 하나뿐이다.
@@ -1377,7 +1416,7 @@ class KrRules:
                 self.last_avoid = {'state': 'SUPPRESS', 'suppress': 'queue',
                                    'queue': self.q_info, 'n': len(self._tick_corridor),
                                    'q_s': round(self.q_ticks / self.hz, 1)}
-                return
+                return False
 
         # ── 규칙 3 + WAIT: 관찰하며 접근, 시간 예산이 다하면 시프트 ────────
         # 일률 6 s 관찰은 못 쓴다 — 10.6 m/s 에서 잔여 16 m 인데 전이가 42 m 면
@@ -1436,15 +1475,15 @@ class KrRules:
             if corridor and self.last_avoid is None:
                 self.last_avoid = {'state': 'WATCH', 'blocker': corridor[0][3].id,
                                    's_rel': round(corridor[0][0], 1)}
-            return
+            return False
         if lg is None or ego_lane is None:
             self.last_overtake = 'no_lane'
             (self.last_avoid or {}).update({'reject': 'no_lane'})
-            return
+            return True
         if lg.lanes[ego_lane]['junction'] != -1:
             self.last_overtake = 'junction'
             (self.last_avoid or {}).update({'reject': 'junction'})
-            return
+            return True
 
         local_s = self._ego_local_s(lg, ap)
         # 연쇄 장애물 병합 (B-9) — 회랑에서 actor 뒤로 chain_gap_m 안에 이어지는
@@ -1465,13 +1504,14 @@ class KrRules:
         self.ot_pass_solid = False
         if self._side_pass(ap, planner, ego_speed, chain, preempt,
                            lg, ego_lane, local_s, 1):
-            return
+            return False
         if self.solid_second_pass and self.ot_pass_solid:
             if self._side_pass(ap, planner, ego_speed, chain, preempt,
                                lg, ego_lane, local_s, 2):
-                return
+                return False
         if self.last_overtake is None:
             self.last_overtake = 'no_neighbor'
+        return True
 
     def _standoff_target(self, ap, planner, corridor) -> None:
         """standoff(관찰 감속) 대상 선정 (B-5) — 매 틱 apply 머리에서 None 으로
@@ -1784,7 +1824,12 @@ class KrRules:
                     self.ot_pass_solid = True              # 2바퀴 사유
                     reject('solid', dash_m=round(cover, 1), span_m=round(span_m, 1))
                     continue
-            if lvl < 1 and not self._side_is_clear(lg, planner, ap, target):
+            # occupied 완화(L1+)는 **정지 stuck_hard_s 경과** 를 요구한다 (E-3 안전
+            # 가드) — 주행 중 시계로 오른 단계로 점유 차로에 밀지 않는다. 시계가
+            # 꺼져 있으면 L1 자체가 정지 stuck_hard_s 뒤라 조건이 항상 참 = 이전 동작.
+            occ_relaxed = lvl >= 1 and (not self.bo_reject_clock
+                                        or self.bo_stop_ticks >= self.bo_hard_ticks)
+            if not occ_relaxed and not self._side_is_clear(lg, planner, ap, target):
                 reject('occupied')
                 continue
             ppm = float(getattr(planner, 'points_per_meter', 10))

@@ -61,6 +61,9 @@ def rig(cfg=CFG, obj_x=FAR, lg=None, stopline=None, lvl=0):
         kr._sl_all = [float(stopline)]
     if lvl:
         kr.bo_state, kr.bo_level = 'BREAKOUT', lvl
+        # E-3 이후 occupied 완화(L1+)는 '정지 stuck_hard_s 경과' 도 요구한다 —
+        # 이 rig 의 단계는 정지 데드락으로 오른 것이므로 그 조건을 채워 둔다.
+        kr.bo_stop_ticks = kr.bo_hard_ticks
     return kr, p, ap
 
 
