@@ -506,3 +506,28 @@ def test_far_red_does_not_pause_breakout():
         kr._tick_cache(ap, p)
         kr._breakout_tick(p, ap, 0.0)
     assert kr.bo_paused is True and kr.bo_state is None
+
+# ══════════════════════════════════════════════════════════════════════════
+# E-8 실차 전 보정
+# ══════════════════════════════════════════════════════════════════════════
+class LgNoneMark(LgOne):
+    """점선은 없고(dashed_runs 빈 목록) 오른쪽 마킹이 'none' 인 구간만 있는 목."""
+
+    def __init__(self):
+        super().__init__()
+        self.lanes[(1, 0, -1)]['right_mark'] = [(0.0, 20.0, 'solid', 'standard', False),
+                                                (20.0, 60.0, 'none', 'standard', False),
+                                                (60.0, 1000.0, 'solid', 'standard', False)]
+
+    def dashed_runs(self, key, side):
+        return []
+
+
+def test_none_marking_counts_as_crossable():
+    """① 선이 없는 구간은 넘어도 위반이 아니다 — 점선처럼 cover 에 든다. 스위치 off 면 0."""
+    kr = KrRules(CFG)
+    assert kr._dashed_ahead_m(LgNoneMark(), (1, 0, -1), 'right', 10.0, 40.0) == pytest.approx(30.0)
+    kr0 = KrRules(cfg_with(none_marking_crossable=False))
+    assert kr0._dashed_ahead_m(LgNoneMark(), (1, 0, -1), 'right', 10.0, 40.0) == 0.0
+    assert kr._dashed_ahead_m(LgOne(), (1, 0, -1), 'right', 0.0, 40.0) == pytest.approx(40.0)  # 마크 없는 목: 점선만
+

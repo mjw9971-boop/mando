@@ -299,6 +299,10 @@ class KrRules:
         # (replay 020439/01 t=38.0 PREEMPT → 38.05 WAIT → 39.85 WAIT_EXPIRED).
         self.preempt_latch = bool(ot.get('preempt_latch_enable', False))
         self.preempt_latch_id = None
+        # E-8 ① 마킹 'none' 구간은 점선과 같이 넘을 수 있다 — 선이 없으면 위반이 아니다.
+        # 실측 020439/02: 정지선 앞 none 구간(lane-local 35.9~57.7)이 커버리지에 안 잡혀
+        # 1바퀴 solid 기각 → 2바퀴(실선 생략)로 생성됐다. false = 이전 동작(점선만).
+        self.none_crossable = bool(ot.get('none_marking_crossable', False))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -751,6 +755,27 @@ class KrRules:
         out.sort(key=lambda z: z[0])
         return out
 
+    def _crossable_runs(self, lg, key, side) -> list:
+        """side 로 **넘을 수 있는** 구간 [(s0, s1) …] — 점선 조각 + (E-8 ①) 마킹
+        'none' 조각. 선이 없는 구간은 넘어도 실선 차로 변경(항목 6)이 아니다.
+        마크 데이터가 없는 목 레인그래프는 점선만 (이전 동작)."""
+        runs = list(lg.dashed_runs(key, side) or [])
+        if not self.none_crossable:
+            return runs
+        try:
+            marks = lg.lanes[key]['left_mark' if side == 'left' else 'right_mark']
+        except Exception:                                   # noqa: BLE001
+            return runs
+        runs += [(float(a), float(b)) for a, b, typ, _c, _ok in marks if typ == 'none']
+        runs.sort()
+        out: list = []
+        for a, b in runs:                                   # 겹침·맞닿음 병합
+            if out and a <= out[-1][1] + 1e-6:
+                out[-1] = (out[-1][0], max(out[-1][1], b))
+            else:
+                out.append((a, b))
+        return out
+
     def _dashed_ahead_m(self, lg, ego_lane, side, ego_local_s, span_m) -> float:
         """자차 앞 span_m 구간 중 **점선인 길이** [m]. 차로 끝을 넘으면 successor 로 잇는다.
 
@@ -766,7 +791,7 @@ class KrRules:
         for _ in range(6):                                  # successor 최대 6칸
             try:
                 L = lg.length(key)
-                runs = lg.dashed_runs(key, side) or []
+                runs = self._crossable_runs(lg, key, side)
             except Exception:                               # noqa: BLE001
                 break
             hi = min(L, s0 + left)
@@ -1764,7 +1789,7 @@ class KrRules:
                 cover += s1 - s0
                 continue
             try:
-                runs = lg.dashed_runs(key, side) or []
+                runs = self._crossable_runs(lg, key, side)
             except Exception:                               # noqa: BLE001
                 runs = []
             for r0, r1 in runs:
