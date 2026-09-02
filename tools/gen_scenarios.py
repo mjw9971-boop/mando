@@ -1810,19 +1810,51 @@ def ev_signal(ctx, v):
     return {'kind': 'signal', 'timing': timing, 'approaches': out}
 
 
+def _place_chain(ctx, n, spacing, frac):
+    """장애물 n개가 **한 가용구간 안에** 통째로 들어가는 시작 route_s. 없으면 None.
+
+    왜 한 구간이어야 하는가 (2026-09-02 실측): pick_s 는 구간들을 이어붙인
+    길이축에서 비율 지점을 고를 뿐이고, 배치는 s0 + i*spacing 으로 raw route_s
+    를 따라간다. 그래서 체인이 구간 밖 — 교차로 안으로 걸어 나갔다. 표본 144
+    에서 개수 6 → 30% / 4 → 14~18% / 3 → 5% 가 교차로 내부에 장애물을 놓았다
+    (예: 좌회전 542 m 경로 spans=[(131,193),(259,355),(463,502)] 에서 s=219.7
+    이 junction 54 안). 교차로 안 장애물은 회피 연습이 아니라 채점 왜곡이다.
+
+    요청 위치(frac)가 들어가는 구간을 먼저 보고, 거기서 체인 꼬리가 넘치면
+    구간 안으로 당긴다. 그 구간이 겹침으로 막히면 요청 위치에서 가까운 구간
+    순으로 옮겨 본다 — 개수를 줄이는 것보다 위치를 옮기는 쪽이 먼저다.
+    """
+    reach = (n - 1) * spacing           # 첫 장애물 → 마지막 장애물
+    try:
+        want = pick_s(ctx.spans, frac, need=n * spacing + 20.0)
+    except GenError:
+        want = None                     # 가용축 전체가 짧다 — 구간만 보고 고른다
+    cands = [(a, b) for a, b in ctx.spans if b - a >= reach]
+    if want is not None:                # 요청 위치를 품은 구간 → 가까운 구간 순
+        cands.sort(key=lambda ab: 0.0 if ab[0] <= want <= ab[1]
+                   else min(abs(ab[0] - want), abs(ab[1] - want)))
+    for a, b in cands:
+        s = a if want is None else min(max(want, a), b - reach)
+        try:
+            # claim 폭은 종전 그대로다 — 이미 한 구간에 들어가던 체인은
+            # 시작점도 점유 구간도 같아야 한다 (기존 산출물 불변 조건).
+            ctx.claim(s - 20, s + n * spacing + 20, 'obstacle_chain')
+        except GenError:
+            continue                    # 다른 이벤트와 겹친다 — 다음 구간
+        return s
+    return None
+
+
 def ev_obstacle_chain(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
     n0 = n = int(v.get('개수', 4))
     spacing = 18.0
     s0 = None
     while n >= 2:
-        try:
-            s0 = pick_s(ctx.spans, v['위치'], need=n * spacing + 20.0)
-            ctx.claim(s0 - 20, s0 + n * spacing + 20, 'obstacle_chain')
+        s0 = _place_chain(ctx, n, spacing, v['위치'])
+        if s0 is not None:
             break
-        except GenError:
-            n -= 1                      # 구간이 짧거나 겹치면 개수를 줄여서라도 놓는다
-            s0 = None
+        n -= 1                          # 어느 구간에도 안 들어간다 — 개수를 줄인다
     if s0 is None:
         raise GenError('obstacle_chain: 장애물 2개도 놓을 구간이 부족하다')
     shrunk = n != n0
