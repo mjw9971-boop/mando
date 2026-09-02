@@ -587,6 +587,12 @@ overtake:
   # 35.9~57.7)이 안 잡혀 1바퀴 solid 기각 → 2바퀴(실선 생략)로 시프트가 생성됐다.
   # false = 이전 동작(점선만).
   none_marking_crossable: true
+  # ② L2 zone 완화 범위 한정 — zone_no_exit / zone_extend_max (와 평가 불가
+  # span_into_zone) 만 L2 에서 해제. zone_turn / zone_lane_change /
+  # zone_no_through_lane 은 경로가 그 교차로에서 회전·차선변경·통과를 요구하는
+  # 경우라 전 단계·전 바퀴 유지 (옆 차로 통과 = 필수 경로 위반). false = 이전 동작
+  # (L2 부터 zone 게이트 전체 생략).
+  zone_relax_limited: true
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

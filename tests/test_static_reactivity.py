@@ -507,6 +507,7 @@ def test_far_red_does_not_pause_breakout():
         kr._breakout_tick(p, ap, 0.0)
     assert kr.bo_paused is True and kr.bo_state is None
 
+
 # ══════════════════════════════════════════════════════════════════════════
 # E-8 실차 전 보정
 # ══════════════════════════════════════════════════════════════════════════
@@ -531,3 +532,42 @@ def test_none_marking_counts_as_crossable():
     assert kr0._dashed_ahead_m(LgNoneMark(), (1, 0, -1), 'right', 10.0, 40.0) == 0.0
     assert kr._dashed_ahead_m(LgOne(), (1, 0, -1), 'right', 0.0, 40.0) == pytest.approx(40.0)  # 마크 없는 목: 점선만
 
+
+def _zone_at_level(lvl, cfg=CFG, **kw):
+    """zone_rig 의 L{lvl} 판 — 정지 데드락으로 오른 단계."""
+    p = RecPlanner(d_tl=float('inf'))
+    p.lg = kw.pop('lg', LgJ())
+    lanes = kw.pop('lanes', (A, J, B))
+    cum = kw.pop('cum', (0.0, SL, J_OUT))
+    lens = kw.pop('lens', (SL, J_OUT - SL, 200.0))
+    p.route = {'lanes': list(lanes), 'cum_s': list(cum), 'lengths': list(lens),
+               'events': list(kw.pop('events', ())), 'total_length': 300.0}
+    kr = KrRules(cfg)
+    kr._sl_all = [SL]
+    ap = Ap(p, [vehicle(2, 38.0)])
+    ap._kr_ego_lane = A
+    for _ in range(WAIT_TICKS):
+        kr._update_obj_timers(ap)
+    kr.bo_state, kr.bo_level, kr.bo_stop_ticks = 'BREAKOUT', lvl, kr.bo_hard_ticks
+    try_overtake(kr, ap, p, ego_speed=V0)
+    return kr
+
+
+def test_zone_relax_at_L2_is_limited_to_exit_and_max():
+    """② L2 는 zone_no_exit / zone_extend_max 만 푼다. 회전·차선변경은 전 단계 유지."""
+    lvl = OT['zone_gate_relax_level']
+    kr = _zone_at_level(lvl, lanes=(A, J), cum=(0.0, SL), lens=(SL, J_OUT - SL))
+    assert kr.ot_span is not None and kr.last_avoid['zone_relaxed'] == 'zone_no_exit'
+    kr = _zone_at_level(lvl, cfg=cfg_with(zone_extend_max_m=10.0))
+    assert kr.ot_span is not None and kr.last_avoid['zone_relaxed'] == 'zone_extend_max'
+    for events, label in [([{'kind': 'turn_right', 's': SL}], 'zone_turn'),
+                          ([{'kind': 'lane_change_left', 's': 10.0, 'window_s0': 10.0,
+                             'window_s1': 25.0}], 'zone_lane_change')]:
+        kr = _zone_at_level(lvl + 2, events=events)                  # L4 여도 유지
+        assert kr.ot_span is None and kr.last_overtake == f'right:{label}@p1'
+    kr = _zone_at_level(lvl, lg=LgJ(j_nb=False))
+    assert kr.ot_span is None and kr.last_overtake == 'right:zone_no_through_lane@p1'
+    # 킬 스위치: 옛 동작 = L2 부터 게이트 전체 생략
+    kr = _zone_at_level(lvl, cfg=cfg_with(zone_relax_limited=False),
+                        events=[{'kind': 'turn_right', 's': SL}])
+    assert kr.ot_span is not None and 'zone_relaxed' not in kr.last_avoid

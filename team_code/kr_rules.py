@@ -255,6 +255,8 @@ class KrRules:
         self.solid_second_pass = bool(ot.get('solid_second_pass_enable', True))
         # 규칙 2 — 데드락 해제 (BREAKOUT)
         self.BO_CREEP = 4                                  # 크립이 켜지는 단계
+        # E-8 ②: L2 zone 완화가 푸는 사유. 회전·차선변경·통과 차로 없음은 여기 없다.
+        self.ZONE_RELAXABLE = ('span_into_zone', 'zone_no_exit', 'zone_extend_max')
         self.bo_enabled = bool(ot.get('breakout_enabled', False))
         self.bo_eps = float(ot.get('stuck_eps', 0.2))
         self.bo_hard_ticks = int(round(float(ot.get('stuck_hard_s', 10.0)) * self.hz))
@@ -303,6 +305,11 @@ class KrRules:
         # 실측 020439/02: 정지선 앞 none 구간(lane-local 35.9~57.7)이 커버리지에 안 잡혀
         # 1바퀴 solid 기각 → 2바퀴(실선 생략)로 생성됐다. false = 이전 동작(점선만).
         self.none_crossable = bool(ot.get('none_marking_crossable', False))
+        # E-8 ② L2 zone 완화 범위 한정 — zone_no_exit / zone_extend_max (와 평가 불가
+        # span_into_zone) 만 해제. zone_turn / zone_lane_change / zone_no_through_lane 은
+        # 경로가 그 교차로에서 회전·차선변경·통과를 요구하므로 전 단계·전 바퀴 유지.
+        # false = 이전 동작 (L2 부터 zone 게이트 전체 생략).
+        self.zone_relax_limited = bool(ot.get('zone_relax_limited', False))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -1865,7 +1872,10 @@ class KrRules:
             extra_after = self.ot_after_m
             zone_ext = None                                # E-2 연장량 [m] (None = 미적용)
             route_s = float(planner.route_s[planner.route_index])
-            if lvl < self.zone_relax_lvl:
+            # E-8 ②: 완화 한정 모드에서는 L2 이상에서도 게이트를 평가한다 — 해제되는
+            # 사유(zone_no_exit / zone_extend_max / 평가 불가)만 통과시키고 회전·차선변경·
+            # 통과 차로 없음은 유지한다. 한정 모드가 아니면 L2 부터 게이트 전체 생략(이전).
+            if lvl < self.zone_relax_lvl or self.zone_relax_limited:
                 span_end = route_s + span_m
                 zone_lo = self._next_stopzone_s(planner)
                 if zone_lo is not None and span_end > zone_lo:
@@ -1890,14 +1900,20 @@ class KrRules:
                         elif why is None:
                             zone_ext = max(0.0, new_end - span_end_est)
                     if why is not None:
-                        reject(why, span_end=round(span_end, 1), zone_lo=round(zone_lo, 1),
-                               **zinfo)
-                        continue
-                    extra_after += zone_ext
-                    span_m += zone_ext
-                    (self.last_avoid or {}).update(
-                        {'zone_extended': True, 'extended_by': round(zone_ext, 1),
-                         'span_m': round(span_m, 1), **zinfo})
+                        relaxed = (lvl >= self.zone_relax_lvl and self.zone_relax_limited
+                                   and why in self.ZONE_RELAXABLE)
+                        if not relaxed:
+                            reject(why, span_end=round(span_end, 1),
+                                   zone_lo=round(zone_lo, 1), **zinfo)
+                            continue
+                        (self.last_avoid or {}).update({'zone_relaxed': why, **zinfo})
+                        zone_ext = None                    # 연장 없이 원 span 으로 진행
+                    if zone_ext is not None:
+                        extra_after += zone_ext
+                        span_m += zone_ext
+                        (self.last_avoid or {}).update(
+                            {'zone_extended': True, 'extended_by': round(zone_ext, 1),
+                             'span_m': round(span_m, 1), **zinfo})
             if not skip_solid:
                 if zone_ext is not None:
                     # 연장 span 은 교차로 연결로를 지나므로 successor 순회가 끊긴다 —
