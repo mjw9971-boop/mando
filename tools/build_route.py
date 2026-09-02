@@ -21,6 +21,9 @@ route.pkl:
     total_length : float
     waypoints    : [(x,y) ...]
     waypoint_s   : [float ...]           각 경유점의 경로 누적거리
+    finish_xy    : [x, y]                CSV 마지막 행 원본 좌표 = 종료선.
+                   scoring.finish_xy 가 null 이면 kr_rules._resolve_stop_s 와
+                   score.py 가 이 값을 자동으로 쓴다 (제어·채점 단일 출처)
     events       : [{kind, s, lane, s_in_lane, ...}]
                    kind = turn_left / turn_right / lane_change_left / lane_change_right
                    lane_change 는 window_s0/window_s1 (경로 누적거리, 점선 구간) 포함
@@ -172,6 +175,23 @@ def lane_change_window(lg, lanes, cum, seq, i, side, target):
         j -= 1
         s0 = runs_p[-1][0]
     return cum[j] + s0, cum[i] + w1, j, s0
+
+
+def finish_tail_cfg():
+    """params.yaml route.finish_tail_* — 종료선 뒤 꼬리 연장 요구량 [m]. 0 = 끔.
+
+    plan_stop_s(team_code/kr_rules.py)가 finish_s + finish_clearance + stop_gap
+    + wheelbase + front_overhang ≤ total − end_slack 을 요구한다 (현재 params 합
+    10.799 m). 기본 12.0 은 그 요구량 + 여유다.
+    """
+    try:
+        from vtd_adapter.config import load_params_yaml
+        rc = load_params_yaml().get('route') or {}
+        if not rc.get('finish_tail_enable', True):
+            return 0.0
+        return float(rc.get('finish_tail_m', 12.0))
+    except Exception:                                    # noqa: BLE001 — 독립 실행 폴백
+        return 12.0
 
 
 def route_check_cfg():
@@ -358,7 +378,7 @@ def junction_segments(n_points):
 
 
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
-                seqs=None):
+                seqs=None, finish_tail_m=0.0):
     # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
     banned, turn_thr = infeasible_connectors(lg)
     forced_infeasible: list = []   # 대안이 없어 불가피하게 포함시킨 연결로
@@ -531,8 +551,41 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
                        'delta_heading_deg': dh, 'source': 'pair'})
 
     events.sort(key=lambda e: e['s'])
+
+    # ── 종료선 뒤 경로 꼬리 확보 ─────────────────────────────────────────
+    # 마지막 경유점이 차로 끝 근처에 매칭되면 꼬리가 우연히 짧아져 finish 정지가
+    # 클립되고 뒷축이 종료선 앞에 선다 (plan_stop_s 요구량은 finish_tail_cfg 참조).
+    # 이벤트·경유점 투영이 끝난 뒤에 연장한다 — 꼬리 차로가 junction 연결로여도
+    # 가짜 turn 이벤트(지시등 점등)가 생기지 않게 하기 위해서다.
+    # (2026-09-03 실측: 대회형식 waypoints.csv 꼬리 15.0 m, tests/fixtures 0.2 m)
+    tail = tail0 = total - (cum[-1] + prev_end[1])
+    if finish_tail_m > 0:
+        added = []
+        while tail < finish_tail_m and len(added) < 8:
+            succs = lg.successors(lanes[-1])
+            if not succs:
+                print(f'  [경고] 종료선 뒤 꼬리 {tail:.1f} m < 요구 {finish_tail_m:g} m — '
+                      f'successor 가 없어 연장 불가 (finish 정지가 클립될 수 있다)',
+                      file=sys.stderr)
+                break
+            # 회전 불가 연결로는 피하되 그것뿐이면 그냥 쓴다 — 꼬리는 계획
+            # 정지점 뒤라 실제로 끝까지 달리지 않는다 (기하 확보용).
+            pool = [k for k in succs if k not in banned] or succs
+            h_end = float(np.unwrap(lg.lanes[lanes[-1]]['hdg'].astype(float))[-1])
+            k2 = min(pool, key=lambda k: abs(wrap(float(lg.lanes[k]['hdg'][0]) - h_end)))
+            cum.append(cum[-1] + lengths[-1])
+            lanes.append(k2)
+            lengths.append(lg.length(k2))
+            tail += lengths[-1]
+            added.append(k2)
+        if added:
+            total = cum[-1] + lengths[-1]
+            print(f'  경로 꼬리 연장: 잔여 {tail0:.1f} m < 요구 {finish_tail_m:g} m → '
+                  f'{" → ".join(str(k) for k in added)}  (꼬리 {tail:.1f} m)')
+
     return {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
             'infeasible_forced': forced_infeasible, 'turn_radius_thr_m': turn_thr,
+            'finish_xy': [float(waypoints[-1][0]), float(waypoints[-1][1])],
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
             'waypoint_seq': list(seqs) if seqs else list(range(1, len(waypoints) + 1)),
             'junction_segments': sorted(junction_segs), 'segment_span': seg_span}
@@ -801,7 +854,8 @@ def main():
             print(f'  교차로 짝 {len(pairs)}개: ' +
                   ', '.join(f'({i}→{o})' for i, o in pairs))
 
-    rt = build_route(lg, wps, a.radius, start_yaw, junction_segs=jsegs, seqs=seqs)
+    rt = build_route(lg, wps, a.radius, start_yaw, junction_segs=jsegs, seqs=seqs,
+                     finish_tail_m=finish_tail_cfg())
 
     with open(a.out, 'wb') as f:
         pickle.dump(rt, f, protocol=4)

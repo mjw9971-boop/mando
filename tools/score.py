@@ -1176,6 +1176,20 @@ def project_route_s(lg, route, x: float, y: float) -> float | None:
     return p[4] if p else None
 
 
+def resolve_finish_xy(cfg: dict, route) -> list | None:
+    """종료선 좌표 우선순위 — 제어(kr_rules._resolve_stop_s)와 같은 순서 (정합).
+
+    params(scoring.finish_xy) → route['finish_xy'](build_route 가 넣은 CSV 마지막
+    행) → None. route_end.finish_xy_from_route_enable=false 면 route 값 무시.
+    """
+    fxy = cfg['scoring'].get('finish_xy')
+    if fxy:
+        return fxy
+    if (cfg.get('route_end') or {}).get('finish_xy_from_route_enable', True):
+        return (route or {}).get('finish_xy')
+    return None
+
+
 def _severity(cat: str, ev: dict, sc: dict) -> str:
     """이벤트 → 'minor' | 'major' | 'none' (안내문 매핑, 작업3).
 
@@ -1376,15 +1390,17 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
         V['ped_response'] = {'count': 0, 'events': []}
 
     # 완주: 안내문 규칙은 "뒷축이 종료 지점 좌표 통과" — finish_xy 를 경로에
-    # 투영한 route_s 로 판정. 미설정이면 기존 route_s 임계(end_margin) + 경고.
+    # 투영한 route_s 로 판정. params → route['finish_xy'](CSV 마지막 행 자동) →
+    # 둘 다 없으면 기존 route_s 임계(end_margin) + 경고 (kr_rules 와 같은 우선순위).
     finish_s = None
-    fxy = cfg['scoring'].get('finish_xy')
+    fxy = resolve_finish_xy(cfg, route)
     if fxy and lg is not None and route is not None:
         finish_s = project_route_s(lg, route, float(fxy[0]), float(fxy[1]))
         if finish_s is None:
             rep['warnings'].append('finish_xy 를 경로에 투영하지 못함 — route_s 임계로 폴백')
     elif not fxy:
-        rep['warnings'].append('scoring.finish_xy 미설정 — 완주를 route_s 임계(end_margin)로 판정')
+        rep['warnings'].append('scoring.finish_xy 미설정 (route.pkl 에도 없음) — '
+                               '완주를 route_s 임계(end_margin)로 판정')
     fin = detect_finish(span, t0, route, cfg, finish_s)
     rep['finish'] = fin['summary']
     if route is None:

@@ -332,13 +332,21 @@ class KrRules:
         total = float(planner.route['total_length'])
         if self.target_mode != 'finish':
             return total
-        if not self.finish_xy:
-            print('[kr_rules] scoring.finish_xy 미설정 — route_total 기준으로 정지 (기존 동작)',
-                  flush=True)
+        # params 우선, null 이면 build_route 가 pkl 에 넣은 CSV 마지막 행 자동
+        # (route_end.finish_xy_from_route_enable=false 면 route 값 무시 = 기존 동작)
+        fxy = self.finish_xy or (
+            planner.route.get('finish_xy')
+            if self.cfg['route_end'].get('finish_xy_from_route_enable', True) else None)
+        if not fxy:
+            print('[kr_rules] scoring.finish_xy 미설정 (route.pkl 에도 없음) — '
+                  'route_total 기준으로 정지 (기존 동작)', flush=True)
             return total
+        print('[kr_rules] finish_xy 출처: '
+              + ('params(scoring.finish_xy)' if self.finish_xy
+                 else 'route.pkl(CSV 마지막 행)'), flush=True)
         lg = getattr(planner, 'lg', None)
         finish_s = (_project_route_s(lg, planner.route,
-                                     float(self.finish_xy[0]), float(self.finish_xy[1]))
+                                     float(fxy[0]), float(fxy[1]))
                     if lg is not None else None)
         if finish_s is None:
             print('[kr_rules] finish_xy 를 경로에 투영하지 못함 — route_total 기준으로 정지',
