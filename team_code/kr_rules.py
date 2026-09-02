@@ -282,6 +282,11 @@ class KrRules:
         # E-1 장애물 클래스(world.classify 의 cls=='obstacle') fast path — 관찰 없이
         # 즉시 정적, 큐 판정 대상 제외.
         self.obs_fastpath = bool(ot.get('obstacle_class_fastpath_enable', False))
+        # E-2 span_into_zone 연장 — 정지선 뒤 교차로 출구 + 여유까지 extra_after 확장.
+        self.zone_extend = bool(ot.get('zone_extend_enable', False))
+        self.zone_extend_max_m = float(ot.get('zone_extend_max_m', 120.0))
+        self.zone_exit_margin_m = float(ot.get('zone_exit_margin_m', 5.0))
+        self.zone_junction_gap_m = float(ot.get('zone_junction_gap_m', 5.0))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -766,11 +771,13 @@ class KrRules:
         return str(col) == 'yellow'
 
     def _planned_shift_geom(self, planner, actor, side, trans_m, ahead_m=None,
-                            last_actor=None):
+                            last_actor=None, after_m=None):
         """적용 **전** 시프트 기하 검사 → `(κ, lc_var)`. 못 재면 None.
 
         ahead_m: 전이 시작 여유 [m]. None 이면 shift_ahead_m (B-2 의 L3 완화가
         실제 시프트와 같은 값을 쓰도록 side 루프가 넘긴다).
+        after_m: 뒤여유 [m]. None 이면 extra_after_m (E-2 zone 연장이 실제 시프트와
+        같은 값을 쓰도록 side 루프가 넘긴다).
 
         `plan_shift_span` 이 cKDTree 를 세우므로(≈4.6 ms) **한 번만 부르고**
         두 지표를 같이 낸다.
@@ -798,7 +805,7 @@ class KrRules:
                 actor, last_actor, obstacle_direction='right' if side == 'left' else 'left',
                 transition_length=trans_m * ppm,
                 extra_length_before=self.ot_before_m * ppm,
-                extra_length_after=self.ot_after_m * ppm,
+                extra_length_after=(self.ot_after_m if after_m is None else after_m) * ppm,
                 min_start_ahead=(self.shift_ahead_m if ahead_m is None else ahead_m) * ppm)
             step = max(1, int(round(self.shift_k_step_m * ppm)))
             d = planner.planned_lateral_offsets(a, b, left, step_pts=step)
@@ -1520,6 +1527,149 @@ class KrRules:
         out['extent_m'] = s_prev - s_first
         return out
 
+    # ── E-2: span_into_zone 연장 ────────────────────────────────────────
+    def _route_zones(self, planner, route_s: float) -> list:
+        """route_s 이후 정지선 route_s 목록 (신호 정지선 + 무신호 정지선, 오름차순).
+        _next_stopzone_s 와 같은 출처 — 첫 원소 − zone_gate_margin 이 zone_lo 다."""
+        out = set()
+        try:
+            d = float(planner.distances_to_next_traffic_lights[planner.route_index])
+            if d < float('inf'):
+                out.add(round(route_s + d, 3))
+        except Exception:                                   # noqa: BLE001
+            pass
+        for s in self._all_stopline_s(planner):
+            if s >= route_s:
+                out.add(round(float(s), 3))
+        return sorted(out)
+
+    def _zone_extension(self, planner, lg, side, route_s: float, span_end: float):
+        """E-2. span 끝이 정지선을 넘을 때 → (새 span 끝, 기각 사유 | None, 진단).
+
+        정지선마다 본다:
+          · 정지선 뒤 zone_junction_gap_m 안에 교차로 진입이 없으면(횡단보도 정지선)
+            그대로 넘는다 — 옆 차로도 같은 도로로 이어진다.
+          · 교차로가 있으면 경로 차로가 그 교차로를 빠져나오는 출구 + zone_exit_margin_m
+            까지 span 을 늘린다. 새 끝이 다음 정지선을 또 넘으면 반복(최대 4).
+        연장이 서는 조건 (하나라도 깨지면 기각):
+          · zone_extend_max_m 이내                              → 'zone_extend_max'
+          · 교차로 출구 뒤 경로 차로가 있다                        → 'zone_no_exit'
+          · [route_s, 새 끝] 에 회전(turn_*) 이벤트 없음             → 'zone_turn'
+          · 차선변경 창(window_s0~s1)과 겹치지 않음                 → 'zone_lane_change'
+          · 구간의 경로 차로마다 side 이웃이 있고, 이웃끼리 successor 로 이어진다
+            (옆 차로가 교차로를 직진 관통)                          → 'zone_no_through_lane'
+        경로 차로 정보가 없으면(목 플래너) 'zone_no_route' — 호출자가 옛 라벨로 기각.
+        """
+        route = getattr(planner, 'route', None) or {}
+        lanes = [tuple(k) for k in (route.get('lanes') or [])]
+        cum = [float(c) for c in (route.get('cum_s') or [])]
+        lens = [float(x) for x in (route.get('lengths') or [])]
+        if (lg is None or not lanes or len(cum) != len(lanes)
+                or len(lens) != len(lanes)):
+            return span_end, 'zone_no_route', {}
+        new_end = float(span_end)
+        zones = self._route_zones(planner, route_s)
+        info: dict = {'zones': []}
+        for _ in range(4):
+            ahead = [z for z in zones if route_s < z < new_end]
+            if not ahead:
+                break
+            z = ahead[0]
+            j = next((i for i in range(len(lanes))
+                      if lg.lanes.get(lanes[i], {}).get('junction', -1) != -1
+                      and cum[i] <= z + self.zone_junction_gap_m
+                      and cum[i] + lens[i] > z), None)
+            if j is None:                                   # 정지선만 있다 (횡단보도)
+                info['zones'].append({'s': round(z, 1), 'junction': None})
+                zones = [q for q in zones if q > z]
+                continue
+            jid = lg.lanes[lanes[j]]['junction']
+            k = j
+            while (k + 1 < len(lanes)
+                   and lg.lanes.get(lanes[k + 1], {}).get('junction', -1) == jid):
+                k += 1
+            if k + 1 >= len(lanes):
+                return span_end, 'zone_no_exit', info
+            j_out = cum[k] + lens[k]
+            new_end = max(new_end, j_out + self.zone_exit_margin_m)
+            info['zones'].append({'s': round(z, 1), 'junction': int(jid),
+                                  'out': round(j_out, 1)})
+            zones = [q for q in zones if q > j_out]
+        info['new_end'] = round(new_end, 1)
+        if new_end - span_end > self.zone_extend_max_m:
+            return span_end, 'zone_extend_max', info
+        for ev in route.get('events') or []:
+            kind = str(ev.get('kind', ''))
+            if kind.startswith('turn_'):
+                if route_s <= float(ev['s']) <= new_end:
+                    return span_end, 'zone_turn', info
+            elif kind.startswith('lane_change'):
+                a = float(ev.get('window_s0', ev.get('s', 0.0)))
+                b = float(ev.get('window_s1', ev.get('s', 0.0)))
+                if a <= new_end and b >= route_s:
+                    return span_end, 'zone_lane_change', info
+        prev_nb, prev_cum = None, None
+        for i, key in enumerate(lanes):
+            if cum[i] + lens[i] < route_s or cum[i] > new_end:
+                continue
+            nb = lg.neighbor(key, side) if key in lg.lanes else None
+            if nb is None:
+                return span_end, 'zone_no_through_lane', info
+            # 차선변경 짝(같은 cum)은 successor 가 아니라 이웃 — 그 쌍은 건너뛴다
+            if (prev_nb is not None and nb != prev_nb and prev_cum is not None
+                    and cum[i] > prev_cum + 1e-6):
+                try:
+                    if nb not in lg.successors(prev_nb):
+                        return span_end, 'zone_no_through_lane', info
+                except Exception:                           # noqa: BLE001
+                    pass
+            prev_nb, prev_cum = nb, cum[i]
+        return new_end, None, info
+
+    def _dashed_ahead_route_m(self, planner, lg, side, route_s: float, span_m: float,
+                              ego_lane) -> float:
+        """E-2 전용 점선 커버리지 [m] — **경로 차로를 따라** 잰다.
+
+        _dashed_ahead_m 의 successor 순회는 교차로 연결로(이웃 없음·마크 none)에서
+        끊긴다. 연장 span 은 교차로를 지나므로 route['lanes'] 를 cum_s 로 잘라
+        본다. 교차로 lane 은 차선을 넘지 않으므로 전부 인정하고, 그 밖은 side
+        점선 조각과의 겹침만 센다. 차선변경 짝(같은 cum)은 자차 차로가 그 안에
+        있으면 그것, 아니면 뒤쪽(to_lane)을 센다.
+        """
+        route = getattr(planner, 'route', None) or {}
+        lanes = [tuple(k) for k in (route.get('lanes') or [])]
+        cum = [float(c) for c in (route.get('cum_s') or [])]
+        lens = [float(x) for x in (route.get('lengths') or [])]
+        if lg is None or not lanes or len(cum) != len(lanes) or len(lens) != len(lanes):
+            return 0.0
+        lo, hi = float(route_s), float(route_s) + float(span_m)
+        cover = 0.0
+        i = 0
+        while i < len(lanes):
+            grp = [i]
+            while i + 1 < len(lanes) and abs(cum[i + 1] - cum[grp[0]]) < 1e-6:
+                i += 1
+                grp.append(i)
+            i += 1
+            pick = next((g for g in grp if lanes[g] == ego_lane), grp[-1])
+            key, a, b = lanes[pick], cum[pick], cum[pick] + lens[pick]
+            s0, s1 = max(lo, a) - a, min(hi, b) - a
+            if s1 <= s0:
+                continue
+            rec = lg.lanes.get(key)
+            if rec is None:
+                continue
+            if rec.get('junction', -1) != -1:
+                cover += s1 - s0
+                continue
+            try:
+                runs = lg.dashed_runs(key, side) or []
+            except Exception:                               # noqa: BLE001
+                runs = []
+            for r0, r1 in runs:
+                cover += max(0.0, min(s1, r1) - max(s0, r0))
+        return cover
+
     def _side_pass(self, ap, planner, ego_speed: float, chain: dict, preempt: bool,
                    lg, ego_lane, local_s: float, n_pass: int) -> bool:
         """side 루프 한 바퀴 (좌측 우선). 시프트를 적용했으면 True.
@@ -1586,16 +1736,50 @@ class KrRules:
             # 정지선 경계(zone_gate_margin_m) **앞에서 끝나야** 시작한다.
             # 시프트 도중에 억제 구역으로 들어가면 되돌릴 수 없다(급조향 금지).
             # BREAKOUT lvl ≥ zone_gate_relax_level 이면 건너뛴다 (B-2).
+            extra_after = self.ot_after_m
+            zone_ext = None                                # E-2 연장량 [m] (None = 미적용)
+            route_s = float(planner.route_s[planner.route_index])
             if lvl < self.zone_relax_lvl:
-                route_s = float(planner.route_s[planner.route_index])
                 span_end = route_s + span_m
                 zone_lo = self._next_stopzone_s(planner)
                 if zone_lo is not None and span_end > zone_lo:
-                    reject('span_into_zone', span_end=round(span_end, 1),
-                           zone_lo=round(zone_lo, 1))
-                    continue
+                    # E-2: 기각 대신 연장을 먼저 본다. 실제 span 끝은 전이 시작이
+                    # 자차 앞 ahead_m 이상이라 route_s + span_m 보다 뒤다 — 연장량은
+                    # 그 추정치(span_end_est)에서 잰다. 평가 불가(목 플래너 등 경로
+                    # 차로 없음)면 옛 라벨 그대로 기각한다.
+                    why, new_end, zinfo = 'span_into_zone', span_end, {}
+                    if self.zone_extend:
+                        pr0 = self._project(planner, actor.get_location().x,
+                                            actor.get_location().y)
+                        ext_x = float(getattr(getattr(actor, 'bounding_box', None),
+                                              'extent', None).x) \
+                            if getattr(actor, 'bounding_box', None) is not None else 0.0
+                        start_est = (max(pr0[0] - ext_x - trans_m - self.ot_before_m, ahead_m)
+                                     if pr0 is not None else 0.0)
+                        span_end_est = route_s + start_est + span_m
+                        new_end, why, zinfo = self._zone_extension(
+                            planner, lg, side, route_s, span_end_est)
+                        if why == 'zone_no_route':
+                            why = 'span_into_zone'
+                        elif why is None:
+                            zone_ext = max(0.0, new_end - span_end_est)
+                    if why is not None:
+                        reject(why, span_end=round(span_end, 1), zone_lo=round(zone_lo, 1),
+                               **zinfo)
+                        continue
+                    extra_after += zone_ext
+                    span_m += zone_ext
+                    (self.last_avoid or {}).update(
+                        {'zone_extended': True, 'extended_by': round(zone_ext, 1),
+                         'span_m': round(span_m, 1), **zinfo})
             if not skip_solid:
-                cover = self._dashed_ahead_m(lg, ego_lane, side, local_s, span_m)
+                if zone_ext is not None:
+                    # 연장 span 은 교차로 연결로를 지나므로 successor 순회가 끊긴다 —
+                    # 경로 차로를 따라 잰다 (교차로 안은 차선을 넘지 않아 전부 인정).
+                    cover = self._dashed_ahead_route_m(planner, lg, side, route_s,
+                                                       span_m, ego_lane)
+                else:
+                    cover = self._dashed_ahead_m(lg, ego_lane, side, local_s, span_m)
                 if cover < span_m - self.ot_dash_slack_m:
                     self.ot_pass_solid = True              # 2바퀴 사유
                     reject('solid', dash_m=round(cover, 1), span_m=round(span_m, 1))
@@ -1608,7 +1792,7 @@ class KrRules:
             # 잰다 (읽기 전용이지만 span 하나에 1.7~5.2 ms 든다). 상태를 남기지
             # 않으므로 기각은 **그 시점 그 경로 한정**이고 다음 틱에 다시 시도한다.
             geom = self._planned_shift_geom(planner, actor, side, trans_m, ahead_m,
-                                            last_actor=chain_last)
+                                            last_actor=chain_last, after_m=extra_after)
             if geom is not None:
                 kap, lc_var = geom
                 (self.last_avoid or {}).update(
@@ -1625,7 +1809,7 @@ class KrRules:
                 obstacle_direction='right' if side == 'left' else 'left',
                 transition_length=trans_m * ppm,
                 extra_length_before=self.ot_before_m * ppm,
-                extra_length_after=self.ot_after_m * ppm,
+                extra_length_after=extra_after * ppm,      # E-2 연장 포함
                 # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
                 # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
                 min_start_ahead=ahead_m * ppm)
@@ -1637,7 +1821,7 @@ class KrRules:
                 {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
                  'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
                  'solid_relaxed': skip_solid, 'chain': list(chain['ids']),
-                 'span_m': round(span_m, 1)})
+                 'span_m': round(span_m, 1), 'after_m': round(extra_after, 1)})
             print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
                   f'(id={chain["ids"]}, 구간 {span[0]}~{span[1]}, p{n_pass})', flush=True)
             return True

@@ -536,6 +536,20 @@ overtake:
   # (_is_queue) 대상에서 뺀다 — 박스는 출발할 앞차가 아니고 신호 대기열도 아니다.
   # 실측 020439/01 t=71~90: 박스 id4 가 선두인 큐 B 112틱. false = 이전 동작.
   obstacle_class_fastpath_enable: true
+  # E-2 span_into_zone → 기각 대신 연장. span 끝이 정지선을 넘으면 (a) 정지선 뒤에
+  # 교차로가 없으면(횡단보도 정지선) 그대로 통과, (b) 교차로가 있으면 옆 차로가
+  # 그 교차로를 직진 관통하고(lg 이웃·successor 연속) 경로가 그 안에서 회전·
+  # 차선변경을 요구하지 않을 때 extra_after 를 교차로 출구 + zone_exit_margin_m
+  # 까지 늘려 교차로 뒤에서 복귀한다. 연장 불가(회전·통과 차로 없음·출구 미상·
+  # 연장 상한 초과)일 때만 기각. 적색이면 SHIFT_HOLD 가 옆 차로에서 정지선에 세운다.
+  # 실측 020439/02·003759/02: 횡단보도 정지선 304.0 이 span 끝 328/318 을 기각해
+  # 25 m 앞 정지 → 미완주. false = 이전 동작(기각).
+  zone_extend_enable: true
+  zone_extend_max_m: 120.0
+  zone_exit_margin_m: 5.0
+  # 정지선에서 이 거리 안에 교차로 진입이 있으면 '그 정지선의 교차로' 로 본다
+  # (지도 실측: 정지선 → junction_in 0.15 m). 이보다 멀면 정지선만 있는 것.
+  zone_junction_gap_m: 5.0
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오
