@@ -44,6 +44,11 @@ ROUTE_PKL = ROOT / 'tests' / 'fixtures' / 'route.pkl'
 # 평범한 직진 구간 — 차선변경 블렌드 밖이어야 한다 (블렌드 위에 놓으면
 # 장애물이 목표 차로로 매칭돼 clear 게이트가 잘못 걸린다).
 IDX = 1250                   # lane (72,2,-2), 좌 이웃 (72,2,-1), 점선 회랑 105.7 m
+# 장애물은 자차 앞 25 m (OBJ). B-12 기하 완성 게이트가 정지 시
+# need = transition_m 12 + shift_ahead_m 5 + shift_geom_margin_m 2 = 19 m 를
+# 요구하므로 옛 8 m(IDX + 80)로는 매 틱 geom 기각이다. 25 m 는 standoff(25)
+# 안이라 PREEMPT 의 t_left 가 음수 → 정지 관찰 3 s 뒤 즉시 시프트한다.
+OBJ = IDX + 250
 
 pytestmark = pytest.mark.skipif(not (GRAPH.exists() and ROUTE_PKL.exists()),
                                 reason='lane_graph.pkl / route.pkl 없음')
@@ -139,7 +144,7 @@ def test_no_blocker_no_shift(rig):
 def test_moving_lead_is_not_static(rig):
     """앞차가 굴러가고 있으면 회피 대상이 아니다 (그냥 따라간다)."""
     pl, ego, actor_at, actor_on_left, make = rig
-    ap = make([actor_at(IDX + 80, speed=OT['blocker_speed_max'] + 2.0)])
+    ap = make([actor_at(OBJ, speed=OT['blocker_speed_max'] + 2.0)])
     kr = run(ap, 100)
     assert kr.ot_span is None
 
@@ -148,7 +153,7 @@ def test_blocked_triggers_left_shift(rig):
     """막힌 채 정지가 지속되면 좌측으로 경로를 민다."""
     pl, ego, actor_at, actor_on_left, make = rig
     before = pl.route_points.copy()
-    ap = make([actor_at(IDX + 80)])
+    ap = make([actor_at(OBJ)])
     kr = run(ap, ticks_needed(KrRules(CFG)))
     assert kr.ot_span is not None, kr.last_overtake
     assert kr.last_overtake == 'left'
@@ -159,7 +164,7 @@ def test_blocked_triggers_left_shift(rig):
 def test_needs_sustained_block(rig):
     """한두 틱 멈춘 것으로는 발동하지 않는다."""
     pl, ego, actor_at, actor_on_left, make = rig
-    ap = make([actor_at(IDX + 80)])
+    ap = make([actor_at(OBJ)])
     kr = run(ap, 2)
     assert kr.ot_span is None
 
@@ -168,7 +173,7 @@ def test_occupied_target_lane_blocks(rig):
     """목표 차로에 차가 있으면 발동하지 않는다 (lc_clear 대용)."""
     pl, ego, actor_at, actor_on_left, make = rig
     side_car = actor_on_left(IDX)                        # 왼쪽 차로 위
-    ap = make([actor_at(IDX + 80), side_car])
+    ap = make([actor_at(OBJ), side_car])
     kr = run(ap, ticks_needed(KrRules(CFG)))
     assert kr.ot_span is None
     assert kr.last_overtake and 'occupied' in kr.last_overtake
@@ -177,7 +182,7 @@ def test_occupied_target_lane_blocks(rig):
 def test_shift_updates_lat_shift_for_signal(rig):
     """시프트가 lat_shift 를 갱신 → 지시등이 자동으로 따라온다."""
     pl, ego, actor_at, actor_on_left, make = rig
-    ap = make([actor_at(IDX + 80)])
+    ap = make([actor_at(OBJ)])
     kr = run(ap, ticks_needed(KrRules(CFG)))
     a, b = kr.ot_span
     assert np.abs(pl.lat_shift[a:b] - pl._lat_build[a:b]).max() > CFG['signal']['lat_shift_on_m']
@@ -187,7 +192,7 @@ def test_shift_once_then_restore(rig):
     """1회만 발동하고, 지나가면 경로를 원복한다."""
     pl, ego, actor_at, actor_on_left, make = rig
     orig = pl.route_points.copy()
-    ap = make([actor_at(IDX + 80)])
+    ap = make([actor_at(OBJ)])
     kr = run(ap, ticks_needed(KrRules(CFG)))
     a, b = kr.ot_span
     assert not np.allclose(pl.route_points[a:b], orig[a:b])
@@ -204,7 +209,7 @@ def test_disabled_switch(rig):
     """overtake.enabled=false 면 아무 일도 하지 않는다."""
     import copy
     pl, ego, actor_at, actor_on_left, make = rig
-    ap = make([actor_at(IDX + 80)])
+    ap = make([actor_at(OBJ)])
     cfg = copy.deepcopy(CFG)
     cfg['overtake']['enabled'] = False
     ap.kr_rules = KrRules(cfg)
