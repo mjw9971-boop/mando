@@ -98,6 +98,10 @@ def build_pdm_config(cfg: dict) -> 'GlobalConfig':
     vh = cfg['vehicle']
     front = float(vh['wheelbase']) + float(vh['front_overhang_m'])
     gc.idm_red_light_minimum_distance = float(cfg['speed']['stop_gap_stopline_m']) + front
+    # params.pdm.* — 같은 방식의 오버라이드. 키가 없으면 원문값 (B-6: 배치 비교용).
+    pdm = cfg.get('pdm') or {}
+    if 'idm_leading_vehicle_time_headway' in pdm:
+        gc.idm_leading_vehicle_time_headway = float(pdm['idm_leading_vehicle_time_headway'])
     return gc
 
 

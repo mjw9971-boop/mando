@@ -596,7 +596,7 @@ def test_geom_gate_rejects_when_transition_cannot_finish():
     kr._try_overtake(ap, p, ego_speed=0.0)
     need = CFG['overtake']['transition_m'] + OT['shift_ahead_m'] + GEOM_MARGIN
     assert kr.ot_span is None                              # 시프트가 생기지 않았다
-    assert kr.last_overtake == 'right:geom'
+    assert kr.last_overtake == 'right:geom@p1'             # solid 기각이 없으니 2바퀴 없음
     a = kr.last_avoid or {}
     assert a.get('reject') == 'right:geom'
     assert a['need_geom'] == pytest.approx(need, abs=0.05)
@@ -619,7 +619,7 @@ def test_geom_gate_boundary_is_the_margin():
     assert kr.ot_span is not None
     kr2, p2, ap2 = _geom_rig(CFG, need - 0.2)
     kr2._try_overtake(ap2, p2, ego_speed=0.0)
-    assert kr2.ot_span is None and kr2.last_overtake == 'right:geom'
+    assert kr2.ot_span is None and kr2.last_overtake == 'right:geom@p1'
 
 
 def test_geom_gate_kill_switch_restores_old_behaviour():
@@ -639,5 +639,5 @@ def test_geom_gate_scales_with_speed():
     need = trans + OT['shift_ahead_m'] + GEOM_MARGIN
     kr, p, ap = _geom_rig(CFG, need - 1.0)
     kr._try_overtake(ap, p, ego_speed=v)
-    assert kr.ot_span is None and kr.last_overtake == 'right:geom'
+    assert kr.ot_span is None and kr.last_overtake == 'right:geom@p1'
     assert (kr.last_avoid or {})['need_geom'] == pytest.approx(need, abs=0.05)

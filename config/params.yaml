@@ -295,6 +295,12 @@ overtake:
   #  지점에서도 null 이었다. 같은 지점에서 1차 키는 214.8 m 로 정상. 무신호
   #  정지선은 lanegraph 원본을 직접 읽어 보조로 본다.)
   stopline_suppress_m: 30.0
+  # span_into_zone 게이트 — 시프트 span(나가는 전이+복귀 전이)이 다음 정지선의
+  # 이 거리 앞에서 끝나야 시작한다 [m] (B-1). 예전에는 stopline_suppress_m(30)을
+  # 그대로 써서, 정지 위치 25 m + span 39 m 이면 정지선 64 m 앞부터 기각이었다.
+  # _signal_zone(억제)과는 결합이 없는 별개 상수다. 0 = 정지선 자체가 경계.
+  # 30.0 이면 B-1 이전 동작.
+  zone_gate_margin_m: 0.0
   # 대기열 형태 판정 — 정지 객체가 종방향으로 이만큼 벌어져 2대 이상이고
   # 횡 위치가 비슷하면 대기열로 본다 (정지선 데이터가 없는 도로의 사각 보완).
   # 스태거드(케이스 B)는 종방향으로 붙고 횡으로 갈리므로 여기 안 걸린다.
@@ -306,8 +312,13 @@ overtake:
   # 실측: 9910 GT 상한이 80 m 이고 박스류도 정확히 79.9~80.0 m 에서 크기·속도가
   # 모두 채워져 온다 (percep.gt_range_m).
   detect_max_m: 80.0
-  # 오프셋 전이를 늦어도 장애물 이만큼 앞에서 시작 [m]
-  shift_latest_m: 10.0
+  # 오프셋 전이를 늦어도 장애물 이만큼 앞에서 시작 [m] = 관찰 감속(standoff)의
+  # 정지 위치. 10 → 25 (B-4, 2026-09-02): 정지 상태 전이 12 m + 전이 시작 여유
+  # 5 m + 기하 여유 2 m 가 들어가려면 장애물 앞 19 m 이상이 필요한데 10 m 에서
+  # 서면 geom 게이트가 영영 못 열린다 (실측 5~10 m 정차 → 매 틱 geom 기각).
+  # 부작용(의도): WAIT_EXPIRED 는 s_rel > standoff(25) ∧ obj_s ≥ 6 의 좁은 창으로
+  # 축소된다 — 25 m 안에 들어오면 PREEMPT 의 t_left 가 음수라 먼저 걸린다.
+  shift_latest_m: 25.0
   # 전이 길이 속도 비례 계수 [s]. 코사인 전이의 최대 횡가속
   #   a_lat = v²·Δ·π²/(2L²)  →  L = v·√(Δπ²/(2·a_lat))
   # Δ=3.0 m(차로 한 칸), a_lat=1.5 m/s²(쾌적) 이면 L ≈ 3.14·v → 3.0 채택.
@@ -317,6 +328,12 @@ overtake:
   shift_ahead_m: 5.0
   # 객체가 이 시간 이상 정지로 관찰돼야 '정적' [s] (물체별 타이머)
   obj_static_s: 3.0
+  # standoff(관찰 감속) 대상 정지 시간 [s] (B-5) — obj_static_s 와 달리 **신호와
+  # 무관하게** 센다. obj_ticks 는 적색 중 멈춰 녹색 직후 앞에 선 차량이 '정적'
+  # 이 되기까지 3 s 가 더 걸리고 그동안 standoff 감속이 없었다. 회랑 조건(침범·
+  # 전방)은 같고, 이 시간 이상 정지한 가장 가까운 객체까지의 거리가 standoff
+  # 상한의 기준이 된다. PREEMPT/WAIT 판정은 여전히 obj_static_s. 0 = 이전 동작.
+  standoff_stop_s: 1.5
   # id 가 잠깐 빠져도 타이머를 유지할 틱 수 (GT '가까운 순 30개' 제한 대비)
   obj_grace_ticks: 10
 
@@ -442,6 +459,23 @@ overtake:
   # 데이터가 없다. 2.0 은 전이 길이 12 m 의 약 1/6.
   shift_geom_gate_enable: true
   shift_geom_margin_m: 2.0
+  # ── 게이트 ↔ BREAKOUT 단계 연동 (B-2, 2026-09-02) ───────────────────
+  # BREAKOUT 단계(escalate_s 마다 +1)는 원래 solid·occupied 만 풀었다. 실선은
+  # 두 바퀴 구조(B-3)가 대신 보고, 단계는 zone·geom 게이트에 쓴다.
+  # center_line·kappa·lc_overlap 은 어느 단계에서도 풀지 않는다.
+  # 단계가 이 값 이상이면 span_into_zone 게이트를 건너뛴다. 99 = 절대 안 품.
+  zone_gate_relax_level: 2
+  # 단계가 이 값 이상이면 전이 시작 여유를 shift_ahead_m 대신 shift_ahead_l3_m
+  # 으로 줄인다 → 정지 시 geom need = 12 + 1 + 2 = 15 m (transition_m 하한 12 는
+  # 그대로). 99 = 절대 안 줄임.
+  geom_relax_level: 3
+  shift_ahead_l3_m: 1.0
+  # ── solid 두 바퀴 (B-3, 2026-09-02) ──────────────────────────────────
+  # 1바퀴는 단계와 무관하게 점선 게이트를 강제한다 (점선이 있으면 거기서 끝).
+  # 1바퀴가 solid 로 기각돼 양쪽 다 실패했을 때만 2바퀴를 돌며 solid 게이트만
+  # 건너뛴다. 비용: cKDTree 최대 4회 ≈ 21 ms 인데 1바퀴 전부 기각일 때만
+  # 도니 정상 주행 비용 0. false 면 1바퀴만 = 이전 동작 (실선 절대 안 넘음).
+  solid_second_pass_enable: true
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오
@@ -820,3 +854,12 @@ debug:
   print_hz: 1.0
 
 default_speed_kph: 50.0
+
+# PDM GlobalConfig 오버라이드 — run_agent.build_pdm_config 가 주입한다.
+# config.py(원문)는 손대지 않는다. 값이 원문과 같으면 동작 불변.
+pdm:
+  # 선행차 IDM 목표 시간간격 [s] (원문 0.25). 배치 비교용 (B-6, 2026-09-02):
+  # 0.25 / 0.5 / 1.0 을 정적회피집중·실전주행_교통류 에서 비교해 케이스 3
+  # (선행차 정지 시 범퍼 간격 0.45 m)의 정지 거리·추종 중 최소 간격·완주 시간을
+  # 본 뒤 확정한다. 확정 전까지 0.25 = 동작 불변.
+  idm_leading_vehicle_time_headway: 0.25
