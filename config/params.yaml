@@ -560,6 +560,12 @@ overtake:
   # 정지선에서 이 거리 안에 교차로 진입이 있으면 '그 정지선의 교차로' 로 본다
   # (지도 실측: 정지선 → junction_in 0.15 m). 이보다 멀면 정지선만 있는 것.
   zone_junction_gap_m: 5.0
+  # E-6 SHIFT_HOLD 정리. 적색이면 span 통과 후에도 SHIFT_HOLD 가 원복 검사보다
+  # 먼저 반환해 회랑·standoff·막힘 회계가 전부 멈췄다 — 실측 020439/01 t=52~71,
+  # 03 t=47~68: 이미 지나간 span 을 쥔 채 다음 박스에 standoff 없이 접근해 접촉.
+  # true = 원복 검사를 먼저 하고, 홀드 중에도 span 활성과 같이 standoff·회계를
+  # 돌린다 (span_active_standoff_enable 과 결합). false = 이전 동작.
+  shift_hold_restore_enable: true
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

@@ -289,6 +289,8 @@ class KrRules:
         self.zone_junction_gap_m = float(ot.get('zone_junction_gap_m', 5.0))
         # E-3 BREAKOUT 시계를 첫 기각부터 (주행 중 포함).
         self.bo_reject_clock = bool(ot.get('breakout_reject_clock_enable', False))
+        # E-6 SHIFT_HOLD: 원복 검사 우선 + 홀드 중 standoff·회계.
+        self.hold_restore = bool(ot.get('shift_hold_restore_enable', False))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -1340,25 +1342,37 @@ class KrRules:
 
     def _try_overtake_inner(self, ap, planner, ego_speed: float) -> bool:
         """_try_overtake 본문. 반환 = 이번 틱 회피 시도가 전부 기각됐나 (E-3)."""
+        red_hold = self.ot_span is not None and self._red_ahead(planner) is not None
+        # 지나갔으면 원복 (다음 장애물용). E-6: 적색이어도 **원복이 먼저다** —
+        # 이미 통과한 span 을 쥔 채 SHIFT_HOLD 로 반환하면 다음 장애물의 회랑·
+        # standoff·회계가 전부 멈춘다 (실측 2026-09-03 020439/01·03 접촉).
+        # 스위치가 꺼지면 옛 순서(홀드 먼저) 그대로.
+        if (self.ot_span is not None and planner.route_index > self.ot_span[1]
+                and (self.hold_restore or not red_hold)):
+            self._restore_span(planner)
+            return False
+
         # 시프트 진행 중 억제 구역에 걸렸다면 — **원복하지 않는다**.
         # 횡위치를 유지하고 종방향은 정지 후보(④′ 프로파일·홀드)에 맡긴다.
         # 급조향으로 차로 중앙에 복귀하려 들면 정지선 앞에서 조향이 튄다.
-        # 차로 중앙 복귀는 span 끝(아래 원복)에서만 일어난다 — 녹색으로 바뀌어
+        # 차로 중앙 복귀는 span 끝(위 원복)에서만 일어난다 — 녹색으로 바뀌어
         # 다시 달리기 시작하면 자연히 그 지점을 통과하며 복귀한다.
-        if self.ot_span is not None and self._red_ahead(planner) is not None:
+        if red_hold:
             self.last_avoid = {'state': 'SHIFT_HOLD', 'suppress': 'red_ahead',
                                'span': list(self.ot_span)}
+            if self.hold_restore and self.span_active_standoff:
+                # E-6: 홀드 중에도 span 활성과 같이 본다 — 복귀 전이 위 다음
+                # 장애물에 standoff 가 걸려야 한다. 생성만 건너뛴다.
+                corridor = self._corridor_blockers(ap, planner)
+                self._standoff_target(ap, planner, corridor)
+                self._blocked_account(ap, planner, ego_speed)
+                self.last_avoid.update(
+                    {'blocker': corridor[0][3].id if corridor else None,
+                     's_rel': round(corridor[0][0], 1) if corridor else None})
             return False
 
-        # 지나갔으면 원복 (다음 장애물용)
         if self.ot_span is not None and planner.route_index > self.ot_span[1]:
-            a, b = self.ot_span
-            planner.route_points[a:b] = planner.original_route_points[a:b]
-            planner.commands[a:b] = planner.commands_orig[a:b]
-            planner.lat_shift[a:b] = planner._lat_build[a:b]
-            planner._kd = _cKDTree(planner.route_points[:, :2])
-            self.ot_span = None
-            self.last_overtake = 'restored'
+            self._restore_span(planner)                    # (E-6 꺼짐 + 적색 아님)
             return False
         if not self.ot_enabled:
             return False
@@ -1512,6 +1526,16 @@ class KrRules:
         if self.last_overtake is None:
             self.last_overtake = 'no_neighbor'
         return True
+
+    def _restore_span(self, planner) -> None:
+        """지나간 시프트 span 원복 (다음 장애물용) — E-6 으로 호출처가 둘이 됐다."""
+        a, b = self.ot_span
+        planner.route_points[a:b] = planner.original_route_points[a:b]
+        planner.commands[a:b] = planner.commands_orig[a:b]
+        planner.lat_shift[a:b] = planner._lat_build[a:b]
+        planner._kd = _cKDTree(planner.route_points[:, :2])
+        self.ot_span = None
+        self.last_overtake = 'restored'
 
     def _standoff_target(self, ap, planner, corridor) -> None:
         """standoff(관찰 감속) 대상 선정 (B-5) — 매 틱 apply 머리에서 None 으로

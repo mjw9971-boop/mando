@@ -112,9 +112,9 @@ def test_suppression_tick_has_no_standoff():
     assert 'standoff_d' not in (kr.last_avoid or {})
 
 
-def test_shift_hold_tick_has_no_stale_standoff():
-    """SHIFT_HOLD(적색 + span 활성) 틱에도 standoff 잔류가 없다."""
-    kr, p, ap, boxes = rig(xs=(52.3,))
+def _shift_hold_tick(cfg):
+    """시프트를 만든 뒤 적색(60 m)으로 바꿔 SHIFT_HOLD 한 틱을 돌린다."""
+    kr, p, ap, boxes = rig(cfg=cfg, xs=(52.3,))
     try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_span is not None
     tl = type('TL', (), {'state': TrafficLightState.Red, 'id': 7})()
@@ -123,6 +123,21 @@ def test_shift_hold_tick_has_no_stale_standoff():
     kr.wait_target_d, kr.standoff_id = None, None                # apply 머리 리셋 모사
     try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.last_avoid['state'] == 'SHIFT_HOLD'
+    return kr
+
+
+def test_shift_hold_tick_has_no_stale_standoff():
+    """SHIFT_HOLD(적색 + span 활성) 틱에도 standoff **잔류**가 없다.
+
+    E-6 이후 홀드 틱은 span 활성과 같이 이번 틱 회랑으로 새로 계산한다 — 값이
+    있으면 그것은 잔류가 아니라 신선한 값(박스 52.3 m)이어야 한다. 스위치를 끄면
+    이전처럼 아무것도 보지 않아 None.
+    """
+    kr = _shift_hold_tick(CFG)
+    assert kr.wait_target_d == pytest.approx(52.3, abs=0.1) and kr.standoff_id == 2
+    cfg = copy.deepcopy(CFG)
+    cfg['overtake']['shift_hold_restore_enable'] = False
+    kr = _shift_hold_tick(cfg)
     assert kr.wait_target_d is None
 
 
