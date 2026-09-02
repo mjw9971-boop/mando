@@ -108,10 +108,19 @@ def test_junction_interior_lanes_lose_the_signal(built):
         assert built['lanes'][k]['stop_lines'] == []
 
 
-def test_metrics_drop_by_exactly_the_reassigned_amount(built):
-    """재귀속 6건 → sig_no_stopline 21→15, 고아 차로 15→11."""
-    assert built['meta']['sig_no_stopline'] == 15
-    assert built['meta']['lanes_signal_no_stopline'] == 11
+@pytest.fixture(scope='module')
+def built_no_synth():
+    """정지선 합성(작업 B)을 끈 빌드 — 재귀속만의 효과를 격리한다."""
+    return _mod().build(XODR, ds=0.5, synth_stopline=False)
+
+
+def test_metrics_drop_by_exactly_the_reassigned_amount(built_no_synth):
+    """재귀속 6건만으로 sig_no_stopline 21→15, 고아 차로 15→11.
+
+    합성까지 켜면 둘 다 0 이 된다 (test_stopline_synth).
+    """
+    assert built_no_synth['meta']['sig_no_stopline'] == 15
+    assert built_no_synth['meta']['lanes_signal_no_stopline'] == 11
 
 
 def test_signal_total_unchanged(built):

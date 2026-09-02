@@ -849,10 +849,11 @@ def rehome_signal(sg, road, roads):
     return out[0] if len(out) == 1 else None
 
 
-def assign_objects(lanes, roads, warnings, sig2ctrl=None):
+def assign_objects(lanes, roads, warnings, sig2ctrl=None, synth_stopline=True):
     stats = collections.Counter()
     repaired = []          # (road, s_orig, t_orig, dir_hdg, s_true, dir_fixed)
     reassigned = []        # 대향 신호 재귀속 내역 (무음 보정 금지)
+    synthesized = []       # 합성 정지선 내역 (무음 보정 금지)
     for road in roads.values():
         # 정지선 클러스터 (방향별, s 3m 이내)
         # 좌표가 깨진 정지선 보정 (2026-09-01). 종방향은 s_true = min(|t|, L) 로
@@ -946,9 +947,10 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
             road['_stop_clusters'].append(entry)
             stats['stop_clusters'] += 1
 
-    # ── 신호등 ────────────────────────────────────────────────────────────
+    # ── 신호등 1/3: 방향·귀속 도로 해석 ───────────────────────────────────
     # 정지선 클러스터가 **모든 도로에서** 끝난 뒤에 돈다. 재귀속(rehome_signal)이
     # 다른 도로의 클러스터를 봐야 하기 때문이다.
+    resolved = []          # (sg, host_road, dir, lane_keys, host_cluster|None)
     for road in roads.values():
         for sg in road['signals']:
             s = min(max(sg['s'], 0.0), road['length'])
@@ -989,23 +991,65 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
                         stats['signal_reassigned'] += 1
                 if lk is None:
                     lk = lanes_of_dir_at(lanes, road, s, d)
-            # 정지선: 같은 방향 클러스터 중 가장 가까운 것 (20m 이내)
-            best = host_c
-            if best is None:
-                for c in host['_stop_clusters']:
-                    if c['dir'] == d and abs(c['s'] - s) < 20.0:
-                        if best is None or abs(c['s'] - s) < abs(best['s'] - s):
-                            best = c
-            stop_s = best['s'] if best else s
-            if best:
-                best['signal_ids'].append(sg['id'])
-            else:
-                stats['sig_no_stopline'] += 1
-            for k in lk:
-                rec = lanes[k]
-                rec['signals'].append({'id': sg['id'], 'stop_s': road_s_to_travel(rec, stop_s),
-                                       'explicit': explicit, 'type': sg['type'], 'subtype': sg['subtype']})
-            stats['signals'] += 1
+            resolved.append((sg, host, d, lk, host_c, explicit))
+
+    # ── 신호등 2/3: 접근로 정지선 합성 ────────────────────────────────────
+    # 신호가 있는데 그 방향에 정지선 클러스터가 **0개**인 접근로에, 지도 자신의
+    # 규약대로 정지선을 만든다.
+    #
+    # 근거 (2026-09-02 실측): 정상 매칭된 신호 625개에서 (정지선 s - 신호 s) 는
+    # 최빈 +0.15 (302건) / -0.15 (227건), p1 -0.158 · p50 +0.146 · p99 +0.531,
+    # |offset| > 1 m 은 3건뿐이다. 신호 자신은 중앙값 기준 도로 끝에 정확히 선다.
+    # 즉 이 지도에서 "신호 s ± 0.15" 는 규약이고, 합성 위치 오차는 최대 0.5 m 다.
+    #
+    # 대상은 road 1928(dir-1) · 2575 · 2806 · 3142 의 15개 신호다. 넷 다 하류
+    # 연결로에 폭이 맞는 정지선이 하나씩 있지만 14~29 m 떨어져 있다 — 규약의
+    # 40~190배 밖이라 접근로 정지선이 아니다. 그 정지선을 끌어오는 안(B2)은
+    # 채택하지 않았다: 별개 지물(교차로 내부 정지선)일 가능성을 배제하지 못했고,
+    # 같은 형태가 junction 42·77 에 3건 더 있는데 그쪽 접근로는 이미 자기
+    # 정지선을 갖고 있어 끌어오면 중복이 된다.
+    #
+    # 교차로 내부(junction != -1)에는 만들지 않는다 — 정지선을 이미 지난 지점이다.
+    if synth_stopline:
+        for sg, host, d, lk, host_c, _ in resolved:
+            if host_c is not None or host['junction'] != -1 or not lk:
+                continue
+            if any(c['dir'] == d for c in host['_stop_clusters']):
+                continue                      # 그 방향에 정지선이 있으면 건드리지 않는다
+            L = host['length']
+            s_syn = min(max(min(max(sg['s'], 0.0), L) - 0.15 * d, 0.0), L)
+            entry = {'dir': d, 's': s_syn, 'lanes': list(lk), 'signal_ids': []}
+            host['_stop_clusters'].append(entry)
+            end = L if d == 1 else 0.0
+            synthesized.append({'road': host['id'], 'dir': d, 's': round(s_syn, 4),
+                                'signal': sg['id'], 'signal_s': round(sg['s'], 4),
+                                'road_length': round(L, 4),
+                                'road_end_gap_m': round(abs(sg['s'] - end), 4),
+                                'lanes': [list(k) for k in lk]})
+            stats['stop_synthesized'] += 1
+
+    # ── 신호등 3/3: 정지선 매칭 + 차로 기록 ───────────────────────────────
+    for sg, host, d, lk, host_c, explicit in resolved:
+        # 정지선: 같은 방향 클러스터 중 가장 가까운 것 (20m 이내).
+        # 재귀속된 신호는 host_c 가 이미 정해져 있다 (sg['s'] 는 원래 도로 좌표라
+        # host 에서 다시 재면 안 된다).
+        s = min(max(sg['s'], 0.0), host['length'])
+        best = host_c
+        if best is None:
+            for c in host['_stop_clusters']:
+                if c['dir'] == d and abs(c['s'] - s) < 20.0:
+                    if best is None or abs(c['s'] - s) < abs(best['s'] - s):
+                        best = c
+        stop_s = best['s'] if best else s
+        if best:
+            best['signal_ids'].append(sg['id'])
+        else:
+            stats['sig_no_stopline'] += 1
+        for k in lk:
+            rec = lanes[k]
+            rec['signals'].append({'id': sg['id'], 'stop_s': road_s_to_travel(rec, stop_s),
+                                   'explicit': explicit, 'type': sg['type'], 'subtype': sg['subtype']})
+        stats['signals'] += 1
 
     for road in roads.values():
 
@@ -1120,6 +1164,14 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
             print(f"         road {r['road']:<5} s {r['s_orig']:>6.2f}→{r['s_true']:>7.2f}  "
                   f"dir {r['dir_hdg']:+d}→{r['dir_fixed']:+d}  "
                   f"(t={r['t_orig']:+.2f} 복원 불가, 방향 전체 차로에 배정)")
+    if synthesized:
+        # 무음 보정 금지 — xodr 에 없는 객체를 만들었으므로 전건을 남긴다.
+        print(f'[synth] 접근로 정지선 합성 {len(synthesized)}건 '
+              f"(road {len({r['road'] for r in synthesized})}개)")
+        for r in sorted(synthesized, key=lambda x: (x['road'], x['dir'])):
+            print(f"         road {r['road']:<5} dir {r['dir']:+d} s={r['s']:>8.2f} "
+                  f"(신호 {r['signal']} s={r['signal_s']:.2f}, 도로끝까지 "
+                  f"{r['road_end_gap_m']:.2f}m, 차로 {len(r['lanes'])}개)")
     if reassigned:
         # 무음 보정 금지 — 어느 신호를 어디로 옮겼는지 전건을 남긴다.
         print(f'[sig  ] 대향 신호 재귀속 {len(reassigned)}건')
@@ -1133,13 +1185,13 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None):
     for k in sorted(orphan)[:20]:
         warnings.append(f'lane {k}: 신호 {len(lanes[k]["signals"])}개가 붙었으나 정지선 없음 '
                         f'— 이 차로에서는 적신호 감속이 발동하지 않는다')
-    return stats, repaired, reassigned
+    return stats, repaired, reassigned, synthesized
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # 6. 메인
 # ────────────────────────────────────────────────────────────────────────────
-def build(xodr_path, ds=0.5):
+def build(xodr_path, ds=0.5, synth_stopline=True):
     t0 = time.time()
     warnings = []
     root = ET.parse(xodr_path).getroot()
@@ -1158,7 +1210,8 @@ def build(xodr_path, ds=0.5):
 
     st = link_lanes(lanes, roads, junctions, warnings)
     print('[link ]', dict(st))
-    so, repairs, resigs = assign_objects(lanes, roads, warnings, sig2ctrl)
+    so, repairs, resigs, synths = assign_objects(lanes, roads, warnings, sig2ctrl,
+                                                 synth_stopline=synth_stopline)
     print('[objs ]', dict(so))
 
     # KD-tree 용 전역 인덱스
@@ -1225,6 +1278,10 @@ def build(xodr_path, ds=0.5):
             # 신호를 실제 접근로로 되돌린 건. junction_ctrl_map.json 은 이 결과에서
             # 파생되므로 그래프를 바꾸면 함께 재생성해야 한다.
             'signal_reassigned': resigs,
+            # 합성 정지선 내역 (2026-09-02) — xodr 에 없는 객체를 만든 유일한 지점이다.
+            # --no-synth-stopline 으로 끄면 이전 동작(정지선 없음)으로 돌아간다.
+            'stop_synthesized': synths,
+            'stop_synth_enabled': bool(synth_stopline),
             'stop_repaired': so.get('stop_repaired', 0),
             'stop_repair_undecided': so.get('stop_repair_undecided', 0),
             'lanes_signal_no_stopline': so.get('lanes_signal_no_stopline', 0),
@@ -1247,8 +1304,10 @@ def main():
     ap.add_argument('xodr')
     ap.add_argument('-o', '--out', default='lane_graph.pkl')
     ap.add_argument('--ds', type=float, default=0.5)
+    ap.add_argument('--no-synth-stopline', action='store_true',
+                    help='신호는 있는데 정지선이 없는 접근로에 정지선을 합성하지 않는다')
     a = ap.parse_args()
-    g = build(a.xodr, a.ds)
+    g = build(a.xodr, a.ds, synth_stopline=not a.no_synth_stopline)
     with open(a.out, 'wb') as f:
         pickle.dump(g, f, protocol=4)
     import os
