@@ -453,6 +453,23 @@ overtake:
   # 데이터가 없다. 2.0 은 전이 길이 12 m 의 약 1/6.
   shift_geom_gate_enable: true
   shift_geom_margin_m: 2.0
+  # ── 게이트 ↔ BREAKOUT 단계 연동 (B-2, 2026-09-02) ───────────────────
+  # BREAKOUT 단계(escalate_s 마다 +1)는 원래 solid·occupied 만 풀었다. 실선은
+  # 두 바퀴 구조(B-3)가 대신 보고, 단계는 zone·geom 게이트에 쓴다.
+  # center_line·kappa·lc_overlap 은 어느 단계에서도 풀지 않는다.
+  # 단계가 이 값 이상이면 span_into_zone 게이트를 건너뛴다. 99 = 절대 안 품.
+  zone_gate_relax_level: 2
+  # 단계가 이 값 이상이면 전이 시작 여유를 shift_ahead_m 대신 shift_ahead_l3_m
+  # 으로 줄인다 → 정지 시 geom need = 12 + 1 + 2 = 15 m (transition_m 하한 12 는
+  # 그대로). 99 = 절대 안 줄임.
+  geom_relax_level: 3
+  shift_ahead_l3_m: 1.0
+  # ── solid 두 바퀴 (B-3, 2026-09-02) ──────────────────────────────────
+  # 1바퀴는 단계와 무관하게 점선 게이트를 강제한다 (점선이 있으면 거기서 끝).
+  # 1바퀴가 solid 로 기각돼 양쪽 다 실패했을 때만 2바퀴를 돌며 solid 게이트만
+  # 건너뛴다. 비용: cKDTree 최대 4회 ≈ 21 ms 인데 1바퀴 전부 기각일 때만
+  # 도니 정상 주행 비용 0. false 면 1바퀴만 = 이전 동작 (실선 절대 안 넘음).
+  solid_second_pass_enable: true
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

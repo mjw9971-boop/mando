@@ -237,6 +237,13 @@ class KrRules:
         # 시프트 기하 완성 게이트 (B-12). false 면 완전 비활성 = 이전 동작.
         self.geom_gate = bool(ot.get('shift_geom_gate_enable', False))
         self.geom_margin_m = float(ot.get('shift_geom_margin_m', 0.0))
+        # 게이트 ↔ BREAKOUT 단계 연동 (B-2). 단계가 이 값 이상이면 그 게이트를
+        # 완화한다. 99 같은 큰 값이면 어느 단계에서도 완화하지 않는다 (= 이전 동작).
+        self.zone_relax_lvl = int(ot.get('zone_gate_relax_level', 2))
+        self.geom_relax_lvl = int(ot.get('geom_relax_level', 3))
+        self.shift_ahead_l3_m = float(ot.get('shift_ahead_l3_m', 1.0))
+        # solid 두 바퀴 (B-3). false 면 1바퀴만 = 이전 동작 (실선은 절대 안 넘는다).
+        self.solid_second_pass = bool(ot.get('solid_second_pass_enable', True))
         # 규칙 2 — 데드락 해제 (BREAKOUT)
         self.BO_CREEP = 4                                  # 크립이 켜지는 단계
         self.bo_enabled = bool(ot.get('breakout_enabled', False))
@@ -282,7 +289,8 @@ class KrRules:
         self.sig_held: int = SIG_OFF               # 유지 중인 값
         self.ot_blocked_ticks = 0                  # 막힌 채 정지한 틱
         self.ot_span: tuple | None = None          # 시프트한 인덱스 구간
-        self.last_overtake: str | None = None      # 로그용 ('left'|'right'|사유)
+        self.last_overtake: str | None = None      # 로그용 ('left'|'right'|사유@p{n})
+        self.ot_pass_solid = False                 # 1바퀴에 solid 기각이 있었나 (B-3)
         self.last_avoid: dict | None = None        # 회피 진단 (reasons.avoid)
         self.obj_ticks: dict = {}                  # 객체별 정지 지속 틱
         self.obj_miss: dict = {}                   # 객체별 미관측 틱 (grace)
@@ -691,8 +699,11 @@ class KrRules:
             return False
         return str(col) == 'yellow'
 
-    def _planned_shift_geom(self, planner, actor, side, trans_m):
+    def _planned_shift_geom(self, planner, actor, side, trans_m, ahead_m=None):
         """적용 **전** 시프트 기하 검사 → `(κ, lc_var)`. 못 재면 None.
+
+        ahead_m: 전이 시작 여유 [m]. None 이면 shift_ahead_m (B-2 의 L3 완화가
+        실제 시프트와 같은 값을 쓰도록 side 루프가 넘긴다).
 
         `plan_shift_span` 이 cKDTree 를 세우므로(≈4.6 ms) **한 번만 부르고**
         두 지표를 같이 낸다.
@@ -721,7 +732,7 @@ class KrRules:
                 transition_length=trans_m * ppm,
                 extra_length_before=self.ot_before_m * ppm,
                 extra_length_after=self.ot_after_m * ppm,
-                min_start_ahead=self.shift_ahead_m * ppm)
+                min_start_ahead=(self.shift_ahead_m if ahead_m is None else ahead_m) * ppm)
             step = max(1, int(round(self.shift_k_step_m * ppm)))
             d = planner.planned_lateral_offsets(a, b, left, step_pts=step)
         except Exception:                                  # noqa: BLE001
@@ -1022,6 +1033,19 @@ class KrRules:
                 self.bo_stall_ticks = 0
             print('[kr_rules] BREAKOUT 단계 상승 → L%d' % self.bo_level, flush=True)
 
+    def _relax_label(self) -> str | None:
+        """현재 BREAKOUT 단계가 푸는 게이트 목록 (로그용). L2 미만은 None."""
+        if self.bo_level < 2:
+            return None
+        out = ['side']
+        if self.bo_level >= self.zone_relax_lvl:
+            out.append('zone_gate')
+        if self.bo_level >= self.geom_relax_lvl:
+            out.append('shift_ahead')
+        if self.bo_level >= self.BO_CREEP:
+            out.append('creep')
+        return '+'.join(out)
+
     def _side_is_clear(self, lg, planner, ap, target) -> bool:
         """목표 차로에 차가 없는가 (lc_clear 대용 — 아직 후방 추종차는 안 본다)."""
         ego = ap._vehicle
@@ -1171,27 +1195,65 @@ class KrRules:
             return
 
         local_s = self._ego_local_s(lg, ap)
+        # ── side 루프 두 바퀴 (B-3) ────────────────────────────────────────
+        # 1바퀴: 점선(solid) 게이트를 BREAKOUT 단계와 무관하게 **강제**한다 —
+        #        점선 회랑이 있으면 여기서 끝난다 (실선을 넘을 이유가 없다).
+        # 2바퀴: 1바퀴에서 한쪽이라도 solid 로 기각됐고 양쪽 다 실패했을 때만,
+        #        solid 게이트만 건너뛰고 다시 돈다. center_line·geom·zone·
+        #        occupied·kappa·lc_overlap 은 2바퀴에서도 그대로다.
+        #        1바퀴 기각이 전부 solid 이외(geom/zone/…)면 2바퀴는 결과가
+        #        같으므로 돌지 않는다 — cKDTree(≈4.6 ms) 재호출을 아낀다.
+        #        solid_second_pass_enable=false 면 1바퀴만 = 이전 동작.
+        self.ot_pass_solid = False
+        if self._side_pass(ap, planner, ego_speed, actor, preempt,
+                           lg, ego_lane, local_s, 1):
+            return
+        if self.solid_second_pass and self.ot_pass_solid:
+            if self._side_pass(ap, planner, ego_speed, actor, preempt,
+                               lg, ego_lane, local_s, 2):
+                return
+        if self.last_overtake is None:
+            self.last_overtake = 'no_neighbor'
+
+    def _side_pass(self, ap, planner, ego_speed: float, actor, preempt: bool,
+                   lg, ego_lane, local_s: float, n_pass: int) -> bool:
+        """side 루프 한 바퀴 (좌측 우선). 시프트를 적용했으면 True.
+
+        n_pass ≥ 2 면 solid 게이트를 건너뛴다 (B-3). 기각 라벨은
+        `{side}:{gate}@p{n}` 이고 last_avoid 에 'pass' 를 남긴다.
+        """
+        # BREAKOUT 사다리 — 단계는 solid·occupied 가 아니라 zone·geom 완화에 쓴다
+        # (B-2). solid 는 두 바퀴 구조(B-3)가, occupied 는 lvl<1 이 그대로 본다.
+        lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
+        skip_solid = n_pass >= 2
         for side in ('left', 'right'):                     # 좌측 추월 우선
             target = lg.neighbor(ego_lane, side)
             if target is None:
                 continue
-            # 중앙선(황색)은 **어느 BREAKOUT 단계에서도** 넘지 않는다 (_is_center_mark).
+
+            def reject(gate, **extra):
+                self.last_overtake = f'{side}:{gate}@p{n_pass}'
+                (self.last_avoid or {}).update(
+                    {'reject': f'{side}:{gate}', 'pass': n_pass, **extra})
+
+            # 중앙선(황색)은 **어느 BREAKOUT 단계·어느 바퀴에서도** 넘지 않는다.
             if self._is_center_mark(lg, ego_lane, side, local_s):
-                self.last_overtake = f'{side}:center_line'
-                (self.last_avoid or {}).update({'reject': f'{side}:center_line'})
+                reject('center_line')
                 continue
-            # BREAKOUT 사다리: L1 측방 반경 완화, L2 이상만 실선 허용
-            lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
             # ④ 점선 게이트 — 고정 하한(min_corridor_m)이 아니라 **실제로 밟을
             # span 전체**가 점선인지 본다. dashed_corridor_m 은 '점선 조각의
             # 길이' 라 이미 지나온 조각도 통과시킨다 (실측: 앞 점선 5 m 인데
             # 76.4 반환 → span 84.1 m 가 전 구간 실선 위에 얹혔다).
             trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
             span_m = 2.0 * trans_m + self.ot_before_m + self.ot_after_m
+            # 전이 시작 여유 — L3 이상은 shift_ahead_l3_m (B-2). 정지 상태에서
+            # need = 12 + 1 + 2 = 15 m 가 된다. 게이트와 실제 시프트가 같은 값을 쓴다.
+            ahead_m = (self.shift_ahead_l3_m if lvl >= self.geom_relax_lvl
+                       else self.shift_ahead_m)
             # ⑥ 기하 완성 게이트 (B-12) — **전이가 장애물 도달 전에 끝나는가**.
-            # 전이는 자차 앞 shift_ahead_m 에서 시작해 trans_m 만큼 간다. 그
-            # 끝점이 장애물보다 뒤면 장애물 지점의 횡이동이 거의 0 이다 (실측
-            # s_rel 5.3 m 에서 3.0 m 중 0.0046 m = 0.15 %).
+            # 전이는 자차 앞 ahead_m 에서 시작해 trans_m 만큼 간다. 그 끝점이
+            # 장애물보다 뒤면 장애물 지점의 횡이동이 거의 0 이다 (실측 s_rel
+            # 5.3 m 에서 3.0 m 중 0.0046 m = 0.15 %).
             # 여기 두는 이유: 뺄셈 하나뿐이라 7게이트 중 가장 싸다. 뒤쪽
             # solid(successor 순회)·kappa/lc_overlap(cKDTree ≈4.6 ms)보다 먼저
             # 걸러야 값싼 게이트 우선 원칙에 맞는다.
@@ -1200,55 +1262,49 @@ class KrRules:
             if self.geom_gate:
                 pr = self._project(planner, actor.get_location().x,
                                    actor.get_location().y)
-                need = trans_m + self.shift_ahead_m + self.geom_margin_m
+                need = trans_m + ahead_m + self.geom_margin_m
                 # pr is None = 전방 창에서 투영 실패. 판단 근거가 없으므로
                 # 기각하지 않는다 (다른 게이트의 '못 재면 통과' 관례와 같다).
                 if pr is not None and need > pr[0]:
-                    self.last_overtake = f'{side}:geom'
-                    (self.last_avoid or {}).update(
-                        {'reject': f'{side}:geom', 'need_geom': round(need, 1),
-                         's_rel_actor': round(pr[0], 1),
-                         'margin': round(pr[0] - need, 1)})
+                    reject('geom', need_geom=round(need, 1),
+                           s_rel_actor=round(pr[0], 1), margin=round(pr[0] - need, 1))
                     continue
             # ② 시프트 기하 게이트 — 나가는 전이 + 복귀 전이 span 전체가
-            # 정지선 억제 구역(stopline_suppress_m) **밖에서 끝나야** 시작한다.
+            # 정지선 경계(zone_gate_margin_m) **앞에서 끝나야** 시작한다.
             # 시프트 도중에 억제 구역으로 들어가면 되돌릴 수 없다(급조향 금지).
-            route_s = float(planner.route_s[planner.route_index])
-            span_end = route_s + span_m
-            zone_lo = self._next_stopzone_s(planner)
-            if zone_lo is not None and span_end > zone_lo:
-                self.last_overtake = f'{side}:span_into_zone'
-                (self.last_avoid or {}).update(
-                    {'reject': 'span_into_zone', 'span_end': round(span_end, 1),
-                     'zone_lo': round(zone_lo, 1)})
-                continue
-            cover = self._dashed_ahead_m(lg, ego_lane, side, local_s, span_m)
-            if lvl < 2 and cover < span_m - self.ot_dash_slack_m:
-                self.last_overtake = f'{side}:solid'
-                (self.last_avoid or {}).update(
-                    {'reject': f'{side}:solid', 'dash_m': round(cover, 1),
-                     'span_m': round(span_m, 1)})
-                continue
+            # BREAKOUT lvl ≥ zone_gate_relax_level 이면 건너뛴다 (B-2).
+            if lvl < self.zone_relax_lvl:
+                route_s = float(planner.route_s[planner.route_index])
+                span_end = route_s + span_m
+                zone_lo = self._next_stopzone_s(planner)
+                if zone_lo is not None and span_end > zone_lo:
+                    reject('span_into_zone', span_end=round(span_end, 1),
+                           zone_lo=round(zone_lo, 1))
+                    continue
+            if not skip_solid:
+                cover = self._dashed_ahead_m(lg, ego_lane, side, local_s, span_m)
+                if cover < span_m - self.ot_dash_slack_m:
+                    self.ot_pass_solid = True              # 2바퀴 사유
+                    reject('solid', dash_m=round(cover, 1), span_m=round(span_m, 1))
+                    continue
             if lvl < 1 and not self._side_is_clear(lg, planner, ap, target):
-                self.last_overtake = f'{side}:occupied'
+                reject('occupied')
                 continue
             ppm = float(getattr(planner, 'points_per_meter', 10))
             # ⑤ 기하 계단 검사 (B-7 임시 가드) — 다른 게이트를 다 통과한 뒤에만
             # 잰다 (읽기 전용이지만 span 하나에 1.7~5.2 ms 든다). 상태를 남기지
             # 않으므로 기각은 **그 시점 그 경로 한정**이고 다음 틱에 다시 시도한다.
-            geom = self._planned_shift_geom(planner, actor, side, trans_m)
+            geom = self._planned_shift_geom(planner, actor, side, trans_m, ahead_m)
             if geom is not None:
                 kap, lc_var = geom
                 (self.last_avoid or {}).update(
                     {'shift_kappa': round(kap, 4), 'lc_var': round(lc_var, 3)})
                 if self.shift_k_reject > 0.0 and kap > self.shift_k_reject:
-                    self.last_overtake = f'{side}:kappa'
-                    (self.last_avoid or {}).update({'reject': f'{side}:kappa'})
+                    reject('kappa')
                     continue
                 # 계획 LC 와 겹치면 기각 (B-11) — 합산 횡이동을 만들지 않는다
                 if self.lc_overlap_m > 0.0 and lc_var > self.lc_overlap_m:
-                    self.last_overtake = f'{side}:lc_overlap'
-                    (self.last_avoid or {}).update({'reject': f'{side}:lc_overlap'})
+                    reject('lc_overlap')
                     continue
             span = planner.shift_route_around_actors(
                 actor,
@@ -1258,19 +1314,19 @@ class KrRules:
                 extra_length_after=self.ot_after_m * ppm,
                 # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
                 # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
-                min_start_ahead=self.shift_ahead_m * ppm)
+                min_start_ahead=ahead_m * ppm)
             planner._kd = _cKDTree(planner.route_points[:, :2])
             self.ot_span = span
             self.ot_blocked_ticks = 0
             self.last_overtake = side
             (self.last_avoid or {}).update(
                 {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
-                 'preempt': preempt})
+                 'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
+                 'solid_relaxed': skip_solid})
             print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
-                  f'(id={actor.id}, 구간 {span[0]}~{span[1]})', flush=True)
-            return
-        if self.last_overtake is None:
-            self.last_overtake = 'no_neighbor'
+                  f'(id={actor.id}, 구간 {span[0]}~{span[1]}, p{n_pass})', flush=True)
+            return True
+        return False
 
     @staticmethod
     def _ego_lane(lg, ap):
@@ -1857,9 +1913,8 @@ class KrRules:
                 'stall_s': round(self.bo_stall_ticks / self.hz, 1),
                 'creep': self.breakout_creep(),
                 # L2 이상은 감점 가능한 완화다 — 단계와 사유를 반드시 남긴다
-                'relax': ({1: 'corridor+side', 2: 'solid_line',
-                           3: 'clearance', 4: 'creep'}.get(self.bo_level)
-                          if self.bo_level >= 2 else None)})
+                # (B-2: 단계는 zone·geom 완화에 쓴다. 실선은 두 바퀴(B-3)가 본다)
+                'relax': self._relax_label()})
         elif self.bo_exit:
             self.last_avoid = dict(self.last_avoid or {}, exit=self.bo_exit)
             self.bo_exit = None
