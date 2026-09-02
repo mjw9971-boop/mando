@@ -577,6 +577,17 @@ def pulk_cfg() -> dict:
     return _PULK_CFG
 
 
+_PLC_CFG = None      # params.yaml gen_placement 캐시 (이벤트별 배치 성립 조건)
+
+
+def plc_cfg() -> dict:
+    global _PLC_CFG
+    if _PLC_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _PLC_CFG = load_params_yaml()['gen_placement']
+    return _PLC_CFG
+
+
 _COV_CFG = None      # params.yaml gen_coverage 캐시 (후보 선별·추첨 상수의 단일 출처)
 
 
@@ -1621,19 +1632,99 @@ def ev_slow_lead(ctx, v):
     return {'kind': 'slow_lead', 'lead': name, 'gap0': gap, 'speed_kph': speed_kph}
 
 
+def _same_dir_lane_count(lg, k, sl: float, min_w: float) -> int:
+    """차로 k 의 sl 지점에서 **동일 방향 주행차로** 수 (자기 포함).
+
+    폭 임계를 두는 이유: 이 맵에는 폭 0 인 테이퍼 차로가 실재한다
+    ((173,3,-1) w=0.0, 2026-09-02 확인). 개수만 세면 "이웃이 있다" 가 참이
+    되지만 비켜 설 자리는 없다. left_nb 는 중앙선을 넘지 않지만
+    (lanegraph.roadway_edges 주석) 반대 통행방향은 dir 로 한 번 더 막는다.
+    """
+    me = lg.lanes[k]
+    n = 1
+    for side in ('left', 'right'):
+        cur = k
+        for _ in range(6):
+            nb = lg.neighbor(cur, side)
+            if nb is None:
+                break
+            o = lg.lanes[nb]
+            if o['type'] != 'driving' or o['dir'] != me['dir']:
+                break
+            if lg.width_at(nb, min(sl, o['length'])) < min_w:
+                break
+            n += 1
+            cur = nb
+    return n
+
+
+def _multi_lane_spans(ctx, min_w: float, min_span: float, step: float = 2.0):
+    """동일 방향 주행차로가 2개 이상인 route_s 부분구간들 (_opposite_spans 와 같은 형태).
+
+    구간 양끝이 **둘 다 검사를 통과한 표본**이 되도록 자른다 — 표본 사이
+    (step 미만)만 미검사로 남는다. step 이 2 m 인 것은 이 맵의 차로 섹션이
+    짧기 때문이다 (실측 최단 1.6~1.8 m): 10 m 간격이면 차로가 끊기는 짧은
+    섹션을 통째로 건너뛴다.
+    """
+    out = []
+    for a, b in ctx.spans:
+        lo = prev = None
+        u = a
+        while True:
+            uu = min(u, b)
+            _, k, sl = lane_at(ctx.route.rt, uu)
+            if _same_dir_lane_count(ctx.lg, k, sl, min_w) >= 2:
+                lo = uu if lo is None else lo
+                prev = uu
+            else:
+                if lo is not None and prev - lo >= min_span:
+                    out.append((lo, prev))
+                lo = prev = None
+            if uu >= b:
+                break
+            u += step
+        if lo is not None and prev - lo >= min_span:
+            out.append((lo, prev))
+    return out
+
+
 def ev_static_vehicle(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
-    s = pick_s(ctx.spans, v['위치'], need=30.0)
-    ctx.claim(s - 40, s + 40, 'static_vehicle')
+    cfg = plc_cfg()['static_vehicle']
+    gate = bool(cfg['require_multi_lane'])
+    min_w = float(cfg['min_neighbor_width_m'])
+    if gate:
+        # 자차로를 막는 정차 차량은 옆 차로가 있어야 회피가 성립한다 —
+        # 근거는 params gen_placement.static_vehicle 주석.
+        mspans = _multi_lane_spans(ctx, min_w, float(cfg['min_span_m']))
+        if not mspans:
+            raise EventUnfeasible('static_vehicle: 동일 방향 주행차로가 2개 이상인 '
+                                  '가용구간이 없다 — 자차로를 막으면 회피가 원천 불가다')
+        s = _place_in_one_span(ctx, v['위치'], reach=0.0, need=30.0,
+                               claim=(-40.0, 40.0), what='static_vehicle',
+                               spans=mspans)
+        if s is None:
+            raise EventUnfeasible('static_vehicle: 2차로 이상 구간이 전부 다른 이벤트에 막혔다')
+    else:
+        s = pick_s(ctx.spans, v['위치'], need=30.0)
+        ctx.claim(s - 40, s + 40, 'static_vehicle')
     i, k, sl = lane_at(rt, s)
     t = 0.0
     lane_tag = 'ego_lane'
     if v.get('차선') == '좌측차로':
         nb = lg.neighbor(k, 'left')
-        if nb is not None and lg.lanes[nb]['dir'] == lg.lanes[k]['dir'] \
-                and lg.lanes[nb]['type'] == 'driving':
+        ok = (nb is not None and lg.lanes[nb]['dir'] == lg.lanes[k]['dir']
+              and lg.lanes[nb]['type'] == 'driving')
+        if ok:
             t = (lg.width_at(k, sl) + lg.width_at(nb, min(sl, lg.length(nb)))) / 2.0
             lane_tag = 'side_lane'
+        elif gate:
+            # 조용히 t=0 으로 떨어지면 '좌측차로' 요청이 **자차로 정중앙 차단**이
+            # 된다 — 요청과 정반대 시나리오다. 2026-09-02 전수에서 1차로 완전차단
+            # 24건 중 6건이 이 폴백이었다 (2차로 도로라도 ego 가 왼쪽 차로면
+            # 좌측 이웃이 없다). 게이트가 켜져 있으면 버리고 백필한다.
+            raise EventUnfeasible(f'static_vehicle: s={s:.0f} m 에 좌측 동방향 '
+                                  f'주행차로가 없다 — 자차로 차단으로 떨어지는 것을 막는다')
     x, y, z, h = route_pt(lg, rt, s, t)
     name = ctx.next_name('StoppedCar')
     ctx.players.append(blk_vehicle_posabs(name, CAR, x, y, z, h))
@@ -1810,7 +1901,7 @@ def ev_signal(ctx, v):
     return {'kind': 'signal', 'timing': timing, 'approaches': out}
 
 
-def _place_in_one_span(ctx, frac, reach, need, claim, what):
+def _place_in_one_span(ctx, frac, reach, need, claim, what, spans=None):
     """s 부터 s+reach 까지가 **한 가용구간 안에** 들어가는 시작 route_s. 없으면 None.
 
     왜 한 구간이어야 하는가 (2026-09-02 실측): pick_s 는 구간들을 이어붙인
@@ -1830,12 +1921,16 @@ def _place_in_one_span(ctx, frac, reach, need, claim, what):
     claim: (lo, hi) — s 기준 점유 구간 오프셋. need·claim 을 종전 값 그대로
     받는 이유는, 이미 한 구간에 들어가던 배치는 시작점도 점유 구간도 바뀌지
     않아야 하기 때문이다 (기존 산출물 불변 조건).
+    spans: 후보 구간을 ctx.spans 가 아닌 다른 목록으로 좁힌다 (기본 ctx.spans).
+    이벤트별 성립 조건으로 미리 걸러 낸 부분구간을 넘기는 용도다 — 예:
+    static_vehicle 의 '동일 방향 주행차로 2개 이상' (_multi_lane_spans).
     """
+    spans = ctx.spans if spans is None else spans
     try:
-        want = pick_s(ctx.spans, frac, need=need)
+        want = pick_s(spans, frac, need=need)
     except GenError:
         want = None                     # 가용축 전체가 짧다 — 구간만 보고 고른다
-    cands = [(a, b) for a, b in ctx.spans if b - a >= reach]
+    cands = [(a, b) for a, b in spans if b - a >= reach]
     if want is not None:                # 요청 위치를 품은 구간 → 가까운 구간 순
         cands.sort(key=lambda ab: 0.0 if ab[0] <= want <= ab[1]
                    else min(abs(ab[0] - want), abs(ab[1] - want)))
