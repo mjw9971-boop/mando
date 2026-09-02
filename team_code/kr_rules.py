@@ -220,6 +220,8 @@ class KrRules:
         # 시프트 기하 계단 검사 (B-7 임시 가드). 0 이면 계측만, 기각 없음.
         self.shift_k_reject = float(ot.get('shift_kappa_reject', 0.0))
         self.shift_k_step_m = float(ot.get('shift_kappa_step_m', 1.0))
+        # 계획 LC 중첩 검사 (B-11). 0 이면 계측만, 기각 없음.
+        self.lc_overlap_m = float(ot.get('shift_lc_overlap_m', 0.0))
         # 규칙 2 — 데드락 해제 (BREAKOUT)
         self.BO_CREEP = 4                                  # 크립이 켜지는 단계
         self.bo_enabled = bool(ot.get('breakout_enabled', False))
@@ -666,8 +668,17 @@ class KrRules:
             return False
         return str(col) == 'yellow'
 
-    def _planned_shift_kappa(self, planner, actor, side, trans_m):
-        """적용 **전** 시프트 목표 기하의 횡곡률 최대값 κ [1/m]. 못 재면 None.
+    def _planned_shift_geom(self, planner, actor, side, trans_m):
+        """적용 **전** 시프트 기하 검사 → `(κ, lc_var)`. 못 재면 None.
+
+        `plan_shift_span` 이 cKDTree 를 세우므로(≈4.6 ms) **한 번만 부르고**
+        두 지표를 같이 낸다.
+
+        · κ  — 목표 이웃 차로 오프셋의 횡곡률 최대값 [1/m]. 계단 검출용 (B-7).
+        · lc_var — span 안에서 **빌드 시점 계획 횡오프셋**(`_lat_build`)이 변하는
+          폭 [m]. 계획 차선변경이 회피 구간과 겹치는지 본다 (B-11). 겹치면
+          `lat_shift = _lat_build ± d` 라 두 횡이동이 **합산**되어, 지시등 한 번에
+          차로 경계를 두 번 넘는 일이 생긴다 (실측 6.25 m = 차로폭의 2.08 배).
 
         찾는 것은 곡률이 아니라 **계단 불연속**이다 (B-7). 실측 2026-09-01
         실전주행_교통류_01 의 시프트 span [6033,6465] 은 경로점 6362 에서
@@ -695,7 +706,14 @@ class KrRules:
         if len(d) < 3:
             return None
         h = step / ppm
-        return float(np.abs(d[2:] - 2.0 * d[1:-1] + d[:-2]).max()) / (h * h)
+        kap = float(np.abs(d[2:] - 2.0 * d[1:-1] + d[:-2]).max()) / (h * h)
+        base = getattr(planner, '_lat_build', None)
+        lc = 0.0
+        if base is not None and b > a:
+            seg = np.asarray(base[int(a):int(b)], dtype=float)
+            if seg.size:
+                lc = float(seg.max() - seg.min())
+        return kap, lc
 
     def _shift_speed_cap(self, planner, ego_speed: float) -> float | None:
         """진행 중인 회피 시프트의 전이 곡률에서 나오는 **속도 상한** — min() 후보.
@@ -1173,14 +1191,20 @@ class KrRules:
             # ⑤ 기하 계단 검사 (B-7 임시 가드) — 다른 게이트를 다 통과한 뒤에만
             # 잰다 (읽기 전용이지만 span 하나에 1.7~5.2 ms 든다). 상태를 남기지
             # 않으므로 기각은 **그 시점 그 경로 한정**이고 다음 틱에 다시 시도한다.
-            kap = self._planned_shift_kappa(planner, actor, side, trans_m)
-            if kap is not None:
-                (self.last_avoid or {}).update({'shift_kappa': round(kap, 4)})
-            if (self.shift_k_reject > 0.0 and kap is not None
-                    and kap > self.shift_k_reject):
-                self.last_overtake = f'{side}:kappa'
-                (self.last_avoid or {}).update({'reject': f'{side}:kappa'})
-                continue
+            geom = self._planned_shift_geom(planner, actor, side, trans_m)
+            if geom is not None:
+                kap, lc_var = geom
+                (self.last_avoid or {}).update(
+                    {'shift_kappa': round(kap, 4), 'lc_var': round(lc_var, 3)})
+                if self.shift_k_reject > 0.0 and kap > self.shift_k_reject:
+                    self.last_overtake = f'{side}:kappa'
+                    (self.last_avoid or {}).update({'reject': f'{side}:kappa'})
+                    continue
+                # 계획 LC 와 겹치면 기각 (B-11) — 합산 횡이동을 만들지 않는다
+                if self.lc_overlap_m > 0.0 and lc_var > self.lc_overlap_m:
+                    self.last_overtake = f'{side}:lc_overlap'
+                    (self.last_avoid or {}).update({'reject': f'{side}:lc_overlap'})
+                    continue
             span = planner.shift_route_around_actors(
                 actor,
                 obstacle_direction='right' if side == 'left' else 'left',

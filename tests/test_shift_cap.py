@@ -194,9 +194,23 @@ class StepPlanner(Planner):
         return self._off
 
 
-def kappa_of(kr, offsets):
+def geom_of(kr, offsets, lat_build=None):
     p = StepPlanner(offsets)
-    return kr._planned_shift_kappa(p, actor=None, side='right', trans_m=12.0)
+    if lat_build is not None:
+        # lc_var 는 _lat_build[span] 을 보므로 span 을 배열에 맞춘다
+        p._lat_build = np.asarray(lat_build, dtype=float)
+        p._span = (0, len(p._lat_build))
+    return kr._planned_shift_geom(p, actor=None, side='right', trans_m=12.0)
+
+
+def kappa_of(kr, offsets):
+    g = geom_of(kr, offsets)
+    return None if g is None else g[0]
+
+
+def lc_of(kr, lat_build):
+    g = geom_of(kr, [3.0] * 40, lat_build)
+    return None if g is None else g[1]
 
 
 def test_flat_neighbour_offset_has_zero_kappa():
@@ -244,4 +258,48 @@ def test_reject_threshold_separates_measured_cases():
 def test_kappa_is_none_when_planner_lacks_api():
     """구형 플래너(목 포함)에서는 None — 게이트가 조용히 통과한다."""
     kr = KrRules(CFG)
-    assert kr._planned_shift_kappa(Planner(), actor=None, side='right', trans_m=12.0) is None
+    assert kr._planned_shift_geom(Planner(), actor=None, side='right', trans_m=12.0) is None
+
+
+# ── 계획 LC 중첩 검사 (B-11) ─────────────────────────────────────────────
+LC_REJECT = OT['shift_lc_overlap_m']
+
+
+def test_lc_overlap_is_zero_without_planned_lane_change():
+    """span 안에서 계획 횡오프셋이 평평하면 lc_var = 0 — 정상 회피다."""
+    kr = KrRules(CFG)
+    assert lc_of(kr, [3.349] * 40) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_lc_overlap_measures_planned_blend():
+    """실측 재현: span 안에서 계획 LC 가 2.597 m 변하면 그대로 잡힌다."""
+    kr = KrRules(CFG)
+    n = 40
+    build = [3.349 + 2.597 * i / (n - 1) for i in range(n)]
+    assert lc_of(kr, build) == pytest.approx(2.597, rel=1e-6)
+
+
+def test_lc_overlap_reject_is_off_by_default():
+    """기본 params 는 계측만 한다 — 기각하지 않는다 (B-11 미활성)."""
+    assert LC_REJECT == 0.0
+    assert KrRules(CFG).lc_overlap_m == 0.0
+
+
+def test_lc_overlap_threshold_separates_measured_cases():
+    """권고 임계 1.0 은 실측 정상(0.000)과 중첩 건(2.597) 사이에 있다."""
+    cfg = copy.deepcopy(CFG)
+    cfg['overtake']['shift_lc_overlap_m'] = 1.0
+    kr = KrRules(cfg)
+    n = 40
+    assert lc_of(kr, [3.349] * n) < kr.lc_overlap_m
+    assert lc_of(kr, [3.349 + 2.597 * i / (n - 1) for i in range(n)]) > kr.lc_overlap_m
+
+
+def test_lc_overlap_zero_when_planner_lacks_lat_build():
+    """_lat_build 가 없는 플래너(목)에서는 0 — 게이트가 조용히 통과한다."""
+    kr = KrRules(CFG)
+    p = StepPlanner([3.0] * 40)
+    if hasattr(p, '_lat_build'):
+        del p._lat_build
+    g = kr._planned_shift_geom(p, actor=None, side='right', trans_m=12.0)
+    assert g is not None and g[1] == 0.0
