@@ -272,8 +272,10 @@ overtake:
   enabled: true
   # 이 속도 미만이면 '정적' 으로 본다 [m/s]
   blocker_speed_max: 0.5
-  # 이 거리 안의 선행차만 대상 [m]
-  blocker_dist_max: 20.0
+  # 이 거리 안의 선행차만 대상 [m]. shift_latest_m + 5 이상이어야 한다 (B-8):
+  # standoff 정지(25 m)에서 _blocker 가 대상을 잡아야 REACTIVE·BREAKOUT 이
+  # 무장된다. 20 이던 때는 25 m 에 서면 어느 것도 서지 않았다 (2026-09-03 실측).
+  blocker_dist_max: 30.0
   # 막힌 채 정지가 이 시간 지속되면 발동 [s] — 신호 대기와 구분하는 것이 아니라
   # (신호는 앞차가 없다) 잠깐 멈춘 앞차에 성급히 반응하지 않기 위한 것
   trigger_s: 3.0
@@ -318,6 +320,8 @@ overtake:
   # 서면 geom 게이트가 영영 못 열린다 (실측 5~10 m 정차 → 매 틱 geom 기각).
   # 부작용(의도): WAIT_EXPIRED 는 s_rel > standoff(25) ∧ obj_s ≥ 6 의 좁은 창으로
   # 축소된다 — 25 m 안에 들어오면 PREEMPT 의 t_left 가 음수라 먼저 걸린다.
+  # 기준점: s_rel 은 자차 뒷축 → 객체 중심. standoff 25 = 앞범퍼–객체 후미 ≈ 18 m
+  # (앞범퍼 3.8 + 승용차 반길이 2.2). 실측 2026-09-03 001829/01: s_rel 24.2 정지.
   shift_latest_m: 25.0
   # 전이 길이 속도 비례 계수 [s]. 코사인 전이의 최대 횡가속
   #   a_lat = v²·Δ·π²/(2L²)  →  L = v·√(Δπ²/(2·a_lat))

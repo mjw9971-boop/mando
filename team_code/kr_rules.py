@@ -1162,9 +1162,7 @@ class KrRules:
         # 본다. 가장 가까운 대상의 s_rel 이 관찰 감속(standoff 상한)의 기준이다.
         # PREEMPT/WAIT 판정은 아래 corridor(_static_ok) 그대로다. standoff_stop_s
         # 가 0 이면 이전 동작(corridor[0]). 적색 중에는 위의 억제 반환이 먼저라
-        # 여기 오지 않는다 — C 에서 활성.
-        self.wait_target_d = None
-        self.standoff_id = None
+        # 여기 오지 않는다 — C 에서 활성. 리셋은 apply 틱 머리에서 (B-8).
         if self.standoff_stop_ticks > 0:
             so_objs = self._corridor_blockers(ap, planner, static_ok=self._stop_ok)
             if so_objs:
@@ -1811,6 +1809,13 @@ class KrRules:
         ego_speed = ap._vehicle.get_velocity().length()
         self.last_candidate = None
         self.last_stop_profile = None
+        # standoff 대상은 **매 틱 새로** 정한다 (B-8). 예전에는 _try_overtake 의
+        # 회랑 블록에서만 리셋해, 억제 반환·SHIFT_HOLD·span 활성 조기 반환 틱마다
+        # 직전 값이 얼어붙었다 (실측 2026-09-03 5로그 전부: standoff_d 39.0/37.2/
+        # 33.0/14.3 이 수십 초 유지, 001829/01 은 시프트 직후 24.2 < 25 로 v_allow 0
+        # → 시프트를 만들고도 정지).
+        self.wait_target_d = None
+        self.standoff_id = None
         self.last_d_end = d_end
         self._ap = ap
         self.last_yellow = None
