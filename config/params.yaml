@@ -7,7 +7,7 @@
 # PDM-Lite 이식으로 폐기 — 필요해지면 kr_rules.py 도입 시 여기로 되살린다.
 
 comm:
-  host: 192.168.10.1
+  host: 192.168.50.11
   port: 9910
   send_hz: 20
   watchdog_s: 1.0
