@@ -266,6 +266,12 @@ class KrRules:
         self.ot_trans_m = float(ot['transition_m'])
         self.ot_before_m = float(ot['extra_before_m'])
         self.ot_after_m = float(ot['extra_after_m'])
+        # 연쇄 장애물 병합 (B-9). 회랑에서 다음 정지 객체가 앞 객체 + 이 거리 안이면
+        # 한 span 으로 묶는다. 기본 = 뒤여유 + 전이 = 22: 그보다 가까우면 복귀 전이가
+        # 다음 객체 위에 떨어진다. 0 = 비활성 (단일 객체 span = 이전 동작).
+        self.chain_gap_m = float(ot.get('chain_gap_m', self.ot_after_m + self.ot_trans_m))
+        # span 활성 중에도 회랑·standoff·막힘 회계를 돌린다 (B-9 (5)). false = 이전 동작.
+        self.span_active_standoff = bool(ot.get('span_active_standoff_enable', True))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -719,7 +725,8 @@ class KrRules:
             return False
         return str(col) == 'yellow'
 
-    def _planned_shift_geom(self, planner, actor, side, trans_m, ahead_m=None):
+    def _planned_shift_geom(self, planner, actor, side, trans_m, ahead_m=None,
+                            last_actor=None):
         """적용 **전** 시프트 기하 검사 → `(κ, lc_var)`. 못 재면 None.
 
         ahead_m: 전이 시작 여유 [m]. None 이면 shift_ahead_m (B-2 의 L3 완화가
@@ -748,7 +755,7 @@ class KrRules:
         try:
             ppm = float(getattr(planner, 'points_per_meter', 10))
             a, b, left = planner.plan_shift_span(
-                actor, obstacle_direction='right' if side == 'left' else 'left',
+                actor, last_actor, obstacle_direction='right' if side == 'left' else 'left',
                 transition_length=trans_m * ppm,
                 extra_length_before=self.ot_before_m * ppm,
                 extra_length_after=self.ot_after_m * ppm,
@@ -1118,7 +1125,20 @@ class KrRules:
             self.ot_span = None
             self.last_overtake = 'restored'
             return
-        if not self.ot_enabled or self.ot_span is not None:
+        if not self.ot_enabled:
+            return
+        if self.ot_span is not None:
+            # 시프트 활성 중 (B-9 (5)) — **생성**만 건너뛴다. 회랑(밀린 경로 기준)·
+            # standoff·막힘 회계는 계속 돈다: 복귀 전이 위에 다음 장애물이 있으면
+            # standoff 가 25 m 앞에 세운다. 적색이면 위 SHIFT_HOLD 가 먼저 반환한다.
+            # false 면 이전 동작(아무것도 안 봄).
+            if self.span_active_standoff:
+                corridor = self._corridor_blockers(ap, planner)
+                self._standoff_target(ap, planner, corridor)
+                self._blocked_account(ap, planner, ego_speed)
+                self.last_avoid = {'state': 'SHIFT_ACTIVE', 'span': list(self.ot_span),
+                                   'blocker': corridor[0][3].id if corridor else None,
+                                   's_rel': round(corridor[0][0], 1) if corridor else None}
             return
 
         # ── 절대 규칙: 적신호·황색 STOP 앞에서는 회피 자체가 없다 ─────────
@@ -1158,18 +1178,7 @@ class KrRules:
         # 이면 더 못 기다리므로 즉시 시프트한다. 아니면 최대 wait 까지 관찰.
         actor = None
         preempt = False
-        # standoff 대상 (B-5) — 회랑 조건은 같되 '정지' 는 신호 무관 카운터로
-        # 본다. 가장 가까운 대상의 s_rel 이 관찰 감속(standoff 상한)의 기준이다.
-        # PREEMPT/WAIT 판정은 아래 corridor(_static_ok) 그대로다. standoff_stop_s
-        # 가 0 이면 이전 동작(corridor[0]). 적색 중에는 위의 억제 반환이 먼저라
-        # 여기 오지 않는다 — C 에서 활성. 리셋은 apply 틱 머리에서 (B-8).
-        if self.standoff_stop_ticks > 0:
-            so_objs = self._corridor_blockers(ap, planner, static_ok=self._stop_ok)
-            if so_objs:
-                self.wait_target_d = so_objs[0][0]
-                self.standoff_id = so_objs[0][3].id
-        elif corridor:
-            self.wait_target_d = corridor[0][0]
+        self._standoff_target(ap, planner, corridor)
         if corridor:
             s_rel, lat, _hw, cand = corridor[0]
             obj_s = self.obj_ticks.get(cand.id, 0) / self.hz
@@ -1197,8 +1206,7 @@ class KrRules:
         # 영원히 무장되지 않았다** (replay 실측: 기각 10틱 동안 ot_blocked_ticks 0,
         # REACTIVE 0, BREAKOUT 0).
         # 시프트에 성공하면 아래에서 0 으로 리셋하는 기존 관례는 그대로다.
-        blocked = ego_speed < self.latch_v and self._blocker(ap, planner) is not None
-        self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
+        self._blocked_account(ap, planner, ego_speed)
 
         # ── REACTIVE: 막힌 채 정지가 지속되면 (기존 경로) ─────────────────
         # 회랑 후보(PREEMPT/WAIT_EXPIRED)가 있어도 **무장한다**. 회계만 밖으로
@@ -1225,6 +1233,12 @@ class KrRules:
             return
 
         local_s = self._ego_local_s(lg, ap)
+        # 연쇄 장애물 병합 (B-9) — 회랑에서 actor 뒤로 chain_gap_m 안에 이어지는
+        # 정지 객체를 한 span 으로 묶는다. 실측 2026-09-03 정적회피집중_01 t=74.6:
+        # id3(47.2)·id4(65.3) 18 m 간격인데 id3 만 보고 span 을 만들어 복귀 전이가
+        # id4 위에 떨어졌고, 밀린 경로 기준으로 id4 는 선행차 판정에서 빠져(on_route
+        # False) OBB 후보가 5.7 m 에서야 서 범퍼 −2.2 m 접촉.
+        chain = self._chain(corridor, actor)
         # ── side 루프 두 바퀴 (B-3) ────────────────────────────────────────
         # 1바퀴: 점선(solid) 게이트를 BREAKOUT 단계와 무관하게 **강제**한다 —
         #        점선 회랑이 있으면 여기서 끝난다 (실선을 넘을 이유가 없다).
@@ -1235,23 +1249,71 @@ class KrRules:
         #        같으므로 돌지 않는다 — cKDTree(≈4.6 ms) 재호출을 아낀다.
         #        solid_second_pass_enable=false 면 1바퀴만 = 이전 동작.
         self.ot_pass_solid = False
-        if self._side_pass(ap, planner, ego_speed, actor, preempt,
+        if self._side_pass(ap, planner, ego_speed, chain, preempt,
                            lg, ego_lane, local_s, 1):
             return
         if self.solid_second_pass and self.ot_pass_solid:
-            if self._side_pass(ap, planner, ego_speed, actor, preempt,
+            if self._side_pass(ap, planner, ego_speed, chain, preempt,
                                lg, ego_lane, local_s, 2):
                 return
         if self.last_overtake is None:
             self.last_overtake = 'no_neighbor'
 
-    def _side_pass(self, ap, planner, ego_speed: float, actor, preempt: bool,
+    def _standoff_target(self, ap, planner, corridor) -> None:
+        """standoff(관찰 감속) 대상 선정 (B-5) — 매 틱 apply 머리에서 None 으로
+        리셋된 뒤 여기서만 채운다 (B-8).
+
+        회랑 조건은 corridor 와 같되 '정지' 는 신호 무관 카운터(_stop_ok)로 본다.
+        가장 가까운 대상의 s_rel 이 standoff 상한의 기준이다. PREEMPT/WAIT 판정은
+        corridor(_static_ok) 그대로. standoff_stop_s 0 이면 이전 동작(corridor[0]).
+        """
+        if self.standoff_stop_ticks > 0:
+            so_objs = self._corridor_blockers(ap, planner, static_ok=self._stop_ok)
+            if so_objs:
+                self.wait_target_d = so_objs[0][0]
+                self.standoff_id = so_objs[0][3].id
+        elif corridor:
+            self.wait_target_d = corridor[0][0]
+
+    def _blocked_account(self, ap, planner, ego_speed: float) -> None:
+        """'막힌 채 정지' 회계 (B-10) — 자차 상태만으로 센다. span 활성 중에도 돈다."""
+        blocked = ego_speed < self.latch_v and self._blocker(ap, planner) is not None
+        self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
+
+    def _chain(self, corridor, actor) -> dict:
+        """actor 에서 시작하는 연쇄 장애물 (B-9). corridor 는 s_rel 오름차순.
+
+        반환 {'first', 'last', 'ids', 'extent_m'} — extent_m 은 첫 객체와 마지막
+        객체의 s_rel 차 (단일이면 0). span 은 first 앞 ~ last 뒤 하나로 만든다
+        (PDM 원문 plan_shift_span 의 first/last_actor). geom need 는 first 기준,
+        zone·solid 는 extent_m 만큼 늘어난 span 기준. chain_gap_m 0 = 비활성.
+        """
+        out = {'first': actor, 'last': actor, 'ids': [actor.id], 'extent_m': 0.0}
+        if self.chain_gap_m <= 0.0 or not corridor:
+            return out
+        idx = next((i for i, c in enumerate(corridor) if c[3].id == actor.id), None)
+        if idx is None:                                    # REACTIVE 의 _blocker 가 회랑 밖
+            return out
+        s_first = s_prev = corridor[idx][0]
+        for s_rel, _lat, _hw, a in corridor[idx + 1:]:
+            if s_rel - s_prev > self.chain_gap_m:
+                break
+            out['ids'].append(a.id)
+            out['last'] = a
+            s_prev = s_rel
+        out['extent_m'] = s_prev - s_first
+        return out
+
+    def _side_pass(self, ap, planner, ego_speed: float, chain: dict, preempt: bool,
                    lg, ego_lane, local_s: float, n_pass: int) -> bool:
         """side 루프 한 바퀴 (좌측 우선). 시프트를 적용했으면 True.
 
         n_pass ≥ 2 면 solid 게이트를 건너뛴다 (B-3). 기각 라벨은
         `{side}:{gate}@p{n}` 이고 last_avoid 에 'pass' 를 남긴다.
+        chain 은 _chain() 결과 — first 가 게이트 거리 기준, first~last 가 span (B-9).
         """
+        actor, last = chain['first'], chain['last']
+        chain_last = None if last is actor else last
         # BREAKOUT 사다리 — 단계는 solid·occupied 가 아니라 zone·geom 완화에 쓴다
         # (B-2). solid 는 두 바퀴 구조(B-3)가, occupied 는 lvl<1 이 그대로 본다.
         lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
@@ -1275,7 +1337,8 @@ class KrRules:
             # 길이' 라 이미 지나온 조각도 통과시킨다 (실측: 앞 점선 5 m 인데
             # 76.4 반환 → span 84.1 m 가 전 구간 실선 위에 얹혔다).
             trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
-            span_m = 2.0 * trans_m + self.ot_before_m + self.ot_after_m
+            span_m = (2.0 * trans_m + self.ot_before_m + self.ot_after_m
+                      + chain['extent_m'])                 # 연쇄면 첫~끝 객체 길이만큼
             # 전이 시작 여유 — L3 이상은 shift_ahead_l3_m (B-2). 정지 상태에서
             # need = 12 + 1 + 2 = 15 m 가 된다. 게이트와 실제 시프트가 같은 값을 쓴다.
             ahead_m = (self.shift_ahead_l3_m if lvl >= self.geom_relax_lvl
@@ -1324,7 +1387,8 @@ class KrRules:
             # ⑤ 기하 계단 검사 (B-7 임시 가드) — 다른 게이트를 다 통과한 뒤에만
             # 잰다 (읽기 전용이지만 span 하나에 1.7~5.2 ms 든다). 상태를 남기지
             # 않으므로 기각은 **그 시점 그 경로 한정**이고 다음 틱에 다시 시도한다.
-            geom = self._planned_shift_geom(planner, actor, side, trans_m, ahead_m)
+            geom = self._planned_shift_geom(planner, actor, side, trans_m, ahead_m,
+                                            last_actor=chain_last)
             if geom is not None:
                 kap, lc_var = geom
                 (self.last_avoid or {}).update(
@@ -1337,7 +1401,7 @@ class KrRules:
                     reject('lc_overlap')
                     continue
             span = planner.shift_route_around_actors(
-                actor,
+                actor, chain_last,
                 obstacle_direction='right' if side == 'left' else 'left',
                 transition_length=trans_m * ppm,
                 extra_length_before=self.ot_before_m * ppm,
@@ -1352,9 +1416,10 @@ class KrRules:
             (self.last_avoid or {}).update(
                 {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
                  'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
-                 'solid_relaxed': skip_solid})
+                 'solid_relaxed': skip_solid, 'chain': list(chain['ids']),
+                 'span_m': round(span_m, 1)})
             print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
-                  f'(id={actor.id}, 구간 {span[0]}~{span[1]}, p{n_pass})', flush=True)
+                  f'(id={chain["ids"]}, 구간 {span[0]}~{span[1]}, p{n_pass})', flush=True)
             return True
         return False
 
