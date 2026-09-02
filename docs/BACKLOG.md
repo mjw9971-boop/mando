@@ -262,7 +262,7 @@ lat_shift − _lat_build:  ... −4.281 | −1.414  −1.417  −1.420 ...
    계단은 span+32.9 m — **13.8 m 뒤, 복귀 전이 안**이다. 즉 자차는 그 시프트로
    장애물을 **이미 지나간 뒤** 계단을 만난다. span 전체를 veto 하면 성공한
    회피를 통째로 잃는다. 표본이 1건뿐이라 계단이 항상 뒤에 오는지는 모른다.
-2. **기각 후 사다리가 이어지지 않는다.** PREEMPT/WAIT_EXPIRED 경로에서는
+2. **기각 후 사다리가 이어지지 않는다** (별건: **B-10**). PREEMPT/WAIT_EXPIRED 경로에서는
    `actor` 가 None 이 아니라 `ot_blocked_ticks` 가 증가하지 않는다 → REACTIVE 가
    무장되지 않는다. replay 실측: 기각 10틱(0.5 s) 뒤 `red_ahead` 억제가
    이어받았고 **BREAKOUT 은 0틱**이었다 (적색 앞에서는 `dc56e2e` 대로 카운터가
@@ -270,7 +270,8 @@ lat_shift − _lat_build:  ... −4.281 | −1.414  −1.417  −1.420 ...
    CREEP_FAIL" 이고, 그건 회피가 막으려던 실패 그 자체다.
 
 **켜는 조건**: 배치에서 (a) 계단이 장애물보다 **앞**에 오는 사례가 확인되거나,
-(b) 기각 시 폴백을 REACTIVE 까지 잇도록 `ot_blocked_ticks` 를 손보고 나서.
+(b) 기각 시 폴백을 REACTIVE 까지 잇도록 `ot_blocked_ticks` 를 손보고 나서
+(= **B-10** 수정).
 켜기는 `overtake.shift_kappa_reject: 1.0` 한 줄이고 부정 테스트는 이미 있다
 (`tests/test_shift_cap.py`).
 
@@ -310,3 +311,73 @@ ctrl 149 뿐, hOffset=π). `collect_stops` 는 `controller_ids or signal_ids`
 
 **같은 계열**: "신호는 있는데 정지선이 없다" controller 15개 (2026-09-01
 지도 조사). 이 건은 그 반대 방향이다.
+
+---
+
+## B-10. REACTIVE 미무장 — 회랑 후보가 있으면 `ot_blocked_ticks` 가 멈춘다
+
+**상태**: 보류 — **배치·현장 뒤**. B-7 켜는 조건 (b)와 상호 참조.
+가드(`61b1917`)와 **무관한 회피 사다리 자체의 결함**이다.
+
+**증상**: [kr_rules.py `_try_overtake`](../team_code/kr_rules.py) 의 REACTIVE
+회계가 `if actor is None:` 안에 있다.
+
+```python
+if corridor:
+    ...
+    if 시간예산 소진:   actor, preempt = cand, True   # PREEMPT
+    elif obj_s >= wait_s: actor, preempt = cand, True # WAIT_EXPIRED
+    else:                 ...                          # WAIT (actor 는 None)
+
+if actor is None:                                      # ← 여기
+    blocked = ego_speed < latch_v and self._blocker(...) is not None
+    self.ot_blocked_ticks = self.ot_blocked_ticks + 1 if blocked else 0
+    if self.ot_blocked_ticks < self.ot_ticks:
+        return
+    actor = self._blocker(...)
+    self.last_avoid = {'state': 'REACTIVE', ...}
+```
+
+PREEMPT·WAIT_EXPIRED 로 들어오면 `actor` 가 None 이 아니므로 이 블록을
+통째로 건너뛴다 → **`ot_blocked_ticks` 가 증가하지 않는다** → REACTIVE 가
+영원히 무장되지 않는다. 그 상태에서 아래 side 루프의 게이트가 기각하면
+(`no_neighbor` / `span_into_zone` / `solid` / `occupied` /
+`center_line`(`127f3b0`) / `kappa`(`61b1917`)) 함수는 아무것도 하지 않고
+빠져나가고, 다음 틱에 같은 일이 반복된다.
+
+**현재 상태 — 잠재 결함이다.** 2026-09-01 배치(20260901_174724) 실측:
+
+| | 좌회전24 | 좌회전8 |
+|---|---:|---:|
+| PREEMPT / WAIT_EXPIRED | 2 / 1 틱 | 1 / 0 틱 |
+| 그중 시프트 성공 | 3 / 3 | 1 / 1 |
+| side 루프 기각 | 0 | 0 |
+| REACTIVE 등장 | **0 틱** | **0 틱** |
+
+즉 이 배치에서는 게이트가 한 번도 기각하지 않아 **발현하지 않았다**.
+재현은 κ 기각을 켠 replay 에서 확인했다 — WAIT_EXPIRED + `reject:right:kappa`
+가 10틱 지속되는 동안 `ot_blocked_ticks` 는 0 이었고 REACTIVE 는 0틱,
+BREAKOUT 도 0틱이었다 (`red_ahead` 가 이어받아 카운터를 일시정지 — `dc56e2e`).
+
+**왜 지금 중요해졌나**: 최근 이틀에 side 루프 게이트를 둘 늘렸다
+(`center_line` `127f3b0`, `kappa` `61b1917`). 게이트가 늘수록 기각 확률이
+올라가고, 그만큼 이 경로에 닿을 확률이 올라간다.
+
+**비용의 크기**: 탈출이 REACTIVE(`overtake.trigger_s` 3 s)에서
+BREAKOUT(`overtake.stuck_hard_s` 10 s)로 밀린다 — **약 7 s 지연**. 적신호
+앞에서는 BREAKOUT 도 일시정지하므로 녹색까지 더 밀린다. 다만 REACTIVE 가
+쓰는 side 루프 게이트는 PREEMPT 와 **같으므로**, 같은 기하에서는 REACTIVE 도
+같은 이유로 기각될 공산이 크다 — 실질 탈출은 게이트를 완화하는
+BREAKOUT 사다리(L1 회랑·측방 / L2 실선 / L3 여유폭 / L4 크립)다.
+그래서 **치명적이지는 않고, 탈출 지연이 본질**이다.
+
+**수정 후보 (미확정)**
+- `ot_blocked_ticks` 회계를 `if actor is None:` 밖으로 빼서 **자차 상태**
+  (정지 + 전방 차단)만으로 세게 한다. 단 PREEMPT 로 시프트에 성공한 직후
+  0 으로 리셋하는 현재 관례는 유지해야 한다.
+- 또는 side 루프가 **전부 기각했을 때만** `ot_blocked_ticks` 를 증가시킨다
+  (기각을 "막힌 것" 으로 세는 쪽. 의미상 더 정확하다).
+
+**재개 조건**: 실주행 배치에서 `reasons.avoid.reject` 가 PREEMPT/WAIT_EXPIRED
+상태와 함께 지속되는 구간이 나오면 착수한다. B-7 의 켜는 조건 (b) 가 곧
+이 항목의 수정이다.
