@@ -566,6 +566,12 @@ overtake:
   # true = 원복 검사를 먼저 하고, 홀드 중에도 span 활성과 같이 standoff·회계를
   # 돌린다 (span_active_standoff_enable 과 결합). false = 이전 동작.
   shift_hold_restore_enable: true
+  # E-7 적색 일시정지 거리 상한 [m]. 다음 적신호 정지선이 이보다 멀면 회피 계층은
+  # 적색을 없는 것으로 본다 — 관찰 일시정지(obj_ticks)·큐 B·BREAKOUT 일시정지.
+  # 근거(2026-09-03 8로그 리플레이): 진짜 대기열(큐 AB, 교통류)은 정지선 12~52 m
+  # 에서 잡혔고, 큐 B 단독은 전부 137~501 m 앞 적신호였다 (정지 차량 1대를 456 m
+  # 앞 신호의 대기열로 오판 → 020439/03 12 s, 02 25 s 정지). 0 = 거리 무관(이전).
+  red_pause_max_m: 100.0
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

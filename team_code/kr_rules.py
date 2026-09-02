@@ -291,6 +291,8 @@ class KrRules:
         self.bo_reject_clock = bool(ot.get('breakout_reject_clock_enable', False))
         # E-6 SHIFT_HOLD: 원복 검사 우선 + 홀드 중 standoff·회계.
         self.hold_restore = bool(ot.get('shift_hold_restore_enable', False))
+        # E-7 적색 일시정지 거리 상한 [m] (관찰 pause·큐 B·BREAKOUT pause). 0 = 무제한.
+        self.red_pause_max_m = float(ot.get('red_pause_max_m', 0.0))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -644,6 +646,21 @@ class KrRules:
         if self.standoff_stop_ticks <= 0:
             return self._static_ok(actor)
         return self.obj_stop_ticks.get(getattr(actor, 'id', None), 0) >= self.standoff_stop_ticks
+
+    def _red_pause(self, planner) -> float | None:
+        """회피 계층이 '적색' 으로 보는 거리 (E-7) — _red_ahead 에 거리 상한을 둔 것.
+
+        _red_ahead 는 거리 무관이다 (legacy 억제의 설계). queue_only 에서 적색은
+        억제가 아니라 일시정지 입력인데, 456 m 앞 적신호가 관찰 pause·큐 B·BREAKOUT
+        pause 를 걸어 정지 차량 1대를 그 신호의 대기열로 오판했다 (실측 2026-09-03
+        020439/03 12 s, 02 25 s 정지). 진짜 대기열은 정지선 12~52 m 에서 잡혔고 큐 B
+        단독은 전부 137 m 이상이었다. red_pause_max_m 0 = 상한 없음 (이전 동작).
+        SHIFT_HOLD 는 이 함수를 쓰지 않는다 — 홀드는 E-6 으로 무해하다.
+        """
+        d = self._red_ahead(planner)
+        if d is None or self.red_pause_max_m <= 0.0 or d <= self.red_pause_max_m:
+            return d
+        return None
 
     def _blocker(self, ap, planner):
         """앞을 막고 선 정적 장애물 → VtdActor. 없으면 None.
@@ -1036,7 +1053,10 @@ class KrRules:
         sig_hold = (state in ('Red', 'Yellow')
                     or (state == 'Green' and self.q_ticks > 0
                         and self.green_since_ticks < self.q_green_release_ticks))
-        cond_b = (sig_hold and d_sl is not None
+        # E-7: 정지선이 red_pause_max_m 보다 멀면 그 신호의 대기열일 수 없다.
+        red_near = (d_sl is not None
+                    and (self.red_pause_max_m <= 0.0 or d_sl <= self.red_pause_max_m))
+        cond_b = (sig_hold and red_near
                   and all(b[0] < d_sl for b in blockers))
         if not (cond_a or cond_b):
             # 직전까지 큐였는데 녹색 유지 시한이 끝나 B 가 사라진 것이면 해제 사유를
@@ -1052,7 +1072,10 @@ class KrRules:
         cond = ('A' if cond_a else '') + ('B' if cond_b else '')
         info = {'cond': cond, 'head_id': int(head[3].id), 'n': len(blockers),
                 'q_s': round(self.q_ticks / self.hz, 1),
-                'green_s': round(self.green_since_ticks / self.hz, 1), 'ped_guard': None}
+                'green_s': round(self.green_since_ticks / self.hz, 1), 'ped_guard': None,
+                # E-7 진단 — 정지선까지(자차·선두) 거리. 큐 B 오판 사후 판정 근거.
+                'd_sl': None if d_sl is None else round(d_sl, 1),
+                'head_sl': None if d_sl is None else round(d_sl - head[0], 1)}
         if signaled:
             # 선두 '여전히 정지' 는 blockers 자체가 보장한다 (정지 객체만 들어온다).
             if self.green_since_ticks >= self.q_green_release_ticks:
@@ -1191,7 +1214,8 @@ class KrRules:
         # 적색·황색 STOP 중에는 **일시정지**한다 — 카운터·단계를 그대로 두고
         # 행동(진입·상승·크립)만 멈춘다. 리셋하면 녹색이 짧은 교차로에서
         # BREAKOUT 이 영영 안 서고, 앞차가 고장 나 있어도 탈출이 안 걸린다.
-        if self._red_ahead(planner) is not None:
+        # 거리 상한은 E-7 (_red_pause) — 456 m 앞 적신호로 멈추지 않는다.
+        if self._red_pause(planner) is not None:
             self.bo_paused = True
             return
         # 교차로 안도 **일시정지** (C-6, queue_only). side 루프가 교차로 lane 에서
@@ -2376,7 +2400,7 @@ class KrRules:
 
         # 정적 장애물 회피 — 경로를 밀면 PDM 의 선행차 판정에서 빠져 다시 달린다.
         self.last_avoid = None
-        red_pause = self._red_ahead(planner) is not None
+        red_pause = self._red_pause(planner) is not None   # E-7: 거리 상한 적용
         self._update_obj_timers(ap, paused=red_pause)
         # 틱당 1회 캐시 (C-2) — standoff 축 회랑과 큐 판정. q_ticks 는 **여기서만**
         # 증가한다: _try_overtake 와 _obstacle_cause 가 각자 _is_queue 를 부르면
