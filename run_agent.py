@@ -102,6 +102,9 @@ def build_pdm_config(cfg: dict) -> 'GlobalConfig':
     pdm = cfg.get('pdm') or {}
     if 'idm_leading_vehicle_time_headway' in pdm:
         gc.idm_leading_vehicle_time_headway = float(pdm['idm_leading_vehicle_time_headway'])
+    # A-2: forecast_walkers 상자 최소 반폭. config.py 기본 0.5, 1.5 = 원문(원복 스위치).
+    if 'pedestrian_minimum_extent' in pdm:
+        gc.pedestrian_minimum_extent = float(pdm['pedestrian_minimum_extent'])
     return gc
 
 

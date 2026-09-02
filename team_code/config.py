@@ -103,7 +103,13 @@ class GlobalConfig:
         # IDM acceleration exponent (default = 4.)
         self.idm_acceleration_exponent = 4.0
         # Minimum extent for pedestrian during bbs forecasting
-        self.pedestrian_minimum_extent = 1.5
+        # VTD: 원값 1.5 → 0.5 (A-2, 2026-09-03). VTD 보행자는 경로 끝·인도에서 정지한다.
+        # 반폭 1.5 = 3 m 상자는 인도(차로 중심 ≈3.2 m)에 서 있는 보행자를 차로에
+        # 겹치게 본다 — 실측 실전주행_교통류_02_직진11: 우측 인도 |lat| 3.17 m 정지
+        # 보행자 앞에서 PDM 후보 0 으로 121 s 무한 정지(no_progress). 걸어나오는
+        # 보행자의 조기 감지는 kr_rules._ped_intent(정지 관찰 후 횡속도 래치) 담당이라
+        # 안전 여유는 유지된다. 원복 = 1.5 (params.pdm.pedestrian_minimum_extent).
+        self.pedestrian_minimum_extent = 0.5
         # Factor to increase the ego vehicles bbs in driving direction during forecasting
         # when speed > extent_ego_bbs_speed_threshold
         self.high_speed_extent_factor_ego_x = 1.3
