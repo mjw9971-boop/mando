@@ -1810,23 +1810,29 @@ def ev_signal(ctx, v):
     return {'kind': 'signal', 'timing': timing, 'approaches': out}
 
 
-def _place_chain(ctx, n, spacing, frac):
-    """장애물 n개가 **한 가용구간 안에** 통째로 들어가는 시작 route_s. 없으면 None.
+def _place_in_one_span(ctx, frac, reach, need, claim, what):
+    """s 부터 s+reach 까지가 **한 가용구간 안에** 들어가는 시작 route_s. 없으면 None.
 
     왜 한 구간이어야 하는가 (2026-09-02 실측): pick_s 는 구간들을 이어붙인
-    길이축에서 비율 지점을 고를 뿐이고, 배치는 s0 + i*spacing 으로 raw route_s
-    를 따라간다. 그래서 체인이 구간 밖 — 교차로 안으로 걸어 나갔다. 표본 144
-    에서 개수 6 → 30% / 4 → 14~18% / 3 → 5% 가 교차로 내부에 장애물을 놓았다
-    (예: 좌회전 542 m 경로 spans=[(131,193),(259,355),(463,502)] 에서 s=219.7
-    이 junction 54 안). 교차로 안 장애물은 회피 연습이 아니라 채점 왜곡이다.
+    길이축에서 비율 지점을 고를 뿐인데, 여러 물체를 놓는 이벤트는 그 지점부터
+    raw route_s 로 뻗어 나간다. 그래서 뒷물체가 구간 밖 — 교차로 안으로 걸어
+    나갔다. obstacle_chain 표본 144 에서 개수 6 → 30% / 4 → 14~18% / 3 → 5%
+    가 교차로 내부에 장애물을 놓았고 (예: 좌회전 542 m 경로
+    spans=[(131,193),(259,355),(463,502)] 에서 s=219.7 이 junction 54 안),
+    narrow 도 같은 결함이 있었다 (실전주행_01_연속교차로24 s=1713.0).
+    교차로 안 장애물은 회피 연습이 아니라 채점 왜곡이다.
 
-    요청 위치(frac)가 들어가는 구간을 먼저 보고, 거기서 체인 꼬리가 넘치면
-    구간 안으로 당긴다. 그 구간이 겹침으로 막히면 요청 위치에서 가까운 구간
-    순으로 옮겨 본다 — 개수를 줄이는 것보다 위치를 옮기는 쪽이 먼저다.
+    요청 위치(frac)가 들어가는 구간을 먼저 보고, 거기서 꼬리가 넘치면 구간
+    안으로 당긴다. 그 구간이 겹침으로 막히면 요청 위치에서 가까운 구간 순으로
+    옮겨 본다 — 개수를 줄이거나 이벤트를 버리는 것보다 위치를 옮기는 쪽이 먼저다.
+
+    reach: 시작점에서 마지막 물체까지 [m]. need: pick_s 예약 길이 (종전 값).
+    claim: (lo, hi) — s 기준 점유 구간 오프셋. need·claim 을 종전 값 그대로
+    받는 이유는, 이미 한 구간에 들어가던 배치는 시작점도 점유 구간도 바뀌지
+    않아야 하기 때문이다 (기존 산출물 불변 조건).
     """
-    reach = (n - 1) * spacing           # 첫 장애물 → 마지막 장애물
     try:
-        want = pick_s(ctx.spans, frac, need=n * spacing + 20.0)
+        want = pick_s(ctx.spans, frac, need=need)
     except GenError:
         want = None                     # 가용축 전체가 짧다 — 구간만 보고 고른다
     cands = [(a, b) for a, b in ctx.spans if b - a >= reach]
@@ -1834,15 +1840,47 @@ def _place_chain(ctx, n, spacing, frac):
         cands.sort(key=lambda ab: 0.0 if ab[0] <= want <= ab[1]
                    else min(abs(ab[0] - want), abs(ab[1] - want)))
     for a, b in cands:
-        s = a if want is None else min(max(want, a), b - reach)
-        try:
-            # claim 폭은 종전 그대로다 — 이미 한 구간에 들어가던 체인은
-            # 시작점도 점유 구간도 같아야 한다 (기존 산출물 불변 조건).
-            ctx.claim(s - 20, s + n * spacing + 20, 'obstacle_chain')
-        except GenError:
-            continue                    # 다른 이벤트와 겹친다 — 다음 구간
+        lo, hi = a, b - reach           # 배치 전체가 구간 안에 남는 시작점 범위
+        target = lo if want is None else min(max(want, lo), hi)
+        s = _nearest_free(lo, hi, target, ctx.occupied, claim)
+        if s is None:
+            continue                    # 이 구간은 다른 이벤트가 통째로 막았다
+        ctx.claim(s + claim[0], s + claim[1], what)
         return s
     return None
+
+
+def _nearest_free(lo, hi, target, occupied, claim):
+    """[lo,hi] 안에서 claim 이 기존 점유와 안 겹치는, target 에 가장 가까운 s.
+
+    구간을 옮기기 전에 **같은 구간 안에서 먼저 민다** — 옮기면 요청 위치에서
+    멀어진다. 2026-09-02 실측: 밀기 없이 바로 옆 구간으로 보내면
+    정적회피집중_02_우회전 의 narrow 가 186.9 → 296.8 로 110 m 튀었다.
+    수정 전에도 186.9 는 구간 안이었으므로 그건 개선이 아니라 회귀다.
+
+    claim 은 (lo,hi) 오프셋이고 Ctx.claim 이 열린 겹침(s0 < b and a < s1)을
+    쓰므로, 점유 (o0,o1) 를 피하는 금지 구간은 열린 (o0-claim[1], o1-claim[0])
+    이다 — 경계에 딱 붙는 배치는 허용된다.
+    """
+    free = [(lo, hi)]
+    for o0, o1 in occupied:
+        bad0, bad1 = o0 - claim[1], o1 - claim[0]
+        nxt = []
+        for f0, f1 in free:
+            if bad1 <= f0 or bad0 >= f1:
+                nxt.append((f0, f1))
+                continue
+            if f0 < bad0:
+                nxt.append((f0, min(bad0, f1)))
+            if f1 > bad1:
+                nxt.append((max(bad1, f0), f1))
+        free = [iv for iv in nxt if iv[1] >= iv[0]]
+    best = None
+    for f0, f1 in free:
+        s = min(max(target, f0), f1)
+        if best is None or abs(s - target) < abs(best - target):
+            best = s
+    return best
 
 
 def ev_obstacle_chain(ctx, v):
@@ -1851,7 +1889,10 @@ def ev_obstacle_chain(ctx, v):
     spacing = 18.0
     s0 = None
     while n >= 2:
-        s0 = _place_chain(ctx, n, spacing, v['위치'])
+        s0 = _place_in_one_span(ctx, v['위치'], reach=(n - 1) * spacing,
+                                need=n * spacing + 20.0,
+                                claim=(-20.0, n * spacing + 20.0),
+                                what='obstacle_chain')
         if s0 is not None:
             break
         n -= 1                          # 어느 구간에도 안 들어간다 — 개수를 줄인다
@@ -1874,13 +1915,25 @@ def ev_obstacle_chain(ctx, v):
     return out
 
 
+# 양측 정차 차량의 (종거리 오프셋, 좌우 부호) — 우측 먼저, 14 m 뒤 좌측.
+# 배치와 "한 구간 안에 들어가는가" 판정이 같은 값을 봐야 해서 상수로 뺐다.
+NARROW_OFFSETS = ((0.0, -1.0), (14.0, 1.0))
+
+
 def ev_narrow(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
-    s = pick_s(ctx.spans, v['위치'], need=40.0)
-    ctx.claim(s - 30, s + 50, 'narrow')
+    # 두 대가 한 가용구간 안에 들어가야 한다 — 뒤차가 교차로로 넘어가면
+    # 협착이 아니라 교차로 안 정차 차량이 된다 (2026-09-02: 실전주행_01_
+    # 연속교차로24 의 narrow s=1713.0 이 구간 밖이었다).
+    reach = max(ds for ds, _ in NARROW_OFFSETS) - min(ds for ds, _ in NARROW_OFFSETS)
+    s = _place_in_one_span(ctx, v['위치'], reach=reach, need=40.0,
+                           claim=(-30.0, 50.0), what='narrow')
+    if s is None:
+        raise GenError(f'narrow: 정차 차량 두 대({reach:.0f} m)가 통째로 들어가는 '
+                       f'가용구간이 없다')
     intr = float(v.get('침범폭', 0.7))
     placed = []
-    for ds, sgn in ((0.0, -1.0), (14.0, 1.0)):       # 우측 먼저, 14 m 뒤 좌측
+    for ds, sgn in NARROW_OFFSETS:
         _, k, sl = lane_at(rt, s + ds)
         w = lg.width_at(k, sl)
         t = sgn * (w / 2.0 + CAR_W / 2.0 - intr)
