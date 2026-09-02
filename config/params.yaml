@@ -202,6 +202,16 @@ route:
   # 위 시간으로 환산한 거리의 하한·상한 [m] (저속·고속 방어)
   lc_move_min_m: 20.0
   lc_move_max_m: 45.0
+  # 종료선 뒤 경로 꼬리 최소 길이 [m] (tools/build_route.py 소비). 마지막 경유점
+  # 매칭 차로의 잔여가 이보다 짧으면 successor 를 따라 부족분을 연장한다.
+  # plan_stop_s(kr_rules) 요구량 = finish_clearance 2.0 + stop_gap 4.0 +
+  # wheelbase 2.944 + front_overhang 0.855 + end_slack 1.0 = 10.799 m. 12.0 은
+  # 그 요구량 + 여유. 꼬리가 부족하면 finish 정지가 클립돼 뒷축이 종료선 앞에
+  # 선다 (2026-09-03 실측: 대회형식 CSV 꼬리 15.0 m — 통과, 픽스처 0.2 m — 클립).
+  # 연장되면 total_length 도 같이 늘어난다 (route_total 폴백은 새 종점 기준).
+  finish_tail_m: 12.0
+  # false 면 꼬리 연장 안 함 (이전 동작).
+  finish_tail_enable: true
 
 route_check:
   # tools/build_route.py 의 경로 검증 리포트 임계 — 대회날 배포 CSV 를 받자마자
@@ -231,6 +241,10 @@ route_end:
   # stop_gap + 앞범퍼, total − end_slack); finish_xy 미설정이면 자동으로
   # route_total 동작 + 경고 1회). 'route_total' = 기존 경로 종점 기준.
   target_mode: finish
+  # scoring.finish_xy 가 null 일 때 route.pkl 의 finish_xy(CSV 마지막 행,
+  # tools/build_route.py 가 자동 기록)를 종료선으로 쓴다. score.py 도 같은
+  # 우선순위 — 제어·채점이 같은 값을 본다. false 면 route 값 무시 = 기존 동작.
+  finish_xy_from_route_enable: true
   idm_time_headway: 0.1     # 적신호 정지(idm_red_light_desired_time_headway)와 같은 축
   active_m: 150.0           # 이 거리 안에서만 후보 생성 (오검출 방지)
   latch_v: 0.5              # 정지 래치 진입 속도 — batch 완주 판정(v<0.5)과 같은 값
@@ -782,8 +796,10 @@ scoring:
   major_penalty: 6
   respawn_free_per_section: 1
   # 완주 = 뒷바퀴 축이 종료 지점 좌표 통과 (경로 투영 route_s 로 환산 판정).
-  # null 이면 기존 route_s 임계(end_margin) 방식 유지 + 경고.
-  # 실제 좌표는 9/3 접속 테스트에서 확보 후 기입.
+  # 주행 정지 위치 값. kr_rules._resolve_stop_s 가 읽는다. null 이면 CSV 마지막
+  # 행 자동 (build_route 가 route.pkl 에 넣은 finish_xy;
+  # route_end.finish_xy_from_route_enable 로 끈다). 둘 다 없으면 기존
+  # route_s 임계(end_margin) 방식 유지 + 경고.
   finish_xy: null               # [x, y]
   # 제어 정지 목표의 여유: 뒷축이 종료선을 이만큼 넘어 정지하도록 계획한다
   # (kr_rules.plan_stop_s). 채점 기준이 아니다 — 채점은 finish_s 통과 여부만 본다.
