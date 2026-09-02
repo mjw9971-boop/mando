@@ -178,6 +178,15 @@ class KrRules:
         # 보행자 의도 감지 (P4). 0 이면 비활성 = PDM forecast_walkers 에만 맡긴다.
         self.ped_intent_v = float(sp.get('ped_intent_v', 0.0))
         self.ped_emg_ratio = float(sp.get('ped_emergency_ratio', 0.0))
+        # 보행자 래치 **위치 기반 해제** (A-1). 0 이면 비활성 = 지나감·관측 끊김으로만
+        # 해제하는 이전 동작. 실측 2026-09-02 실전주행_교통류_02_좌회전8 id4: 횡단을
+        # 마치고 |lat| 8.8 m 에 서 있는데도 래치가 남아 로그 끝(118 s)까지 정지했다.
+        _hz = float(cfg['comm']['send_hz'])
+        self.ped_release_lat = float(sp.get('ped_release_lat_m', 0.0))
+        self.ped_release_ticks = int(round(float(sp.get('ped_release_s', 1.5)) * _hz))
+        self.ped_stop_v = float(sp.get('ped_stop_v', 0.2))
+        self.ped_offroad_lat = float(sp.get('ped_offroad_lat_m', 6.0))
+        self.ped_backstop_ticks = int(round(float(sp.get('ped_backstop_s', 30.0)) * _hz))
         self.a_emergency = float(sp.get('a_emergency', -8.0))
         self.a_dec_max = abs(float(cfg['control']['a_dec_max']))
         self.y_guard_max_m = float(sp.get('yellow_guard_max_m', 60.0))
@@ -278,6 +287,10 @@ class KrRules:
         self.ped_static: set = set()               # '정지 관찰' 을 마친 보행자 id
         self.ped_lat: dict = {}                    # id → 직전 틱의 경로 횡거리
         self.ped_intent: set = set()               # 의도 래치가 걸린 id
+        self.ped_clear: dict = {}                  # id → 해제 조건 연속 틱 (A-1)
+        self.ped_hold: dict = {}                   # id → 래치 유지 틱 (A-1 backstop)
+        self.ped_diag: dict = {}                   # id → 이번 틱 진단 (lat/v_toward/…)
+        self.ped_released: dict = {}               # id → 이번 틱 해제 사유
         self.last_ped: dict | None = None          # 이번 틱 진단 (reasons.ped)
         self.ped_emergency = False                 # 이번 틱 비상 제동 우회 여부
         self._sl_all: list | None = None           # 경로상 전 정지선 route_s (1회)
@@ -1356,6 +1369,8 @@ class KrRules:
         self.ped_lat.clear()
         self.ped_intent.clear()
         self.ped_static.clear()
+        self.ped_clear.clear()
+        self.ped_hold.clear()
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -1473,6 +1488,13 @@ class KrRules:
         래치는 보행자가 지나가면(뒤로 감) 또는 관측이 끊기면 풀린다. 정지 목표는
         보행자의 **횡단 지점**이고 gap 은 PDM 주입값
         `idm_pedestrian_minimum_distance` 를 그대로 읽는다 (단일 출처).
+
+        위치 기반 해제 (A-1, `_ped_release_tick`) — 횡단을 **마친** 보행자는 뒤로
+        가지 않아 위 두 해제로는 절대 풀리지 않는다 (실측 2026-09-02 좌회전8 id4:
+        |lat| 8.8 m 에 서 있는데 로그 끝까지 정지). 회랑 밖(|lat| > ped_release_lat_m)
+        에서 경로 쪽으로 오지 않고(v_toward ≤ 0) **멈췄거나 차도 밖이면**
+        ped_release_s 동안 지속 시 해제. 도로 위를 계속 걷는 동안은 유지한다
+        (되돌아올 수 있다). backstop: 회랑 밖이면 ped_backstop_s 뒤 조건 무관 해제.
         """
         if self.ped_intent_v <= 0.0 or self.stop_profile_a <= 0.0:
             return None
@@ -1482,6 +1504,8 @@ class KrRules:
             return None
         live = set()
         best = None
+        self.ped_diag = {}
+        self.ped_released = {}
         s0 = float(getattr(getattr(ap, 'config', None),
                            'idm_pedestrian_minimum_distance', 4.0))
         for w in walkers:
@@ -1492,25 +1516,41 @@ class KrRules:
             loc = w.get_location()
             pr = self._project(planner, loc.x, loc.y)
             if pr is None:
+                # 투영 불가 틱 — 직전 횡거리는 버리고(차분이 무의미) 해제 카운터도
+                # 리셋한다. 래치와 hold 는 유지 — 관측이 끊긴 것이 아니다.
                 self.ped_lat.pop(wid, None)
+                self.ped_clear.pop(wid, None)
                 continue
             s_rel, lat = pr
             prev = self.ped_lat.get(wid)
             self.ped_lat[wid] = lat
+            # 경로 쪽 횡속도 — |lat| 이 줄어드는 속도, 멀어지면 음수. 래치 여부와
+            # 무관하게 매 틱 산출한다 (해제 판정과 진단이 같은 값을 본다).
+            v_toward = None if prev is None else (abs(prev) - abs(lat)) * self.hz
             if self._static_ok(w):
                 self.ped_static.add(wid)               # 정지 관찰 완료 (지속 기억)
             if not (0.0 < s_rel <= self.detect_max_m):
-                self.ped_intent.discard(wid)           # 지나갔거나 범위 밖
+                self._ped_unlatch(wid)                 # 지나갔거나 범위 밖
                 continue
             if wid not in self.ped_intent:
-                if wid not in self.ped_static or prev is None:
+                if wid not in self.ped_static or v_toward is None:
                     continue
-                # 경로 쪽 횡속도 — |lat| 이 줄어드는 속도. 멀어지면 음수다.
-                v_toward = (abs(prev) - abs(lat)) * self.hz
                 if (float(getattr(w, 'speed', 0.0)) < self.ped_intent_v
                         or v_toward < self.ped_intent_v):
                     continue
                 self.ped_intent.add(wid)
+                self.ped_clear[wid] = 0
+                self.ped_hold[wid] = 0
+            why = self._ped_release_tick(wid, w, lat, v_toward)
+            self.ped_diag[wid] = {
+                'lat': round(float(lat), 2),
+                'v_toward': None if v_toward is None else round(float(v_toward), 2),
+                'clear_s': round(self.ped_clear.get(wid, 0) / self.hz, 1),
+                'hold_s': round(self.ped_hold.get(wid, 0) / self.hz, 1)}
+            if why is not None:
+                self._ped_unlatch(wid)
+                self.ped_released[wid] = why
+                continue
             d_eff = s_rel - self.front - s0
             v_allow = _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_eff))
             # 분모 하한 0.5 m — d_eff→0 에서 a_req 가 발산해 로그가 못 쓰게 된다.
@@ -1521,7 +1561,7 @@ class KrRules:
         # 관측이 끊긴 id 정리 (obj_ticks 의 grace 와 별개 — 여기선 즉시)
         for wid in list(self.ped_intent):
             if wid not in live:
-                self.ped_intent.discard(wid)
+                self._ped_unlatch(wid)
         for wid in list(self.ped_static):
             if wid not in live and wid not in self.obj_ticks:
                 self.ped_static.discard(wid)
@@ -1529,6 +1569,42 @@ class KrRules:
             if wid not in live:
                 self.ped_lat.pop(wid, None)
         return best
+
+    def _ped_unlatch(self, wid) -> None:
+        """래치 해제 + 해제 카운터 정리 (지나감·끊김·위치 해제 공통)."""
+        self.ped_intent.discard(wid)
+        self.ped_clear.pop(wid, None)
+        self.ped_hold.pop(wid, None)
+
+    def _ped_release_tick(self, wid, w, lat: float, v_toward) -> str | None:
+        """래치된 보행자의 **위치 기반 해제** 판정 (A-1). 투영이 된 틱마다 부른다.
+
+        카운터를 갱신하고 해제 사유('clear' / 'backstop') 또는 None 을 준다.
+          · clear   : 회랑 밖(|lat| > ped_release_lat_m) ∧ 경로 쪽으로 오지 않음
+                      (v_toward ≤ 0) ∧ (보행자 정지 speed < ped_stop_v ∨ 차도 밖
+                      |lat| > ped_offroad_lat_m) 이 ped_release_s 연속. 한 틱이라도
+                      깨지면 처음부터 — 되돌아오는 보행자는 즉시 다시 구속한다.
+          · backstop: 래치 후 ped_backstop_s 가 지났고 **지금 회랑 밖**이면 조건
+                      무관 해제. 회랑 안(|lat| ≤ ped_release_lat_m)이면 유지.
+        보행자 속도(자차 아님)를 보는 이유 — 도로 위를 걷는 동안은 방향을 바꿔
+        되돌아올 수 있어, 멈추거나 차도를 완전히 벗어나야 '지나갔다' 고 본다.
+        """
+        if self.ped_release_lat <= 0.0:
+            return None
+        outside = abs(lat) > self.ped_release_lat
+        self.ped_hold[wid] = self.ped_hold.get(wid, 0) + 1
+        away = v_toward is not None and v_toward <= 0.0
+        settled = (float(getattr(w, 'speed', 0.0)) < self.ped_stop_v
+                   or abs(lat) > self.ped_offroad_lat)
+        if outside and away and settled:
+            self.ped_clear[wid] = self.ped_clear.get(wid, 0) + 1
+        else:
+            self.ped_clear[wid] = 0
+        if self.ped_clear[wid] >= self.ped_release_ticks:
+            return 'clear'
+        if outside and self.ped_hold[wid] >= self.ped_backstop_ticks:
+            return 'backstop'
+        return None
 
     def _standoff_profile(self, ego_speed: float) -> float | None:
         """WAIT/관찰 중 **장애물 앞 standoff 에 서도록** 하는 속도 상한 — min() 후보.
@@ -1726,7 +1802,15 @@ class KrRules:
             if candidate is None or v_allow < candidate:
                 candidate = v_allow
             self.last_ped = {'id': int(wid), 'v_allow': round(float(v_allow), 2),
-                             'a_req': round(float(a_req), 2), 'wins': bool(ped_bind)}
+                             'a_req': round(float(a_req), 2), 'wins': bool(ped_bind),
+                             **self.ped_diag.get(wid, {})}
+            if self.ped_released:                       # 다른 id 가 같은 틱에 해제됨
+                self.last_ped['released'] = {int(k): v for k, v in self.ped_released.items()}
+        elif self.ped_released:
+            # 해제 틱 — 후보는 없지만 사유·직전 계측을 남긴다 (A-1 검증용).
+            wid, why = next(iter(self.ped_released.items()))
+            self.last_ped = {'id': int(wid), 'wins': False, 'release': why,
+                             **self.ped_diag.get(wid, {})}
 
         # 보행자 비상 우회 — **보행자 후보가 최종 목표를 구속하는 틱 한정**이다.
         # 선행차·신호·종점·크립 후보가 이긴 틱에서는 절대 발동하지 않는다.
