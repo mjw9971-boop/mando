@@ -187,6 +187,11 @@ class KrRules:
         self.ped_stop_v = float(sp.get('ped_stop_v', 0.2))
         self.ped_offroad_lat = float(sp.get('ped_offroad_lat_m', 6.0))
         self.ped_backstop_ticks = int(round(float(sp.get('ped_backstop_s', 30.0)) * _hz))
+        # 걷는 채로 등장한 보행자 래치 (A-4). false 면 정지 관찰(ped_static) 전제 그대로.
+        self.walkin_enable = bool(sp.get('ped_walkin_enable', False))
+        self.walkin_v = float(sp.get('ped_walkin_v', 0.5))
+        self.walkin_ticks = int(round(float(sp.get('ped_walkin_s', 0.5)) * _hz))
+        self.walkin_lat = float(sp.get('ped_walkin_lat_m', 8.0))
         # 횡단보도 앞 서행 (A-3). false 면 비활성 = 서 있는 보행자는 PDM forecast 에만.
         self.cw_enable = bool(sp.get('ped_crosswalk_creep_enable', False))
         self.cw_zone_m = float(sp.get('ped_crosswalk_zone_m', 10.0))
@@ -381,6 +386,7 @@ class KrRules:
         self.green_since_ticks = 0                 # 다음 신호가 녹색인 연속 틱 (C-3 해제)
         self.green_tl_id = None
         self.ped_vt: dict = {}                     # 보행자 id → 직전 틱 v_toward (C-3 가드)
+        self.ped_walkin: dict = {}                 # 보행자 id → 걷는 채 접근 연속 틱 (A-4)
         self.cw_wait: dict = {}                    # 보행자 id → 횡단보도 대기 정지 틱 (A-3)
         self._cw_zones: list | None = None         # 경로상 횡단보도 [route_s 구간] (1회)
         self.wait_target_d: float | None = None    # 관찰 감속 목표 (장애물까지 거리)
@@ -2090,6 +2096,7 @@ class KrRules:
         self.ped_clear.clear()
         self.ped_hold.clear()
         self.cw_wait.clear()
+        self.ped_walkin.clear()
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -2254,14 +2261,18 @@ class KrRules:
                 self._ped_unlatch(wid)                 # 지나갔거나 범위 밖
                 continue
             if wid not in self.ped_intent:
-                if wid not in self.ped_static or v_toward is None:
+                if v_toward is None:
                     continue
-                if (float(getattr(w, 'speed', 0.0)) < self.ped_intent_v
-                        or v_toward < self.ped_intent_v):
+                w_speed = float(getattr(w, 'speed', 0.0))
+                if wid in self.ped_static:
+                    if w_speed < self.ped_intent_v or v_toward < self.ped_intent_v:
+                        continue
+                elif not self._ped_walkin(wid, w_speed, v_toward, lat):
                     continue
                 self.ped_intent.add(wid)
                 self.ped_clear[wid] = 0
                 self.ped_hold[wid] = 0
+                self.ped_walkin.pop(wid, None)
             why = self._ped_release_tick(wid, w, lat, v_toward)
             self.ped_diag[wid] = {
                 'lat': round(float(lat), 2),
@@ -2292,7 +2303,28 @@ class KrRules:
         for wid in list(self.ped_vt):
             if wid not in live:
                 self.ped_vt.pop(wid, None)
+        for wid in list(self.ped_walkin):
+            if wid not in live:
+                self.ped_walkin.pop(wid, None)
         return best
+
+    def _ped_walkin(self, wid, w_speed: float, v_toward: float, lat: float) -> bool:
+        """걷는 채로 등장한 보행자의 래치 조건 (A-4) — 정지 관찰(ped_static) 없이.
+
+        GT 범위(80 m) 안으로 걸어 들어오거나 걷는 상태로 스폰된 보행자는 ped_static
+        전제 때문에 래치되지 않았고, A-2 로 PDM 상자가 0.5 가 되어 그런 보행자의 PDM
+        검출 시점이 3.44 → 2.44 m 로 늦어진다 (무단횡단 시나리오 직결). 여기서는
+        연속 ped_walkin_s 동안 보행자 속도 ≥ ped_intent_v ∧ 경로 쪽 횡속도 ≥ ped_walkin_v
+        ∧ |lat| < ped_walkin_lat_m 이면 래치한다. 정지 관찰 경로(0.3, 1틱)보다 임계·
+        시간을 두는 이유는 노이즈 여유 — 첫 관측 틱의 횡거리 차분은 스폰·코스팅으로
+        튈 수 있다. 한 틱이라도 깨지면 처음부터. 래치 후 동작·해제는 A-1 그대로.
+        """
+        if not self.walkin_enable:
+            return False
+        ok = (w_speed >= self.ped_intent_v and v_toward >= self.walkin_v
+              and abs(lat) < self.walkin_lat)
+        self.ped_walkin[wid] = self.ped_walkin.get(wid, 0) + 1 if ok else 0
+        return self.ped_walkin[wid] >= self.walkin_ticks
 
     def _crosswalk_zones(self, planner) -> list:
         """경로상 횡단보도 route_s 구간 [(s0, s1) …]. 시작 시 1회 (A-3).

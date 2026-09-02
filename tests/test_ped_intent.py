@@ -136,10 +136,13 @@ def test_receding_pedestrian_never_latches():
         assert walk(kr, ap, p, w, dy=-2.5 / HZ, ticks=1) is None
 
 
-def test_never_observed_static_does_not_latch():
-    """정지 관찰이 없으면(이미 걷고 있던 보행자) 이 경로로는 안 잡는다 —
-    그런 보행자는 PDM 예측이 정상적으로 덮는다 (과검출 방지)."""
-    kr, p = make()
+def test_never_observed_static_does_not_latch_via_static_path():
+    """정지 관찰이 없으면(이미 걷고 있던 보행자) **정지 관찰 경로**로는 안 잡는다.
+    A-4 이후 그런 보행자는 걷는 채 접근 경로(ped_walkin, 0.5 s)가 잡는다 — 여기서는
+    그 스위치를 끄고 옛 전제를 고정한다 (과검출 방지). 켜진 동작은 test_ped_walkin."""
+    cfg = copy.deepcopy(CFG)
+    cfg['speed']['ped_walkin_enable'] = False
+    kr, p = make(cfg)
     w = Walker(7, 25.0, -5.0, speed=2.5)
     ap = Ap(p, actors=[w])
     for _ in range(40):

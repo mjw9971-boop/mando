@@ -85,6 +85,18 @@ speed:
   # backstop — 래치 후 이 시간이 지났고 지금 회랑 밖이면 조건 무관 해제.
   # 회랑 안이면 유지 (보행자가 경로 위에 서 있는 한 절대 안 푼다).
   ped_backstop_s: 30.0
+  # ── 걷는 채로 등장한 보행자 래치 (A-4, 2026-09-03) ─────────────────────
+  # _ped_intent 는 정지 관찰(obj_static_s)을 마친 보행자만 래치했다. GT 80 m 안으로
+  # 걸어 들어오거나 걷는 상태로 스폰된 보행자는 그 전제에 걸려 래치가 없고, A-2 로
+  # PDM 상자가 0.5 가 되어 PDM 검출도 3.44 → 2.44 m 로 늦어진다 (무단횡단 직결).
+  # 정지 관찰 없이도 연속 ped_walkin_s 동안 보행자 속도 ≥ ped_intent_v ∧ 경로 쪽
+  # 횡속도 ≥ ped_walkin_v ∧ |lat| < ped_walkin_lat_m 이면 래치. 정지 관찰 경로(0.3 /
+  # 1틱)보다 임계·시간을 두는 것은 노이즈 여유. 래치 후 동작·해제는 A-1 그대로.
+  # false = 이전 동작.
+  ped_walkin_enable: true
+  ped_walkin_v: 0.5
+  ped_walkin_s: 0.5
+  ped_walkin_lat_m: 8.0
   # ── 횡단보도 앞 서행 (A-3, 2026-09-03). 기본 false = 비활성. ─────────────
   # 전방 횡단보도(레인그래프 crosswalks, 없으면 정지선) ±ped_crosswalk_zone_m 안에
   # |lat| < ped_crosswalk_lat_m 로 **서 있는**(speed < ped_stop_v) 보행자가 있으면,
