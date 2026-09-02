@@ -207,6 +207,9 @@ class KrRules:
         self.hz = float(cfg['comm']['send_hz'])
         # 규칙 1 — 신호 구역 억제
         self.sup_m = float(ot.get('stopline_suppress_m', 30.0))
+        # span_into_zone 게이트의 정지선 앞 여유 (B-1). _signal_zone 의 sup_m 과는
+        # 값을 공유만 했지 결합이 없었다 — 분리해 따로 튜닝한다. 0 = 정지선 자체.
+        self.zone_gate_margin = float(ot.get('zone_gate_margin_m', 0.0))
         self.queue_gap_min_m = float(ot.get('queue_gap_min_m', 3.0))
         self.queue_lat_max_m = float(ot.get('queue_lat_max_m', 1.5))
         # 규칙 3 — 선제 회피
@@ -476,10 +479,14 @@ class KrRules:
         return None
 
     def _next_stopzone_s(self, planner) -> float | None:
-        """다음 정지선 억제 구역이 **시작되는** route_s (= 정지선 − suppress_m).
+        """시프트 span 이 넘으면 안 되는 route_s (= 다음 정지선 − zone_gate_margin_m).
 
         시프트 span 이 여기를 넘으면 시작하지 않는다 — 시프트 도중 신호가 바뀌어
         억제 구역에 걸리면 되돌릴 방법이 없다(진행 중 급조향은 금지).
+        예전에는 _signal_zone 의 stopline_suppress_m(30) 을 그대로 뺐다 (B-1 전).
+        두 함수는 상수를 공유만 했을 뿐 결합이 없어, 정지선 30 m 앞에서 span 이
+        끝나야 하는 과한 조건이 됐다 — 정지 위치 25 m + span 39 m 면 정지선 64 m
+        앞부터 기각이다. 여유는 zone_gate_margin_m 이 따로 정한다.
         """
         route_s = float(planner.route_s[planner.route_index])
         cands = []
@@ -490,7 +497,7 @@ class KrRules:
         except Exception:                                   # noqa: BLE001
             pass
         cands += [s for s in self._all_stopline_s(planner) if s >= route_s]
-        return (min(cands) - self.sup_m) if cands else None
+        return (min(cands) - self.zone_gate_margin) if cands else None
 
     def _signal_zone(self, planner, ap) -> tuple | None:
         """신호 구역이면 (사유, 거리), 아니면 None — 회피 계열 전면 억제 게이트.

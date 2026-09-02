@@ -38,6 +38,7 @@ from test_avoid import (Ap, Box, HARD_TICKS, ESC_TICKS, STATIC_TICKS,  # noqa: E
 CFG = load_params_yaml(PARAMS_YAML)
 OT = CFG['overtake']
 SUP_M = OT['stopline_suppress_m']
+ZONE_M = OT['zone_gate_margin_m']             # span_into_zone 여유 (B-1, sup_m 과 별개)
 HZ = CFG['comm']['send_hz']
 FRONT = CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m']
 S0 = CFG['speed']['stop_gap_stopline_m'] + FRONT
@@ -149,11 +150,11 @@ def test_queue_judgement_runs_when_green():
 
 # ── 시프트 기하 게이트 ──────────────────────────────────────────────────
 def test_shift_span_into_stopzone_is_rejected():
-    """span 이 억제 구역(정지선−30 m)을 넘으면 시작하지 않는다."""
+    """span 이 경계(정지선 − zone_gate_margin_m)를 넘으면 시작하지 않는다."""
     kr, p = make(d_tl=float('inf'))
-    kr._sl_all = [40.0]                                   # 정지선 40 m 앞
+    kr._sl_all = [30.0]                                   # 정지선 30 m 앞
     zone_lo = kr._next_stopzone_s(p)
-    assert zone_lo == pytest.approx(40.0 - SUP_M)
+    assert zone_lo == pytest.approx(30.0 - ZONE_M)
     span_m = 2 * OT['transition_m'] + OT['extra_before_m'] + OT['extra_after_m']
     assert span_m > zone_lo                                # 이 span 은 기각돼야 한다
 
@@ -161,10 +162,10 @@ def test_shift_span_into_stopzone_is_rejected():
 def test_stopzone_start_uses_nearest_of_signal_and_stopline():
     kr, p = make(d_tl=100.0)
     kr._sl_all = [40.0]
-    assert kr._next_stopzone_s(p) == pytest.approx(40.0 - SUP_M)
+    assert kr._next_stopzone_s(p) == pytest.approx(40.0 - ZONE_M)
     kr2, p2 = make(d_tl=20.0)
     kr2._sl_all = [400.0]
-    assert kr2._next_stopzone_s(p2) == pytest.approx(20.0 - SUP_M)
+    assert kr2._next_stopzone_s(p2) == pytest.approx(20.0 - ZONE_M)
 
 
 def test_active_shift_is_held_not_reverted_when_red_appears():
