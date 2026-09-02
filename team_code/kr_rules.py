@@ -293,6 +293,12 @@ class KrRules:
         self.hold_restore = bool(ot.get('shift_hold_restore_enable', False))
         # E-7 적색 일시정지 거리 상한 [m] (관찰 pause·큐 B·BREAKOUT pause). 0 = 무제한.
         self.red_pause_max_m = float(ot.get('red_pause_max_m', 0.0))
+        # E-4 예산 소진 래치 — 한 번 PREEMPT/WAIT_EXPIRED 가 된 차단물은 기각돼도
+        # 다음 틱 WAIT 로 되돌아가지 않는다. t_left 는 속도에 따라 출렁여(standoff 감속
+        # 중 v↓ → t_left↑) 예산 3 s 에서는 한 틱 기각 뒤 WAIT 로 튀어 E-3 시계가 끊겼다
+        # (replay 020439/01 t=38.0 PREEMPT → 38.05 WAIT → 39.85 WAIT_EXPIRED).
+        self.preempt_latch = bool(ot.get('preempt_latch_enable', False))
+        self.preempt_latch_id = None
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -1477,14 +1483,21 @@ class KrRules:
                     't_left': round(t_left, 1), 'budget': round(budget, 1)}
             # 정적 조건은 _static_ok — 장애물 클래스(E-1)는 관찰 없이 참이라
             # 예산 규칙이 t_left < budget 하나로 줄어든다.
-            if self._static_ok(cand) and t_left < budget:
+            if self.preempt_latch_id is not None and self.preempt_latch_id != cand.id:
+                self.preempt_latch_id = None                # 차단물이 바뀌었다 — 새로
+            latched = self.preempt_latch and self.preempt_latch_id == cand.id
+            if (self._static_ok(cand) and t_left < budget) or latched:
                 actor, preempt = cand, True
-                self.last_avoid = dict(base, state='PREEMPT')
+                self.last_avoid = dict(base, state='PREEMPT', latched=latched)
             elif obj_s >= self.wait_s:
                 actor, preempt = cand, True                 # 대기 만료 — 그래도 안 감
                 self.last_avoid = dict(base, state='WAIT_EXPIRED')
             else:
                 self.last_avoid = dict(base, state='WAIT')  # 앞차 출발 기회를 준다
+            if actor is not None and self.preempt_latch:
+                self.preempt_latch_id = cand.id             # E-4 래치 (기각돼도 유지)
+        else:
+            self.preempt_latch_id = None
 
         # ── '막힌 채 정지' 회계 (B-10) ───────────────────────────────────
         # **자차 상태만으로** 센다. 예전에는 이 회계가 아래 `if actor is None:`
@@ -1909,6 +1922,7 @@ class KrRules:
             planner._kd = _cKDTree(planner.route_points[:, :2])
             self.ot_span = span
             self.ot_blocked_ticks = 0
+            self.preempt_latch_id = None                   # E-4 래치 해제 (시프트 성공)
             self.last_overtake = side
             (self.last_avoid or {}).update(
                 {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),

@@ -407,7 +407,16 @@ overtake:
   # 일률 대기는 못 쓴다 — 10.6 m/s 에서 잔여 16 m 인데 전이가 42 m 면 늦는다.
   # 시간 예산 규칙: obj_s ≥ obj_static_s 이고 (d−standoff)/v < (wait−obj_s)
   # 이면 즉시 시프트, 아니면 최대 wait 까지 관찰.
-  wait_before_shift_s: 6.0
+  # 6.0 → 3.0 (E-4, 2026-09-03): 020439/02 는 WAIT 5.75 s 동안 standoff 감속으로
+  # 11 → 6.7 m/s 까지 떨어진 뒤에야 첫 시도를 했다. 차량은 obj_static_s(1.5) 관찰
+  # 뒤 t_left 예산이 남고, 장애물 클래스(E-1)는 관찰이 없어 t_left 판정만 남는다.
+  wait_before_shift_s: 3.0
+  # 예산 소진 래치 (E-4). 한 번 PREEMPT/WAIT_EXPIRED 가 된 차단물은 기각돼도 다음
+  # 틱 WAIT 로 되돌아가지 않는다 — t_left 는 standoff 감속으로 v 가 떨어지면 다시
+  # 커져 예산 3 s 에서는 한 틱 기각 뒤 WAIT 로 튀고, E-3 의 첫 기각 시계가 끊긴다
+  # (replay 020439/01 t=38.0 PREEMPT → 38.05 WAIT → 39.85 WAIT_EXPIRED). 차단물이
+  # 바뀌거나 시프트에 성공하면 해제. false = 이전 동작.
+  preempt_latch_enable: true
   # 점선 커버리지 허용 오차 [m] — 마킹 데이터 이산화 여유.
   dash_slack_m: 2.0
 
