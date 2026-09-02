@@ -528,6 +528,15 @@ overtake:
   # 도니 정상 주행 비용 0. false 면 1바퀴만 = 이전 동작 (실선 절대 안 넘음).
   solid_second_pass_enable: true
 
+  # ── E: 정적 장애물 반응성 (2026-09-03, 020439 3건 + 003759 5건 분석) ────
+  # 증상: 옆 차로가 비었는데 25 m 앞에 서서 10~30 s 기다리거나 끝내 못 갔다.
+  # E-1 장애물 클래스 fast path. vtd_adapter/world.classify 가 크기로 나눈
+  # cls('obstacle' = 길이 ≤ 3 m 정지 물체, 'vehicle' = 길이 > 3 m)를 읽어, obstacle
+  # 은 정지 관찰(obj_static_s·standoff_stop_s) 없이 즉시 정적으로 보고 큐 판정
+  # (_is_queue) 대상에서 뺀다 — 박스는 출발할 앞차가 아니고 신호 대기열도 아니다.
+  # 실측 020439/01 t=71~90: 박스 id4 가 선두인 큐 B 112틱. false = 이전 동작.
+  obstacle_class_fastpath_enable: true
+
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오
 # 정의와 함께 검토), 여기는 "후보 선별·추첨 알고리즘 상수"(lane_graph 자산과

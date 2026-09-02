@@ -278,6 +278,10 @@ class KrRules:
         self.chain_gap_m = float(ot.get('chain_gap_m', self.ot_after_m + self.ot_trans_m))
         # span 활성 중에도 회랑·standoff·막힘 회계를 돌린다 (B-9 (5)). false = 이전 동작.
         self.span_active_standoff = bool(ot.get('span_active_standoff_enable', True))
+        # ── E: 정적 장애물 반응성 (2026-09-03). 각각 false/0 이면 이전 동작. ──
+        # E-1 장애물 클래스(world.classify 의 cls=='obstacle') fast path — 관찰 없이
+        # 즉시 정적, 큐 판정 대상 제외.
+        self.obs_fastpath = bool(ot.get('obstacle_class_fastpath_enable', False))
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -609,12 +613,23 @@ class KrRules:
                 self.obj_stop_ticks.pop(oid, None)
                 self.obj_miss.pop(oid, None)
 
+    def _is_obstacle(self, actor) -> bool:
+        """장애물 클래스인가 (E-1). vtd_adapter/world.classify 가 9910 크기로 나눈
+        cls 를 읽는다 — 9910 에는 타입 필드가 없어(SPEC §1.1) 길이 ≤ 3 m 정지 물체가
+        'obstacle', 길이 > 3 m 가 'vehicle' 이다. 박스·라바콘·자재는 출발할 앞차가
+        아니므로 정지 관찰도 큐 판정도 의미가 없다. 스위치가 꺼지면 항상 거짓."""
+        return self.obs_fastpath and getattr(actor, 'cls', None) == 'obstacle'
+
     def _static_ok(self, actor) -> bool:
+        if self._is_obstacle(actor):
+            return True                                    # E-1: 감지 즉시 정적
         return self.obj_ticks.get(getattr(actor, 'id', None), 0) >= self.obj_static_ticks
 
     def _stop_ok(self, actor) -> bool:
         """standoff 대상 조건 (B-5) — 신호 무관 정지가 standoff_stop_s 이상.
         standoff_stop_s 0 = 킬 스위치: 정적 관찰(_static_ok) 축으로 되돌린다."""
+        if self._is_obstacle(actor):
+            return True                                    # E-1
         if self.standoff_stop_ticks <= 0:
             return self._static_ok(actor)
         return self.obj_stop_ticks.get(getattr(actor, 'id', None), 0) >= self.standoff_stop_ticks
@@ -972,6 +987,14 @@ class KrRules:
         가드 아님. 옛 15 s hold 는 없다 — 적색 38 s 에서 큐를 철회해 버렸다.
         """
         self.q_info = None
+        if blockers and self.obs_fastpath:
+            # E-1: 큐는 차량만이다. 박스가 선두든 사이에 끼었든 큐 형태에서 뺀다.
+            veh = [b for b in blockers if not self._is_obstacle(b[3])]
+            if not veh:
+                self.q_ticks = 0
+                self.q_reject = 'obstacle_class'
+                return False
+            blockers = veh
         if planner is None or not blockers:
             self.q_ticks = 0
             self.q_reject = None
@@ -1368,7 +1391,9 @@ class KrRules:
             base = {'blocker': cand.id, 's_rel': round(s_rel, 1), 'lat': round(lat, 2),
                     'obj_s': round(obj_s, 1), 'need_m': round(standoff, 1),
                     't_left': round(t_left, 1), 'budget': round(budget, 1)}
-            if obj_s >= self.obj_static_ticks / self.hz and t_left < budget:
+            # 정적 조건은 _static_ok — 장애물 클래스(E-1)는 관찰 없이 참이라
+            # 예산 규칙이 t_left < budget 하나로 줄어든다.
+            if self._static_ok(cand) and t_left < budget:
                 actor, preempt = cand, True
                 self.last_avoid = dict(base, state='PREEMPT')
             elif obj_s >= self.wait_s:
