@@ -994,11 +994,21 @@ class KrRules:
         state = nxt[1] if nxt else None
         d_sl = self._stopline_d(planner)
         cond_a = self._head_near_stopline(planner, head[0])
-        cond_b = (state in ('Red', 'Yellow') and d_sl is not None
+        # B 는 녹색 첫 틱에 사라지지 않는다 — 직전 틱까지 큐였다면(q_ticks > 0) 녹색
+        # q_green_release_s 까지 유지한다. 그래야 "녹색 3 s 경과 ∧ 선두 정지 → 해제"
+        # 가 성립한다 (실측 003759/05 t=103.9: 녹색 첫 틱에 PREEMPT → standoff 급정지).
+        sig_hold = (state in ('Red', 'Yellow')
+                    or (state == 'Green' and self.q_ticks > 0
+                        and self.green_since_ticks < self.q_green_release_ticks))
+        cond_b = (sig_hold and d_sl is not None
                   and all(b[0] < d_sl for b in blockers))
         if not (cond_a or cond_b):
+            # 직전까지 큐였는데 녹색 유지 시한이 끝나 B 가 사라진 것이면 해제 사유를
+            # 'green_expired' 로 남긴다 (진단·테스트가 head_far 와 구분한다).
+            expired = (self.q_ticks > 0 and state == 'Green'
+                       and self.green_since_ticks >= self.q_green_release_ticks)
             self.q_ticks = 0
-            self.q_reject = 'head_far'
+            self.q_reject = 'green_expired' if expired else 'head_far'
             return False
         self.q_ticks += 1
         signaled = state in ('Red', 'Yellow', 'Green')

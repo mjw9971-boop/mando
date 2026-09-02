@@ -123,6 +123,23 @@ def test_green_release_after_3s_when_head_still_stopped():
     assert kr.last_avoid['state'] in ('PREEMPT', 'WAIT', 'WAIT_EXPIRED')
 
 
+def test_cond_B_queue_survives_green_transition_until_release():
+    """적색 큐(B)는 녹색 첫 틱에 풀리지 않고 q_green_release_s 까지 유지된다."""
+    kr, p, ap = rig(xs=(10.0,), state=TrafficLightState.Red, d_tl=60.0)
+    assert kr._tick_queue is True and kr.q_info['cond'] == 'B'
+    p.next_traffic_lights = [TL(TrafficLightState.Green)] * len(p.route_s)
+    for i in range(GREEN_TICKS):
+        kr.green_since_ticks = i
+        kr._tick_cache(ap, p)
+        assert kr._tick_queue is True, i
+    kr.green_since_ticks = GREEN_TICKS
+    kr._tick_cache(ap, p)
+    assert kr._tick_queue is False and kr.q_reject == 'green_expired'
+    # 처음부터 녹색이면(직전 큐 없음) B 는 성립하지 않는다
+    kr2, p2, ap2 = rig(xs=(10.0,), state=TrafficLightState.Green, d_tl=60.0)
+    assert kr2._tick_queue is False
+
+
 def test_green_counter_tracks_signal_state_in_apply():
     """green_since_ticks 는 녹색 연속 틱, 다른 색이면 0, 신호 id 바뀌면 0."""
     from vtd_adapter.carla_types import VehicleControl
@@ -245,6 +262,7 @@ def test_breakout_pauses_under_red_and_resumes_green():
     drive(kr, p, ap, 20)
     assert kr.bo_paused is True and kr.bo_stuck_ticks == 20
     p.next_traffic_lights = [TL(TrafficLightState.Green)] * len(p.route_s)
+    kr.green_since_ticks = GREEN_TICKS                       # 녹색 3 s 경과 → 큐 해제
     kr._tick_cache(ap, p)
     drive(kr, p, ap, 1)
     assert kr.bo_stuck_ticks == 21
