@@ -466,3 +466,178 @@ def test_disabled_switch_never_arms():
     # apply 를 타지 않는 목이므로 _breakout_tick 을 직접 부르지 않는 경로를 모사
     assert kr.bo_enabled is False
     assert kr.breakout_creep() is False
+
+
+# ── B-10: '막힌 채 정지' 회계는 회랑 후보 유무와 무관하다 ────────────────
+def _blocked_ap(kr, p, oid=2, x=6.0):
+    """코앞에 정지 차량 하나 — _blocker 가 잡는 배치."""
+    b = Box(oid, x, 0.0, 0.0)
+    ap = Ap(p, actors=[b])
+    for _ in range(STATIC_TICKS + 2):
+        kr._update_obj_timers(ap)
+    return ap
+
+
+def test_blocked_ticks_accumulate_while_corridor_candidate_exists():
+    """PREEMPT/WAIT_EXPIRED 로 들어와 side 루프가 기각해도 카운터는 쌓인다.
+
+    옛 동작은 회계가 `if actor is None:` 안에 있어 회랑 후보(=actor)가 있으면
+    한 틱도 증가하지 않았다 → REACTIVE 가 영원히 무장되지 않았다 (B-10).
+    여기서는 lg 를 주지 않아 side 루프 직전에 빠지므로(no_lane) '기각과 같은
+    경로' 를 만든다.
+    """
+    kr, p = make(d_tl=float('inf'))
+    ap = _blocked_ap(kr, p)
+    assert kr.ot_blocked_ticks == 0
+    for n in range(1, 6):
+        kr._try_overtake(ap, p, ego_speed=0.0)          # 정지 + 전방 차단
+        assert kr.ot_blocked_ticks == n                  # 매 틱 증가한다
+    assert (kr.last_avoid or {}).get('state') in ('PREEMPT', 'WAIT', 'WAIT_EXPIRED')
+
+
+def test_reactive_arms_after_trigger_s_even_under_preempt():
+    """기각이 계속돼도 trigger_s 를 넘기면 REACTIVE 가 무장된다."""
+    kr, p = make(d_tl=float('inf'))
+    ap = _blocked_ap(kr, p)
+    for _ in range(kr.ot_ticks + 1):
+        kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_blocked_ticks >= kr.ot_ticks
+    assert kr.last_overtake == 'no_lane'                 # side 루프 직전까지 갔다
+    assert (kr.last_avoid or {}).get('state') == 'REACTIVE'
+
+
+def test_blocked_ticks_reset_when_moving():
+    """굴러가고 있으면 '막힌 채 정지' 가 아니다 — 0 으로 리셋."""
+    kr, p = make(d_tl=float('inf'))
+    ap = _blocked_ap(kr, p)
+    for _ in range(4):
+        kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_blocked_ticks == 4
+    kr._try_overtake(ap, p, ego_speed=5.0)               # 주행 중
+    assert kr.ot_blocked_ticks == 0
+
+
+def test_blocked_ticks_reset_when_nothing_blocks():
+    """전방에 막는 것이 없으면 카운터가 쌓이지 않는다."""
+    kr, p = make(d_tl=float('inf'))
+    ap = Ap(p, actors=[])
+    for _ in range(5):
+        kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_blocked_ticks == 0
+
+
+# ── B-12: 기하 완성 게이트 (전이가 장애물 앞에서 끝나는가) ───────────────
+GEOM_MARGIN = OT['shift_geom_margin_m']
+
+
+class LgOne:
+    """오른쪽 이웃만 있는 최소 레인그래프 목 — side 루프까지 도달시킨다."""
+
+    def __init__(self):
+        self.lanes = {(1, 0, -1): {'junction': -1}, (1, 0, -2): {'junction': -1}}
+
+    def neighbor(self, key, side):
+        return (1, 0, -2) if side == 'right' else None
+
+    def mark_at(self, key, s, side):
+        return ('broken', 'standard', True)
+
+    def dashed_runs(self, key, side):
+        return [(0.0, 1000.0)]
+
+    def length(self, key):
+        return 1000.0
+
+    def successors(self, key):
+        return []
+
+    def predecessors(self, key):
+        return []
+
+    def locate(self, x, y):
+        return None
+
+
+class GeomPlanner(Planner):
+    """시프트 적용을 흉내만 내는 목 — 게이트 통과 여부만 보면 되므로 경로는
+    건드리지 않는다 (span 만 돌려준다)."""
+
+    def shift_route_around_actors(self, first_actor, last_actor=None,
+                                  obstacle_direction='right', transition_length=120.0,
+                                  lane_transition_factor=1.0, extra_length_before=0.0,
+                                  extra_length_after=0.0, min_start_ahead=0):
+        a = self.route_index + int(min_start_ahead)
+        return a, a + int(2 * transition_length)
+
+
+def _geom_rig(cfg, obj_x, obs_ticks=None):
+    """장애물이 obj_x [m] 앞에 정지해 있는 배치. side 루프까지 들어간다.
+
+    관찰 틱을 wait_before_shift_s 이상 쌓아 WAIT_EXPIRED 로 진입시킨다 —
+    원거리 장애물은 PREEMPT 의 시간예산(t_left < budget)을 만족하지 못한다.
+    """
+    if obs_ticks is None:
+        obs_ticks = int(cfg['overtake']['wait_before_shift_s'] * HZ) + 5
+    p = GeomPlanner(d_tl=float('inf'))
+    p.lg = LgOne()
+    kr = KrRules(cfg)
+    kr._sl_all = []
+    b = Box(2, obj_x, 0.0, 0.0)
+    ap = Ap(p, actors=[b])
+    ap._kr_ego_lane = (1, 0, -1)
+    for _ in range(obs_ticks):
+        kr._update_obj_timers(ap)
+    return kr, p, ap
+
+
+def test_geom_gate_rejects_when_transition_cannot_finish():
+    """실측 재현 — s_rel 5.3 m, v 0 이면 need 19.0 m > 5.3 → 기각."""
+    kr, p, ap = _geom_rig(CFG, 5.3)
+    kr._try_overtake(ap, p, ego_speed=0.0)
+    need = CFG['overtake']['transition_m'] + OT['shift_ahead_m'] + GEOM_MARGIN
+    assert kr.ot_span is None                              # 시프트가 생기지 않았다
+    assert kr.last_overtake == 'right:geom'
+    a = kr.last_avoid or {}
+    assert a.get('reject') == 'right:geom'
+    assert a['need_geom'] == pytest.approx(need, abs=0.05)
+    assert a['margin'] < 0
+
+
+def test_geom_gate_passes_when_transition_finishes_in_time():
+    """여유가 충분하면 통과한다 — 정상 회피 회귀."""
+    kr, p, ap = _geom_rig(CFG, 52.3)
+    kr._try_overtake(ap, p, ego_speed=1.62)
+    assert kr.ot_span is not None                          # 시프트 생성됨
+    assert kr.last_overtake == 'right'
+
+
+def test_geom_gate_boundary_is_the_margin():
+    """need 와 정확히 같은 거리면 통과, 그보다 가까우면 기각."""
+    need = CFG['overtake']['transition_m'] + OT['shift_ahead_m'] + GEOM_MARGIN
+    kr, p, ap = _geom_rig(CFG, need + 0.2)
+    kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_span is not None
+    kr2, p2, ap2 = _geom_rig(CFG, need - 0.2)
+    kr2._try_overtake(ap2, p2, ego_speed=0.0)
+    assert kr2.ot_span is None and kr2.last_overtake == 'right:geom'
+
+
+def test_geom_gate_kill_switch_restores_old_behaviour():
+    """shift_geom_gate_enable: false 면 수정 전과 동일 — 기각하지 않는다."""
+    cfg = copy.deepcopy(CFG)
+    cfg['overtake']['shift_geom_gate_enable'] = False
+    kr, p, ap = _geom_rig(cfg, 5.3)
+    kr._try_overtake(ap, p, ego_speed=0.0)
+    assert kr.ot_span is not None                          # 옛 동작: 생성된다
+    assert kr.last_overtake == 'right'
+
+
+def test_geom_gate_scales_with_speed():
+    """trans_m 이 속도 비례로 커지면 필요 거리도 커진다 (재계산 없이 같은 값)."""
+    v = 8.0
+    trans = max(CFG['overtake']['transition_m'], OT['shift_k_s'] * v)
+    need = trans + OT['shift_ahead_m'] + GEOM_MARGIN
+    kr, p, ap = _geom_rig(CFG, need - 1.0)
+    kr._try_overtake(ap, p, ego_speed=v)
+    assert kr.ot_span is None and kr.last_overtake == 'right:geom'
+    assert (kr.last_avoid or {})['need_geom'] == pytest.approx(need, abs=0.05)
