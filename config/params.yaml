@@ -69,6 +69,22 @@ speed:
   # 건너뛰고 a_emergency 를 즉시 낸다 (보행자 후보 한정). 0 이면 비활성.
   # 실측: 후보 생성 후 −4.0 도달까지 1.0 s 가 걸려 그 사이 12.1 m 를 갔다.
   ped_emergency_ratio: 0.75
+  # 보행자 래치 위치 기반 해제 (A-1, 2026-09-02 실전주행_교통류_02_좌회전8 id4).
+  # 래치는 '지나감(뒤로 감)·관측 끊김' 으로만 풀렸는데, 횡단을 **마치고** 길가에
+  # 선 보행자는 둘 다 아니라 로그 끝까지(118 s) 정지했다. 회랑 밖(|lat| >
+  # ped_release_lat_m)에서 경로 쪽으로 오지 않고(v_toward ≤ 0) 멈췄거나(보행자
+  # speed < ped_stop_v) 차도 밖(|lat| > ped_offroad_lat_m)이면 ped_release_s
+  # 연속 시 해제. 도로 위를 걷는 동안은 되돌아올 수 있어 유지한다.
+  # ped_release_lat_m 0 이면 비활성 = 이전 동작.
+  ped_release_lat_m: 2.5
+  ped_release_s: 1.5
+  ped_stop_v: 0.2
+  # ped_offroad_lat_m 은 코스 최대 폭의 보수값 — 4차로(2+2)에서 6.0 은 반대 차로
+  # 한복판이라 '차도 밖' 이 아니다. 차선 그래프 기반 산출은 A-3.
+  ped_offroad_lat_m: 12.5
+  # backstop — 래치 후 이 시간이 지났고 지금 회랑 밖이면 조건 무관 해제.
+  # 회랑 안이면 유지 (보행자가 경로 위에 서 있는 한 절대 안 푼다).
+  ped_backstop_s: 30.0
   # 경로 종점(route_end) 계획 정지점 = 기준점 − stop_gap_route_end − 앞범퍼.
   # 완주 임계(end_margin_m)가 이 값을 따른다. (구 stop_gap_m — 정지선 정지와는
   # 무관하다: 정지선은 PDM red-light IDM 소관, 아래 stop_gap_stopline_m 참조)
