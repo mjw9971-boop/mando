@@ -1980,6 +1980,21 @@ def _nearest_free(lo, hi, target, occupied, claim):
 
 def ev_obstacle_chain(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
+    cfg = plc_cfg()
+    spans = None
+    if bool(cfg['obstacle_chain']['require_multi_lane']):
+        # 1차로 구간의 체인은 슬라럼이 아니라 차단이다 — 실측(2026-09-02,
+        # logs/batch/20260902_231132 정적회피집중_01_좌회전0): 1차로 (2818,6,-1)
+        # 에서 체인이 자차로를 직접 막아 충돌 1 + blocked 로 끝났다.
+        # 폭·구간 임계는 static_vehicle 과 같은 물리량이라 그쪽 값을 읽는다
+        # (값을 두 곳에 적지 않는다). 체인 전체(reach)가 2차로 부분구간 안에
+        # 들어가야 하므로 _place_in_one_span 의 spans 인자로 좁힌다.
+        sv = cfg['static_vehicle']
+        spans = _multi_lane_spans(ctx, float(sv['min_neighbor_width_m']),
+                                  float(sv['min_span_m']))
+        if not spans:
+            raise EventUnfeasible('obstacle_chain: 동일 방향 주행차로가 2개 이상인 '
+                                  '가용구간이 없다 — 1차로의 체인은 회피가 원천 불가다')
     n0 = n = int(v.get('개수', 4))
     spacing = 18.0
     s0 = None
@@ -1987,7 +2002,7 @@ def ev_obstacle_chain(ctx, v):
         s0 = _place_in_one_span(ctx, v['위치'], reach=(n - 1) * spacing,
                                 need=n * spacing + 20.0,
                                 claim=(-20.0, n * spacing + 20.0),
-                                what='obstacle_chain')
+                                what='obstacle_chain', spans=spans)
         if s0 is not None:
             break
         n -= 1                          # 어느 구간에도 안 들어간다 — 개수를 줄인다
@@ -2228,6 +2243,15 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
 
     pulk 는 pulk_def 결과 — 이벤트가 아니라 시나리오 전역 속성이라 events 와
     별도 인자로 받아 <PulkTraffic> 에 그대로 쓴다."""
+    if pulk is not None and any(ev == 'narrow' for ev, _v in events) \
+            and bool(plc_cfg().get('narrow_pulk_guard_enable', True)):
+        # narrow 는 pulk 교통류를 막는다 — internal-driver 차량이 협착을 못 지나
+        # 그 앞에 정체를 만들고 ego 가 갇힌다 (실측 2026-09-02: 실전주행_교통류_01_
+        # 좌회전24 · 정적회피집중_02_우회전, 근거는 params gen_placement 주석).
+        # 테마 정의(themes.yaml)와 저장된 정의(--from-yaml) 양쪽을 여기 한 곳에서
+        # 막는다. narrow 단독 검증은 pulk 없는 차로폭협착 테마가 담당한다.
+        raise GenError(f'{name}: narrow 는 pulk 교통류를 막는다 — pulk 가 켜진 '
+                       f'시나리오에는 배치하지 않는다 (gen_placement.narrow_pulk_guard_enable)')
     ctx = Ctx(lg, route, random.Random(seed_key), ctrl_map)
     resolved = []
     dropped = []

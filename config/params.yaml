@@ -499,6 +499,19 @@ gen_events:
 gen_placement:
   # 이벤트를 **놓아도 되는 자리**의 조건. usable_spans(교차로·시종점 여유)만으로는
   # 걸러지지 않는, 이벤트 종류별 성립 조건이 여기 온다.
+  #
+  # pulk 교통류가 켜진 시나리오에 narrow 를 함께 배치하면 GenError 로 폐기한다.
+  # 근거(2026-09-02): narrow(침범폭 0.7)는 ego 기준으로는 통과 가능하지만
+  # (잔여폭 2.1~2.14 m > 차폭 1.9 m, 엇갈림 14 m) VTD internal-driver 교통류는
+  # 이 협착을 지나지 못하고 그 앞에 정체를 만들며, ego 가 정체에 갇혀
+  # blocked 로 끝난다.
+  #   · 실전주행_교통류_01_좌회전24 (logs/batch/20260902_230229): narrow 20.7 m
+  #     앞에서 pulk 차량(id 9, 이력상 최대 15.6 m/s 주행)이 정지, ego 는 그 뒤
+  #     9.6 m 에 갇힘. 앞뒤 모두 정지 pulk 차량.
+  #   · 정적회피집중_02_우회전 (logs/batch/20260902_231132): ego 가 narrow 직전
+  #     5.1 m 에서 정지(blocked), 뒤로 pulk 3대 정체.
+  # false 로 두면 종전 동작(동시 배치 허용)이 그대로 재현된다.
+  narrow_pulk_guard_enable: true
   static_vehicle:
     # 자차로 정중앙 정차 차량은 동일 방향 주행차로가 1개뿐인 구간에서 **회피가
     # 원천 불가**다: 차폭 1.9 m / 이 맵 차로 폭 2.6~3.2 m 라 좌우 여유가
@@ -533,6 +546,18 @@ gen_placement:
     #             30 → 5,034 m (71%) · 3/30      ← 채택
     #             60 → 4,249 m (60%) · 10/30     (급격히 나빠진다)
     min_span_m: 30.0
+  obstacle_chain:
+    # 1차로 구간의 체인은 슬라럼이 아니라 차단이다 — 실측(2026-09-02,
+    # logs/batch/20260902_231132 정적회피집중_01_좌회전0): 1차로 (2818,6,-1)
+    # 에서 체인(Fuelcan 엇갈림)이 자차로를 직접 막아 **충돌 1 + blocked** 로
+    # 끝났다. static_vehicle 게이트 때는 "가장자리 엇갈림이라 원천 불가 아님"
+    # 으로 제외했으나 실측이 반증했다.
+    # true 면 static_vehicle 과 같은 _multi_lane_spans 경로로, 체인 전체가
+    # 동일 방향 주행차로 2개 이상인 부분구간 안에 들어가는 자리에만 놓는다.
+    # 폭(min_neighbor_width_m)·최소구간(min_span_m) 임계는 위 static_vehicle
+    # 값을 그대로 읽는다 (같은 물리량 — 값을 두 곳에 적지 않는다).
+    # false 면 종전 동작(1차선 배치 허용)이 바이트 단위로 재현된다.
+    require_multi_lane: true
 
 gen_traffic:
   # 교통류 **관측 지표** 전용 (tools/event_check.py traffic_metrics).

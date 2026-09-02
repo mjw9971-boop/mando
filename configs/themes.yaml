@@ -148,7 +148,12 @@ themes:
     # 25.9→27.8건/시간으로 올리면서 이벤트 성립률 손실이 0 이다. 250 이하는
     # +1% 를 더 얻는 대신 가용구간이 0 m 인 경로(이벤트를 하나도 못 놓는 경로)가
     # 나오기 시작한다 — static_vehicle·narrow 성립 30/30 → 28/30.
-    event: [static_vehicle, obstacle_chain, narrow]
+    # narrow 제거 (2026-09-02): pulk 교통류가 협착을 못 지나 그 앞에 정체를
+    # 만들고 ego 가 갇혀 blocked 로 끝난다 — 정적회피집중_02_우회전
+    # (logs/batch/20260902_231132) 에서 ego 가 narrow 5.1 m 앞 정지, 뒤로 pulk
+    # 3대 정체. gen_scenarios 의 narrow_pulk_guard 가 이중으로 막는다.
+    # narrow 단독 검증은 pulk 없는 차로폭협착 테마가 담당한다.
+    event: [static_vehicle, obstacle_chain]
     # 밀도의 지배적 지렛대는 경로 단축이 아니라 이쪽이다 (2026-09-02 실측):
     # 회피 시도 25.9(400 단일) → 27.8(300 단일) → 54.8건/시간(300+combine2).
     # 비용은 배치 재시도 9/36 이고 전부 백필돼 개수 미달은 없다.
@@ -293,7 +298,12 @@ themes:
     # 기존 실전주행 테마는 회귀 비교 기준이므로 손대지 않고 따로 세운다.
     min_length_m: 3000
     # oncoming/cut_in 은 UNSUPPORTED(대응 미구현)라 실전주행과 같이 제외.
-    event: [static_vehicle, obstacle_chain, narrow,
+    # narrow 제거 (2026-09-02): pulk 교통류가 협착(침범 0.7, ego 는 통과 가능)을
+    # 못 지나 그 앞에 정체를 만들고 ego 가 갇힌다 — 실전주행_교통류_01_좌회전24
+    # (logs/batch/20260902_230229): narrow 20.7 m 앞에서 pulk 차량이 정지,
+    # ego 는 그 뒤 9.6 m 에 고착. narrow 단독 검증은 pulk 없는 차로폭협착
+    # 테마가 담당한다 (gen_scenarios 의 narrow_pulk_guard 가 이중으로 막는다).
+    event: [static_vehicle, obstacle_chain,
             pedestrian, jaywalk, lead_brake, signal]
     scale_events: true
     random_axes: true
@@ -308,7 +318,11 @@ themes:
     # 교통류대수 → PulkDef Count, 교통류밀도 → 영역 크기(반경 + 내부 반경) 프리셋.
     # 시드가 바뀌면 이 두 축이 다시 뽑혀 교통류 밀도가 실제로 달라진다.
     vary: [감속강도, 발동거리, 개수, 속도, 차선, 교통류대수, 교통류밀도]
-    교통류대수: [12, 20, 30]
+    # 30대 제거 (2026-09-02): 30대/보통에서 정체가 교차로 안까지 밀린다 —
+    # 실전주행_교통류_02_좌회전8 (logs/batch/20260902_212135): 교차로 내부에서
+    # pulk 정체를 따라 10.6 s 정차 (in_junction=true, 교차로 내 정차는 채점
+    # 왜곡). 정적회피집중이 같은 근거(회피창 점유 81%)로 30대를 뺀 것과 동일.
+    교통류대수: [12, 20]
     교통류밀도: [조밀, 보통, 성김]
 
   적색점멸집중:
