@@ -176,7 +176,8 @@ def test_occupied_target_lane_blocks(rig):
     ap = make([actor_at(OBJ), side_car])
     kr = run(ap, ticks_needed(KrRules(CFG)))
     assert kr.ot_span is None
-    assert kr.last_overtake and 'occupied' in kr.last_overtake
+    # 최종 라벨은 마지막 side(우측 이웃 없음, C-8) 것이라 기각 이력으로 본다
+    assert any('occupied' in r for r in kr.last_avoid['rejects']), kr.last_avoid
 
 
 def test_shift_updates_lat_shift_for_signal(rig):

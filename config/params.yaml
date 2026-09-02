@@ -361,7 +361,9 @@ overtake:
   # 이 되기까지 3 s 가 더 걸리고 그동안 standoff 감속이 없었다. 회랑 조건(침범·
   # 전방)은 같고, 이 시간 이상 정지한 가장 가까운 객체까지의 거리가 standoff
   # 상한의 기준이 된다. PREEMPT/WAIT 판정은 여전히 obj_static_s. 0 = 이전 동작.
-  standoff_stop_s: 1.5
+  # 1.5 → 1.0 (C-7): 교통류_02 id27 은 정지 후 1.5 s 동안 자차가 4 m/s 로 6 m 를
+  # 더 접근한 뒤에야 대상이 됐다.
+  standoff_stop_s: 1.0
   # id 가 잠깐 빠져도 타이머를 유지할 틱 수 (GT '가까운 순 30개' 제한 대비)
   obj_grace_ticks: 10
 
@@ -376,7 +378,23 @@ overtake:
   queue_head_max_m: 25.0
   # 1급 안전망 — **시한 없는 억제 금지**. 대기열은 신호 주기로 풀린다.
   # 이 시간 넘게 안 풀리면 판정을 스스로 철회하고 회피·BREAKOUT 을 허용한다.
+  # (suppress_mode: legacy 전용. queue_only 는 아래 q_*_release_s 가 대신한다 —
+  #  15 s 는 실측 38.8 s 적신호 안에서 큐를 철회해 버린다.)
   queue_hold_s: 15.0
+  # ── 억제 단일화 (C, 2026-09-03) ──────────────────────────────────────
+  # queue_only: 회피 억제는 _is_queue 하나. 적색은 일시정지(obj_ticks pause·
+  # bo_paused·SHIFT_HOLD), 교차로는 side 루프 lane 검사(시프트 금지) + BREAKOUT
+  # pause, 정지선 30 m 억제는 없다. 실측 교통류_02: 적신호 억제 1259틱(32.5 %)·
+  # junction 억제 446틱이 회피·standoff·BREAKOUT 을 원천 차단해 id27 을 28 m 에서
+  # 보고도 standoff 없이 IDM 이 범퍼 0.45 m 에 세웠다.
+  # 큐 = 정지 객체 ≥1 ∧ (선두가 정지선 queue_head_max_m 안 ∨ 신호 Red/Yellow ∧
+  # 정지 객체 전부가 자차~정지선 사이). legacy = 이전 3중 억제 (바이트 동일).
+  suppress_mode: queue_only
+  # 큐 해제 — 신호 있음: 녹색이 이 시간 지나도 선두가 정지면 큐가 아니라 장애물.
+  q_green_release_s: 3.0
+  # 큐 해제 — 무신호 정지선: 이 시간 지나고 보행자 가드(회랑 안 또는 접근 중
+  # 보행자)가 없으면 해제. 서 있는 인도 보행자는 가드가 아니다.
+  q_nosignal_release_s: 10.0
 
   # ── WAIT: 앞차 출발 기회 (2026-08-30) ───────────────────────────────
   # 정적 장애물을 봐도 곧장 비켜가지 않고 이 시간까지 관찰한다. 관찰 중에도

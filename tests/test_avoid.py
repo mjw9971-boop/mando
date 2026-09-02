@@ -130,6 +130,19 @@ def tick(kr, ap, p, n=1):
         kr._update_obj_timers(ap)
 
 
+def legacy_cfg(cfg=CFG):
+    """suppress_mode: legacy — 옛 3중 억제 의미를 검증하는 테스트용."""
+    c = copy.deepcopy(cfg)
+    c['overtake']['suppress_mode'] = 'legacy'
+    return c
+
+
+def try_overtake(kr, ap, p, ego_speed=0.0):
+    """apply 가 하는 틱당 캐시(C-2)를 먼저 채운 뒤 _try_overtake — 직접 호출용."""
+    kr._tick_cache(ap, p)
+    return kr._try_overtake(ap, p, ego_speed)
+
+
 # ── 규칙 1: 신호 구역 억제 ──────────────────────────────────────────────
 def test_suppress_when_signal_within_window():
     kr, p = make(d_tl=SUP_M - 5.0)
@@ -173,7 +186,7 @@ def test_primary_key_covers_where_dist_stop_line_is_null():
 # ── 규칙 1: 대기열 형태 판정 ────────────────────────────────────────────
 def test_queue_of_two_longitudinal_objects_is_suppressed():
     """종방향으로 벌어져 줄 선 정지 객체 2대 = 대기열 (신호 데이터 없어도)."""
-    kr, p = make(d_tl=float('inf'))
+    kr, p = make(legacy_cfg(), d_tl=float('inf'))   # 형태 판정은 legacy 의미
     ap = Ap(p, [Box(1, 20.0, 0.0), Box(2, 30.0, 0.0)])
     tick(kr, ap, p, STATIC_TICKS)
     assert kr._is_queue(kr._corridor_blockers(ap, p)) is True
@@ -181,14 +194,14 @@ def test_queue_of_two_longitudinal_objects_is_suppressed():
 
 def test_staggered_pair_is_not_a_queue():
     """스태거드(케이스 B) — 종방향으로 붙고 횡으로 갈린다. 대기열 아님."""
-    kr, p = make(d_tl=float('inf'))
+    kr, p = make(legacy_cfg(), d_tl=float('inf'))   # 형태 판정은 legacy 의미
     ap = Ap(p, [Box(1, 20.0, -0.8), Box(2, 21.5, +0.8)])
     tick(kr, ap, p, STATIC_TICKS)
     assert kr._is_queue(kr._corridor_blockers(ap, p)) is False
 
 
 def test_single_object_is_not_a_queue():
-    kr, p = make(d_tl=float('inf'))
+    kr, p = make(legacy_cfg(), d_tl=float('inf'))   # 형태 판정은 legacy 의미
     ap = Ap(p, [Box(1, 20.0, 0.0)])
     tick(kr, ap, p, STATIC_TICKS)
     assert kr._is_queue(kr._corridor_blockers(ap, p)) is False
@@ -313,6 +326,7 @@ def blocked_rig(cfg=CFG, d_tl=float('inf'), junction=False):
 def drive(kr, p, ap, n, v=0.0):
     for _ in range(n):
         kr._update_obj_timers(ap)
+        kr._tick_cache(ap, p)                          # apply 와 같은 순서 (C-2)
         kr._breakout_tick(p, ap, v)
 
 
@@ -490,7 +504,7 @@ def test_blocked_ticks_accumulate_while_corridor_candidate_exists():
     ap = _blocked_ap(kr, p)
     assert kr.ot_blocked_ticks == 0
     for n in range(1, 6):
-        kr._try_overtake(ap, p, ego_speed=0.0)          # 정지 + 전방 차단
+        try_overtake(kr, ap, p, ego_speed=0.0)          # 정지 + 전방 차단
         assert kr.ot_blocked_ticks == n                  # 매 틱 증가한다
     assert (kr.last_avoid or {}).get('state') in ('PREEMPT', 'WAIT', 'WAIT_EXPIRED')
 
@@ -500,7 +514,7 @@ def test_reactive_arms_after_trigger_s_even_under_preempt():
     kr, p = make(d_tl=float('inf'))
     ap = _blocked_ap(kr, p)
     for _ in range(kr.ot_ticks + 1):
-        kr._try_overtake(ap, p, ego_speed=0.0)
+        try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_blocked_ticks >= kr.ot_ticks
     assert kr.last_overtake == 'no_lane'                 # side 루프 직전까지 갔다
     assert (kr.last_avoid or {}).get('state') == 'REACTIVE'
@@ -511,9 +525,9 @@ def test_blocked_ticks_reset_when_moving():
     kr, p = make(d_tl=float('inf'))
     ap = _blocked_ap(kr, p)
     for _ in range(4):
-        kr._try_overtake(ap, p, ego_speed=0.0)
+        try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_blocked_ticks == 4
-    kr._try_overtake(ap, p, ego_speed=5.0)               # 주행 중
+    try_overtake(kr, ap, p, ego_speed=5.0)               # 주행 중
     assert kr.ot_blocked_ticks == 0
 
 
@@ -522,7 +536,7 @@ def test_blocked_ticks_reset_when_nothing_blocks():
     kr, p = make(d_tl=float('inf'))
     ap = Ap(p, actors=[])
     for _ in range(5):
-        kr._try_overtake(ap, p, ego_speed=0.0)
+        try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_blocked_ticks == 0
 
 
@@ -593,7 +607,7 @@ def _geom_rig(cfg, obj_x, obs_ticks=None):
 def test_geom_gate_rejects_when_transition_cannot_finish():
     """실측 재현 — s_rel 5.3 m, v 0 이면 need 19.0 m > 5.3 → 기각."""
     kr, p, ap = _geom_rig(CFG, 5.3)
-    kr._try_overtake(ap, p, ego_speed=0.0)
+    try_overtake(kr, ap, p, ego_speed=0.0)
     need = CFG['overtake']['transition_m'] + OT['shift_ahead_m'] + GEOM_MARGIN
     assert kr.ot_span is None                              # 시프트가 생기지 않았다
     assert kr.last_overtake == 'right:geom@p1'             # solid 기각이 없으니 2바퀴 없음
@@ -606,7 +620,7 @@ def test_geom_gate_rejects_when_transition_cannot_finish():
 def test_geom_gate_passes_when_transition_finishes_in_time():
     """여유가 충분하면 통과한다 — 정상 회피 회귀."""
     kr, p, ap = _geom_rig(CFG, 52.3)
-    kr._try_overtake(ap, p, ego_speed=1.62)
+    try_overtake(kr, ap, p, ego_speed=1.62)
     assert kr.ot_span is not None                          # 시프트 생성됨
     assert kr.last_overtake == 'right'
 
@@ -615,10 +629,10 @@ def test_geom_gate_boundary_is_the_margin():
     """need 와 정확히 같은 거리면 통과, 그보다 가까우면 기각."""
     need = CFG['overtake']['transition_m'] + OT['shift_ahead_m'] + GEOM_MARGIN
     kr, p, ap = _geom_rig(CFG, need + 0.2)
-    kr._try_overtake(ap, p, ego_speed=0.0)
+    try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_span is not None
     kr2, p2, ap2 = _geom_rig(CFG, need - 0.2)
-    kr2._try_overtake(ap2, p2, ego_speed=0.0)
+    try_overtake(kr2, ap2, p2, ego_speed=0.0)
     assert kr2.ot_span is None and kr2.last_overtake == 'right:geom@p1'
 
 
@@ -627,7 +641,7 @@ def test_geom_gate_kill_switch_restores_old_behaviour():
     cfg = copy.deepcopy(CFG)
     cfg['overtake']['shift_geom_gate_enable'] = False
     kr, p, ap = _geom_rig(cfg, 5.3)
-    kr._try_overtake(ap, p, ego_speed=0.0)
+    try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_span is not None                          # 옛 동작: 생성된다
     assert kr.last_overtake == 'right'
 
@@ -638,6 +652,6 @@ def test_geom_gate_scales_with_speed():
     trans = max(CFG['overtake']['transition_m'], OT['shift_k_s'] * v)
     need = trans + OT['shift_ahead_m'] + GEOM_MARGIN
     kr, p, ap = _geom_rig(CFG, need - 1.0)
-    kr._try_overtake(ap, p, ego_speed=v)
+    try_overtake(kr, ap, p, ego_speed=v)
     assert kr.ot_span is None and kr.last_overtake == 'right:geom@p1'
     assert (kr.last_avoid or {})['need_geom'] == pytest.approx(need, abs=0.05)

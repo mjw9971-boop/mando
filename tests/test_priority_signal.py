@@ -33,7 +33,8 @@ sys.path.insert(0, str(ROOT / 'team_code'))
 
 from kr_rules import KrRules                                       # noqa: E402
 from test_avoid import (Ap, Box, HARD_TICKS, ESC_TICKS, STATIC_TICKS,  # noqa: E402
-                        Planner, World, drive, make, tick)
+                        Planner, World, drive, legacy_cfg, make, tick,
+                        try_overtake)
 
 CFG = load_params_yaml(PARAMS_YAML)
 OT = CFG['overtake']
@@ -51,9 +52,11 @@ class TL:
         self.id = tl_id
 
 
-def rig(d_tl=60.0, state=TrafficLightState.Red, obj_x=(8.0,), junction=False):
-    """적신호 정지선이 d_tl 앞, 그 **사이**에 정지 객체가 있는 상황."""
-    kr, p = make(d_tl=d_tl)
+def rig(d_tl=60.0, state=TrafficLightState.Red, obj_x=(8.0,), junction=False,
+        legacy=False):
+    """적신호 정지선이 d_tl 앞, 그 **사이**에 정지 객체가 있는 상황.
+    legacy=True 면 옛 3중 억제(suppress_mode: legacy) 의미를 검증한다."""
+    kr, p = make(legacy_cfg() if legacy else CFG, d_tl=d_tl)
     p.next_traffic_lights = [TL(state)] * len(p.next_traffic_lights)
     kr._sl_all = []
     ap = Ap(p, [Box(i + 1, x, 0.0, half_w=0.9) for i, x in enumerate(obj_x)],
@@ -69,18 +72,18 @@ def rig(d_tl=60.0, state=TrafficLightState.Red, obj_x=(8.0,), junction=False):
 @pytest.mark.parametrize('d_tl', [10.0, 35.0, 60.0, 120.0, 250.0])
 def test_red_ahead_suppresses_at_any_distance(d_tl):
     """30 m 억제창과 달리 **거리 조건이 없다** — 250 m 밖 적신호도 막는다."""
-    kr, p, ap = rig(d_tl=d_tl)
+    kr, p, ap = rig(d_tl=d_tl, legacy=True)
     assert kr._red_ahead(p) == pytest.approx(d_tl)
-    kr._try_overtake(ap, p, 0.0)
+    try_overtake(kr, ap, p, 0.0)
     assert kr.last_avoid['suppress'] == 'red_ahead'
     assert kr.ot_span is None                       # 시프트 없음
 
 
 def test_yellow_stop_latch_suppresses_like_red():
-    kr, p, ap = rig(state=TrafficLightState.Yellow)
+    kr, p, ap = rig(state=TrafficLightState.Yellow, legacy=True)
     kr.y_decision = 'stop'
     assert kr._red_ahead(p) is not None
-    kr._try_overtake(ap, p, 0.0)
+    try_overtake(kr, ap, p, 0.0)
     assert kr.last_avoid['suppress'] == 'red_ahead'
 
 
@@ -95,17 +98,17 @@ def test_green_reopens_avoidance():
     """녹색 전환 후에는 회피가 열린다 (객체가 계속 정지라면)."""
     kr, p, ap = rig(state=TrafficLightState.Green)
     assert kr._red_ahead(p) is None
-    kr._try_overtake(ap, p, 0.0)
+    try_overtake(kr, ap, p, 0.0)
     assert (kr.last_avoid or {}).get('suppress') != 'red_ahead'
 
 
 # ── 회피 상태 전부 × 적신호 ─────────────────────────────────────────────
 @pytest.mark.parametrize('v,label', [(10.0, 'PREEMPT/WAIT 속도대'), (0.0, 'REACTIVE 정지')])
 def test_no_avoid_state_arms_under_red(v, label):
-    kr, p, ap = rig()
+    kr, p, ap = rig(legacy=True)
     for _ in range(int(OT['wait_before_shift_s'] * HZ) + 40):
         kr._update_obj_timers(ap)
-        kr._try_overtake(ap, p, v)
+        try_overtake(kr, ap, p, v)
         assert kr.last_avoid['suppress'] == 'red_ahead', label
         assert kr.ot_span is None
 
@@ -135,7 +138,7 @@ def test_yellow_go_hook_false_under_red_stop():
 # ── 대기열 판별의 2선 강등 ──────────────────────────────────────────────
 def test_queue_judgement_is_skipped_under_red():
     """적신호에서는 대기열 판별이 아예 돌지 않는다 (절대 규칙이 먼저)."""
-    kr, p, ap = rig(obj_x=(10.0, 25.0))
+    kr, p, ap = rig(obj_x=(10.0, 25.0), legacy=True)
     tick(kr, ap, p, STATIC_TICKS)
     assert kr._is_queue(kr._corridor_blockers(ap, p), p, ap) is False
     assert kr.q_ticks == 0
@@ -173,7 +176,7 @@ def test_active_shift_is_held_not_reverted_when_red_appears():
     kr, p, ap = rig(state=TrafficLightState.Green)
     kr.ot_span = (100, 900)                                # 시프트 진행 중으로 가정
     p.next_traffic_lights = [TL(TrafficLightState.Red)] * len(p.next_traffic_lights)
-    kr._try_overtake(ap, p, 2.0)
+    try_overtake(kr, ap, p, 2.0)
     assert kr.ot_span == (100, 900)                        # 유지 (원복 안 함)
     assert kr.last_avoid['state'] == 'SHIFT_HOLD'
 
