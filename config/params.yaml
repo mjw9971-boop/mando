@@ -85,6 +85,19 @@ speed:
   # backstop — 래치 후 이 시간이 지났고 지금 회랑 밖이면 조건 무관 해제.
   # 회랑 안이면 유지 (보행자가 경로 위에 서 있는 한 절대 안 푼다).
   ped_backstop_s: 30.0
+  # ── 횡단보도 앞 서행 (A-3, 2026-09-03). 기본 false = 비활성. ─────────────
+  # 전방 횡단보도(레인그래프 crosswalks, 없으면 정지선) ±ped_crosswalk_zone_m 안에
+  # |lat| < ped_crosswalk_lat_m 로 **서 있는**(speed < ped_stop_v) 보행자가 있으면,
+  # 보행자 앞(idm_pedestrian_minimum_distance + 앞범퍼)에 정지 프로파일(④′ 형태)로
+  # 서서 ped_crosswalk_wait_s 를 채운 뒤 보행자를 지날 때까지 v ≤ ped_crosswalk_creep_v
+  # 로 통과한다. min() 후보다 — 오버라이드가 아니다. 대기는 정지 중(v < ped_stop_v)
+  # 이고 계획 정지점 앞 ped_crosswalk_zone_m 안일 때만 센다 (먼 적신호 정지는 제외). _ped_intent 래치가 선 보행자는 그쪽이 맡고, 회랑 안
+  # (|lat| < ped_release_lat_m) 보행자는 이 규칙 대상이 아니다(그건 정지).
+  ped_crosswalk_creep_enable: false
+  ped_crosswalk_zone_m: 10.0
+  ped_crosswalk_lat_m: 4.0
+  ped_crosswalk_wait_s: 3.0
+  ped_crosswalk_creep_v: 2.0
   # 경로 종점(route_end) 계획 정지점 = 기준점 − stop_gap_route_end − 앞범퍼.
   # 완주 임계(end_margin_m)가 이 값을 따른다. (구 stop_gap_m — 정지선 정지와는
   # 무관하다: 정지선은 PDM red-light IDM 소관, 아래 stop_gap_stopline_m 참조)

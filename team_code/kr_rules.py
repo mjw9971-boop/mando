@@ -187,6 +187,12 @@ class KrRules:
         self.ped_stop_v = float(sp.get('ped_stop_v', 0.2))
         self.ped_offroad_lat = float(sp.get('ped_offroad_lat_m', 6.0))
         self.ped_backstop_ticks = int(round(float(sp.get('ped_backstop_s', 30.0)) * _hz))
+        # 횡단보도 앞 서행 (A-3). false 면 비활성 = 서 있는 보행자는 PDM forecast 에만.
+        self.cw_enable = bool(sp.get('ped_crosswalk_creep_enable', False))
+        self.cw_zone_m = float(sp.get('ped_crosswalk_zone_m', 10.0))
+        self.cw_lat_m = float(sp.get('ped_crosswalk_lat_m', 4.0))
+        self.cw_wait_ticks = int(round(float(sp.get('ped_crosswalk_wait_s', 3.0)) * _hz))
+        self.cw_creep_v = float(sp.get('ped_crosswalk_creep_v', 2.0))
         self.a_emergency = float(sp.get('a_emergency', -8.0))
         self.a_dec_max = abs(float(cfg['control']['a_dec_max']))
         self.y_guard_max_m = float(sp.get('yellow_guard_max_m', 60.0))
@@ -375,6 +381,8 @@ class KrRules:
         self.green_since_ticks = 0                 # 다음 신호가 녹색인 연속 틱 (C-3 해제)
         self.green_tl_id = None
         self.ped_vt: dict = {}                     # 보행자 id → 직전 틱 v_toward (C-3 가드)
+        self.cw_wait: dict = {}                    # 보행자 id → 횡단보도 대기 정지 틱 (A-3)
+        self._cw_zones: list | None = None         # 경로상 횡단보도 [route_s 구간] (1회)
         self.wait_target_d: float | None = None    # 관찰 감속 목표 (장애물까지 거리)
         self.bo_paused = False                     # 적색·황색STOP 중 일시정지
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
@@ -2081,6 +2089,7 @@ class KrRules:
         self.ped_static.clear()
         self.ped_clear.clear()
         self.ped_hold.clear()
+        self.cw_wait.clear()
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -2283,6 +2292,102 @@ class KrRules:
         for wid in list(self.ped_vt):
             if wid not in live:
                 self.ped_vt.pop(wid, None)
+        return best
+
+    def _crosswalk_zones(self, planner) -> list:
+        """경로상 횡단보도 route_s 구간 [(s0, s1) …]. 시작 시 1회 (A-3).
+
+        출처는 레인그래프 lane 레코드의 crosswalks — world.ahead 의 'crosswalk' 와 같은
+        데이터다. 경로 전체에 횡단보도가 하나도 없으면 정지선(_all_stopline_s)을
+        점 구간으로 쓴다 (횡단보도 마킹이 빠진 지도 구간 대비).
+        """
+        if self._cw_zones is not None:
+            return self._cw_zones
+        out = []
+        lg = getattr(planner, 'lg', None)
+        route = getattr(planner, 'route', None) or {}
+        if lg is not None:
+            for i, k in enumerate(route.get('lanes') or []):
+                rec = lg.lanes.get(tuple(k))
+                if not rec:
+                    continue
+                base = float(route['cum_s'][i])
+                for a, b, _kind in rec.get('crosswalks', []):
+                    out.append((base + float(a), base + float(b)))
+        if not out:
+            out = [(s, s) for s in self._all_stopline_s(planner)]
+        self._cw_zones = sorted(out)
+        return self._cw_zones
+
+    def _ped_crosswalk(self, planner, ap, ego_speed: float):
+        """횡단보도 앞 서행 후보 (A-3) → `(v_allow, 진단)` 또는 None.
+
+        대상: 전방 횡단보도 ±ped_crosswalk_zone_m 안, 회랑 밖(|lat| ≥ ped_release_lat_m)
+        이고 ped_crosswalk_lat_m 안에 **서 있는**(speed < ped_stop_v) 보행자. 회랑 안은
+        정지(PDM·래치)의 몫이고, _ped_intent 래치가 선 id 는 그쪽이 우선이다.
+
+        동작: 대기 단계는 보행자 앞(앞범퍼 + idm_pedestrian_minimum_distance)에 서는
+        정지 프로파일 v = √(2·a·d_eff) — 멀면 제한속도보다 커서 스스로 비활성이다.
+        대기 틱은 **정지 중**(v < ped_stop_v ∧ 계획 정지점 앞 zone_m 안) 에만 센다 —
+        감지 직후부터 세면 80 m 밖에서 3 s 만 지나면 서행이 시작되고, 먼 적신호 정지가
+        대기를 채워도 안 된다. PDM 이 몇 m 앞에 먼저 세운 경우는 채워진다.
+        ped_crosswalk_wait_s 를 채우면 보행자를 지날 때까지 v ≤ ped_crosswalk_creep_v.
+        보행자가 걷기 시작하면(speed ≥ ped_stop_v) 대상에서 빠지고 래치가 이어받는다.
+        """
+        if not self.cw_enable or self.stop_profile_a <= 0.0:
+            return None
+        try:
+            walkers = list(ap._world.get_actors().filter('*walker*'))
+        except Exception:                                  # noqa: BLE001
+            return None
+        zones = self._crosswalk_zones(planner)
+        if not walkers or not zones:
+            self.cw_wait.clear()
+            return None
+        route_s = float(planner.route_s[planner.route_index])
+        s0 = float(getattr(getattr(ap, 'config', None),
+                           'idm_pedestrian_minimum_distance', 4.0))
+        best, live = None, set()
+        for w in walkers:
+            wid = getattr(w, 'id', None)
+            if wid is None or wid in self.ped_intent:
+                continue
+            if float(getattr(w, 'speed', 0.0)) >= self.ped_stop_v:
+                continue
+            loc = w.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None:
+                continue
+            s_rel, lat = pr
+            if not (0.0 < s_rel <= self.detect_max_m):
+                continue
+            if abs(lat) < self.ped_release_lat or abs(lat) >= self.cw_lat_m:
+                continue
+            ps = route_s + s_rel
+            if not any(a - self.cw_zone_m <= ps <= b + self.cw_zone_m for a, b in zones):
+                continue
+            live.add(wid)
+            d_eff = s_rel - self.front - s0
+            v_prof = _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_eff))
+            ticks = self.cw_wait.get(wid, 0)
+            # 대기는 정지 중 + 계획 정지점 근처(d_eff ≤ zone_m)에서만 센다 — PDM 이
+            # 몇 m 앞에 먼저 세워도 채워지고, 먼 적신호 정지(30 m 밖)는 세지 않는다.
+            if (ticks < self.cw_wait_ticks and ego_speed < self.ped_stop_v
+                    and d_eff <= self.cw_zone_m):
+                ticks += 1
+            self.cw_wait[wid] = ticks
+            if ticks >= self.cw_wait_ticks:
+                v_allow, phase = self.cw_creep_v, 'creep'
+            else:
+                v_allow, phase = v_prof, 'wait'
+            if best is None or v_allow < best[0]:
+                best = (v_allow, {'id': int(wid), 'phase': phase,
+                                  'wait_s': round(ticks / self.hz, 1),
+                                  'lat': round(float(lat), 2), 's_rel': round(float(s_rel), 1),
+                                  'v_allow': round(float(v_allow), 2)})
+        for wid in list(self.cw_wait):
+            if wid not in live:
+                self.cw_wait.pop(wid, None)              # 지나감·걷기 시작·소실 → 처음부터
         return best
 
     def _ped_unlatch(self, wid) -> None:
@@ -2549,6 +2654,18 @@ class KrRules:
             wid, why = next(iter(self.ped_released.items()))
             self.last_ped = {'id': int(wid), 'wins': False, 'release': why,
                              **self.ped_diag.get(wid, {})}
+
+        # 횡단보도 앞 서행 (A-3) — 서 있는 보행자 앞 3 s 정지 후 creep 상한. min() 후보.
+        cw = self._ped_crosswalk(planner, ap, ego_speed)
+        if cw is not None:
+            v_cw, info = cw
+            if candidate is None or v_cw < candidate:
+                candidate = v_cw
+            cw_wins = bool(v_cw <= min(target_speed, candidate) + 1e-9)   # 최종 목표를 구속하나
+            if self.last_ped is None:
+                self.last_ped = {'id': int(info['id']), 'wins': cw_wins, 'crosswalk': info}
+            else:
+                self.last_ped['crosswalk'] = info
 
         # 보행자 비상 우회 — **보행자 후보가 최종 목표를 구속하는 틱 한정**이다.
         # 선행차·신호·종점·크립 후보가 이긴 틱에서는 절대 발동하지 않는다.
