@@ -455,6 +455,39 @@ def _walk_once(lg, rng, start, turns, tail_m, max_gap_m,
     return chain, out
 
 
+_BLINK_CTRLS = None       # TEMPLATE 의 점멸 SignalController id 집합 (1회 추출)
+
+
+def blink_ctrls() -> set:
+    """점멸(blink) 페이즈를 가진 SignalController id — TEMPLATE 에서 읽는다.
+
+    **하드코딩하지 않는 이유**: 지도·배포본이 바뀌면 id 가 따라 바뀐다. 생성기가
+    이미 베이스로 쓰는 TEMPLATE 이 곧 시나리오가 될 XML 이므로, 거기서 뽑으면
+    산출물과 항상 일치한다 (2026-09-01 현재 이 맵은 117 하나뿐).
+    """
+    global _BLINK_CTRLS
+    if _BLINK_CTRLS is None:
+        ls = ET.parse(TEMPLATE).getroot().find('LightSigns')
+        _BLINK_CTRLS = {int(sc.get('Id')) for sc in (ls.findall('SignalController') if ls is not None else [])
+                        if any(p.get('Type') == 'blink' for p in sc.findall('Phase'))}
+    return _BLINK_CTRLS
+
+
+# 점멸 정지선을 규율받는 접근 차로 id. 이 접근로(road 2312)는 정지선 하나에
+# controller 두 개(116 빈 컨트롤러 / 117 점멸)가 함께 걸려 있고, 9910 은 접근로당
+# 하나만 준다 — 차로 중심 t 대조(lane3 +5.29 ↔ 117 녹376 +5.20, lane2 +2.10 ↔
+# 116 적371 +2.00)와 실측(lane 3 에서 117 수신)으로 3·4 만 점멸을 받는다.
+# lane 2 를 섞으면 점멸이 안 잡히는 시나리오가 생겨 "채점기가 틀렸나 신호가 안
+# 왔나"를 가릴 수 없다 (2026-09-01 결정).
+BLINK_LANE_IDS = (3, 4)
+
+
+def _blink_stopline(lg, v) -> bool:
+    """이 차로의 정지선이 점멸 controller 에 걸려 있는가."""
+    b = blink_ctrls()
+    return any(b & set(sl.get('controller_ids') or []) for sl in (v.get('stop_lines') or []))
+
+
 def _upstream_starts(lg, pred, back_m=180.0):
     """조건(pred)에 맞는 차로의 상류 차로들 — require 경로의 출발 후보."""
     outs = []
@@ -497,6 +530,15 @@ def _check_require(lg, chain, require) -> bool:
                 slow = lg.lanes[k]['school_zone'] or (v is not None and v <= 30)
                 if (require == 'signalized_slow') == bool(slow):
                     return True
+        return False
+    if require == 'blink':
+        # 교차로 직전 접근 차로가 점멸 정지선을 물고 있고, 그 차로가 실제로
+        # 점멸을 수신하는 차로(BLINK_LANE_IDS)여야 한다. lane 2 를 통과시키면
+        # 9910 이 116(빈 컨트롤러)을 줄 수 있어 점멸이 안 잡힌다.
+        for i, k in enumerate(chain[:-1]):
+            if lg.lanes[k]['junction'] == -1 and lg.lanes[chain[i + 1]]['junction'] != -1 \
+                    and _blink_stopline(lg, lg.lanes[k]) and k[2] in BLINK_LANE_IDS:
+                return True
         return False
     return True
 
@@ -854,6 +896,10 @@ def synth_walk(lg, rng, name, spec, gen_cfg, used_cells: dict | None = None,
         cands = _upstream_starts(lg, lambda v: bool(v['signals'])
                                  and not v['school_zone']
                                  and (v['speed_limit'] or 0) >= 50)
+    elif require == 'blink':
+        # 점멸 신호는 이 맵에 접근로 하나뿐(junction 60 / road 2312)이라 후보가
+        # 2개로 좁다 — 변이는 시작점이 아니라 경로 길이·꼬리에서 난다.
+        cands = _upstream_starts(lg, lambda v: _blink_stopline(lg, v))
     else:
         cands = start_pool(lg)          # 맵 전체 후보 풀(1회 수집)에서 시드 샘플링
     if not cands:
