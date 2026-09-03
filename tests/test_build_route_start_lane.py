@@ -157,7 +157,9 @@ def test_locate_none_falls_back_to_candidates(lg, route_args, monkeypatch, capsy
 def test_real_csvs_do_not_trigger(lg, monkeypatch, capsys):
     """기준 CSV 들에서는 발동하지 않는다 — 이 우회가 기존 경로를 건드리지 않는다."""
     monkeypatch.setattr(BR, '_CAND_CFG', (True, 5000))
-    csvs = [ROOT / 'waypoints.csv', ROOT / 'data' / 'official_route.csv',
+    csvs = [ROOT / 'waypoints.csv',
+            ROOT / 'tests' / 'fixtures' / 'venue_20260903_waypoints.csv',
+            ROOT / 'data' / 'official_route.csv',
             ROOT / 'data' / 'test_route_waypoints.csv', CSV]
     csvs = [c for c in csvs if c.exists()]
     if not csvs:

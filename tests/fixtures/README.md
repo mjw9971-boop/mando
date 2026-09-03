@@ -28,3 +28,14 @@ python3 tools/build_route.py data/lane_graph.pkl tests/fixtures/waypoints.csv \
 
 `data/lane_graph.pkl` 은 여기로 옮기지 않았다 — xodr 에서만 파생되고 xodr 이
 바뀔 때만 재생성하는 안정 자산이라, 주행·채점·테스트가 같은 것을 봐야 한다.
+
+## `venue_20260903_waypoints.csv`
+
+2026-09-03 대회장 배포 경유점 CSV (10점, 대회형식 = 시작 + 교차로 짝 4 + 종료).
+`tests/test_build_route_candidates.py` 가 읽는다 — 개수 기반 후보 수집(k=40)이
+seq 8→9 에서 "경로 없음" 으로 깨지고 반경 기반은 `(836,0,-1)` 로 통과하는,
+이 저장소에서 유일하게 그 차이가 드러나는 CSV 다.
+
+레포 루트의 `waypoints.csv`(32점)와는 다른 파일이다. 루트 쪽은
+`configs/themes.yaml` `routes.기본` 이 "검증된 연습 경로" 로 읽으므로 교체하지
+않는다.

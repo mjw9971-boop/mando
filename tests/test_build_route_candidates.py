@@ -4,7 +4,8 @@
   · 개수 기반 kd.query(k=40) 은 경유점이 차로 중심선에 얹히면 그 차로 점들이
     k 를 다 채워 인접 차로·연결로를 후보에서 떨어뜨린다. 반경 안 점을 전부
     보면 몰림에 영향받지 않는다.
-  · 대회장 CSV(waypoints.csv)는 k=40 으로 seq 8->9 가 "경로 없음" 이고,
+  · 대회장 CSV(tests/fixtures/venue_20260903_waypoints.csv)는 k=40 으로
+    seq 8->9 가 "경로 없음" 이고,
     반경 기반이면 목표 차로 (836,0,-1) 로 빌드된다.
   · 킬 스위치 route.candidates_ball_query_enable=false 는 옛 동작 그대로다
     (현장 롤백 경로라 반드시 재현돼야 한다).
@@ -23,7 +24,9 @@ import build_route as BR                                        # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
 
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-VENUE_CSV = ROOT / 'waypoints.csv'
+# 대회장 배포 CSV(10점, 2026-09-03). 레포 루트의 waypoints.csv 는 건드리지
+# 않는다 — configs/themes.yaml routes.기본 이 그걸 '검증된 연습 경로'로 읽는다.
+VENUE_CSV = ROOT / 'tests' / 'fixtures' / 'venue_20260903_waypoints.csv'
 RADIUS = 8.0
 # 대회장 CSV seq 8 -> seq 9 (4번째 교차로 진입->진출). k=40 이 이 차로를
 # 후보에서 떨어뜨려 실패했다 — 5.02 m 인데 k=40 도달이 4.84 m 였다.
@@ -40,7 +43,7 @@ def lg():
 @pytest.fixture(scope='module')
 def venue():
     if not VENUE_CSV.exists():
-        pytest.skip('waypoints.csv 없음')
+        pytest.skip(f'{VENUE_CSV.name} 없음')
     rows = BR.read_waypoints_csv(str(VENUE_CSV))
     return [(r[1], r[2]) for r in rows], [r[0] for r in rows]
 
