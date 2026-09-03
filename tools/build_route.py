@@ -55,9 +55,78 @@ def lc_cost(lg, key, side):
 TARGET_DIST_W = 5.0
 
 
-def candidates(lg, x, y, radius, yaw=None):
-    """경유점 근처 후보 (lane_key, s, dist)"""
-    d, ii = lg.kd.query((x, y), k=40)
+# 후보 수집이 개수 기반이던 시절의 k. candidates_ball_query_enable=false 로
+# 되돌릴 때만 쓴다 (현장 롤백용) — 이 값이 왜 부족한지는 candidates() 주석 참고.
+CANDIDATES_K = 40
+
+_CAND_CFG = None
+
+
+def candidates_cfg(reload=False):
+    """params.yaml route.candidates_* — 후보 수집 방식의 단일 출처.
+
+    load_params_yaml 은 부를 때마다 YAML 을 다시 파싱한다. candidates() 는
+    경유점마다 여러 번 불리므로 여기서 한 번만 읽고 캐시한다.
+    """
+    global _CAND_CFG
+    if _CAND_CFG is None or reload:
+        try:
+            from vtd_adapter.config import load_params_yaml
+            rc = load_params_yaml().get('route') or {}
+            _CAND_CFG = (bool(rc.get('candidates_ball_query_enable', True)),
+                         int(rc.get('candidates_max_points', 5000)))
+        except Exception:                                # noqa: BLE001 — 독립 실행 폴백
+            _CAND_CFG = (True, 5000)
+    return _CAND_CFG
+
+
+def candidates(lg, x, y, radius, yaw=None, ball=None, max_points=None):
+    """경유점 근처 후보 (lane_key, s, dist)
+
+    **반경 안의 kd 점을 전부** 본다. 개수 기반(kd.query(k=N))은 경유점이 어떤
+    차로 중심선 위에 얹히면 그 차로 점들이 N 을 다 채워 인접 차로·연결로가
+    후보에서 통째로 빠진다. kd 샘플 간격이 0.5 m 라 k=40 은 20 m 어치일 뿐이다.
+
+    2026-09-03 실측 (data/lane_graph.pkl, ds 0.5 m, radius 8 m):
+      · 반경 안 점 수 중앙 106 / p99 253 / **최대 330** (교차로에서 최대)
+      · k=40 이 실제로 도달하는 거리는 경유점 대부분에서 3.4 ~ 5.4 m
+      · 대회장 CSV seq 9 는 정답 차로 (836,0,-1) 가 5.02 m 인데 k=40 도달이
+        4.84 m — 0.18 m 차이로 잘려 "seq 8 -> seq 9 경로 없음" 이 났다.
+        seq 8->9 는 교차로 짝 구간이라 차선변경이 금지돼, 잘려나간 그 차로가
+        유일한 연결이었다.
+    k=200 으로 키우는 건 같은 병의 다른 크기일 뿐이다 (최악 330 > 200).
+    반경 안을 전부 보면 아래 `dist > radius` 컷과 의미가 같아지고, 점 몰림에
+    영향받지 않는다.
+
+    ball / max_points 는 테스트용 명시 오버라이드다. None 이면 params 를 읽는다.
+    """
+    if ball is None or max_points is None:
+        cfg_ball, cfg_max = candidates_cfg()
+        ball = cfg_ball if ball is None else ball
+        max_points = cfg_max if max_points is None else max_points
+
+    if ball:
+        ii = np.asarray(lg.kd.query_ball_point((x, y), radius), dtype=np.intp)
+        if len(ii):
+            P = np.asarray(lg.kd_pts)[ii]
+            d = np.hypot(P[:, 0].astype(np.float64) - x, P[:, 1].astype(np.float64) - y)
+            # 거리순 정렬은 선택이 아니다. project(idx_hint) 는 힌트 주변
+            # 세그먼트 두 개만 보므로, **그 차로에서 처음 만난 kd 점**이 투영
+            # 결과를 정한다. 순서가 흐트러지면 같은 차로의 먼 점이 힌트가 돼
+            # (s, dist) 가 엉뚱한 국소 최소로 간다.
+            order = np.argsort(d, kind='stable')
+            ii, d = ii[order], d[order]
+            if len(ii) > max_points:
+                print(f'  [경고] ({x:.2f},{y:.2f}) 반경 {radius:g}m 안 kd 점 {len(ii)}개 > '
+                      f'route.candidates_max_points {max_points} — 가까운 순으로 자른다',
+                      file=sys.stderr)
+                ii, d = ii[:max_points], d[:max_points]
+        else:
+            d = np.empty(0, dtype=np.float64)
+    else:
+        d, ii = lg.kd.query((x, y), k=CANDIDATES_K)
+        d, ii = np.atleast_1d(d), np.atleast_1d(ii)
+
     seen = {}
     for dist, i in zip(d, ii):
         if not np.isfinite(dist) or dist > radius:

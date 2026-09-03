@@ -237,6 +237,20 @@ route:
   finish_tail_m: 12.0
   # false 면 꼬리 연장 안 함 (이전 동작).
   finish_tail_enable: true
+  # 경유점 후보 차로 수집 (tools/build_route.py candidates). true = 반경 안의 kd
+  # 점을 전부 본다. false = 개수 기반 kd.query(k=40) — 이전 동작, 현장 롤백용.
+  #
+  # 개수 기반은 경유점이 어떤 차로 중심선 위에 얹히면 그 차로 점들이 k 를 다
+  # 채워 인접 차로·연결로가 후보에서 빠진다. kd 샘플 간격 0.5 m 라 k=40 은
+  # 20 m 어치일 뿐이다. 2026-09-03 실측(radius 8 m): 반경 안 점 수 중앙 106 /
+  # 최대 330, k=40 실제 도달거리 3.4~5.4 m. 대회장 CSV seq 9 는 정답 차로가
+  # 5.02 m 인데 k=40 도달이 4.84 m 라 0.18 m 차이로 잘려 "seq 8->9 경로 없음"
+  # 이 났다 (교차로 짝 구간이라 차선변경 금지 = 그 차로가 유일한 연결).
+  candidates_ball_query_enable: true
+  # 반경 안 kd 점이 이보다 많으면 가까운 순으로 자르고 경고 1줄 [개].
+  # radius 8 m 에서는 미발동한다 (지도 전체 최악 330점). r>=65 m 로 --radius 를
+  # 올렸을 때를 대비한 미래 방어다 (실측: r=60 m 최대 4640, r=80 m 최대 6054).
+  candidates_max_points: 5000
 
 route_check:
   # tools/build_route.py 의 경로 검증 리포트 임계 — 대회날 배포 CSV 를 받자마자
