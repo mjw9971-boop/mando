@@ -80,6 +80,27 @@ def candidates_cfg(reload=False):
     return _CAND_CFG
 
 
+_START_OVERRIDE = None
+
+
+def start_override_cfg(reload=False):
+    """params.yaml route.start_lane_ball_override_enable — 출발 차로 우회 스위치.
+
+    false 면 lg.locate() 결과를 그대로 쓴다 (2d8a7e1 이전 동작). candidates 스위치와
+    따로 두는 이유: 후보 수집 전환과 출발 차로 우회는 독립된 판단이라, 현장에서
+    한쪽만 되돌려야 할 수 있다.
+    """
+    global _START_OVERRIDE
+    if _START_OVERRIDE is None or reload:
+        try:
+            from vtd_adapter.config import load_params_yaml
+            rc = load_params_yaml().get('route') or {}
+            _START_OVERRIDE = bool(rc.get('start_lane_ball_override_enable', True))
+        except Exception:                                # noqa: BLE001 — 독립 실행 폴백
+            _START_OVERRIDE = True
+    return _START_OVERRIDE
+
+
 def candidates(lg, x, y, radius, yaw=None, ball=None, max_points=None):
     """경유점 근처 후보 (lane_key, s, dist)
 
@@ -497,7 +518,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             cand0 = candidates(lg, x0, y0, radius, start_yaw)
             m0 = lg.locate(x0, y0, start_yaw, max_dist=radius)
             override = None
-            if m0 is not None and cand0:
+            if m0 is not None and cand0 and start_override_cfg():
                 sc_m0 = locate_score(lg, m0.lane, m0.s, m0.dist, start_yaw)
                 best0 = min(cand0, key=lambda c: locate_score(lg, c[0], c[1], c[2], start_yaw))
                 sc_b0 = locate_score(lg, best0[0], best0[1], best0[2], start_yaw)

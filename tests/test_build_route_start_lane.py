@@ -120,6 +120,31 @@ def test_no_override_when_locate_is_closer(lg):
     assert sc_b >= sc_m, '더 나쁜 차로로 덮어쓰려 하고 있다'
 
 
+def test_switch_default_is_on(monkeypatch):
+    """params 기본값 = 우회 켬."""
+    monkeypatch.setattr(BR, '_START_OVERRIDE', None)
+    assert BR.start_override_cfg(reload=True) is True
+
+
+def test_switch_off_keeps_locate(lg, multi_args, monkeypatch, capsys):
+    """킬 스위치 off = locate 결과 그대로 (2d8a7e1 이전 동작).
+
+    현장 롤백 경로라 '경고도 안 뜨고 경로도 locate 를 따른다' 가 지켜져야 한다.
+    """
+    monkeypatch.setattr(BR, '_CAND_CFG', (True, 5000))
+    wps, _seqs, yaw0 = multi_args
+    x0, y0 = wps[0]
+    cand = BR.candidates(lg, x0, y0, RADIUS, yaw0, ball=True)
+    worse = max(cand, key=lambda c: BR.locate_score(lg, c[0], c[1], c[2], yaw0))
+    monkeypatch.setattr(lg, 'locate', lambda *a, **kw: LaneMatch(
+        worse[0], worse[1], 0.0, 0.0, worse[2], 0))
+
+    monkeypatch.setattr(BR, '_START_OVERRIDE', False)
+    got = _build(lg, multi_args)
+    assert '출발 차로 불일치' not in capsys.readouterr().err
+    assert got['lanes'][0] == worse[0], 'locate 결과를 그대로 쓰지 않았다'
+
+
 def test_override_fires_and_recovers(lg, multi_args, monkeypatch, capsys):
     """locate 가 엉뚱한 차로를 주면 경고하고 반경 후보로 복구한다.
 
@@ -127,6 +152,7 @@ def test_override_fires_and_recovers(lg, multi_args, monkeypatch, capsys):
     0.1 이하) locate 를 직접 가짜로 바꿔 경로만 검증한다.
     """
     monkeypatch.setattr(BR, '_CAND_CFG', (True, 5000))
+    monkeypatch.setattr(BR, '_START_OVERRIDE', True)
     ref = _build(lg, multi_args)
     wps, _seqs, yaw0 = multi_args
     x0, y0 = wps[0]

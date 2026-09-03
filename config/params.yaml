@@ -251,6 +251,21 @@ route:
   # radius 8 m 에서는 미발동한다 (지도 전체 최악 330점). r>=65 m 로 --radius 를
   # 올렸을 때를 대비한 미래 방어다 (실측: r=60 m 최대 4640, r=80 m 최대 6054).
   candidates_max_points: 5000
+  # 출발 차로 확정에서 lg.locate() 의 개수 절단(kd.query(k=16))을 우회할지.
+  # true = locate 의 점수 규칙(거리 + 0.5×헤딩오차)을 반경 기반 후보집합에 다시
+  # 적용해, 더 나은 차로가 나오면 그쪽을 쓰고 경고 1줄. false = locate 결과 그대로.
+  #
+  # 바꾸는 건 후보집합뿐이다 — locate 가 헤딩을 보고 일부러 조금 먼 차로를 고른
+  # 판단은 살아 있고, candidates 만의 필터(폭 2 m 미만 포켓 배제)로 빠진 차로
+  # 때문에 더 가까운 정답을 밀어내지도 않는다. "후보 1번과 다르면 덮어쓴다" 로
+  # 하면 후자에서 회귀한다 (2026-09-03 지도 랜덤 12,000 표본 중 242건이 그 유형).
+  #
+  # 발동률은 낮다: 기준 CSV 11개 전부 미발동, 진행방향 무작위 5,639 표본에서
+  # 4건(0.07%)·점수 여유 0.1 이하. 고치는 게 아니라 안전망이다. 진짜 원인은
+  # vtd_adapter/lanegraph.py locate() 의 k=16 이고, 그건 제어기 런타임
+  # (ego.py, kr_rules.py)도 같이 쓰므로 별건이다.
+  # candidates_ball_query_enable 와 따로 둔다 — 한쪽만 되돌릴 수 있어야 한다.
+  start_lane_ball_override_enable: true
 
 route_check:
   # tools/build_route.py 의 경로 검증 리포트 임계 — 대회날 배포 CSV 를 받자마자
