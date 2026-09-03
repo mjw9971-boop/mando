@@ -115,15 +115,43 @@ def test_venue_csv_builds_with_ball(lg, venue, monkeypatch):
 
 
 def test_venue_csv_fails_with_k40(lg, venue, monkeypatch):
-    """킬 스위치 off = 옛 동작. 대회장 CSV 는 seq 8->9 에서 그대로 실패한다.
+    """옛 동작으로 되돌리면 대회장 CSV 는 seq 8->9 에서 그대로 실패한다.
 
     현장 롤백 경로라 '옛 동작 그대로' 가 지켜지는지 확인한다.
+
+    **스위치 둘 다 꺼야 옛 동작이다.** 짝 공동 선택(route.waypoint_lane_is_hint)이
+    켜져 있으면 진입·진출 후보를 도로 단위로 넓히므로, k=40 이 잘라낸 차로가
+    그 확장으로 되살아나 seq 8->9 가 연결된다 — 아래 테스트가 그걸 고정한다.
     """
     _set(monkeypatch, False)
+    monkeypatch.setattr(BR, '_PAIR_CFG', (False, 400.0, 25.0))
     wps, seqs = venue
     with pytest.raises(BR.RouteError) as e:
         _build(lg, wps, seqs)
     assert 'seq 8' in str(e.value) and 'seq 9' in str(e.value)
+
+
+def test_pair_choice_rescues_k40_venue(lg, venue, monkeypatch):
+    """짝 공동 선택은 k=40 절단까지 덮는다 — 후보를 도로 단위로 넓히기 때문이다.
+
+    작업2 시점에는 k=40 이면 대회장 CSV 가 반드시 깨졌다. 짝 공동 선택이 들어온
+    뒤로는 안 깨진다. 두 스위치가 독립이 아니라는 사실을 여기서 고정해 둔다 —
+    현장에서 후보 수집만 되돌렸을 때 무슨 일이 나는지 알 수 있어야 한다.
+    """
+    _set(monkeypatch, False)                       # 후보 수집만 옛 방식(k=40)
+    monkeypatch.setattr(BR, '_PAIR_CFG', (True, 400.0, 25.0))
+    wps, seqs = venue
+    rt = _build(lg, wps, seqs)                     # RouteError 가 나면 실패
+    # 목표 차로까지 같지는 않다 — k=40 이 진출 후보를 자르면 도로 확장의 출발
+    # 집합이 달라져 seq 9 목표가 (418,0,-4) 로 나온다(반경 기반은 (836,0,-1)).
+    # 여기서 고정하는 건 "깨지지 않는다" 와 "그 회전을 실제로 할 수 있다" 다.
+    span = {wi: (i0, i1) for wi, i0, i1 in rt['segment_span']}
+    wi = seqs.index(8)
+    k_in, k_out = rt['lanes'][span[wi][0]], rt['lanes'][span[wi][1]]
+    s_in = lg.project(k_in, *wps[wi])[0]
+    s_out = lg.project(k_out, *wps[wi + 1])[0]
+    banned, _thr = BR.infeasible_connectors(lg)
+    assert BR.turn_connect(lg, k_in, s_in, k_out, s_out, banned, 400.0) is not None
 
 
 def test_centerline_csvs_unchanged(lg, monkeypatch):

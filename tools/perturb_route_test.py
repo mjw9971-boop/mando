@@ -53,10 +53,38 @@ def kind_of(i, n):
     return 'entry' if i % 2 == 1 else 'exit'
 
 
+# 짝 공동 선택 상한 — params 와 같은 값을 쓴다 (여기서 새로 정하지 않는다)
+TURN_CAP = BR.pair_cfg()[1]
+
+
 def set_mode(mode):
-    """ball = 반경 기반(현재 기본) / k40 = 개수 기반(HEAD 동작)."""
-    BR._CAND_CFG = (mode == 'ball', 5000)
-    BR._START_OVERRIDE = (mode == 'ball')
+    """ball = 반경 기반 + 짝 공동 선택(현재 기본) / k40 = 개수 기반 + 탐욕(옛 동작).
+
+    pair = 반경 기반은 그대로 두고 짝 공동 선택만 끈 상태 (7-2 이전).
+    """
+    BR._CAND_CFG = (mode != 'k40', 5000)
+    BR._START_OVERRIDE = (mode != 'k40')
+    BR._PAIR_CFG = (mode == 'ball', TURN_CAP, BR.pair_cfg()[2])
+
+
+def turn_ok_count(lg, rt, wps, banned):
+    """짝 구간 중 '고른 진입 차로가 그 회전을 실제로 할 수 있는' 비율 (ok, 전체)."""
+    span = {wi: (i0, i1) for wi, i0, i1 in rt['segment_span']}
+    ok = tot = 0
+    for wi in sorted(junction_of(len(wps))):
+        if wi not in span:
+            continue
+        k_in, k_out = rt['lanes'][span[wi][0]], rt['lanes'][span[wi][1]]
+        s_in = lg.project(k_in, *wps[wi])[0]
+        s_out = lg.project(k_out, *wps[wi + 1])[0]
+        tot += 1
+        if BR.turn_connect(lg, k_in, s_in, k_out, s_out, banned, TURN_CAP):
+            ok += 1
+    return ok, tot
+
+
+def junction_of(n):
+    return BR.junction_segments(n)
 
 
 def build(lg, wps, seqs, radius):
@@ -122,6 +150,8 @@ def perturb(wps, L, rng):
 
 # ── 4-2 흔들기 ──────────────────────────────────────────────────────────
 def run_perturb(lg, csvs, offsets, seeds, radius, modes):
+    global _BANNED
+    _BANNED, _thr = BR.infeasible_connectors(lg)
     rows = []                     # (csv, mode, L, seed, ok, match, first_bad, ...)
     base = {}
     for f in csvs:
@@ -133,9 +163,9 @@ def run_perturb(lg, csvs, offsets, seeds, radius, modes):
         if rt is None:
             print(f'  [건너뜀] {f}: 무흔들 빌드 실패', file=sys.stderr)
             continue
-        base[f] = (wps, seqs, targets_of(rt), rt['lanes'])
+        base[f] = (wps, seqs, targets_of(rt), rt['lanes'], rt['total_length'])
 
-    for f, (wps, seqs, tgt0, lanes0) in base.items():
+    for f, (wps, seqs, tgt0, lanes0, len0) in base.items():
         n = len(wps)
         for mode in modes:
             set_mode(mode)
@@ -147,6 +177,7 @@ def run_perturb(lg, csvs, offsets, seeds, radius, modes):
                     rec = dict(csv=f, mode=mode, L=L, seed=sd, ok=rt is not None,
                                match=False, first_bad=None, kind=None, got=None,
                                want=None, tier=None, wpmax=None, ov=False, ov_gap=None,
+                               turn_ok=None, turn_tot=None, dlen=None, fallback=0,
                                err=None if rt is not None else err)
                     if rt is not None:
                         m = WARN_RE.search(err)
@@ -154,6 +185,9 @@ def run_perturb(lg, csvs, offsets, seeds, radius, modes):
                         if m:
                             rec['ov_gap'] = float(m.group(1)) - float(m.group(2))
                         rec['wpmax'] = wp_max_dist(lg, rt)
+                        rec['turn_ok'], rec['turn_tot'] = turn_ok_count(lg, rt, pw, _BANNED)
+                        rec['dlen'] = rt['total_length'] - len0
+                        rec['fallback'] = err.count('짝이 없다')
                         tgt = targets_of(rt)
                         rec['match'] = rt['lanes'] == lanes0
                         if not rec['match']:
@@ -190,7 +224,20 @@ def report_perturb(rows, offsets, modes):
                 len(mt), 100 * len(mt) / max(1, len(ok)), ov,
                 np.percentile(wm, 50), np.percentile(wm, 95), wm.max()))
 
-    print('\n 불일치 유형별 (첫 갈라지는 경유점 기준)')
+    print('\n 짝 구간 회전 수행 가능 비율 / total_length 변동 / 폴백')
+    print(' L [m]  mode   회전가능      폴백 WARN   Δtotal_length p50/p95/max [m]')
+    for mode in modes:
+        for L in offsets:
+            r = [x for x in rows if x['mode'] == mode and x['L'] == L and x['ok']]
+            if not r:
+                continue
+            ok = sum(x['turn_ok'] or 0 for x in r); tt = sum(x['turn_tot'] or 0 for x in r)
+            dl = np.abs(np.array([x['dlen'] for x in r if x['dlen'] is not None]))
+            print(' %4.1f  %-5s %5d/%-5d (%5.1f%%) %6d      %.1f / %.1f / %.1f' % (
+                L, mode, ok, tt, 100 * ok / max(1, tt), sum(x['fallback'] for x in r),
+                np.percentile(dl, 50), np.percentile(dl, 95), dl.max()))
+
+    print('\n 불일치 유형별 (첫 갈라지는 경유점 기준 — 무흔들 차로열=정답 전제가 깨졌으므로 참고용)')
     print(' L [m]  mode  start  entry   exit    end   (차로열만)   빌드실패')
     for mode in modes:
         for L in offsets:
@@ -324,7 +371,7 @@ def main(argv=None):
     ap.add_argument('--radius', type=float, default=8.0)
     ap.add_argument('--offsets', default='1.5,3.0,4.5')
     ap.add_argument('--seeds', type=int, default=30)
-    ap.add_argument('--modes', default='ball,k40')
+    ap.add_argument('--modes', default='ball,pair,k40')
     ap.add_argument('--csv', nargs='*', default=None)
     ap.add_argument('--ties', action='store_true', help='동률 감사만')
     ap.add_argument('--boundary', action='store_true', help='경계 노드 스냅만')

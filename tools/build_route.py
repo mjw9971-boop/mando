@@ -167,6 +167,97 @@ def candidates(lg, x, y, radius, yaw=None, ball=None, max_points=None):
     return sorted(seen.values(), key=lambda c: c[2])
 
 
+_PAIR_CFG = None
+
+
+def pair_cfg(reload=False):
+    """params.yaml route.waypoint_lane_is_hint / turn_connect_max_m /
+    turn_heading_thr_deg — 짝 공동 선택의 단일 출처.
+
+    candidates_cfg 와 같은 이유로 여기서 한 번만 읽고 캐시한다.
+    """
+    global _PAIR_CFG
+    if _PAIR_CFG is None or reload:
+        try:
+            from vtd_adapter.config import load_params_yaml
+            rc = load_params_yaml().get('route') or {}
+            _PAIR_CFG = (bool(rc.get('waypoint_lane_is_hint', True)),
+                         float(rc.get('turn_connect_max_m', 400.0)),
+                         float(rc.get('turn_heading_thr_deg', 25.0)))
+        except Exception:                                # noqa: BLE001 — 독립 실행 폴백
+            _PAIR_CFG = (True, 400.0, 25.0)
+    return _PAIR_CFG
+
+
+def road_lane_pool(lg, cands, x, y, yaw):
+    """후보집합에 등장한 **모든 도로**의 같은 섹션·같은 통행방향 driving 차로.
+
+    경유점이 어느 차로에 찍혔는지는 정보가 아니다 (주최측 2026-09-03). 도로를
+    하나로 확정하지도 않는다 — 최근접 후보의 도로만 보면 경유점을 1.5 m 흔들었을
+    때 15 %, 4.5 m 에서 28.6 % 가 엉뚱한 도로를 집는다 (실측).
+
+    반환: [(lane_key, s, dist)] — 반경 밖으로 확장된 차로도 project 로 s·거리를
+    채운다. 거리는 스텝4 의 동점 깨기 항에만 쓰인다.
+    """
+    # 후보 자신을 먼저 넣는다 — 확장 풀은 candidates() 의 **상위집합**이어야 한다.
+    # 확장은 차로 중점에서 헤딩·폭을 보는데, 짧은 연결로처럼 중점 헤딩이 투영
+    # 지점과 크게 다른 차로는 그 필터에 걸려 자기 자신조차 빠진다 (실측:
+    # test_route_waypoints seq 15 에서 진출 풀이 통째로 비어 폴백했다).
+    out = list(cands)
+    seen_key = {c[0] for c in cands}
+    seen_road = set()
+    for k0, _s0, _d0 in cands:
+        if k0[0] in seen_road:
+            continue
+        seen_road.add(k0[0])
+        for kk in lg.lanes_of_road(k0[0]):
+            if kk in seen_key or kk[1] != k0[1]:
+                continue
+            r = lg.lanes[kk]
+            if r.get('type') != 'driving' or (kk[2] > 0) != (k0[2] > 0):
+                continue
+            hd = float(np.interp(0.5 * r['length'], r['s'],
+                                 np.unwrap(r['hdg'].astype(float))))
+            if yaw is not None and abs(wrap(yaw - hd)) > math.radians(70):
+                continue
+            if lg.width_at(kk, 0.5 * r['length']) < 2.0:
+                continue
+            seen_key.add(kk)
+            s_p, _t, d_p, _j = lg.project(kk, x, y)
+            out.append((kk, s_p, d_p))
+    return sorted(out, key=lambda c: c[2])
+
+
+def road_heading(lg, road_id, like_key):
+    """도로 단위 헤딩 [rad].
+
+    리포트 [2] 의 Δheading 은 **차로** 시작·끝 헤딩으로 낸다(build_route.report).
+    짝 공동 선택은 차로를 정하기 **전에** 회전 방향이 필요하므로 같은 도로·같은
+    통행방향의 driving 차로 헤딩으로 대신한다 — 같은 도로에서 통행방향이 같으면
+    차로 헤딩이 같으므로 **등가 대체**이지, 같은 코드의 재사용은 아니다.
+    회전 방향은 표시용(WARN·리포트·turn 이벤트)이고 후보 필터가 아니다.
+    """
+    for kk in lg.lanes_of_road(road_id):
+        r = lg.lanes[kk]
+        if r.get('type') != 'driving' or (kk[2] > 0) != (like_key[2] > 0):
+            continue
+        h = np.unwrap(r['hdg'].astype(float))
+        return float(h[0]), float(h[-1])
+    return None, None
+
+
+def turn_connect(lg, ka, s_a, kb, s_b, banned, cap):
+    """진입 차로 ka → 진출 차로 kb 를 **차선변경 없이** 잇는 비용 [m]. 안 되면 None.
+
+    cap 상한이 없으면 successor 만 따라가도 블록을 5 km 돌아 "연결됨" 이 된다
+    (실측 p90 1455 m / 최대 5109 m). 실제 짝 43개가 쓴 연결 비용은 최대 363 m 다.
+    """
+    r = dijkstra(lg, [(ka, s_a)], {kb: s_b}, allow_lane_change=False, banned=banned)
+    if r is None or r[0] > cap:
+        return None
+    return r
+
+
 def locate_score(lg, key, s, dd, yaw):
     """lanegraph.locate 의 후보 점수(prefer 없음) — 거리 + 헤딩오차 가중.
 
@@ -481,6 +572,97 @@ def junction_segments(n_points):
     return {wi for wi in range(1, n_points - 1, 2)}
 
 
+def _pair_diag(lg, pool_in, pool_out, starts, allow_prev, banned, cap):
+    """진입 차로별 (앞 세그먼트 도달 / 진출 연결 최소비용) — WARN·RouteError 용."""
+    out = []
+    for ka, sa, da in pool_in:
+        pre = dijkstra(lg, starts, {ka: sa}, allow_lane_change=allow_prev, banned=banned)
+        best = None
+        for kb, sb, _db in pool_out:
+            c = turn_connect(lg, ka, sa, kb, sb, banned, cap)
+            if c is not None and (best is None or c[0] < best[0]):
+                best = (c[0], kb)
+        out.append((ka, da, None if pre is None else pre[0], best))
+    return out
+
+
+def _fmt_pair_diag(diag):
+    rows = []
+    for ka, da, pre, best in diag:
+        rows.append('%s @%.2fm 앞도달 %s 회전 %s' % (
+            ka, da, '-' if pre is None else '%.0fm' % pre,
+            '불가' if best is None else '%s %.0fm' % (best[1], best[0])))
+    return '\n              '.join(rows)
+
+
+def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label, seqs):
+    """교차로 짝 (진입, 진출) 차로를 함께 고른다.
+
+    스텝 (2026-09-03 주최측 답변 반영):
+      1. 진입·진출 경유점 각각 candidates() 후보집합에 등장한 **모든 도로**의
+         같은 섹션·같은 통행방향 driving 차로로 넓힌다. 도로를 하나로 확정하지
+         않는다 — 경유점이 찍힌 차로도, 그 차로의 도로도 정보가 아니다.
+      2. 회전 방향은 도로 단위 헤딩으로 낸다. **표시용**이고 필터가 아니다.
+      3. 진입 차로 → 진출 차로가 차선변경 없이 이어지고 그 비용이 cap 이하인
+         짝만 남긴다.
+      4. cost(앞→진입) + cost(진입→진출) + W×진입거리 + W×진출거리 최소.
+         거리 항은 동점 깨기지 결정 요인이 아니다.
+      5. 짝이 0개면 None 을 돌려 호출부가 기존 탐욕으로 폴백하게 한다 (+WARN).
+
+    tier 층은 쓰지 않는다 — 실패를 만든 게 "가까운 후보부터 좁게 본다" 였고,
+    거리는 이미 4의 비용에 들어 있다.
+
+    반환: (path_in, k_in, s_in, path_out, k_out, s_out, used_banned) 또는 None
+    """
+    x1, y1 = wps[wi + 1]
+    x2, y2 = wps[wi + 2]
+    ay_in = math.atan2(y1 - wps[wi][1], x1 - wps[wi][0])
+    ay_out = math.atan2(y2 - y1, x2 - x1)
+    ca = candidates(lg, x1, y1, radius, ay_in)
+    cb = candidates(lg, x2, y2, radius, ay_out)
+    if not ca or not cb:
+        return None
+    pool_in = road_lane_pool(lg, ca, x1, y1, ay_in)
+    pool_out = road_lane_pool(lg, cb, x2, y2, ay_out)
+    allow_prev = wi not in junction_segs
+
+    def search(bans):
+        best = None
+        for ka, sa, da in pool_in:
+            pre = dijkstra(lg, starts, {ka: sa}, allow_lane_change=allow_prev, banned=bans)
+            if pre is None:
+                continue
+            for kb, sb, db in pool_out:
+                c = turn_connect(lg, ka, sa, kb, sb, bans, cap)
+                if c is None:
+                    continue
+                score = pre[0] + c[0] + TARGET_DIST_W * da + TARGET_DIST_W * db
+                if best is None or score < best[0]:
+                    best = (score, pre[1], ka, sa, c[1], kb, sb)
+        return best
+
+    best, used_banned = search(banned), []
+    if best is None:
+        # 금지 연결로를 풀면 되는가 — 기존 탐욕과 같은 취급(불가피하면 허용 + 기록)
+        best = search(frozenset())
+        if best is None:
+            roads_in = sorted({k[0] for k, _s, _d in pool_in})
+            roads_out = sorted({k[0] for k, _s, _d in pool_out})
+            h0, _ = road_heading(lg, ca[0][0][0], ca[0][0])
+            _, h1 = road_heading(lg, cb[0][0][0], cb[0][0])
+            kind = ('?' if h0 is None or h1 is None
+                    else turn_kind(math.degrees(wrap(h1 - h0))))
+            print(f'  [경고] {label(wi + 1)}→{label(wi + 2)} 회전 가능한 (진입,진출) '
+                  f'짝이 없다 — 진입 도로 {roads_in} 진출 도로 {roads_out} {kind}, '
+                  f'연결 상한 {cap:g}m. 기존 탐욕으로 폴백한다\n'
+                  f'              {_fmt_pair_diag(_pair_diag(lg, pool_in, pool_out, starts, allow_prev, banned, cap))}',
+                  file=sys.stderr)
+            return None
+        used_banned = [kk for kk, _ in (best[1] + best[4]) if kk in banned]
+    _sc, path_in, k_in, s_in, path_out, k_out, s_out = best
+    return path_in, k_in, s_in, path_out, k_out, s_out, used_banned
+
+
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
                 seqs=None, finish_tail_m=0.0):
     # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
@@ -496,7 +678,12 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
     def nearest_report(x, y):
         d, _ii = lg.kd.query((x, y), k=1)
         return float(np.atleast_1d(d)[0])
+    pair_hint, turn_cap, _thr = pair_cfg()
+    skip_next = False
     for wi in range(len(waypoints) - 1):
+        if skip_next:                       # 앞 반복에서 짝으로 함께 처리했다
+            skip_next = False
+            continue
         x0, y0 = waypoints[wi]
         x1, y1 = waypoints[wi + 1]
         if prev_end is None:
@@ -542,6 +729,37 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         else:
             starts = [prev_end]
 
+        # ── 교차로 짝 공동 선택 ──────────────────────────────────────────
+        # 진입 경유점(waypoints[wi+1])의 차로를 확정하기 **전에** 진출
+        # 경유점(waypoints[wi+2])까지 함께 본다. 짝 사이는 차선변경 금지라
+        # 진입이 틀리면 복구가 없고, 현재 탐욕은 진출점을 보지 않는다.
+        if pair_hint and (wi + 1) in junction_segs and wi + 2 < len(waypoints):
+            got = _pair_choice(lg, starts, waypoints, wi, radius, junction_segs,
+                               banned, turn_cap, label, seqs)
+            if got is not None:
+                (pa, k_in, s_in, pb, k_out, s_out, ub) = got
+                for kk in ub:
+                    forced_infeasible.append((wi, kk, banned[kk]))
+                if wi == 0:
+                    wp_s.append(0.0)
+                i0 = max(0, len(seq) - 1)
+                for k, s_en in pa:
+                    if seq and seq[-1][0] == k:
+                        continue
+                    seq.append((k, s_en))
+                seg_span.append((wi, i0, len(seq) - 1))
+                i0b = max(0, len(seq) - 1)
+                for k, s_en in pb:
+                    if seq and seq[-1][0] == k:
+                        continue
+                    seq.append((k, s_en))
+                seg_span.append((wi + 1, i0b, len(seq) - 1))
+                prev_end = (k_out, s_out)
+                wp_s.append(None); wp_s.append(None)
+                skip_next = True
+                continue
+            # 회전 가능 짝이 0개 — 아래 기존 탐욕으로 폴백한다 (WARN 은 _pair_choice 가 냈다)
+
         # 도착 헤딩 = 이 구간의 진행방향. 경유점은 "여기를 이 방향으로 지난다" 는
         # 뜻이므로 반대편 차로는 후보에서 빼야 한다 (안 그러면 유턴 경로가 생긴다).
         arrive_yaw = math.atan2(y1 - y0, x1 - x0)
@@ -583,17 +801,34 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         if best is None:
             # 제약을 풀지 않는다. 풀면 경로가 통째로 엉뚱한 데로 새면서
             # "성공했지만 완전히 틀린 경로" 가 나온다. 실패를 그대로 보고한다.
-            near = ', '.join(f'{k}@{d:.2f}m' for k, s, d in tg[:4])
+            #
+            # 현장에서 이 메시지만 보고 판단해야 하므로 **후보별 거리와 dijkstra
+            # 결과를 전부** 싣는다 (예전에는 어느 seq 가 왜 막혔는지 알려면 따로
+            # 스크립트를 짜야 했다).
+            lines = []
+            for k, s, d in tg:
+                r_lc = dijkstra(lg, starts, {k: s}, allow_lane_change=allow_lc,
+                                banned=banned)
+                r_free = None if r_lc is not None else dijkstra(
+                    lg, starts, {k: s}, allow_lane_change=True)
+                lines.append('%s @%.2fm  %s%s' % (
+                    k, d,
+                    '연결 %.0fm' % r_lc[0] if r_lc else '연결 X',
+                    '' if r_lc or r_free is None else ' (차선변경 허용하면 %.0fm)' % r_free[0]))
             extra = ''
             if not allow_lc:
                 extra = ('\n       이 구간은 교차로 내부(짝)라 차선변경이 금지돼 있다.'
                          '\n       진입 차로가 이미 틀렸을 가능성이 크다 — 앞 구간이 끝난 차로를 확인할 것.')
-                if any(dijkstra(lg, starts, {k: s}, allow_lane_change=True)
-                       for k, s, d in tg[:4]):
+                if any(l.endswith(')') for l in lines):
                     extra += '\n       (차선변경을 허용하면 연결된다 = 차로 선택 문제)'
+            if pair_hint and (wi + 1) in junction_segs:
+                extra += ('\n       짝 공동 선택이 회전 가능한 (진입,진출) 짝을 찾지 못해'
+                          ' 탐욕으로 폴백한 뒤 실패했다 (위 [경고] 참조).')
             raise RouteError(
                 f'{label(wi)} ({x0:.2f},{y0:.2f}) -> {label(wi + 1)} ({x1:.2f},{y1:.2f}): '
-                f'경로 없음\n       출발 차로 {starts[0][0]}   후보 {near}{extra}')
+                f'경로 없음\n       출발 차로 {starts[0][0]} @s={starts[0][1]:.1f}'
+                f'\n       진출 후보 {len(tg)}개:\n              ' + '\n              '.join(lines)
+                + extra)
         _score, path, k_end, s_end, used_banned = best
         for kk in used_banned:
             forced_infeasible.append((wi, kk, banned[kk]))
@@ -653,7 +888,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
                 h2 = np.unwrap(lg.lanes[lanes[j]]['hdg'].astype(float))
                 dh += float(h2[-1] - h2[0])
                 j += 1
-            if abs(dh) > math.radians(25):
+            if abs(dh) > math.radians(pair_cfg()[2]):
                 events.append({'kind': 'turn_left' if dh > 0 else 'turn_right', 's': cum[i], 'lane': k, 's_in_lane': 0.0,
                                'junction': r['junction'], 'delta_heading_deg': math.degrees(dh)})
     # ── 짝(공식 CSV) 기준 회전 보정 ──────────────────────────────────────
@@ -667,7 +902,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         h0 = np.unwrap(lg.lanes[lanes[i0]]['hdg'].astype(float))
         h1 = np.unwrap(lg.lanes[lanes[i1]]['hdg'].astype(float))
         dh = math.degrees(wrap(float(h1[-1]) - float(h0[0])))
-        if abs(dh) <= 25.0:
+        if abs(dh) <= pair_cfg()[2]:
             continue
         kind = 'turn_left' if dh > 0 else 'turn_right'
         # 이 교차로 구간에 이미 같은 방향 회전 이벤트가 있으면 건드리지 않는다
@@ -724,7 +959,10 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             'junction_segments': sorted(junction_segs), 'segment_span': seg_span}
 
 
-def turn_kind(delta_deg, straight_deg=25.0):
+def turn_kind(delta_deg, straight_deg=None):
+    """직진/좌회전/우회전. 임계는 params route.turn_heading_thr_deg 단일 출처."""
+    if straight_deg is None:
+        straight_deg = pair_cfg()[2]
     if delta_deg > straight_deg:
         return '좌회전'
     if delta_deg < -straight_deg:
