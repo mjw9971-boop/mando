@@ -146,6 +146,20 @@ def candidates(lg, x, y, radius, yaw=None, ball=None, max_points=None):
     return sorted(seen.values(), key=lambda c: c[2])
 
 
+def locate_score(lg, key, s, dd, yaw):
+    """lanegraph.locate 의 후보 점수(prefer 없음) — 거리 + 헤딩오차 가중.
+
+    build_route 는 출발 차로 판정에서 **locate 와 같은 규칙, 다른 후보집합**을
+    쓰려고 이걸 따로 갖는다. 규칙까지 다르면 locate 가 헤딩을 보고 내린 판단을
+    통째로 덮어써 버린다 — 여기서 고치려는 건 후보집합 절단뿐이다.
+    lanegraph.locate 가 바뀌면 이 함수도 같이 맞춰야 한다.
+    """
+    if yaw is None:
+        return dd
+    hd = float(np.interp(s, lg.lanes[key]['s'], np.unwrap(lg.lanes[key]['hdg'].astype(float))))
+    return dd + 0.5 * abs(wrap(yaw - hd))
+
+
 def has_broken(lg, key, side):
     if lg.neighbor(key, side) is None:
         return False
@@ -466,11 +480,40 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         x1, y1 = waypoints[wi + 1]
         if prev_end is None:
             # 출발점: 헤딩 포함해서 하나로 확정 (여러 후보를 주면 바로 앞 차로가 선택되는 문제)
+            #
+            # locate() 는 lanegraph 안에서 kd.query(k=16) 으로 후보를 뽑는다 —
+            # candidates 가 갖고 있던 것과 **같은 개수 절단 결함**이다. 출발점이
+            # 중심선에서 벗어나 있으면 조용히 옆 차로를 고르고, 그러면 에러 없이
+            # 경로 전체가 어긋난다 (가장 위험한 실패 모드).
+            # 2026-09-03 실측: 대회장 CSV 출발점에서 k=16 도달거리는 3.06 m 뿐이고
+            # 정답 차로가 0.14 m 라 우연히 맞았다 — 3 m 넘게 벗어나면 안 맞는다.
+            #
+            # lanegraph.py 는 제어기 런타임(EgoTracker)이 같이 쓰는 파일이라 여기서
+            # 고치지 않는다. 대신 **locate 의 점수 규칙을 반경 기반 후보집합에 그대로
+            # 적용**해 보고, 더 나은 차로가 나오면 그쪽을 쓰고 경고한다. 바꾸는 건
+            # 후보집합뿐이라 locate 가 헤딩을 보고 일부러 조금 먼 차로를 고른 판단은
+            # 그대로 살아 있고, candidates 만의 필터(폭 2 m 미만 포켓 배제)로 빠진
+            # 차로 때문에 더 가까운 정답을 밀어내는 일도 없다.
+            cand0 = candidates(lg, x0, y0, radius, start_yaw)
             m0 = lg.locate(x0, y0, start_yaw, max_dist=radius)
-            if m0 is not None:
+            override = None
+            if m0 is not None and cand0:
+                sc_m0 = locate_score(lg, m0.lane, m0.s, m0.dist, start_yaw)
+                best0 = min(cand0, key=lambda c: locate_score(lg, c[0], c[1], c[2], start_yaw))
+                sc_b0 = locate_score(lg, best0[0], best0[1], best0[2], start_yaw)
+                if best0[0] != m0.lane and sc_b0 < sc_m0 - 1e-9:
+                    print(f'  [경고] {label(wi)} ({x0:.2f},{y0:.2f}) 출발 차로 불일치 — '
+                          f'locate {m0.lane} @{m0.dist:.2f}m (점수 {sc_m0:.3f}) vs '
+                          f'반경후보 {best0[0]} @{best0[2]:.2f}m (점수 {sc_b0:.3f}). '
+                          f'반경후보를 쓴다 — locate 는 kd.query(k=16) 절단 '
+                          f'(vtd_adapter/lanegraph.py)', file=sys.stderr)
+                    override = [(best0[0], best0[1])]
+            if override is not None:
+                starts = override
+            elif m0 is not None:
                 starts = [(m0.lane, m0.s)]
             else:
-                starts = [(k, s) for k, s, d in candidates(lg, x0, y0, radius, start_yaw)[:6]]
+                starts = [(k, s) for k, s, d in cand0[:6]]
             if not starts:
                 raise RouteError(
                     f'{label(wi)} ({x0:.2f},{y0:.2f}): 반경 {radius:g}m 내 차로 없음 '
