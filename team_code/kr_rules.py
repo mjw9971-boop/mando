@@ -321,6 +321,18 @@ class KrRules:
         # 경로가 그 교차로에서 회전·차선변경·통과를 요구하므로 전 단계·전 바퀴 유지.
         # false = 이전 동작 (L2 부터 zone 게이트 전체 생략).
         self.zone_relax_limited = bool(ot.get('zone_relax_limited', False))
+        # span 국소성 게이트 (2026-09-03 실주행 100310/100458). `plan_shift_span` 은
+        # `original_route_points[route_index:]` 전체에 cKDTree 를 세워 차단물에 가장
+        # 가까운 경로점을 잡는다 (PDM 원문 privileged_route_planner 447~453 과 동일).
+        # 순환 코스에서 경로가 같은 자리를 두 번 지나면 4.5 km 앞 경로점이 잡혀
+        # (실측 13건 4550~4595 m) 자차 앞이 아니라 한 바퀴 뒤 구간이 밀리고, 자차는
+        # SHIFT_ACTIVE 로 원복만 기다리며 서 있었다 (100310 158틱). 시프트 시작점이
+        # 자차 route_index 보다 이 거리 이상 앞이면 그 span 을 기각한다. 정상 시프트
+        # 실측은 5.0~34.7 m (104648/104807/배치). route.py 의 근본 수정은 범위 밖.
+        # false = 이전 동작 (거리 무관).
+        self.span_gate = bool(ot.get('span_gate_enable', False))
+        self.span_gate_max_m = float(ot.get('span_gate_max_m', 100.0))
+        self.last_span_plan: tuple | None = None   # _planned_shift_geom 의 (a, b, left)
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -874,6 +886,7 @@ class KrRules:
         매끄러워서 빼면 정상 전이의 곡률이 함께 빠지고 판별이 깨끗해진다.
         실측 (간격 1.0 m): 정상 4건 0.0002~0.0095, 계단 1건 2.977 → 313 배.
         """
+        self.last_span_plan = None
         try:
             ppm = float(getattr(planner, 'points_per_meter', 10))
             a, b, left = planner.plan_shift_span(
@@ -882,6 +895,10 @@ class KrRules:
                 extra_length_before=self.ot_before_m * ppm,
                 extra_length_after=(self.ot_after_m if after_m is None else after_m) * ppm,
                 min_start_ahead=(self.shift_ahead_m if ahead_m is None else ahead_m) * ppm)
+            # span 국소성 게이트가 읽는다. 실제 시프트(shift_route_around_actors)는
+            # 같은 인자로 plan_shift_span 을 다시 불러 같은 span 을 얻으므로, 여기서
+            # 본 span 이 곧 적용될 span 이다. 반환 형태는 그대로 (κ, lc_var) / None.
+            self.last_span_plan = (int(a), int(b), bool(left))
             step = max(1, int(round(self.shift_k_step_m * ppm)))
             d = planner.planned_lateral_offsets(a, b, left, step_pts=step)
         except Exception:                                  # noqa: BLE001
@@ -1964,6 +1981,14 @@ class KrRules:
                 # 계획 LC 와 겹치면 기각 (B-11) — 합산 횡이동을 만들지 않는다
                 if self.lc_overlap_m > 0.0 and lc_var > self.lc_overlap_m:
                     reject('lc_overlap')
+                    continue
+            # ⑥ span 국소성 — 시프트 시작점이 자차보다 span_gate_max_m 이상 앞이면
+            # 순환 코스의 한 바퀴 뒤 구간이 잡힌 것이다 (실측 4550~4595 m). 기록이
+            # 없으면(plan_shift_span 실패) "못 재면 통과" 관례대로 검사하지 않는다.
+            if self.span_gate and self.last_span_plan is not None:
+                span_off_m = (self.last_span_plan[0] - int(planner.route_index)) / ppm
+                if span_off_m >= self.span_gate_max_m:
+                    reject('span_too_far', span_off_m=round(span_off_m, 1))
                     continue
             span = planner.shift_route_around_actors(
                 actor, chain_last,
