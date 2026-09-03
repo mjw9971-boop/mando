@@ -1,7 +1,7 @@
 """
 배치 회귀 실행기 — 시나리오 여러 개를 사람 손 없이 순차 실행하고 한 표로 정리.
 
-    python3 tools/batch_run.py scenarios.json [--host 192.168.10.1] [--dry-run]
+    python3 tools/batch_run.py scenarios.json [--host 192.168.50.11] [--dry-run]
     python3 tools/batch_run.py scenarios/batch_보행자집중.json scenarios/batch_급정거집중.json
     python3 tools/batch_run.py 'scenarios/batch_*집중.json'      # glob 도 받는다 (합쳐 실행)
 
@@ -833,7 +833,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='배치 회귀 실행기 (SCP 원격 제어)')
     ap.add_argument('scenarios', nargs='+',
                     help='시나리오 목록 json/yaml — 여러 개·glob 가능, 합쳐서 순차 실행')
-    ap.add_argument('--host', default='192.168.10.1', help='VTD 주소 (SCP 48179 + 9910)')
+    ap.add_argument('--host', default='192.168.50.11', help='VTD 주소 (SCP 48179 + 9910)')
     ap.add_argument('--ssh', default=None,
                     help='실행 전 시나리오 실존 확인용 ssh 대상 (기본: <vtd_xml_path 의 홈 사용자>@host)')
     ap.add_argument('--settle-s', type=float, default=3.0, help='SCP 명령 간 대기')
