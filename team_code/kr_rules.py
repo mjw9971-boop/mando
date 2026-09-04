@@ -192,6 +192,14 @@ class KrRules:
         self.walkin_v = float(sp.get('ped_walkin_v', 0.5))
         self.walkin_ticks = int(round(float(sp.get('ped_walkin_s', 0.5)) * _hz))
         self.walkin_lat = float(sp.get('ped_walkin_lat_m', 8.0))
+        # 다중 보행자 회랑 홀드 (P4-M, 2026-09-04 실주행 101405). false = 이전 동작:
+        # 회랑 안 보행자에게도 정지 프로파일 √(2·a·d_eff) 만 주어 12 m 앞에서 5.1 m/s
+        # 를 허용했고, 적신호 IDM 후보(1.2→2.3)가 더 낮아 그쪽이 이기며 재가속했다.
+        # 회랑(|lat| < ped_release_lat_m — A-1 해제와 같은 축) 안 보행자는 홀드 래치로
+        # v_allow = 0 을 강제한다. 해제는 A-1 규칙(_ped_release_tick) 그대로.
+        self.ped_multi = bool(sp.get('ped_multi_enable', False))
+        # 관측 드롭아웃 coast — 이 시간 안의 미관측은 '이탈' 이 아니다 (직전 기여 유지).
+        self.ped_coast_ticks = int(round(float(sp.get('ped_hold_coast_s', 0.5)) * _hz))
         # 횡단보도 앞 서행 (A-3). false 면 비활성 = 서 있는 보행자는 PDM forecast 에만.
         self.cw_enable = bool(sp.get('ped_crosswalk_creep_enable', False))
         self.cw_zone_m = float(sp.get('ped_crosswalk_zone_m', 10.0))
@@ -403,6 +411,11 @@ class KrRules:
         self.ped_released: dict = {}               # id → 이번 틱 해제 사유
         self.last_ped: dict | None = None          # 이번 틱 진단 (reasons.ped)
         self.ped_emergency = False                 # 이번 틱 비상 제동 우회 여부
+        # 다중 보행자 회랑 홀드 (P4-M) — ped_multi_enable 일 때만 채워진다
+        self.ped_hold_ids: set = set()             # 회랑 홀드 래치가 걸린 id (v_allow = 0)
+        self.ped_miss: dict = {}                   # id → 연속 미관측 틱 (coast)
+        self.ped_last: dict = {}                   # id → 직전 관측 기여 (v_allow, a_req)
+        self.ped_all: dict = {}                    # id → 이번 틱 전 보행자 평가 (reasons.ped.all)
         self._sl_all: list | None = None           # 경로상 전 정지선 route_s (1회)
         # BREAKOUT 상태
         self.bo_state: str | None = None           # None | 'BREAKOUT' | 'CREEP_FAIL'
@@ -2454,6 +2467,9 @@ class KrRules:
         self.ped_hold.clear()
         self.cw_wait.clear()
         self.ped_walkin.clear()
+        self.ped_hold_ids.clear()
+        self.ped_miss.clear()
+        self.ped_last.clear()
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -2589,6 +2605,9 @@ class KrRules:
         best = None
         self.ped_diag = {}
         self.ped_released = {}
+        self.ped_all = {}
+        # 회랑 폭이 0(A-1 비활성)이면 회랑 자체가 정의되지 않아 홀드도 비활성이다.
+        multi = self.ped_multi and self.ped_release_lat > 0.0
         s0 = float(getattr(getattr(ap, 'config', None),
                            'idm_pedestrian_minimum_distance', 4.0))
         for w in walkers:
@@ -2603,6 +2622,20 @@ class KrRules:
                 # 리셋한다. 래치와 hold 는 유지 — 관측이 끊긴 것이 아니다.
                 self.ped_lat.pop(wid, None)
                 self.ped_clear.pop(wid, None)
+                # P4-M: 홀드 래치가 살아 있으면 투영 불가 틱도 coast 로 다룬다 —
+                # 래치 on 인데 v_allow 가 사라지는 틱을 만들지 않는다 (상한은 coast).
+                if multi and wid in self.ped_hold_ids and wid in self.ped_last:
+                    self.ped_miss[wid] = self.ped_miss.get(wid, 0) + 1
+                    if self.ped_miss[wid] <= self.ped_coast_ticks:
+                        v_allow, a_req = self.ped_last[wid]
+                        self.ped_all[wid] = {'v_allow': round(float(v_allow), 2),
+                                             'latched': wid in self.ped_intent,
+                                             'hold': True, 'coast': self.ped_miss[wid],
+                                             'unprojectable': True}
+                        if best is None or v_allow < best[0]:
+                            best = (v_allow, a_req, wid)
+                    else:
+                        self._ped_unlatch(wid)
                 continue
             s_rel, lat = pr
             prev = self.ped_lat.get(wid)
@@ -2617,19 +2650,39 @@ class KrRules:
             if not (0.0 < s_rel <= self.detect_max_m):
                 self._ped_unlatch(wid)                 # 지나갔거나 범위 밖
                 continue
+            self.ped_miss[wid] = 0                     # 관측됨 — coast 카운터 리셋
+            # ── 회랑 홀드 래치 (P4-M) ───────────────────────────────────────
+            # 회랑(|lat| < ped_release_lat_m) 안에 있는 보행자는 **누구든** 홀드한다 —
+            # 의도 래치 여부·몇 명인지·어느 id 가 best 로 뽑히는지와 무관하다. 회랑
+            # 폭은 A-1 해제·C-3 큐 가드와 같은 값을 그대로 읽는다 (판정 기준 불변).
+            if (multi and abs(lat) < self.ped_release_lat
+                    and wid not in self.ped_hold_ids):
+                self.ped_hold_ids.add(wid)
+                self.ped_clear.setdefault(wid, 0)
+                self.ped_hold.setdefault(wid, 0)
             if wid not in self.ped_intent:
-                if v_toward is None:
+                latch_ok = v_toward is not None
+                if latch_ok:
+                    w_speed = float(getattr(w, 'speed', 0.0))
+                    if wid in self.ped_static:
+                        latch_ok = (w_speed >= self.ped_intent_v
+                                    and v_toward >= self.ped_intent_v)
+                    else:
+                        latch_ok = self._ped_walkin(wid, w_speed, v_toward, lat)
+                if latch_ok:
+                    self.ped_intent.add(wid)
+                    self.ped_clear[wid] = 0
+                    self.ped_hold[wid] = 0
+                    self.ped_walkin.pop(wid, None)
+                elif wid not in self.ped_hold_ids:
+                    if multi:
+                        self.ped_all[wid] = {'s_rel': round(float(s_rel), 2),
+                                             'lat': round(float(lat), 2),
+                                             'latched': False, 'hold': False}
                     continue
-                w_speed = float(getattr(w, 'speed', 0.0))
-                if wid in self.ped_static:
-                    if w_speed < self.ped_intent_v or v_toward < self.ped_intent_v:
-                        continue
-                elif not self._ped_walkin(wid, w_speed, v_toward, lat):
-                    continue
-                self.ped_intent.add(wid)
-                self.ped_clear[wid] = 0
-                self.ped_hold[wid] = 0
-                self.ped_walkin.pop(wid, None)
+            # ── 순서 보장: **해제 판정이 먼저**, v_allow 산출은 그 다음 ──────────
+            # 홀드 래치가 살아 있는 한 이 아래에서 v_allow 는 0 이다. 다른 계산 경로
+            # (프로파일·coast·비상)가 홀드보다 앞서 값을 만들 수 없다.
             why = self._ped_release_tick(wid, w, lat, v_toward)
             self.ped_diag[wid] = {
                 'lat': round(float(lat), 2),
@@ -2641,16 +2694,44 @@ class KrRules:
                 self.ped_released[wid] = why
                 continue
             d_eff = s_rel - self.front - s0
-            v_allow = _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_eff))
+            hold = multi and wid in self.ped_hold_ids
+            # 회랑 홀드 = 0. 회랑 밖 의도 래치 = 횡단 지점 앞 정지 프로파일 (이전 그대로).
+            v_allow = 0.0 if hold else _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_eff))
             # 분모 하한 0.5 m — d_eff→0 에서 a_req 가 발산해 로그가 못 쓰게 된다.
             # 판정(임계 초과 여부)에는 영향이 없다: 하한을 써도 이미 임계 위다.
             a_req = ego_speed * ego_speed / (2.0 * max(d_eff, 0.5))
+            if multi:
+                self.ped_last[wid] = (v_allow, a_req)
+                self.ped_all[wid] = {'s_rel': round(float(s_rel), 2),
+                                     'lat': round(float(lat), 2),
+                                     'v_allow': round(float(v_allow), 2),
+                                     'latched': wid in self.ped_intent, 'hold': bool(hold)}
             if best is None or v_allow < best[0]:
                 best = (v_allow, a_req, wid)
-        # 관측이 끊긴 id 정리 (obj_ticks 의 grace 와 별개 — 여기선 즉시)
-        for wid in list(self.ped_intent):
-            if wid not in live:
-                self._ped_unlatch(wid)
+        # 관측이 끊긴 id 정리 (obj_ticks 의 grace 와 별개 — 이전 동작은 즉시 해제).
+        # P4-M coast: ped_hold_coast_s 안의 미관측은 이탈이 아니다 — 직전 틱 기여
+        # (홀드면 0, 의도 래치면 직전 프로파일)를 그대로 낸다. 두 타이머의 관계:
+        #   · coast (ped_hold_coast_s, 미관측 연속 틱) — **관측이 없을 때만** 센다.
+        #     만료 + 그 사이 재관측 없음 → 해제. 재관측되면 0 으로 리셋.
+        #   · release (ped_release_s, _ped_release_tick) — **관측된 틱에서만** 센다.
+        #     회랑 밖 ∧ 멀어짐 ∧ (멈춤 ∨ 차도 밖) 연속 시 해제.
+        #   둘은 서로 다른 틱에서만 진행하므로 합산되지 않는다 — 과홀드 상한은
+        #   max(release 경로, coast 경로) 이지 합이 아니다.
+        for wid in list(self.ped_intent | self.ped_hold_ids):
+            if wid in live:
+                continue
+            if multi and self.ped_coast_ticks > 0 and wid in self.ped_last:
+                self.ped_miss[wid] = self.ped_miss.get(wid, 0) + 1
+                if self.ped_miss[wid] <= self.ped_coast_ticks:
+                    v_allow, a_req = self.ped_last[wid]
+                    self.ped_all[wid] = {'v_allow': round(float(v_allow), 2),
+                                         'latched': wid in self.ped_intent,
+                                         'hold': wid in self.ped_hold_ids,
+                                         'coast': self.ped_miss[wid]}
+                    if best is None or v_allow < best[0]:
+                        best = (v_allow, a_req, wid)
+                    continue
+            self._ped_unlatch(wid)
         for wid in list(self.ped_static):
             if wid not in live and wid not in self.obj_ticks:
                 self.ped_static.discard(wid)
@@ -2780,10 +2861,17 @@ class KrRules:
         return best
 
     def _ped_unlatch(self, wid) -> None:
-        """래치 해제 + 해제 카운터 정리 (지나감·끊김·위치 해제 공통)."""
+        """래치 해제 + 해제 카운터 정리 (지나감·끊김·위치 해제 공통).
+
+        의도 래치와 회랑 홀드 래치(P4-M)는 **같이** 풀린다 — 해제 조건은 하나
+        (_ped_release_tick / 지나감 / coast 만료)이고, 그 뒤에야 v_allow 가 사라진다.
+        """
         self.ped_intent.discard(wid)
+        self.ped_hold_ids.discard(wid)
         self.ped_clear.pop(wid, None)
         self.ped_hold.pop(wid, None)
+        self.ped_miss.pop(wid, None)
+        self.ped_last.pop(wid, None)
 
     def _ped_release_tick(self, wid, w, lat: float, v_toward) -> str | None:
         """래치된 보행자의 **위치 기반 해제** 판정 (A-1). 투영이 된 틱마다 부른다.
@@ -3043,6 +3131,13 @@ class KrRules:
             wid, why = next(iter(self.ped_released.items()))
             self.last_ped = {'id': int(wid), 'wins': False, 'release': why,
                              **self.ped_diag.get(wid, {})}
+        # P4-M: 평가된 보행자 **전부**를 남긴다 (id 별 종·횡거리·v_allow 기여·래치·홀드).
+        # 이전에는 best 1명만 기록돼 다중 보행자 창에서 다른 id 의 상태를 알 수 없었다.
+        if self.ped_multi and (self.ped_all or self.ped_hold_ids):
+            if self.last_ped is None:
+                self.last_ped = {'id': None, 'wins': False}
+            self.last_ped['all'] = {int(k): v for k, v in self.ped_all.items()}
+            self.last_ped['hold'] = sorted(int(k) for k in self.ped_hold_ids)
 
         # 횡단보도 앞 서행 (A-3) — 서 있는 보행자 앞 3 s 정지 후 creep 상한. min() 후보.
         cw = self._ped_crosswalk(planner, ap, ego_speed)

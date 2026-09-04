@@ -97,6 +97,22 @@ speed:
   ped_walkin_v: 0.5
   ped_walkin_s: 0.5
   ped_walkin_lat_m: 8.0
+  # ── 다중 보행자 회랑 홀드 (P4-M, 2026-09-04 실주행 101405). 기본 false. ───
+  # 실측: id4·id5 가 12 m 앞 회랑(|lat| < 2.5)을 횡단하는 동안(k205~266) 의도
+  # 후보는 정지 프로파일 √(2·a·(s_rel − 앞범퍼 − s0)) ≈ 5.1 m/s 였고, 적신호
+  # IDM 후보(1.2 → 2.3)가 더 낮아 그쪽이 winner 가 되며 정지(0.01 m/s)에서
+  # 재가속했다(k238~266, accel +0.7 → +0.95, 종거리 12.3 → 11.4 m). 판정은
+  # 보행자 전부를 보지만(최저 v_allow) 회랑 안이라도 v_allow 가 0 이 아니었다.
+  # true 면 회랑(ped_release_lat_m — A-1 해제와 같은 축) 안 보행자는 누구든
+  # 홀드 래치 → v_allow = 0 을 min() 후보로 낸다. 해제는 A-1 규칙 그대로
+  # (회랑 밖 ∧ 멀어짐 ∧ (멈춤 ∨ 차도 밖) 연속 ped_release_s, backstop 포함).
+  # 회랑 밖 의도 래치의 접근 프로파일은 바꾸지 않는다. reasons.ped 에 평가된
+  # 보행자 전부(all)와 홀드 id(hold)를 남긴다. false = 이전 동작.
+  ped_multi_enable: false
+  # 관측 드롭아웃 coast [s] — 이 시간 안의 미관측은 이탈이 아니다(직전 기여 유지).
+  # 만료 + 재관측 없음 → 해제. release(ped_release_s)는 관측된 틱에서만, coast 는
+  # 미관측 틱에서만 세므로 둘은 합산되지 않는다. ped_multi_enable 일 때만 의미.
+  ped_hold_coast_s: 0.5
   # ── 횡단보도 앞 서행 (A-3, 2026-09-03). 기본 false = 비활성. ─────────────
   # 전방 횡단보도(레인그래프 crosswalks, 없으면 정지선) ±ped_crosswalk_zone_m 안에
   # |lat| < ped_crosswalk_lat_m 로 **서 있는**(speed < ped_stop_v) 보행자가 있으면,
