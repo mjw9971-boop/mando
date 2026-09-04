@@ -1017,6 +1017,15 @@ def report(lg, rt, radius, warn_dev=None):
     max_dist = float((route_cfg() or {}).get('check_waypoint_max_dist_m', 6.0))
     banned, _thr0 = infeasible_connectors(lg)
     turn_cap = pair_cfg()[1]
+    # 경고 심각도 2단 (2026-09-04). 가르는 기준 하나: **이 경로로 달리면
+    # 물리적으로 실패하거나 채점 위반이 확정되는가.** 그러면 ERROR(rc=1),
+    # 아니면 WARN(정보성, rc 에 반영 안 함).
+    #   ERROR  교차로 내부 차선변경 / 회전 수행 불가 / LC 창 부족 /
+    #          회전 불가 기하 / 불가피 포함된 회전 불가 연결로
+    #   WARN   경유점 이탈 / junction 차로 미경유 / 총 길이 비율
+    # warn_affects_rc=true 면 WARN 도 rc=1 을 낸다 (이전 동작).
+    warn_rc = bool(rc.get('warn_affects_rc', False))
+    errs = 0
     lanes, cum = rt['lanes'], rt['cum_s']
     jsegs = set(rt.get('junction_segments') or [])
     # 짝 경유점 = 진입(wi) + 진출(wi+1). 이 점들은 "찍힌 차로 = 주행 차로" 가
@@ -1066,7 +1075,7 @@ def report(lg, rt, radius, warn_dev=None):
         elif best_d > lim:
             flag = (f'   <= [경고] 허용 {lim:.2f} m 초과 — 경로가 이 경유점에서 '
                     f'너무 멀다 (차로 반폭 {half:.2f} m)')
-            warns += 1
+            warns += 1                     # WARN — 주행은 가능하다
         print(f"  seq {sq:>3}  ({x:9.2f},{y:9.2f})  이탈 {best_d:6.2f} / 한계 "
               f"{'—' if is_pair and warn_dev is None else f'{lim:4.2f}'} m  "
               f"경로 s={best_s:8.1f} m  lane={best_lane}{flag}")
@@ -1102,11 +1111,16 @@ def report(lg, rt, radius, warn_dev=None):
                  and lg.lanes[e['lane']]['junction'] != -1)
         flag = ''
         if not jids:
+            # WARN — 연결로 사이 링크 도로·같은 도로 다음 섹션으로 이어지는
+            # 정당한 짝이 실재한다 (2026-09-04 실측 43개 중 6개). 오탐률이 높다.
             flag = '   <= [경고] junction 차로를 안 거친다'
             warns += 1
         if lc:
-            flag += f'   <= [경고] 교차로 내부에서 차선변경 {lc}회'
-            warns += 1
+            # ERROR — 짝 구간은 allow_lane_change=False 로 만든다. 그런데 LC
+            # 이벤트가 있으면 경로 생성과 이벤트 생성이 모순이고, 실주행에선
+            # 실선 차로변경(채점 항목 6) 위험이다.
+            flag += f'   <= [오류] 교차로 내부에서 차선변경 {lc}회'
+            errs += 1
         # 짝 경유점의 진짜 판정 기준 — 고른 진입 차로에서 진출 차로로 차선변경
         # 없이 갈 수 있는가. 경유점과의 거리가 아니라 이게 성립해야 정상이다.
         ok, k_in, k_out, cost = pair_turn_ok(lg, rt, wi, banned, turn_cap)
@@ -1117,9 +1131,11 @@ def report(lg, rt, radius, warn_dev=None):
             turn_txt = f'  회전 OK ({k_in}→{k_out}, {cost:.0f} m)'
         else:
             turn_txt = f'  회전 X ({k_in}→{k_out})'
-            flag += (f'   <= [경고] 진입 차로에서 진출 차로로 차선변경 없이 갈 수 없다'
+            # ERROR — 짝 사이는 차선변경 금지다. 이게 안 되면 물리적으로
+            # 주행 불가능한 경로다.
+            flag += (f'   <= [오류] 진입 차로에서 진출 차로로 차선변경 없이 갈 수 없다'
                      f' (상한 {turn_cap:g} m)')
-            warns += 1
+            errs += 1
         print(f"  seq {sq_in:>3}→{sq_out:<3}  junction={jids if jids else '없음'}  "
               f"Δheading={dh:+7.1f}°  {turn_kind(dh)}  차로 {len(seg_lanes)}개"
               f"{turn_txt}{flag}")
@@ -1163,6 +1179,7 @@ def report(lg, rt, radius, warn_dev=None):
     r_max = float(rc['length_ratio_max'])
     r_flag = ''
     if ratio > r_max:
+        # WARN — 경유점이 성기면 정상 경로도 넘는다 (params 주석 참조).
         r_flag = (f'   <= [경고] 임계 {r_max:g} 초과 — 옆 차로·먼 길로 잡혔을 수 있다')
         warns += 1
 
@@ -1191,9 +1208,11 @@ def report(lg, rt, radius, warn_dev=None):
             extra = (f"  window {e['window_s0']:.1f}-{e['window_s1']:.1f} m  ({w:.1f} m)"
                      + (f"  회랑 {corr:.1f} m" if corr is not None else ''))
             if w < MIN_LC_WINDOW_M:
-                extra += (f'   <= [경고] 창이 {MIN_LC_WINDOW_M:.0f} m 미만 — '
+                # ERROR — 2026-08-21 실사고: 창 6.1 m LC 가 실패해 헤딩오차 46°,
+                # 조향 풀락 포화, 도로이탈 + courseRespawn. 지시등 선행 3 s 도 못 낸다.
+                extra += (f'   <= [오류] 창이 {MIN_LC_WINDOW_M:.0f} m 미만 — '
                           f'전이거리(max(transition_s*v, transition_min_m))를 못 채운다')
-                warns += 1
+                errs += 1
         if 'delta_heading_deg' in e:
             extra = (f"  Δ{e['delta_heading_deg']:+.1f}°  junction={e.get('junction')}"
                      + ('  [짝 기준 보정]' if e.get('source') == 'pair' else ''))
@@ -1223,17 +1242,28 @@ def report(lg, rt, radius, warn_dev=None):
             print(f"  {e['s']:8.1f} m  {e['kind']:<11} 연결로 {str(k):<16} "
                   f"R_min {r:8.2f} m{note}")
             if bad:
-                warns += 1
+                errs += 1              # ERROR — 풀락으로도 못 도는 기하
     forced = rt.get('infeasible_forced', [])
     for wi, k, r in forced:
         print(f"  ⚠ 구간 {wi}: 대안 경로가 없어 회전 불가 연결로 {k} (R_min {r:.2f} m) 를 "
               f"**불가피하게 포함** — 실주행에서 이탈 가능성 높음")
-        warns += 1
+        errs += 1                      # ERROR — #7 과 같은 사유, 대안까지 없다
 
+    rc_n = (errs + warns) if warn_rc else errs
     print(f"\n{'=' * 72}")
-    print('경고 없음' if warns == 0 else f'[경고] {warns}건 — 위 표시된 항목을 확인할 것')
+    if errs == 0 and warns == 0:
+        print('경고 없음')
+    else:
+        parts = []
+        if errs:
+            parts.append(f'[오류] {errs}건')
+        if warns:
+            parts.append(f'[경고] {warns}건' + ('' if warn_rc else ' (정보성 — rc 무관)'))
+        print('  '.join(parts) + ' — 위 표시된 항목을 확인할 것')
     print('=' * 72)
-    return warns
+    # 반환값 = **rc 를 유발하는 건수**. main() 의 rc 와 gen_scenarios.route_check
+    # 의 합격 기준이 같은 값을 봐야 생성 시점과 실행 시점이 어긋나지 않는다.
+    return rc_n
 
 
 def main():

@@ -81,7 +81,7 @@ def test_pair_waypoints_exempted_and_turn_reported(lg, capsys):
 
 def test_switch_off_restores_halfwidth(lg, monkeypatch, capsys):
     """킬 스위치 off = 이전 동작. 같은 CSV 가 반폭 경고 2건을 다시 낸다."""
-    _patch(monkeypatch, pair_waypoint_exempt_enable=False)
+    _patch(monkeypatch, pair_waypoint_exempt_enable=False, warn_affects_rc=True)
     rt = _build(lg, PAIR_CSV)
     assert BR.report(lg, rt, 8.0, None) == 2
     assert '차로 반폭' in capsys.readouterr().out
@@ -90,8 +90,10 @@ def test_switch_off_restores_halfwidth(lg, monkeypatch, capsys):
 def test_warn_dev_still_overrides(lg, capsys):
     """--warn-dev 는 짝 포함 모든 경유점에 대한 고정 임계 override 로 남는다."""
     rt = _build(lg, PAIR_CSV)
-    assert BR.report(lg, rt, 8.0, warn_dev=1.0) >= 2   # 2.86·3.05 가 1.0 을 넘는다
-    assert '허용 1 m 고정' in capsys.readouterr().out
+    # 이탈은 WARN 이라 rc 는 0 이지만 표시는 떠야 한다
+    assert BR.report(lg, rt, 8.0, warn_dev=1.0) == 0
+    out = capsys.readouterr().out
+    assert '허용 1 m 고정' in out and '[경고] 2건 (정보성' in out
 
 
 def test_non_pair_uses_max_dist(lg, monkeypatch, capsys):
@@ -150,3 +152,120 @@ def test_pair_turn_ok_helper(lg):
         assert ok is True and cost is not None and cost >= 0.0
         assert k_in in rt['lanes'] and k_out in rt['lanes']
     assert BR.pair_turn_ok(lg, rt, 999, banned) == (None, None, None, None)
+
+
+# ── 경고 심각도 2단 (작업11 스펙 3항) ────────────────────────────────────
+# 가르는 기준: 이 경로로 달리면 물리적으로 실패하거나 채점 위반이 확정되는가.
+#   ERROR(rc=1): #3 교차로 내부 LC / #4 회전 불가 / #6 LC 창 부족 /
+#                #7 회전 불가 기하 / #8 불가피 포함
+#   WARN(정보성): #1 경유점 이탈 / #2 junction 미경유 / #5 길이 비율
+
+def test_warn_does_not_affect_rc(lg, monkeypatch, capsys):
+    """#1 경유점 이탈은 WARN — 표시는 되지만 rc 는 0."""
+    _patch(monkeypatch, pair_waypoint_exempt_enable=False)   # 반폭 경고 2건 되살림
+    rt = _build(lg, PAIR_CSV)
+    assert BR.report(lg, rt, 8.0, None) == 0                 # rc 유발 0
+    out = capsys.readouterr().out
+    assert '[경고] 2건 (정보성 — rc 무관)' in out
+
+
+def test_warn_affects_rc_switch(lg, monkeypatch, capsys):
+    """킬 스위치 true = 이전 동작 (모든 경고가 rc=1)."""
+    _patch(monkeypatch, pair_waypoint_exempt_enable=False, warn_affects_rc=True)
+    rt = _build(lg, PAIR_CSV)
+    assert BR.report(lg, rt, 8.0, None) == 2
+    assert '(정보성' not in capsys.readouterr().out
+
+
+def _pair0(rt):
+    jseg = sorted(BR.junction_segments(len(rt['waypoints'])))
+    spans = {wi: (i0, i1) for wi, i0, i1 in rt['segment_span']}
+    wi = jseg[0]
+    return wi, spans[wi]
+
+
+def test_error_junction_lane_change(lg, capsys):
+    """#3 교차로 내부 차선변경 → ERROR."""
+    rt = _build(lg, PAIR_CSV)
+    wi, (i0, i1) = _pair0(rt)
+    jk = next((k for k in rt['lanes'][i0:i1 + 1] if lg.lanes[k]['junction'] != -1), None)
+    if jk is None:
+        pytest.skip('이 짝에 junction 차로가 없다')
+    rt2 = dict(rt)
+    rt2['events'] = list(rt['events']) + [
+        {'kind': 'lane_change_left', 's': rt['cum_s'][rt['lanes'].index(jk)],
+         'lane': jk, 's_in_lane': 0.0, 'window_s0': 0.0, 'window_s1': 100.0}]
+    assert BR.report(lg, rt2, 8.0, None) >= 1
+    assert '[오류] 교차로 내부에서 차선변경' in capsys.readouterr().out
+
+
+def test_error_lane_change_window_too_short(lg, capsys):
+    """#6 LC 창 20 m 미만 → ERROR.
+
+    2026-08-21 실사고: 창 6.1 m LC 실패 → 헤딩오차 46°, 조향 풀락 포화,
+    도로이탈 + courseRespawn. 지시등 선행 3 s 도 못 낸다.
+    """
+    rt = _build(lg, PAIR_CSV)
+    k = rt['lanes'][0]
+    rt2 = dict(rt)
+    rt2['events'] = list(rt['events']) + [
+        {'kind': 'lane_change_right', 's': 5.0, 'lane': k, 's_in_lane': 5.0,
+         'window_s0': 5.0, 'window_s1': 11.1}]        # 창 6.1 m — 사고와 같은 폭
+    n = BR.report(lg, rt2, 8.0, None)
+    out = capsys.readouterr().out
+    assert n >= 1, out
+    assert f'[오류] 창이 {BR.MIN_LC_WINDOW_M:.0f} m 미만' in out
+    assert '[오류] 1건' in out
+
+
+def test_error_infeasible_turn_geometry(lg, capsys):
+    """#7 회전 불가 기하(R_min < 임계) → ERROR."""
+    rt = _build(lg, PAIR_CSV)
+    banned, thr = BR.infeasible_connectors(lg)
+    if not banned:
+        pytest.skip('이 지도에 회전 불가 연결로가 없다')
+    bad_lane = sorted(banned)[0]
+    rt2 = dict(rt)
+    rt2['lanes'] = list(rt['lanes']) + [bad_lane]
+    rt2['lengths'] = list(rt['lengths']) + [lg.length(bad_lane)]
+    rt2['cum_s'] = list(rt['cum_s']) + [rt['total_length']]
+    rt2['events'] = list(rt['events']) + [
+        {'kind': 'turn_left', 's': rt['total_length'], 'lane': bad_lane,
+         's_in_lane': 0.0, 'junction': lg.lanes[bad_lane]['junction'],
+         'delta_heading_deg': 90.0}]
+    assert BR.report(lg, rt2, 8.0, None) >= 1
+    assert '⚠ 회전 불가 기하' in capsys.readouterr().out
+
+
+def test_error_forced_infeasible(lg, capsys):
+    """#8 대안이 없어 불가피하게 포함된 회전 불가 연결로 → ERROR."""
+    rt = _build(lg, PAIR_CSV)
+    banned, _thr = BR.infeasible_connectors(lg)
+    if not banned:
+        pytest.skip('이 지도에 회전 불가 연결로가 없다')
+    k = sorted(banned)[0]
+    rt2 = dict(rt)
+    rt2['infeasible_forced'] = [(0, k, 2.55)]
+    assert BR.report(lg, rt2, 8.0, None) >= 1
+    assert '불가피하게 포함' in capsys.readouterr().out
+
+
+def test_error_turn_incapable_pair_is_rc(lg, capsys):
+    """#4 회전 수행 불가 → ERROR (rc=1)."""
+    rt = _build(lg, PAIR_CSV)
+    wi, (i0, i1) = _pair0(rt)
+    banned, _t = BR.infeasible_connectors(lg)
+    cap = BR.pair_cfg()[1]
+    s_out = lg.project(rt['lanes'][i1], *rt['waypoints'][wi + 1])[0]
+    bad = next((nb for nb in (lg.neighbor(rt['lanes'][i0], 'left'),
+                              lg.neighbor(rt['lanes'][i0], 'right'))
+                if nb is not None
+                and BR.turn_connect(lg, nb, 0.0, rt['lanes'][i1], s_out, banned, cap) is None),
+               None)
+    if bad is None:
+        pytest.skip('이 짝에는 회전 불가 이웃 차로가 없다')
+    rt2 = dict(rt)
+    rt2['lanes'] = list(rt['lanes'])
+    rt2['lanes'][i0] = bad
+    assert BR.report(lg, rt2, 8.0, None) >= 1
+    assert '[오류] 진입 차로에서 진출 차로로' in capsys.readouterr().out
