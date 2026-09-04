@@ -765,7 +765,7 @@ overtake:
   # (planned_lateral_offsets)이 같은 헬퍼를 쓴다 — 어긋나면 shift_entry·
   # span_extend 의 사전 이격 계측이 실제로 갈 차로가 아닌 곳을 잰다.
   # false = PDM 원문 동작. 기본 off (실차 검증 전).
-  shift_target_current_lane_enable: false
+  shift_target_current_lane_enable: true
   # 원 경로 차로에서 최대 몇 열까지 나갈 수 있나 [열]. 위 기준점 이동의 상한이며
   # 한 번의 시프트가 넘는 차선 수가 아니다. 2 = 104648 의 열2→열4 가 상한.
   # 3 이상이면 편도 3~4 차로에서 반대쪽 갓길·중앙선에 닿고 복귀 횡거리가 열마다
@@ -787,7 +787,7 @@ overtake:
   # 산출물이라, 꺼져 있으면 기준이 없어 현행(좌측 우선)으로 폴백한다.
   # 임계는 percep.obstacle_clearance_m 을 그대로 쓴다(신규 상수 없음).
   # false = 이전 동작(좌측 고정 순서). 기본 off (실차 검증 전).
-  side_pick_enable: false
+  side_pick_enable: true
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

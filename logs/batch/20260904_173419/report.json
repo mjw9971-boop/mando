@@ -1,0 +1,267 @@
+[
+ {
+  "name": "추월집중_01_우회전0",
+  "status": "완주",
+  "log": "/home/jw/mando/logs/batch/20260904_173419/추월집중_01_우회전0.jsonl",
+  "scenario_yaml": "scenarios/추월집중/추월집중_01_우회전0.yaml",
+  "route_total_m": 879.6,
+  "finish_thr_m": 864.6,
+  "finish_basis": "finish_xy",
+  "camera_sent": true,
+  "done": false,
+  "dist_m": 867.7,
+  "time_s": 130.3,
+  "avg_kph": 24.0,
+  "end_stopped": true,
+  "overspeed_ticks": 2,
+  "resets": 0,
+  "estop_ticks": 0,
+  "shield": {},
+  "min_obj_dist_m": 2.89,
+  "n_violations": 3,
+  "violations": {
+   "speed": 1,
+   "lane_departure": 2
+  },
+  "deduction": -9,
+  "stops": [],
+  "events_ok": 0,
+  "events_total": 0,
+  "events_unreached": 0,
+  "events": []
+ },
+ {
+  "name": "추월집중_02_우회전",
+  "status": "완주",
+  "log": "/home/jw/mando/logs/batch/20260904_173419/추월집중_02_우회전.jsonl",
+  "scenario_yaml": "scenarios/추월집중/추월집중_02_우회전.yaml",
+  "route_total_m": 785.4,
+  "finish_thr_m": 758.8,
+  "finish_basis": "finish_xy",
+  "camera_sent": true,
+  "done": false,
+  "dist_m": 762.6,
+  "time_s": 89.0,
+  "avg_kph": 30.8,
+  "end_stopped": true,
+  "overspeed_ticks": 0,
+  "resets": 0,
+  "estop_ticks": 0,
+  "shield": {},
+  "min_obj_dist_m": 3.01,
+  "n_violations": 0,
+  "violations": {},
+  "deduction": 0,
+  "stops": [
+   {
+    "green_delay_s": 0.85,
+    "t": 59.4,
+    "route_s": 650.2,
+    "slf_m": -0.89,
+    "ctrl_ids": [
+     91
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 47.8,
+    "cmd_reversals": 77,
+    "hold_s": 9.4
+   }
+  ],
+  "events_ok": 0,
+  "events_total": 0,
+  "events_unreached": 0,
+  "events": []
+ },
+ {
+  "name": "추월집중_03_직진2",
+  "status": "완주",
+  "log": "/home/jw/mando/logs/batch/20260904_173419/추월집중_03_직진2.jsonl",
+  "scenario_yaml": "scenarios/추월집중/추월집중_03_직진2.yaml",
+  "route_total_m": 719.9,
+  "finish_thr_m": 654.8,
+  "finish_basis": "finish_xy",
+  "camera_sent": true,
+  "done": false,
+  "dist_m": 655.5,
+  "time_s": 102.3,
+  "avg_kph": 23.1,
+  "end_stopped": true,
+  "overspeed_ticks": 0,
+  "resets": 0,
+  "estop_ticks": 0,
+  "shield": {},
+  "min_obj_dist_m": 2.98,
+  "n_violations": 3,
+  "violations": {
+   "lane_departure": 2,
+   "red_stop_far": 1
+  },
+  "deduction": -9,
+  "stops": [
+   {
+    "green_delay_s": 0.9,
+    "t": 11.9,
+    "route_s": 69.9,
+    "slf_m": -3.39,
+    "ctrl_ids": [
+     124
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 41.7,
+    "cmd_reversals": 11,
+    "hold_s": 2.7
+   },
+   {
+    "green_delay_s": 0.9,
+    "t": 17.0,
+    "route_s": 72.2,
+    "slf_m": -1.17,
+    "ctrl_ids": [
+     124
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 41.7,
+    "cmd_reversals": 27,
+    "hold_s": 5.8
+   }
+  ],
+  "events_ok": 0,
+  "events_total": 0,
+  "events_unreached": 0,
+  "events": []
+ },
+ {
+  "name": "추월집중_04_좌회전3",
+  "status": "완주",
+  "log": "/home/jw/mando/logs/batch/20260904_173419/추월집중_04_좌회전3.jsonl",
+  "scenario_yaml": "scenarios/추월집중/추월집중_04_좌회전3.yaml",
+  "route_total_m": 679.9,
+  "finish_thr_m": 664.9,
+  "finish_basis": "finish_xy",
+  "camera_sent": true,
+  "done": true,
+  "dist_m": 671.0,
+  "time_s": 109.2,
+  "avg_kph": 22.1,
+  "end_stopped": true,
+  "overspeed_ticks": 0,
+  "resets": 0,
+  "estop_ticks": 0,
+  "shield": {},
+  "min_obj_dist_m": 3.25,
+  "n_violations": 1,
+  "violations": {
+   "red_stop_far": 1
+  },
+  "deduction": -3,
+  "stops": [
+   {
+    "green_delay_s": 0.9,
+    "t": 38.7,
+    "route_s": 239.4,
+    "slf_m": -0.56,
+    "ctrl_ids": [
+     17,
+     18
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 25.9,
+    "cmd_reversals": 71,
+    "hold_s": 12.2
+   },
+   {
+    "green_delay_s": 0.95,
+    "t": 78.0,
+    "route_s": 488.6,
+    "slf_m": -2.98,
+    "ctrl_ids": [
+     7,
+     8
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 48.0,
+    "cmd_reversals": 13,
+    "hold_s": 3.7
+   },
+   {
+    "green_delay_s": 0.95,
+    "t": 83.8,
+    "route_s": 490.4,
+    "slf_m": -1.21,
+    "ctrl_ids": [
+     7,
+     8
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 48.0,
+    "cmd_reversals": 27,
+    "hold_s": 3.1
+   }
+  ],
+  "events_ok": 0,
+  "events_total": 0,
+  "events_unreached": 0,
+  "events": []
+ },
+ {
+  "name": "추월집중_05_우회전5",
+  "status": "blocked",
+  "log": "/home/jw/mando/logs/batch/20260904_173419/추월집중_05_우회전5.jsonl",
+  "scenario_yaml": "scenarios/추월집중/추월집중_05_우회전5.yaml",
+  "route_total_m": 673.6,
+  "finish_thr_m": 615.0,
+  "finish_basis": "finish_xy",
+  "camera_sent": true,
+  "done": false,
+  "dist_m": 356.3,
+  "time_s": 84.6,
+  "avg_kph": 15.2,
+  "end_stopped": true,
+  "overspeed_ticks": 0,
+  "resets": 0,
+  "estop_ticks": 0,
+  "shield": {},
+  "min_obj_dist_m": 23.33,
+  "n_violations": 7,
+  "violations": {
+   "lane_departure": 5,
+   "off_route": 1,
+   "not_finished": 1
+  },
+  "deduction": -6,
+  "stops": [
+   {
+    "green_delay_s": 0.85,
+    "t": 17.6,
+    "route_s": 97.8,
+    "slf_m": -1.39,
+    "ctrl_ids": [
+     175,
+     176
+    ],
+    "states": [
+     1
+    ],
+    "approach_kph": 26.7,
+    "cmd_reversals": 59,
+    "hold_s": 15.2
+   }
+  ],
+  "events_ok": 0,
+  "events_total": 0,
+  "events_unreached": 0,
+  "events": []
+ }
+]
