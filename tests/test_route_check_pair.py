@@ -36,7 +36,17 @@ PAIR_CSV = 'tests/fixtures/pair_lane_offset_waypoints.csv'
 # 가 되어 rc=1 이다. 임계가 맞고 **경로 쪽이 틀렸다** — 작업15 에서 경유점을
 # 조정해 좁은 연결로를 우회시킨 뒤 이 목록에 되돌린다.
 # 테스트가 검증하는 계약("기준 CSV 는 경고 0 = 배치가 안 버린다")은 그대로다.
-CSVS = ['tests/fixtures/venue_20260903_waypoints.csv', 'data/official_route.csv'] + sorted(
+# venue_20260903_waypoints.csv 제외 (2026-09-04, 작업19-2). 이 경로는 도로 418
+# 섹션 2 의 29.8 m 안에 차선변경 3회를 몰아넣는다 — 전이 하나에 20 m 가 필요하니
+# 60 m 가 있어야 하고, planner 램프는 hop 하나만 블렌드하므로 경로 점열에
+# 3.402 m · 6.800 m 계단이 남는다. 물리적으로 주행 불가라 새 hop 간격 검사가
+# ERROR 를 낸다. **배치가 이 경로를 버리는 게 의도된 동작이다.**
+# 3차로 횡단 자체는 강제된다((836,0,-1)→(418,0,-4) 는 막다른 차로, (589,0,-1) 의
+# predecessor 는 (418,2,-1) 뿐). 틀린 것은 그 4회를 어디에 놓느냐이고, 섹션 0 의
+# 70.5 m 에 나눠 놓는 동등 비용 대안이 있다(총비용 211.68 vs 211.14, 차 0.54 m).
+# 작업19-3 이 비용 모델에 hop 간격을 반영해 그 대안을 뽑게 되면 이 목록에 되돌린다.
+# 그때까지 이 CSV 의 계약은 tests/test_route_hop_gap.py 가 대신 지킨다.
+CSVS = ['data/official_route.csv'] + sorted(
     str(p.relative_to(ROOT)) for p in (ROOT / 'scenarios').glob('*/*.csv'))
 
 

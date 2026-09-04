@@ -329,6 +329,34 @@ def advance(lg, k, k2, length_k) -> float:
 # 헤딩오차 46°, 조향 풀락 포화, 도로이탈 + courseRespawn 으로 끝났다.
 MIN_LC_WINDOW_M = 20.0
 
+def hop_gaps(lg, rt):
+    """연속 차선변경(hop) 사이의 경로거리 -> [(i, cum_i, gap, from_lane, to_lane)].
+
+    gap 은 **앞 hop 지점부터 이 hop 지점까지의 route 누적거리**다. hop 은 평행
+    차로로 옮겨 타는 것이라 advance() 가 진행거리를 0 으로 두므로, 같은 cum_s 에
+    쌓인 hop 들의 gap 은 0.0 이 된다 -- 한 차로 안에서 전이를 여러 번 끝내야
+    한다는 뜻이고, 물리적으로 불가능하다.
+
+    창(window_s0/s1) 검사로는 못 잡는다: lane_change_window 가 창 시작을 최대한
+    앞으로 당기는 탓에, 같은 29.8 m 를 공유하는 hop 3 개가 각각 "29.8 m 창"
+    으로 보고된다 (venue_20260903 실측). hop 지점 사이의 간격이 정확한 축이다.
+    """
+    lanes = [tuple(k) for k in rt['lanes']]
+    cum = rt['cum_s']
+    hops = [i for i in range(len(lanes) - 1)
+            if is_lane_change_hop(lg, lanes[i], lanes[i + 1])]
+    out = []
+    for a_i, b_i in zip(hops, hops[1:]):
+        out.append((b_i, float(cum[b_i]), float(cum[b_i] - cum[a_i]),
+                    lanes[b_i], lanes[b_i + 1]))
+    return out
+
+
+def min_hop_gap_m():
+    """연속 hop 사이에 있어야 하는 최소 경로거리 [m]. params 가 단일 출처."""
+    return float((route_cfg() or {}).get('min_hop_gap_m', MIN_LC_WINDOW_M))
+
+
 # 점선 구간 두 개가 이만큼 안쪽으로 붙어 있으면 하나로 잇는다 (샘플 경계 오차)
 MARK_JOIN_M = 1e-6
 # 점선 구간이 차로 끝까지 닿았다고 볼 허용오차 [m]
@@ -1217,6 +1245,30 @@ def report(lg, rt, radius, warn_dev=None):
             extra = (f"  Δ{e['delta_heading_deg']:+.1f}°  junction={e.get('junction')}"
                      + ('  [짝 기준 보정]' if e.get('source') == 'pair' else ''))
         print(f"  {e['s']:8.1f} m  {e['kind']:<20}{extra}")
+
+    # ── 연속 차선변경 간격 (작업19-2) ────────────────────────────────────
+    # 위 창 검사와 축이 다르다. 창은 "이 전이를 어디서 시작할 수 있나" 이고,
+    # 여기는 "앞 전이가 끝나기 전에 다음이 시작되지 않나" 다.
+    gaps = hop_gaps(lg, rt)
+    if gaps:
+        thr = min_hop_gap_m()
+        gap_on = bool(rc.get('hop_gap_enable', True))
+        print(f"  ── 연속 차선변경 간격 (임계 {thr:g} m"
+              f"{'' if gap_on else ', 검사 꺼짐'})")
+        for _i, cum_i, gap, fl, tl in gaps:
+            note = ''
+            if gap < thr:
+                # ERROR — 앞 전이가 끝나기 전에 다음 전이가 시작된다. 계획대로면
+                # 한 차로 길이 안에서 여러 번 옮겨타야 하고, planner 램프는 hop
+                # 하나만 블렌드하므로 경로 점열에 차로 폭짜리 계단이 남는다
+                # (venue_20260903: 같은 cum_s 에 hop 3개 -> 3.402 m / 6.800 m).
+                note = (f'   <= [오류] 간격 {gap:.1f} m < {thr:g} m — '
+                        f'앞 전이가 끝나기 전에 다음이 시작된다')
+                if gap_on:
+                    errs += 1
+                else:
+                    note += ' (검사 꺼짐 — rc 무관)'
+            print(f"    {cum_i:8.1f} m  {str(fl)} -> {str(tl)}   간격 {gap:7.1f} m{note}")
 
     # ── [5] 회전 가능성 — 회전 이벤트가 지나는 연결로들의 최소 곡률반경 ──────
     # R_min < 최소회전반경 × vehicle.min_turn_margin 이면 풀락으로도 못 돈다
