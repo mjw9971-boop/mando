@@ -1632,15 +1632,27 @@ def ev_slow_lead(ctx, v):
     return {'kind': 'slow_lead', 'lead': name, 'gap0': gap, 'speed_kph': speed_kph}
 
 
-def _same_dir_lane_count(lg, k, sl: float, min_w: float) -> int:
+def _same_dir_lane_count(lg, k, sl: float, min_w: float,
+                         check_self: bool = False) -> int:
     """차로 k 의 sl 지점에서 **동일 방향 주행차로** 수 (자기 포함).
 
     폭 임계를 두는 이유: 이 맵에는 폭 0 인 테이퍼 차로가 실재한다
     ((173,3,-1) w=0.0, 2026-09-02 확인). 개수만 세면 "이웃이 있다" 가 참이
     되지만 비켜 설 자리는 없다. left_nb 는 중앙선을 넘지 않지만
     (lanegraph.roadway_edges 주석) 반대 통행방향은 dir 로 한 번 더 막는다.
+
+    check_self=True 면 **자기 차로에도 같은 폭 임계**를 걸고, 미달이면 0 을
+    돌려 그 자리를 후보에서 뺀다. 폭 임계가 이웃에만 걸려 있어(n=1 은 무조건
+    셌다) 소멸 직전 테이퍼 차로가 "자차로" 로 뽑혔다 — 추월집중_05_우회전5
+    (2026-09-04): 장애물이 (2756,2,-6) 의 s_in 11.23 m, **폭 0.11 m** 지점에
+    놓였다. 그 차로는 12.57 m 동안 1.70 → 0.00 m 로 사라진다. 이웃
+    (2756,2,-5) 이 2.9 m 라 개수 2 로 게이트를 통과했다. 자차로를 막는
+    시나리오가 성립하지 않을 뿐 아니라, 그 런은 blocked 로 끝났다
+    (logs/batch/20260904_173419, 20260904_181929).
     """
     me = lg.lanes[k]
+    if check_self and lg.width_at(k, min(sl, me['length'])) < min_w:
+        return 0
     n = 1
     for side in ('left', 'right'):
         cur = k
@@ -1658,7 +1670,8 @@ def _same_dir_lane_count(lg, k, sl: float, min_w: float) -> int:
     return n
 
 
-def _multi_lane_spans(ctx, min_w: float, min_span: float, step: float = 2.0):
+def _multi_lane_spans(ctx, min_w: float, min_span: float, step: float = 2.0,
+                      check_self: bool = False):
     """동일 방향 주행차로가 2개 이상인 route_s 부분구간들 (_opposite_spans 와 같은 형태).
 
     구간 양끝이 **둘 다 검사를 통과한 표본**이 되도록 자른다 — 표본 사이
@@ -1673,7 +1686,7 @@ def _multi_lane_spans(ctx, min_w: float, min_span: float, step: float = 2.0):
         while True:
             uu = min(u, b)
             _, k, sl = lane_at(ctx.route.rt, uu)
-            if _same_dir_lane_count(ctx.lg, k, sl, min_w) >= 2:
+            if _same_dir_lane_count(ctx.lg, k, sl, min_w, check_self) >= 2:
                 lo = uu if lo is None else lo
                 prev = uu
             else:
@@ -1696,7 +1709,8 @@ def ev_static_vehicle(ctx, v):
     if gate:
         # 자차로를 막는 정차 차량은 옆 차로가 있어야 회피가 성립한다 —
         # 근거는 params gen_placement.static_vehicle 주석.
-        mspans = _multi_lane_spans(ctx, min_w, float(cfg['min_span_m']))
+        mspans = _multi_lane_spans(ctx, min_w, float(cfg['min_span_m']),
+                                   check_self=bool(cfg['require_self_lane_width']))
         if not mspans:
             raise EventUnfeasible('static_vehicle: 동일 방향 주행차로가 2개 이상인 '
                                   '가용구간이 없다 — 자차로를 막으면 회피가 원천 불가다')
@@ -1991,7 +2005,8 @@ def ev_obstacle_chain(ctx, v):
         # 들어가야 하므로 _place_in_one_span 의 spans 인자로 좁힌다.
         sv = cfg['static_vehicle']
         spans = _multi_lane_spans(ctx, float(sv['min_neighbor_width_m']),
-                                  float(sv['min_span_m']))
+                                  float(sv['min_span_m']),
+                                  check_self=bool(sv['require_self_lane_width']))
         if not spans:
             raise EventUnfeasible('obstacle_chain: 동일 방향 주행차로가 2개 이상인 '
                                   '가용구간이 없다 — 1차로의 체인은 회피가 원천 불가다')
