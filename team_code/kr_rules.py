@@ -234,6 +234,11 @@ class KrRules:
         # 규칙 3 — 선제 회피
         self.detect_max_m = float(ot.get('detect_max_m', 80.0))
         self.shift_latest_m = float(ot.get('shift_latest_m', 10.0))
+        # standoff 프로파일 전용 바닥 — shift_latest_m 과 소비처를 나눈다.
+        # 그 값은 _shift_speed_cap 의 미리보기 창(look)과 _try_overtake 의
+        # PREEMPT 시간 예산에도 쓰이므로, standoff 정지 거리만 조정하려면
+        # 여기를 쓴다. 미지정이면 shift_latest_m 을 그대로 따른다(무변화).
+        self.standoff_floor_m = float(ot.get('standoff_floor_m', self.shift_latest_m))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -3005,12 +3010,16 @@ class KrRules:
 
         ④′ 정지선 프로파일과 같은 형태다: v_allow = √(2·a_stop·(d − standoff)).
         standoff 는 시프트 전이가 들어갈 공간이라 전이 길이 공식과 정합시킨다:
-            standoff = max(shift_latest_m, shift_k_s · v)
+            standoff = max(standoff_floor_m, shift_k_s · v)
+        바닥은 **standoff_floor_m** 이다 — shift_latest_m 이 아니다. 둘은 기본값이
+        같지만(25.0) 소비처가 다르다: shift_latest_m 은 _shift_speed_cap 의
+        미리보기 창과 _try_overtake 의 PREEMPT 시간 예산이 쓰고, 여기만 이 값을
+        읽는다. 정지 거리만 조정하려면 standoff_floor_m 을 움직인다.
         IDM 의 정지 gap 과 충돌하지 않는다 — 둘 다 상한이고 min() 이 낮은 쪽을 쓴다.
         """
         if self.wait_target_d is None or self.stop_profile_a <= 0.0:
             return None
-        standoff = max(self.shift_latest_m, self.shift_k_s * max(ego_speed, 0.1))
+        standoff = max(self.standoff_floor_m, self.shift_k_s * max(ego_speed, 0.1))
         d = self.wait_target_d - standoff
         return _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d))
 

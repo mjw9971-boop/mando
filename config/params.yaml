@@ -465,6 +465,13 @@ overtake:
   # 기준점: s_rel 은 자차 뒷축 → 객체 중심. standoff 25 = 앞범퍼–객체 후미 ≈ 18 m
   # (앞범퍼 3.8 + 승용차 반길이 2.2). 실측 2026-09-03 001829/01: s_rel 24.2 정지.
   shift_latest_m: 25.0
+  # standoff 정지 프로파일 **전용** 바닥 [m]. 위 shift_latest_m 과 값은 같지만
+  # 소비처를 나눈다 — shift_latest_m 은 _shift_speed_cap 의 미리보기 창과
+  # _try_overtake 의 PREEMPT 시간 예산에도 쓰여, 그 값을 내리면 standoff 와
+  # 무관한 두 곳이 함께 움직인다 (2026-09-05 조사). 여기만 내리면 파급이 없고
+  # 되돌리기도 이 값 하나다.
+  # 기본 25.0 = shift_latest_m 과 동일 = 현행 동작 그대로(무변화).
+  standoff_floor_m: 25.0
   # 전이 길이 속도 비례 계수 [s]. 코사인 전이의 최대 횡가속
   #   a_lat = v²·Δ·π²/(2L²)  →  L = v·√(Δπ²/(2·a_lat))
   # Δ=3.0 m(차로 한 칸), a_lat=1.5 m/s²(쾌적) 이면 L ≈ 3.14·v → 3.0 채택.
