@@ -70,7 +70,8 @@ run_agent.py                     (a) 진입점. 어댑터+PDM 조립, 20 Hz 틱 
 ├─ configs/themes.yaml           (d) 별개 파일. gen_scenarios 전용 시나리오 생성 프리셋
 ├─ templates/*.xml               (d) 검증된 VTD 시나리오 원본. gen_scenarios 가 9_clean_drive.xml 을 베이스로 사용
 ├─ data/                         (d) 지도·경로 자산 (xodr, lane_graph.pkl, route.pkl, junction_ctrl_map.json)
-├─ docs/                         (d) lane_graph.md(지도 빌드), PDM_MIGRATION_PLAN.md(이식 계획), 이 문서
+├─ docs/                         (d) RACE_DAY_ROUTE.md(대회 당일 경로 절차 — 한 페이지),
+│                                    lane_graph.md(지도 빌드), PDM_MIGRATION_PLAN.md(이식 계획), 이 문서
 └─ tests/                        (e) pytest 20개 — comm 파싱/송신, 속도추정, 리셋, lanegraph,
                                      adapter, route_end/finish/stopline, 지시등, 실선 LC, scoring, batch, gen_scenarios
 ```

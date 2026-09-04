@@ -659,14 +659,98 @@ def read_waypoints_csv(path):
     return out
 
 
-def junction_segments(n_points):
+def junction_segments(n_points, offset=1):
     """
     교차로 내부 구간(0-based 세그먼트 인덱스) 집합.
 
-    seq 1=시작, (2,3)(4,5)... 짝, 마지막=종료 이므로 0-based 로는
+    offset=1 (기본): seq 1=시작, (2,3)(4,5)... 짝, 마지막=종료. 0-based 로는
     waypoints[1]→[2], [3]→[4], ... 즉 **홀수 인덱스 세그먼트**가 교차로 내부다.
+    주최 공식 형식(짝수 경유점)이 이것이다.
+
+    offset=0: 첫 점이 곧 진입점 — [(진입,진출)×N, 종료]. 경유점이 홀수로 올 때의
+    또 다른 해석이다 (작업21). 어느 쪽인지는 pair_offset_auto 가 고른다.
     """
-    return {wi for wi in range(1, n_points - 1, 2)}
+    return {wi for wi in range(offset, n_points - 1, 2)}
+
+
+# ── 짝 해석 자동 판정 (작업21) ────────────────────────────────────────────
+def pair_auto_cfg():
+    """params.yaml route.pair_auto_* — 자동 판정 임계의 단일 출처."""
+    rc = route_cfg() or {}
+    return (float(rc.get('pair_auto_min_ratio', 0.75)),
+            float(rc.get('pair_auto_min_margin', 0.50)))
+
+
+def pair_junction_ratio(lg, rt):
+    """(짝 구간 junction 경유 비율, 짝 개수, 비짝 구간 비율, 비짝 개수).
+
+    **짝 구간이 교차로 연결로를 실제로 지나는가** — 짝 해석이 맞는지를 가르는
+    유일하게 결정적인 신호다. 짝수 기준 CSV 25개 실측(2026-09-04): 정답
+    offset 65/65 = 100 %, 오답 offset 4/86 = 5 %.
+
+    비짝 비율은 보조 표시다. 단독으로는 못 쓴다 — 정답 offset 에서도
+    0.00~0.80 으로 흔들린다(official_route 0.50, venue 0.80). 다만 오답
+    offset 에서는 25/25 전부 1.00 이었으므로, **짝 비율이 높은데 비짝 비율도
+    1.00 이면 의심 신호**다.
+    """
+    spans = {w: (a, b) for w, a, b in rt.get('segment_span') or []}
+    js = set(rt.get('junction_segments') or [])
+
+    def has_junction(wi):
+        if wi not in spans:
+            return None
+        i0, i1 = spans[wi]
+        return any(lg.lanes[k]['junction'] != -1 for k in rt['lanes'][i0:i1 + 1])
+
+    pair = [v for v in (has_junction(w) for w in sorted(js)) if v is not None]
+    other = [v for v in (has_junction(w) for w in range(len(rt['waypoints']) - 1)
+                         if w not in js) if v is not None]
+    return (sum(pair) / len(pair) if pair else 0.0, len(pair),
+            sum(other) / len(other) if other else 0.0, len(other))
+
+
+def pair_offset_auto(lg, waypoints, radius, start_yaw, seqs, finish_tail_m, build_fn=None):
+    """짝 해석을 고른다 → (offset|None, 근거 문자열, {offset: 신호}).
+
+    짝수면 시험 빌드 없이 offset 1 이다 (주최 공식 형식). 홀수일 때만 0/1 을
+    각각 지어 보고 pair_junction_ratio 로 고른다 — 시험 빌드 2회가 늘어난다.
+
+    판정이 서지 않으면 None(짝 해석 안 함) 으로 떨어진다. 그건 현재 동작과
+    같고, **교차로 내부 차선변경 금지가 안 걸린다**는 뜻이라 리포트가 크게
+    표시한다.
+    """
+    n = len(waypoints)
+    if n <= 2:
+        return None, f'경유점 {n}개 — 시작/종료뿐, 짝 없음', {}
+    if n % 2 == 0:
+        return 1, f'짝수 {n}점 — 주최 공식 형식 (offset 1)', {}
+
+    fn = build_fn or build_route
+    ev = {}
+    for off in (0, 1):
+        try:
+            rt = fn(lg, waypoints, radius, start_yaw,
+                    junction_segs=junction_segments(n, off),
+                    seqs=seqs, finish_tail_m=finish_tail_m)
+        except RouteError as e:                 # SystemExit 파생 — 이것만 잡는다.
+            ev[off] = dict(ok=False, why=str(e).splitlines()[0], ratio=-1.0,
+                           n=0, other=0.0, n_other=0)
+            continue
+        r, np_, ro, no = pair_junction_ratio(lg, rt)
+        ev[off] = dict(ok=True, why=None, ratio=r, n=np_, other=ro, n_other=no)
+
+    min_ratio, min_margin = pair_auto_cfg()
+    win, lose = (0, 1) if ev[0]['ratio'] >= ev[1]['ratio'] else (1, 0)
+    margin = ev[win]['ratio'] - ev[lose]['ratio']
+    detail = ' / '.join(
+        f"offset{o}: " + ('빌드실패' if not ev[o]['ok']
+                          else f"junction {ev[o]['ratio']:.2f}({ev[o]['n']}개)")
+        for o in (0, 1))
+    if ev[win]['ok'] and ev[win]['ratio'] >= min_ratio and margin >= min_margin:
+        return win, (f'홀수 {n}점 — offset {win} 채택 ({detail}; '
+                     f'margin {margin:.2f} ≥ {min_margin:g})'), ev
+    return None, (f'홀수 {n}점 — **판정 불가** ({detail}; margin {margin:.2f} < '
+                  f'{min_margin:g} 또는 비율 < {min_ratio:g})'), ev
 
 
 def _pair_diag(lg, pool_in, pool_out, starts, allow_prev, banned, cap):
@@ -761,7 +845,9 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
 
 
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
-                seqs=None, finish_tail_m=0.0):
+                seqs=None, finish_tail_m=0.0, pair_meta=None):
+    """pair_meta: {'offset','source','why'} — 짝 해석을 pkl 에 기록만 한다.
+    경로 계산에는 쓰지 않는다 (계산은 junction_segs 가 전부다)."""
     # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
     banned, turn_thr = infeasible_connectors(lg)
     forced_infeasible: list = []   # 대안이 없어 불가피하게 포함시킨 연결로
@@ -1053,7 +1139,11 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             'finish_xy': [float(waypoints[-1][0]), float(waypoints[-1][1])],
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
             'waypoint_seq': list(seqs) if seqs else list(range(1, len(waypoints) + 1)),
-            'junction_segments': sorted(junction_segs), 'segment_span': seg_span}
+            'junction_segments': sorted(junction_segs), 'segment_span': seg_span,
+            # 어느 짝 해석으로 지었는지 (작업21). 리포트·현장 확인·사후 추적용.
+            'pair_offset': (pair_meta or {}).get('offset'),
+            'pair_offset_source': (pair_meta or {}).get('source', 'caller'),
+            'pair_offset_why': (pair_meta or {}).get('why', '')}
 
 
 def turn_kind(delta_deg, straight_deg=None):
@@ -1143,9 +1233,26 @@ def report(lg, rt, radius, warn_dev=None):
 
     # ── 2) 짝(교차로) 구간 ───────────────────────────────────────────────
     spans = {wi: (i0, i1) for wi, i0, i1 in rt.get('segment_span') or []}
-    print(f"\n[2] 교차로 짝 구간")
+    # ── 짝 해석 머리 (작업21) — 대회 당일 사람이 눈으로 확인하는 한 줄이다.
+    p_off = rt.get('pair_offset')
+    p_src = rt.get('pair_offset_source') or 'caller'
+    p_why = rt.get('pair_offset_why') or ''
+    r_pair, n_pair, r_other, n_other = pair_junction_ratio(lg, rt)
+    head = f"짝 해석: {'offset ' + str(p_off) if p_off is not None else '없음'} ({p_src})"
+    print(f"\n[2] 교차로 짝 구간   {head}")
+    if p_why:
+        print(f"    근거: {p_why}")
+    print(f"    junction 경유: 짝 {r_pair:.2f} ({n_pair}개) / 비짝 {r_other:.2f} ({n_other}개)"
+          + ('   <= [경고] 짝·비짝이 둘 다 높다 — 한 칸 밀렸을 수 있다'
+             if (n_pair and n_other and r_pair >= 0.75 and r_other >= 0.999) else ''))
     if not jsegs:
-        print('  (짝 정보 없음 — --no-pairs 이거나 경유점이 홀수 개)')
+        # ERROR 는 아니지만 **가장 위험한 상태**다. 당일에 이 줄을 놓치면 안 된다.
+        print('  ' + '!' * 68)
+        print('  !! 짝 해석 없음 — 이 경로는 교차로 내부 차선변경 금지가 걸리지 않았다.')
+        print('  !! 교차로 안에서 차선을 바꾸는 경로가 나올 수 있다 (채점 항목 6 위험).')
+        print('  !! --pair-offset 0 또는 1 로 강제해 재빌드하고 [2] 표를 대조할 것.')
+        print('  ' + '!' * 68)
+        print('  (짝 정보 없음 — --pair-offset none 이거나 auto 판정 불가)')
     for wi in sorted(jsegs):
         sq_in, sq_out = rt['waypoint_seq'][wi], rt['waypoint_seq'][wi + 1]
         i0, i1 = spans.get(wi, (None, None))
@@ -1364,7 +1471,12 @@ def main():
     ap.add_argument('--ego-yaw', type=float, default=None,
                     help='[rad] 9910 에서 받은 실제 ego heading (--start-yaw 보다 우선)')
     ap.add_argument('--no-pairs', action='store_true',
-                    help='중간 지점을 교차로 진입·진출 짝으로 해석하지 않는다')
+                    help='중간 지점을 교차로 진입·진출 짝으로 해석하지 않는다 '
+                         '(= --pair-offset none)')
+    ap.add_argument('--pair-offset', choices=('auto', 'none', '0', '1'), default='auto',
+                    help='짝 해석 시작점. auto=짝수면 1, 홀수면 시험 빌드로 판정 '
+                         '(안 서면 none). 0=첫 점부터 짝, 1=두 번째 점부터 짝 '
+                         '(주최 공식 형식), none=짝 해석 안 함')
     ap.add_argument('--warn-dev', type=float, default=None,
                     help='[m] 경유점 이탈 경고 임계 (기본: --radius)')
     ap.add_argument('--yaw-min-dist', type=float, default=2.0,
@@ -1404,22 +1516,33 @@ def main():
         src = f'자동 추정 (seq {seqs[0]}→{seqs[j]} 방향, {d:.1f} m)'
     print(f'출발 헤딩 {start_yaw:+.5f} rad ({math.degrees(start_yaw):+.1f}°)  ← {src}')
 
-    # ── 교차로 짝 ────────────────────────────────────────────────────────
-    jsegs = set()
-    if not a.no_pairs:
-        if len(wps) % 2 != 0:
-            print(f'  [경고] 경유점이 {len(wps)}개(홀수)다. 공식 형식은 '
-                  f'시작 + 짝*N + 종료 = 짝수여야 한다. 짝 해석을 건너뛴다', file=sys.stderr)
-        elif len(wps) == 2:
-            print('  경유점이 시작/종료뿐 — 교차로 짝 없음')
-        else:
-            jsegs = junction_segments(len(wps))
-            pairs = [(seqs[wi], seqs[wi + 1]) for wi in sorted(jsegs)]
-            print(f'  교차로 짝 {len(pairs)}개: ' +
-                  ', '.join(f'({i}→{o})' for i, o in pairs))
+    # ── 교차로 짝 (작업21) ────────────────────────────────────────────────
+    # 주최 형식은 [시작, (진입,진출)*N, 종료] = 짝수지만 홀수로 올 수도 있다.
+    # 홀수면 해석이 둘이라 auto 가 시험 빌드로 고른다. 어느 해석을 썼는지는
+    # 리포트 [2] 머리와 pkl 에 남는다 — 당일 눈으로 확인할 근거다.
+    tail_m = finish_tail_cfg()
+    mode = 'none' if a.no_pairs else a.pair_offset
+    if mode == 'none':
+        offset, why, src = None, '--pair-offset none (짝 해석 안 함)', 'forced'
+    elif mode == 'auto':
+        offset, why, _ev = pair_offset_auto(lg, wps, a.radius, start_yaw, seqs, tail_m)
+        src = 'auto'
+    else:
+        offset, why, src = int(mode), f'--pair-offset {mode} (사람이 지정)', 'forced'
+    print(f'  짝 해석: {"offset " + str(offset) if offset is not None else "없음"} ({src})')
+    print(f'    근거: {why}')
+
+    jsegs = junction_segments(len(wps), offset) if offset is not None else set()
+    if jsegs:
+        pairs = [(seqs[wi], seqs[wi + 1]) for wi in sorted(jsegs)]
+        print(f'  교차로 짝 {len(pairs)}개: ' +
+              ', '.join(f'({i}→{o})' for i, o in pairs))
+    elif offset is not None:
+        print('  경유점이 시작/종료뿐 — 교차로 짝 없음')
 
     rt = build_route(lg, wps, a.radius, start_yaw, junction_segs=jsegs, seqs=seqs,
-                     finish_tail_m=finish_tail_cfg())
+                     finish_tail_m=tail_m,
+                     pair_meta={'offset': offset, 'source': src, 'why': why})
 
     with open(a.out, 'wb') as f:
         pickle.dump(rt, f, protocol=4)
