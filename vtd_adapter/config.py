@@ -39,12 +39,20 @@ def load_params_yaml(path: str | None = None) -> dict[str, Any]:
 
 
 def end_margin_m(cfg: dict[str, Any]) -> float:
-    """완주 임계 [m]: route_s(뒷축) ≥ total − 이 값이면 완주.
+    """완주 임계 [m]: route_s(뒷축) ≥ total − 이 값이면 완주. **폴백 경로 전용.**
 
     계획 정지점이 total − stop_gap − (wheelbase + front_overhang) 이므로
     임계 = stop_gap_route_end + 앞범퍼거리 + 여유(end_slack). stop_gap 튜닝을 자동으로
     따라간다 — 2026-08-25: stop_gap 1→4 후 고정 임계 5 m 로 완주가 timeout 처리.
     batch_run / summarize_run / score 가 전부 이 함수를 본다 (단일 출처).
+
+    **이 유도식은 route_end.target_mode 가 'route_total' 일 때만 맞다.** 현재
+    기본값은 'finish' 이고 계획 정지점은 finish_s + finish_clearance 라, 경로
+    꼬리(route.finish_tail_m, 기본 12 m)만큼 이 임계보다 앞에 선다. 그래서
+    score.detect_finish 와 batch_run 은 finish_xy 를 경로에 투영한 finish_s 를
+    먼저 쓰고, 그게 없을 때만 이 값으로 폴백한다
+    (batch.finish_judge_use_finish_s). 2026-09-04 실측: 11개 CSV 전부 계획
+    정지점이 이 임계에 −4.2 ~ −78.2 m 못 미친다.
     """
     sp, vh = cfg['speed'], cfg['vehicle']
     return (float(sp['stop_gap_route_end_m']) + float(vh['wheelbase'])

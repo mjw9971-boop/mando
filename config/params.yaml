@@ -880,9 +880,23 @@ pulk:
     보통: {semi_major_m: 300.0, semi_minor_m: 300.0, inner_radius_m: 30.0}
     성김: {semi_major_m: 450.0, semi_minor_m: 450.0, inner_radius_m: 45.0}
 batch:
+  # 배치 완주 판정을 채점(tools/score.py detect_finish)과 같은 규칙으로 할지.
+  # true = route.pkl 의 finish_xy 를 경로에 투영한 finish_s 를 임계로 쓴다.
+  #
+  # 아래 end_slack_m 기반 임계(total − end_margin_m)는 route_end.target_mode 가
+  # 'route_total' 이던 시절 유도식이다. 지금 기본은 'finish' 라 계획 정지점이
+  # finish_s + 2.0 = total − 꼬리 + 2.0 이고, 꼬리 연장(route.finish_tail_m 12 m)
+  # 때문에 임계가 계획보다 항상 위에 있다 — 2026-09-04 실측 11개 CSV 전부
+  # 계획대로 서면 미완주다 (venue −33.1 m, official_route −78.2 m, 꼬리 15 m 짜리
+  # 시나리오들 −4.2 m). 지금까지 완주가 찍힌 건 실주행 오버슈트 덕이고
+  # (20260903_173432: 계획 499.9 → 실제 507.0, 여유 3.0 m) 꼬리가 긴 경로에서는
+  # 성립하지 않는다.
+  # false = 이전 동작(total − end_margin_m).
+  finish_judge_use_finish_s: true
   # 완주 임계 = total − (stop_gap + wheelbase + front_overhang + 이 값).
-  # route_s 는 뒷축 기준이고 계획 정지점이 total − stop_gap − 앞범퍼 이므로
-  # 임계가 stop_gap 튜닝을 자동으로 따라간다.
+  # **위 스위치가 false 이거나 route.pkl 에 finish_xy 가 없을 때의 폴백 전용**이다.
+  # route_s 는 뒷축 기준이고 (route_total 모드의) 계획 정지점이
+  # total − stop_gap − 앞범퍼 이므로 임계가 stop_gap 튜닝을 자동으로 따라간다.
   end_slack_m: 1.0
 
   # ── 종료 판정 시간 4종 (이름이 비슷하니 무엇을 재는지 명시한다) ──────────

@@ -57,20 +57,53 @@ POLL_S = 2.0
 # (2026-08-25: stop_gap 1→4 튜닝 후 고정 임계 5 m 에 계획 정지점이 7.9 m 못 미쳐
 #  정상 완주가 전부 timeout 처리된 사고)
 from vtd_adapter.config import end_margin_m, load_params_yaml as load_cfg  # noqa: E402
+# 완주 임계는 채점과 같은 함수를 쓴다 (규칙 두 벌 금지 — finish_threshold 참조)
+from score import project_route_s, resolve_finish_xy  # noqa: E402
 
 # {grace}/{stall}/{blocked}/{noprog} 는 params batch.* 에서 채운다 (상수 이중화 금지)
-DONE_RULE = ('완주 판정: 로그 ego.route_s ≥ route_{name}.pkl 총길이 − {margin:.1f} m '
-             '(stop_gap+앞범퍼+여유, params.yaml 연동), 도달 후 v < 0.5 m/s 또는 '
+DONE_RULE = ('완주 판정: {basis}, 도달 후 v < 0.5 m/s 또는 '
              '{grace:.0f} s 유예.  조기 종료: stall(계획은 진행인데 못 감) {stall:.0f} s / '
              'blocked(앞이 막힘 — 신호·보행자 대기 제외) {blocked:.0f} s / '
              'no_progress(무전진, 최종 안전망) {noprog:.0f} s')
+BASIS_FINISH = ('로그 ego.route_s ≥ finish_s (route_<name>.pkl 의 finish_xy = 배포 CSV '
+                '마지막 행을 경로에 투영한 route_s) — score.py detect_finish 와 같은 규칙')
+BASIS_MARGIN = ('로그 ego.route_s ≥ route_<name>.pkl 총길이 − {margin:.1f} m '
+                '(stop_gap+앞범퍼+여유, params.yaml 연동) [폴백]')
 
 
-def done_rule(margin: float, b: dict) -> str:
-    return DONE_RULE.format(name='<name>', margin=margin,
-                            grace=float(b['stop_grace_s']), stall=float(b['stall_end_s']),
-                            blocked=float(b['blocked_end_s']),
-                            noprog=float(b['no_progress_end_s']))
+def done_rule(margin: float, b: dict, basis: str | None = None) -> str:
+    return DONE_RULE.format(
+        basis=basis or BASIS_MARGIN.format(margin=margin),
+        grace=float(b['stop_grace_s']), stall=float(b['stall_end_s']),
+        blocked=float(b['blocked_end_s']), noprog=float(b['no_progress_end_s']))
+
+
+def finish_threshold(cfg: dict, lg, route: dict, margin: float) -> tuple[float, str]:
+    """완주 route_s 임계와 그 근거. **score.detect_finish 와 같은 값을 낸다.**
+
+    score.py:1137 이 `thr = finish_s if finish_s is not None else total − end_margin_m`
+    이고 finish_s = `project_route_s(resolve_finish_xy(cfg, route))` 다. 여기서는
+    그 두 함수를 **그대로 import 해서 쓴다** — 산식을 옮겨 적으면 두 벌이 된다.
+
+    왜 바꾸나: 폴백 임계는 route_end.target_mode 가 'route_total' 이던 시절
+    유도식이라, 'finish' 모드의 계획 정지점(finish_s + finish_clearance)보다 경로
+    꼬리(route.finish_tail_m 12 m)만큼 위에 있다. 2026-09-04 실측 11개 CSV 전부
+    계획대로 서면 미완주였다 (−4.2 ~ −78.2 m). 지금까지 완주가 찍힌 건 실주행
+    오버슈트 덕이고(20260903_173432: 계획 499.9 → 실제 507.0, 여유 3.0 m),
+    꼬리가 44~89 m 인 경로에서는 성립하지 않는다.
+    """
+    total = float(route['total_length'])
+    if not bool(cfg.get('batch', {}).get('finish_judge_use_finish_s', True)):
+        return total - margin, 'route_s_margin(스위치 off)'
+    if lg is None:
+        return total - margin, 'route_s_margin(lane_graph 없음)'
+    fxy = resolve_finish_xy(cfg, route)
+    if not fxy:
+        return total - margin, 'route_s_margin(finish_xy 없음)'
+    fs = project_route_s(lg, route, float(fxy[0]), float(fxy[1]))
+    if fs is None:
+        return total - margin, 'route_s_margin(투영 실패)'
+    return float(fs), 'finish_xy'
 
 
 # 정차 사유 판정 어휘.
@@ -128,10 +161,12 @@ class EndJudge:
     """
 
     def __init__(self, total: float, margin: float, cfg_batch: dict | None = None,
-                 **over) -> None:
+                 thr: float | None = None, **over) -> None:
         b = dict(cfg_batch if cfg_batch is not None else load_cfg()['batch'])
         b.update({k: v for k, v in over.items() if v is not None})
         self.total, self.margin = total, margin
+        # thr 를 주면 그게 완주 임계다 (finish_s). 안 주면 기존 total − margin.
+        self.thr = float(total - margin) if thr is None else float(thr)
         self.grace = float(b['stop_grace_s'])
         self.stall_s = float(b['stall_end_s'])
         self.blocked_s = float(b['blocked_end_s'])
@@ -160,7 +195,7 @@ class EndJudge:
         if self.progress_t is None:
             self.progress_t = now
         # 완주
-        if route_s >= self.total - self.margin:
+        if route_s >= self.thr:
             if self.reached_at is None:        # `or now` 는 now=0.0 을 falsy 로 오판
                 self.reached_at = now
             if v < 0.5 or now - self.reached_at > self.grace:
@@ -455,6 +490,19 @@ class Runner:
         self.cfg = cfg = load_cfg()
         self.margin = end_margin_m(cfg)
         self.batch_cfg = cfg['batch']       # 종료 판정 임계 전부 (EndJudge 가 읽는다)
+        self._lg = None                     # 완주 임계 투영용 (지연 로드, 배치당 1회)
+
+    def lane_graph(self):
+        """완주 임계(finish_s) 투영용 LaneGraph. 12 MB 라 배치당 한 번만 읽는다."""
+        if self._lg is None:
+            try:
+                from vtd_adapter.lanegraph import LaneGraph
+                self._lg = LaneGraph(str(_ROOT / 'data' / 'lane_graph.pkl'))
+            except Exception as e:          # noqa: BLE001 — 없으면 폴백 임계로 간다
+                print(f'  [경고] lane_graph 로드 실패 ({e}) — 완주 임계를 '
+                      f'total − {self.margin:.1f} m 폴백으로 쓴다')
+                self._lg = False
+        return self._lg or None
 
     # ── 정리 (Ctrl+C 포함 모든 경로에서 호출) ─────────────────────────────
     def cleanup(self) -> None:
@@ -553,7 +601,9 @@ class Runner:
                   % (sc['vtd_xml_path'], self.args.host))
             print('  camera:', build_camera_scp(self.cfg) or '비활성 (camera.enabled=false)')
             print('  launch:', ' '.join(launch_cmd))
-            print(f'  종료   : {done_rule(self.margin, self.batch_cfg)} '
+            basis = (BASIS_FINISH
+                     if self.batch_cfg.get('finish_judge_use_finish_s', True) else None)
+            print(f'  종료   : {done_rule(self.margin, self.batch_cfg, basis)} '
                   f'/ timeout {sc["timeout_s"]}s')
             res['status'] = 'dry-run'
             return res
@@ -571,8 +621,15 @@ class Runner:
             print(f'  ✗ build_route 실패 (rc={cp.returncode}) — {warn or f"{name}.build_route.txt 참고"}')
             return res
         import pickle
-        total = float(pickle.load(open(route_pkl, 'rb'))['total_length'])
+        route = pickle.load(open(route_pkl, 'rb'))
+        total = float(route['total_length'])
         res['route_total_m'] = round(total, 1)
+        # 완주 임계 — 채점(score.detect_finish)과 같은 규칙
+        finish_thr, finish_basis = finish_threshold(self.cfg, self.lane_graph(),
+                                                    route, self.margin)
+        res['finish_thr_m'] = round(finish_thr, 1)
+        res['finish_basis'] = finish_basis
+        print(f'  완주 임계 {finish_thr:.1f} m / 총길이 {total:.1f} m  ({finish_basis})')
 
         # 2) VTD 로드→Init→(카메라)→Start — scp_client.load_and_run 을 단계로
         #    분해했다: IG 팔로워 뷰는 시나리오 Load 마다 초기화되므로 Init 완료
@@ -613,7 +670,7 @@ class Runner:
         t0 = time.monotonic()
         deadline = t0 + float(sc['timeout_s'])
         last_size, last_grow = -1, time.monotonic()
-        judge = EndJudge(total, self.margin, self.batch_cfg)
+        judge = EndJudge(total, self.margin, self.batch_cfg, thr=finish_thr)
         status = 'timeout'
         while time.monotonic() < deadline:
             time.sleep(POLL_S)
@@ -791,7 +848,9 @@ class Runner:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             self.precheck_vtd_paths(scenarios)
         print(f'배치 {len(scenarios)}건, host={self.args.host}')
-        print(done_rule(self.margin, self.batch_cfg))
+        print(done_rule(self.margin, self.batch_cfg,
+                        BASIS_FINISH if self.batch_cfg.get('finish_judge_use_finish_s', True)
+                        else None))
         try:
             for i, sc in enumerate(scenarios, 1):
                 print(f'\n[{i}/{len(scenarios)}] {sc["name"]}  (timeout {sc["timeout_s"]}s)')
@@ -811,7 +870,9 @@ class Runner:
             print('\n[중단] 정리 중…')
             self.cleanup()
         table = self.report()
-        rule = done_rule(self.margin, self.batch_cfg)
+        rule = done_rule(self.margin, self.batch_cfg,
+                         BASIS_FINISH if self.batch_cfg.get('finish_judge_use_finish_s', True)
+                         else None)
         # 판정 기준 설명문은 표 아래로 — 표가 첫 화면에 오도록.
         print('\n' + '=' * int(self.cfg['report']['table_width']))
         print(table)
