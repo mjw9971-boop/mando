@@ -329,32 +329,52 @@ def advance(lg, k, k2, length_k) -> float:
 # 헤딩오차 46°, 조향 풀락 포화, 도로이탈 + courseRespawn 으로 끝났다.
 MIN_LC_WINDOW_M = 20.0
 
-def hop_gaps(lg, rt):
-    """연속 차선변경(hop) 사이의 경로거리 -> [(i, cum_i, gap, from_lane, to_lane)].
+def min_hop_gap_m():
+    """전이 하나가 먹는 최소 진행거리 [m]. params 가 단일 출처."""
+    return float((route_cfg() or {}).get('min_hop_gap_m', MIN_LC_WINDOW_M))
 
-    gap 은 **앞 hop 지점부터 이 hop 지점까지의 route 누적거리**다. hop 은 평행
-    차로로 옮겨 타는 것이라 advance() 가 진행거리를 0 으로 두므로, 같은 cum_s 에
-    쌓인 hop 들의 gap 은 0.0 이 된다 -- 한 차로 안에서 전이를 여러 번 끝내야
-    한다는 뜻이고, 물리적으로 불가능하다.
 
-    창(window_s0/s1) 검사로는 못 잡는다: lane_change_window 가 창 시작을 최대한
-    앞으로 당기는 탓에, 같은 29.8 m 를 공유하는 hop 3 개가 각각 "29.8 m 창"
-    으로 보고된다 (venue_20260903 실측). hop 지점 사이의 간격이 정확한 축이다.
+def hop_spacing_cost_enable():
+    """탐색이 hop 간격을 비용으로 보는가 (작업19-3). false = 이전 동작."""
+    return bool((route_cfg() or {}).get('hop_spacing_cost_enable', True))
+
+
+def hop_room(lg, rt, gap=None):
+    """차선변경마다 (인덱스, cum, from, to, 누적 필요거리, 차로 여유, 연쇄번째).
+
+    **탐색(dijkstra)과 같은 축이다.** 전이 하나는 목표 차로 안에서 gap 만큼의
+    진행거리를 먹는다. 연속 hop 은 커서가 누적되고, successor 전이는 커서를
+    0 으로 되돌린다(새 차로에서 다시 시작).
+
+    경로 누적거리(cum) 축으로는 이걸 못 잰다 -- advance() 가 hop 의 진행거리를
+    0 으로 두므로 같은 차로 안의 hop 은 전부 간격 0 이고, "29.8 m 에 3회"와
+    "70.5 m 에 3회"가 똑같이 보인다. 앞쪽은 주행 불가, 뒤쪽은 정상이다.
+
+    연쇄의 **첫 hop(nth=0)은 여기서 판정하지 않는다** -- 그건 창 검사
+    (window_s1 - window_s0 >= MIN_LC_WINDOW_M)가 이미 본다. 창은
+    lane_change_window 가 laneSection 경계를 넘어 이어 붙이므로, 17 m 짜리
+    짧은 차로라도 후행 차로까지 회랑이 이어지면 정상으로 잡힌다. 차로 길이만
+    보는 여기서 첫 hop 까지 재면 그런 정상 경로를 과탐한다
+    (실측: (2801,0,3)->(2801,0,2) 차로 17.07 m / 회랑 20.8 m, 계단 0).
     """
+    if gap is None:
+        gap = min_hop_gap_m()
     lanes = [tuple(k) for k in rt['lanes']]
     cum = rt['cum_s']
-    hops = [i for i in range(len(lanes) - 1)
-            if is_lane_change_hop(lg, lanes[i], lanes[i + 1])]
+    cur = 0.0
+    nth = 0
     out = []
-    for a_i, b_i in zip(hops, hops[1:]):
-        out.append((b_i, float(cum[b_i]), float(cum[b_i] - cum[a_i]),
-                    lanes[b_i], lanes[b_i + 1]))
+    for i in range(len(lanes) - 1):
+        a, b = lanes[i], lanes[i + 1]
+        if not is_lane_change_hop(lg, a, b):
+            cur, nth = 0.0, 0                    # successor -> 커서 리셋
+            continue
+        room = lg.length(b)
+        need = cur + gap
+        out.append((i + 1, float(cum[i + 1]), a, b, need, room, nth))
+        cur = min(need, room)
+        nth += 1
     return out
-
-
-def min_hop_gap_m():
-    """연속 hop 사이에 있어야 하는 최소 경로거리 [m]. params 가 단일 출처."""
-    return float((route_cfg() or {}).get('min_hop_gap_m', MIN_LC_WINDOW_M))
 
 
 # 점선 구간 두 개가 이만큼 안쪽으로 붙어 있으면 하나로 잇는다 (샘플 경계 오차)
@@ -512,6 +532,8 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
     tgt = dict(targets)
     best = {}
     heap = []
+    # 전이 하나가 먹는 진행거리 [m]. 0 이면 이전 동작(간격을 비용에서 무시).
+    hop_gap = min_hop_gap_m() if hop_spacing_cost_enable() else 0.0
     for key, s in starts:
         if key in tgt and tgt[key] >= s - 1e-6:
             # 같은 차로 안에서 도달
@@ -547,9 +569,20 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
                 continue
             k2 = lg.neighbor(key, side)
             L2 = lg.length(k2)
-            s2 = min(s_enter, L2)
+            if hop_gap > 0.0:
+                # 전이 하나가 목표 차로 안에서 hop_gap 만큼의 진행거리를 먹는다.
+                # 연속 hop 은 s_enter 가 누적되므로 짧은 차로에 몰아넣으면
+                # 부족분을 문다 — 이게 없으면 "3회를 100 m 에"와 "29.8 m 에"가
+                # 같은 비용이다 (작업19-3). + hop_gap 은 전이 중 실제로 달리는
+                # 거리라 회계상 맞다.
+                s_req = s_enter + hop_gap
+                s2 = min(s_req, L2)
+                extra = hop_gap + LC_SHORT_PENALTY_PER_M * max(0.0, s_req - L2)
+            else:
+                s2 = min(s_enter, L2)          # 이전 동작
+                extra = 0.0
             # 이 차로를 s_enter 에서 떠나는 비용으로 되돌리고 + 차선변경 비용(회랑 반영)
-            c_lc = cost - (r['length'] - s_enter) + lc_cost(lg, key, side)
+            c_lc = cost - (r['length'] - s_enter) + lc_cost(lg, key, side) + extra
             if k2 in tgt and tgt[k2] >= s2:
                 heapq.heappush(heap, (c_lc + (tgt[k2] - s2), k2, s2, (key, s_enter), root, True))
             heapq.heappush(heap, (c_lc + (L2 - s2), k2, s2, (key, s_enter), root, False))
@@ -1246,29 +1279,31 @@ def report(lg, rt, radius, warn_dev=None):
                      + ('  [짝 기준 보정]' if e.get('source') == 'pair' else ''))
         print(f"  {e['s']:8.1f} m  {e['kind']:<20}{extra}")
 
-    # ── 연속 차선변경 간격 (작업19-2) ────────────────────────────────────
+    # ── 차선변경 여유 적합 (작업19-2 도입 / 19-3 축 교체) ─────────────────
     # 위 창 검사와 축이 다르다. 창은 "이 전이를 어디서 시작할 수 있나" 이고,
     # 여기는 "앞 전이가 끝나기 전에 다음이 시작되지 않나" 다.
-    gaps = hop_gaps(lg, rt)
-    if gaps:
+    rooms = hop_room(lg, rt)
+    if rooms:
         thr = min_hop_gap_m()
         gap_on = bool(rc.get('hop_gap_enable', True))
-        print(f"  ── 연속 차선변경 간격 (임계 {thr:g} m"
+        print(f"  ── 차선변경 여유 적합 (전이 하나에 {thr:g} m"
               f"{'' if gap_on else ', 검사 꺼짐'})")
-        for _i, cum_i, gap, fl, tl in gaps:
+        for _i, cum_i, fl, tl, need, room, nth in rooms:
             note = ''
-            if gap < thr:
-                # ERROR — 앞 전이가 끝나기 전에 다음 전이가 시작된다. 계획대로면
-                # 한 차로 길이 안에서 여러 번 옮겨타야 하고, planner 램프는 hop
-                # 하나만 블렌드하므로 경로 점열에 차로 폭짜리 계단이 남는다
-                # (venue_20260903: 같은 cum_s 에 hop 3개 -> 3.402 m / 6.800 m).
-                note = (f'   <= [오류] 간격 {gap:.1f} m < {thr:g} m — '
+            if nth > 0 and need > room + 1e-9:
+                # ERROR — 한 차로 안에서 전이를 여러 번 끝내야 한다. planner
+                # 램프는 cum_s 당 hop 하나만 블렌드하므로 나머지는 경로 점열에
+                # 차로 폭짜리 계단으로 남는다 (venue_20260903 실측:
+                # 29.8 m 에 hop 3개 -> 3.402 m / 6.800 m 계단).
+                note = (f'   <= [오류] 누적 {need:.1f} m > 차로 {room:.1f} m — '
                         f'앞 전이가 끝나기 전에 다음이 시작된다')
                 if gap_on:
                     errs += 1
                 else:
                     note += ' (검사 꺼짐 — rc 무관)'
-            print(f"    {cum_i:8.1f} m  {str(fl)} -> {str(tl)}   간격 {gap:7.1f} m{note}")
+            mark = '연쇄' if nth else '단발'
+            print(f"    {cum_i:8.1f} m  {str(fl)} -> {str(tl)}   "
+                  f"{mark} 누적 {need:5.1f} / 차로 {room:6.1f} m{note}")
 
     # ── [5] 회전 가능성 — 회전 이벤트가 지나는 연결로들의 최소 곡률반경 ──────
     # R_min < 최소회전반경 × vehicle.min_turn_margin 이면 풀락으로도 못 돈다

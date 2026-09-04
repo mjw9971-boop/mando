@@ -77,13 +77,35 @@ def test_pkl_finish_xy_equals_csv_last_row(lg, wps):
 
 
 # ── build_route: 꼬리 연장 ──────────────────────────────────────────────
-def test_tail_off_reproduces_fixture(lg, wps):
-    """finish_tail_m=0 (스위치 off) = 기존 픽스처와 동일한 경로."""
+def test_tail_off_reproduces_fixture(lg, wps, monkeypatch):
+    """finish_tail_m=0 (스위치 off) = 기존 픽스처와 동일한 경로.
+
+    픽스처 route.pkl 은 작업19-3(전이 간격 비용) 이전에 만든 것이라, 재현하려면
+    그 스위치도 꺼야 한다. 픽스처를 재생성하지 않는 이유는 다섯 테스트 묶음
+    (test_overtake · test_turn_signal · test_solid_lc · test_lc_corridor ·
+    test_static_obstacle)이 이 pkl 을 기준값으로 쓰기 때문이다 —
+    tests/fixtures/README.md 참조.
+    """
+    monkeypatch.setattr(br, 'hop_spacing_cost_enable', lambda: False)
     rt = _build(lg, wps, tail=0.0)
     with open(FIXTURE_PKL, 'rb') as f:
         base = pickle.load(f)
     assert rt['lanes'] == base['lanes']
     assert rt['total_length'] == pytest.approx(base['total_length'], abs=0.01)
+
+
+def test_hop_spacing_cost_changes_this_route(lg, wps):
+    """작업19-3 이 이 경로를 바꾼다 — 위 테스트가 스위치를 끄는 이유.
+
+    (429,0,5) -> (429,1,6) 로 차선변경 지점이 옮겨가고, 경로 점열 계단이
+    3개(최대 0.290 m) -> 2개(최대 0.238 m)로 준다.
+    """
+    on = _build(lg, wps, tail=0.0)
+    with open(FIXTURE_PKL, 'rb') as f:
+        base = pickle.load(f)
+    assert on['lanes'] != base['lanes']
+    diff = [i for i, (a, b) in enumerate(zip(on['lanes'], base['lanes'])) if a != b]
+    assert diff and on['lanes'][diff[0]] == (429, 1, 6)
 
 
 def test_tail_extension_removes_clip(lg, wps, capsys):
