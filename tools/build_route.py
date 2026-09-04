@@ -258,6 +258,27 @@ def turn_connect(lg, ka, s_a, kb, s_b, banned, cap):
     return r
 
 
+def pair_turn_ok(lg, rt, wi, banned=frozenset(), cap=None):
+    """짝 세그먼트 wi 의 (진입 차로 → 진출 차로) 가 차선변경 없이 이어지는가.
+
+    반환: (ok, k_in, k_out, cost) — 안 되면 cost 는 None.
+    report() 와 작업10(직선 구간 유효 차로 집합)이 같이 쓴다. turn_connect 를
+    감싸기만 하고 판정을 새로 만들지 않는다.
+    """
+    spans = {w: (a, b) for w, a, b in rt.get('segment_span') or []}
+    if wi not in spans:
+        return None, None, None, None
+    i0, i1 = spans[wi]
+    k_in, k_out = rt['lanes'][i0], rt['lanes'][i1]
+    wps = rt['waypoints']
+    s_in = lg.project(k_in, wps[wi][0], wps[wi][1])[0]
+    s_out = lg.project(k_out, wps[wi + 1][0], wps[wi + 1][1])[0]
+    if cap is None:
+        cap = pair_cfg()[1]
+    r = turn_connect(lg, k_in, s_in, k_out, s_out, banned, cap)
+    return (r is not None), k_in, k_out, (None if r is None else r[0])
+
+
 def locate_score(lg, key, s, dd, yaw):
     """lanegraph.locate 의 후보 점수(prefer 없음) — 거리 + 헤딩오차 가중.
 
@@ -387,6 +408,21 @@ def finish_tail_cfg():
         return float(rc.get('finish_tail_m', 12.0))
     except Exception:                                    # noqa: BLE001 — 독립 실행 폴백
         return 12.0
+
+
+_ROUTE_CFG = None
+
+
+def route_cfg(reload=False):
+    """params.yaml route.* 원본 dict (캐시). 개별 소비자는 필요한 키만 읽는다."""
+    global _ROUTE_CFG
+    if _ROUTE_CFG is None or reload:
+        try:
+            from vtd_adapter.config import load_params_yaml
+            _ROUTE_CFG = dict(load_params_yaml().get('route') or {})
+        except Exception:                                # noqa: BLE001 — 독립 실행 폴백
+            _ROUTE_CFG = {}
+    return _ROUTE_CFG
 
 
 def route_check_cfg():
@@ -977,7 +1013,16 @@ def report(lg, rt, radius, warn_dev=None):
     """
     rc = route_check_cfg()
     hw_k = float(rc['wp_dev_halfwidth_k'])
+    pair_exempt = bool(rc.get('pair_waypoint_exempt_enable', True))
+    max_dist = float((route_cfg() or {}).get('check_waypoint_max_dist_m', 6.0))
+    banned, _thr0 = infeasible_connectors(lg)
+    turn_cap = pair_cfg()[1]
     lanes, cum = rt['lanes'], rt['cum_s']
+    jsegs = set(rt.get('junction_segments') or [])
+    # 짝 경유점 = 진입(wi) + 진출(wi+1). 이 점들은 "찍힌 차로 = 주행 차로" 가
+    # 아니므로(주최측 2026-09-03) 반폭 이탈로 판정하지 않는다 — [2] 에서
+    # "그 회전을 수행 가능한가" 로 본다.
+    pair_wps = {w for wi in jsegs for w in (wi, wi + 1)}
     warns = 0
 
     print(f"\n{'=' * 72}")
@@ -985,11 +1030,20 @@ def report(lg, rt, radius, warn_dev=None):
     print('=' * 72)
 
     # ── 1) seq 점이 경로에서 얼마나 떨어져 있나 ──────────────────────────
-    # 허용치는 **매칭된 차로의 반폭** 이다 — 이걸 넘으면 옆 차로가 더 가까워져
-    # 조용히 옆 차로로 경로가 잡힐 수 있다. --radius(경유점 매칭 반경)는 이 판정과
-    # 무관한 별개 값이라 쓰지 않는다 (--warn-dev 로 고정 임계를 줄 수는 있다).
+    # **반폭 기준은 폐기했다.** 그건 "경유점이 찍힌 차로 = 주행 차로" 를 전제로
+    # "반폭을 넘으면 옆 차로로 잘못 잡힌 것" 이라 보는 판정인데, 주최측 답변
+    # (2026-09-03 "좌표는 대략적", "좌회전 구간에 3차로 경유지가 올 수 있다")
+    # 으로 그 전제가 무효가 됐다. 짝 공동 선택(route.waypoint_lane_is_hint)이
+    # 회전 가능한 차로를 고르면 경유점에서 한 차로(~3 m) 멀어지는 게 정상이고,
+    # 반폭(~1.5 m)으로 재면 정상 경로가 경고를 받는다 (실측 2026-09-04:
+    # 정적회피집중_01 seq 2 이탈 2.86 / 한계 1.54 → rc=1 → batch 가 시나리오 폐기).
+    #   · 짝 경유점(진입·진출) → 이 판정에서 **제외**. [2] 의 회전 가능 판정이 대신한다.
+    #   · 그 밖(시작·종료·직선 구간) → route.check_waypoint_max_dist_m (도로 폭 급).
+    # --warn-dev 는 여전히 모든 경유점에 대한 고정 임계 override 다.
     head = (f'허용 {warn_dev:g} m 고정 (--warn-dev)' if warn_dev is not None
-            else f'허용 = 매칭 차로 반폭 × {hw_k:g}')
+            else (f'허용 {max_dist:g} m (route.check_waypoint_max_dist_m); '
+                  f'짝 경유점은 [2] 에서 판정' if pair_exempt
+                  else f'허용 = 매칭 차로 반폭 × {hw_k:g}'))
     print(f"\n[1] 경유점 이탈 ({head};  매칭 반경 --radius {radius:g} m 는 별개)")
     for wi, (x, y) in enumerate(rt['waypoints']):
         sq = rt['waypoint_seq'][wi]
@@ -999,17 +1053,25 @@ def report(lg, rt, radius, warn_dev=None):
             if best_d is None or d_p < best_d:
                 best_d, best_s, best_sp, best_lane = d_p, cum[i] + s_p, s_p, k
         half = 0.5 * lg.width_at(best_lane, best_sp)
-        lim = warn_dev if warn_dev is not None else hw_k * half
+        is_pair = pair_exempt and wi in pair_wps
+        if warn_dev is not None:
+            lim = warn_dev
+        elif not pair_exempt:
+            lim = hw_k * half
+        else:
+            lim = max_dist
         flag = ''
-        if best_d > lim:
-            flag = (f'   <= [경고] 차로 반폭 {half:.2f} m 를 벗어난다 — '
-                    f'옆 차로로 잡힐 수 있다')
+        if is_pair and warn_dev is None:
+            flag = '   (짝 경유점 — [2] 회전 가능 판정)'
+        elif best_d > lim:
+            flag = (f'   <= [경고] 허용 {lim:.2f} m 초과 — 경로가 이 경유점에서 '
+                    f'너무 멀다 (차로 반폭 {half:.2f} m)')
             warns += 1
-        print(f"  seq {sq:>3}  ({x:9.2f},{y:9.2f})  이탈 {best_d:6.2f} / 한계 {lim:4.2f} m  "
+        print(f"  seq {sq:>3}  ({x:9.2f},{y:9.2f})  이탈 {best_d:6.2f} / 한계 "
+              f"{'—' if is_pair and warn_dev is None else f'{lim:4.2f}'} m  "
               f"경로 s={best_s:8.1f} m  lane={best_lane}{flag}")
 
     # ── 2) 짝(교차로) 구간 ───────────────────────────────────────────────
-    jsegs = set(rt.get('junction_segments') or [])
     spans = {wi: (i0, i1) for wi, i0, i1 in rt.get('segment_span') or []}
     print(f"\n[2] 교차로 짝 구간")
     if not jsegs:
@@ -1045,8 +1107,22 @@ def report(lg, rt, radius, warn_dev=None):
         if lc:
             flag += f'   <= [경고] 교차로 내부에서 차선변경 {lc}회'
             warns += 1
+        # 짝 경유점의 진짜 판정 기준 — 고른 진입 차로에서 진출 차로로 차선변경
+        # 없이 갈 수 있는가. 경유점과의 거리가 아니라 이게 성립해야 정상이다.
+        ok, k_in, k_out, cost = pair_turn_ok(lg, rt, wi, banned, turn_cap)
+        turn_txt = ''
+        if ok is None:
+            turn_txt = '  회전 —'
+        elif ok:
+            turn_txt = f'  회전 OK ({k_in}→{k_out}, {cost:.0f} m)'
+        else:
+            turn_txt = f'  회전 X ({k_in}→{k_out})'
+            flag += (f'   <= [경고] 진입 차로에서 진출 차로로 차선변경 없이 갈 수 없다'
+                     f' (상한 {turn_cap:g} m)')
+            warns += 1
         print(f"  seq {sq_in:>3}→{sq_out:<3}  junction={jids if jids else '없음'}  "
-              f"Δheading={dh:+7.1f}°  {turn_kind(dh)}  차로 {len(seg_lanes)}개{flag}")
+              f"Δheading={dh:+7.1f}°  {turn_kind(dh)}  차로 {len(seg_lanes)}개"
+              f"{turn_txt}{flag}")
 
     # ── 3) 총계 ──────────────────────────────────────────────────────────
     ev = rt['events']
