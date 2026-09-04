@@ -220,12 +220,57 @@ def smooth_curvature(cv, k=5):
     return out.astype(np.float32)
 
 
+_MAP_CFG = None
+
+
+def map_cfg(reload=False):
+    """params.yaml map.* — xodr 파싱 상수의 단일 출처.
+
+    이 도구는 params 없이 단독 실행될 수 있어야 하므로(현장 롤백·최소 환경),
+    읽기 실패는 기본값 폴백으로 삼킨다. build_route.candidates_cfg 와 같은 관례.
+    """
+    global _MAP_CFG
+    if _MAP_CFG is None or reload:
+        try:
+            import pathlib as _pl, sys as _sy
+            _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
+            from vtd_adapter.config import load_params_yaml
+            mc = load_params_yaml().get('map') or {}
+            _MAP_CFG = (bool(mc.get('laneoffset_stable_order', True)),
+                        float(mc.get('laneoffset_tie_tol_m', 1e-3)))
+        except Exception:                            # noqa: BLE001 — 독립 실행 폴백
+            _MAP_CFG = (True, 1e-3)
+    return _MAP_CFG
+
+
 def parse_pieces(el, tag, keys=('a', 'b', 'c', 'd'), skey='sOffset'):
+    """(s, a, b, c, d) 조각 리스트를 s 오름차순으로.
+
+    **같은 s 의 레코드는 xodr 문서 순서를 지킨다** (map.laneoffset_stable_order).
+    list.sort 는 안정 정렬이라 키가 *정확히* 같으면 문서 순서가 보존되지만,
+    이 맵의 laneOffset 은 같은 지점을 e-12 ~ e-9 만큼 다른 s 로 적어 놓아
+    정렬이 문서 순서를 뒤집는다. poly_eval / poly_eval_arr 은 "s 이하의 마지막
+    조각"을 고르므로, 뒤로 밀린 앞 구간 종결자(b=0)가 다음 구간의 램프(b≠0)를
+    덮어쓴다 -- 도로 2803 에서 1.195 m, 1603 에서 2.700 m 짜리 중심선 오차.
+    자세한 근거는 params.yaml map: 주석.
+    """
+    stable, tol = map_cfg()
     out = []
-    for e in el.findall(tag):
+    for i, e in enumerate(el.findall(tag)):
         out.append((float(e.get(skey, e.get('s', 0.0))),) + tuple(float(e.get(k, 0.0)) for k in keys))
-    out.sort(key=lambda p: p[0])
-    return out
+    if not stable:
+        out.sort(key=lambda p: p[0])                 # 이전 동작
+        return out
+    # s 로 정렬하되, 같은 s 묶음 안에서는 문서 순서(원래 인덱스)를 보조키로.
+    order = sorted(range(len(out)), key=lambda i: out[i][0])
+    ranked = []                                      # (묶음 대표 s, 문서 인덱스)
+    for n, i in enumerate(order):
+        if n and out[i][0] - out[order[n - 1]][0] < tol:
+            ranked.append((ranked[-1][0], i))        # 앞 묶음에 합류
+        else:
+            ranked.append((out[i][0], i))
+    ranked.sort()
+    return [out[i] for _s, i in ranked]
 
 
 def parse_lane(lane_el):
