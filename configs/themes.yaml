@@ -126,12 +126,19 @@ themes:
     차폐물: [버스, 승용차]
 
   추월집중:
-    min_length_m: 400
+    min_length_m: 250
     event: [static_vehicle]
     # 회전 추가는 보류 후보 — 회전 구간은 차선변경 공간이 좁아 회피가 성립하지
     # 않을 수 있어 폐기율 실측으로 판단한다 (2026-08-28)
-    routes: [직진, 우회전, 좌회전]
+    routes: [직진]
     vary: [위치, 차선, 대향차]
+    start: 자유
+
+  추월회전:
+    min_length_m: 400
+    event: [static_vehicle]
+    routes: [우회전, 좌회전]
+    vary: [위치, 차선]
     start: 자유
 
   정적회피집중:
