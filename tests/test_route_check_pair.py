@@ -24,8 +24,12 @@ import build_route as BR                                        # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
 
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
-# 짝 진입 차로가 경유점에서 한 차로 벗어나는, 실측으로 확인된 CSV
-PAIR_CSV = 'scenarios/정적회피집중/정적회피집중_01_좌회전2.csv'
+# 짝 진입 차로가 경유점에서 한 차로 벗어나는, 실측으로 확인된 CSV.
+# tests/fixtures 에 고정한다 (2026-09-04, 작업17) — 예전에는 scenarios/ 아래
+# 생성물을 가리켰는데 그쪽은 .gitignore 대상이고 시드 스트림에 따라 같은 이름에
+# 다른 경로가 들어온다. 재생성 한 번에 이 파일의 테스트 6건이 "파일은 있는데
+# 내용이 달라서" 깨졌다. 출처·재현법은 tests/fixtures/README.md 참조.
+PAIR_CSV = 'tests/fixtures/pair_lane_offset_waypoints.csv'
 # waypoints.csv · tests/fixtures/waypoints.csv 임시 제외 (2026-09-04, 작업13-2).
 # vehicle.min_turn_margin 0.7 → 1.0 (임계 3.96 → 5.65 m) 으로 두 경로가 각각
 # (2429,0,-1) R 5.43 m / (550,0,-1) R 4.52 m 를 지나 #7 '회전 불가 기하' ERROR

@@ -120,7 +120,7 @@ def test_pool_is_superset_of_candidates(lg, monkeypatch):
 
 def test_switch_off_is_previous_behaviour(lg, monkeypatch):
     """킬 스위치 off 는 짝 로직을 통째로 끈다 — 짝 구간 차로가 탐욕 결과와 같다."""
-    csv = 'scenarios/정적회피집중/정적회피집중_01_좌회전2.csv'
+    csv = 'tests/fixtures/pair_lane_offset_waypoints.csv'   # 작업17: 생성물 → 픽스처
     if not (ROOT / csv).exists():
         pytest.skip(f'{csv} 없음')
     _on(monkeypatch, hint=False)
