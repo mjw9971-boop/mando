@@ -844,6 +844,122 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
     return path_in, k_in, s_in, path_out, k_out, s_out, used_banned
 
 
+def valid_entry_lanes_enable():
+    """route.valid_entry_lanes_enable (기본 true). false 면 필드를 안 넣는다."""
+    return bool((route_cfg() or {}).get('valid_entry_lanes_enable', True))
+
+
+def valid_entry_lanes(lg, rt, radius=8.0, banned=None, cap=None):
+    """짝이 아닌 세그먼트마다 "다음 제약을 차선변경 없이 만족시키는 차로 집합" (작업10).
+
+    쓰임: 회피 시프트로 옆 차로에 나간 뒤 **원래 차로로 복귀해야 하는가**를
+    제어기가 판단할 재료다. 복귀 공간이 부족하면 곡률이 커져 속도가 하한에
+    붙거나(2026-09-03 정적회피집중_01, 27.7 s 크립) span 게이트가 회피를 기각해
+    장애물 앞에 선다. 직진 구간이면 굳이 복귀하지 않고 그 차로로 다음 교차로에
+    들어가도 되는 경우가 많다 — 그걸 여기서 알려 준다.
+
+    판정은 **작업7-2 의 turn_connect 를 그대로** 쓴다. 새 탐색을 만들지 않는다:
+      · 후보 풀은 _pair_choice 와 같은 방식 — candidates() 후보집합에 등장한
+        모든 도로의 같은 섹션·같은 통행방향 driving 차로(road_lane_pool).
+      · 진입 후보 ka 가 진출 후보 kb 중 하나로 차선변경 없이 cap 안에 이어지면
+        유효하다.
+
+    좌·우회전이면 진입 차로가 하나로 좁혀져 집합 크기가 1 이 되고, 그게 곧
+    **복귀 강제**다. 직진이면 여러 개가 남는다.
+
+    반환: [{seg, seq, target, turn, lanes, chosen, in_set}] — target 은
+      'pair'   다음 세그먼트가 짝이다. lanes 는 그 짝의 진입 차로 후보.
+      'finish' 다음 짝이 없는 마지막 세그먼트. lanes 는 종료 경유점까지
+               차선변경 없이 갈 수 있는 차로들 (같은 축으로 계산한다).
+      None     다음 제약이 없다 (짝 해석이 없는 경로의 중간 세그먼트).
+    """
+    if banned is None:
+        banned, _thr = infeasible_connectors(lg)
+    if cap is None:
+        cap = pair_cfg()[1]
+    thr = pair_cfg()[2]
+    wps = rt['waypoints']
+    n = len(wps)
+    jsegs = set(rt.get('junction_segments') or [])
+    spans = {w: (a, b) for w, a, b in rt.get('segment_span') or []}
+    seqs = rt.get('waypoint_seq') or list(range(1, n + 1))
+    lanes_r = rt['lanes']
+    out = []
+    for wi in range(n - 1):
+        if wi in jsegs:
+            continue                                  # 짝 구간 자체는 대상이 아니다
+        nxt = wi + 1
+        if nxt in jsegs and wi + 2 < n:
+            target, i_ent, i_ext = 'pair', wi + 1, wi + 2
+        elif nxt == n - 1:
+            # 마지막 세그먼트(마지막 진출 → 종료). 다음 짝이 없으므로 **차로 제약이
+            # 없다** — 종료선은 점이고 채점은 뒷축의 route_s 로 판정하므로 어느
+            # 평행 차로에 있어도 완주가 성립한다. 그래서 빈 집합을 넣는다.
+            # target='finish' 가 "유효 차로가 없다"가 아니라 "제약이 없다"임을
+            # 구분한다 — 소비자는 target 을 먼저 봐야 한다.
+            out.append(dict(seg=wi, seq=(seqs[wi], seqs[wi + 1]), target='finish',
+                            turn=None, lanes=[],
+                            chosen=(tuple(lanes_r[spans[wi][1]]) if wi in spans else None),
+                            in_set=None))
+            continue
+        else:
+            out.append(dict(seg=wi, seq=(seqs[wi], seqs[wi + 1]), target=None,
+                            turn=None, lanes=[], chosen=None, in_set=None))
+            continue
+        # 후보 풀 — _pair_choice 와 같은 방식
+        ax, ay = wps[i_ent]
+        bx, by = wps[i_ext]
+        ay_in = math.atan2(ay - wps[i_ent - 1][1], ax - wps[i_ent - 1][0]) if i_ent else start_yaw_of(rt)
+        ay_out = math.atan2(by - ay, bx - ax)
+        ca = candidates(lg, ax, ay, radius, ay_in)
+        cb = candidates(lg, bx, by, radius, ay_out)
+        pool_in = road_lane_pool(lg, ca, ax, ay, ay_in) if ca else []
+        pool_out = road_lane_pool(lg, cb, bx, by, ay_out) if cb else []
+        # 진입 후보에서 **교차로 연결로를 뺀다**. 진입 경유점은 교차로 어귀에
+        # 찍히므로 후보집합에 접근 차로와 그 successor 연결로가 같이 들어온다.
+        # 연결로는 "어느 평행 차로에 있을 것인가" 의 선택지가 아니라 그 다음
+        # 단계라, 넣어 두면 집합 크기가 실제 선택지의 두 배로 부풀고 좌회전인데
+        # 2개로 보이는 착시가 생긴다 (실측: venue 4개 짝 전부).
+        # pool_out 은 그대로 둔다 — 저건 turn_connect 의 목적지일 뿐이고,
+        # 진출 경유점이 연결로 위에 찍혀도 "거기까지 간다" 는 성립한다.
+        pool_in = [(k, sv, d) for k, sv, d in pool_in if lg.lanes[k]['junction'] == -1]
+        ok = []
+        for ka, sa, _da in pool_in:
+            if any(turn_connect(lg, ka, sa, kb, sb, banned, cap) is not None
+                   for kb, sb, _db in pool_out):
+                ok.append(ka)
+        # 회전 종류 — report() 와 같은 축(짝 구간 진입 시작 → 진출 끝 헤딩차)
+        turn = None
+        if target == 'pair' and nxt in spans:
+            i0, i1 = spans[nxt]
+            h0 = np.unwrap(lg.lanes[lanes_r[i0]]['hdg'].astype(float))
+            h1 = np.unwrap(lg.lanes[lanes_r[i1]]['hdg'].astype(float))
+            dh = math.degrees(wrap(float(h1[-1]) - float(h0[0])))
+            turn = 'straight' if abs(dh) <= thr else ('left' if dh > 0 else 'right')
+        # 경로가 실제로 고른 차로 (그 세그먼트가 끝나는 차로)
+        # 경로가 실제로 고른 진입 차로. 세그먼트가 연결로 위에서 끝나는 경우가
+        # 있어(경유점이 교차로 어귀에 찍히면 그렇다) **마지막 일반 도로 차로**를
+        # 쓴다 — 집합과 같은 축이라야 in_set 이 뜻이 있다.
+        chosen = None
+        if wi in spans:
+            i0, i1 = spans[wi]
+            for i in range(i1, i0 - 1, -1):
+                if lg.lanes[lanes_r[i]]['junction'] == -1:
+                    chosen = tuple(lanes_r[i])
+                    break
+        okt = [tuple(k) for k in ok]
+        out.append(dict(seg=wi, seq=(seqs[i_ent], seqs[i_ext]), target=target, turn=turn,
+                        lanes=okt, chosen=chosen,
+                        in_set=(chosen in okt) if chosen is not None else None))
+    return out
+
+
+def start_yaw_of(rt):
+    """경로 시작 헤딩 (첫 두 경유점) — valid_entry_lanes 의 진입 헤딩 폴백."""
+    w = rt['waypoints']
+    return math.atan2(w[1][1] - w[0][1], w[1][0] - w[0][0])
+
+
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
                 seqs=None, finish_tail_m=0.0, pair_meta=None):
     """pair_meta: {'offset','source','why'} — 짝 해석을 pkl 에 기록만 한다.
@@ -1134,7 +1250,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             print(f'  경로 꼬리 연장: 잔여 {tail0:.1f} m < 요구 {finish_tail_m:g} m → '
                   f'{" → ".join(str(k) for k in added)}  (꼬리 {tail:.1f} m)')
 
-    return {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
+    rt = {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
             'infeasible_forced': forced_infeasible, 'turn_radius_thr_m': turn_thr,
             'finish_xy': [float(waypoints[-1][0]), float(waypoints[-1][1])],
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
@@ -1144,6 +1260,11 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             'pair_offset': (pair_meta or {}).get('offset'),
             'pair_offset_source': (pair_meta or {}).get('source', 'caller'),
             'pair_offset_why': (pair_meta or {}).get('why', '')}
+    # ── 직선 구간 유효 차로 집합 (작업10) — 정보 필드다. 경로 계산에 안 쓴다.
+    # 아무도 안 읽으면 영향 0 이어야 하므로 여기서 **덧붙이기만** 한다.
+    if valid_entry_lanes_enable():
+        rt['valid_entry_lanes'] = valid_entry_lanes(lg, rt, radius, banned, turn_cap)
+    return rt
 
 
 def turn_kind(delta_deg, straight_deg=None):
