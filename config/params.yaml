@@ -640,6 +640,17 @@ overtake:
   shift_entry_max_delay_m: 15.0
   shift_entry_step_m: 0.5
   shift_exit_min_after_m: 0.0
+  # ── span 연장 (2026-09-03 배치 연쇄장애물_01) ───────────────────────────
+  # 시프트 생성 시 detect_max_m 밖이던 연쇄 뒷부분이 전진하며 보이면 활성 span 의
+  # 끝만 뒤로 민다. 자차 인덱스에서 shift_route_smoothly 를 같은 방향으로 다시 불러
+  # 발밑은 그대로(f=0), 앞쪽만 목표 차로로 다시 오른다. 발동 조건 네 개: span 활성 ·
+  # standoff 차단물이 span 끝 너머 · 막힌 채 정지 stuck_s 이상 · 연장 후 예상 최소
+  # 이격 ≥ percep.obstacle_clearance_m(새 span 전 구간 모든 객체). 실측 01: 연장 후
+  # id6 1.45 / id7 0.95, 발밑 변화 0.000000 m. 02(엇갈린 배치)는 이격 미달로 연장 안 함.
+  # false = 이전 동작(기본 off, 실차 검증 전).
+  span_extend_enable: false
+  span_extend_stuck_s: 4.0
+  span_extend_max_n: 3
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

@@ -344,6 +344,22 @@ class KrRules:
         self.entry_max_delay_m = float(ot.get('shift_entry_max_delay_m', 15.0))
         self.entry_step_m = float(ot.get('shift_entry_step_m', 0.5))
         self.exit_min_after_m = float(ot.get('shift_exit_min_after_m', 0.0))
+        # span 연장 (2026-09-03 배치 연쇄장애물_01). 시프트 생성 시 detect_max_m 밖이던
+        # 연쇄 뒷부분(id6·id7)이 전진하며 보이는데, span 은 연쇄 한가운데(608.3)서 끝나
+        # 복귀 직후 id7(618.9)을 만났다. 활성 span 은 새 시프트를 막고(요동 방지, 유지)
+        # 원복은 span 끝을 지나야 성립하는데 standoff(25 m)가 속도를 0 으로 잡아 12.7 m 를
+        # 못 갔다 — 32 s 고착·미완주. 원복은 반증됐다(자차가 span 안이라 발밑 경로 2.7 m
+        # 횡점프, 원복해도 id6 5.3 m 가 geom 미달). 대신 **span 끝 뒤쪽만** 연장한다:
+        # shift_route_smoothly 는 현재 경로점을 기준으로 f·loc + (1−f)·cur 로 섞고 f 가
+        # 시작점에서 0 이므로 자차 인덱스에서 다시 적용하면 발밑은 그대로(실측 변화
+        # 0.000000 m)이고 앞쪽만 밀린다. 네 조건(활성·차단물이 span 밖·정지 지속·
+        # **연장 후 예상 이격 ≥ 임계**)을 다 만족할 때만. 네 번째가 없으면 02_우회전처럼
+        # 엇갈린 배치에서 뒤쪽 객체(id5 0.86→0.22)를 끌어들인다. false = 이전 동작.
+        self.span_extend = bool(ot.get('span_extend_enable', False))
+        self.ext_stuck_ticks = int(round(float(ot.get('span_extend_stuck_s', 4.0)) * self.hz))
+        self.ext_max_n = int(ot.get('span_extend_max_n', 3))
+        self.ot_side: str | None = None            # 활성 span 의 방향 (연장에 같은 방향 사용)
+        self.span_extend_n = 0                     # 현재 span 의 연장 횟수
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
@@ -1424,33 +1440,20 @@ class KrRules:
         f[inside & ~out & ~back] = 1.0
         return f
 
-    def _shift_placement(self, planner, ap, trans_m, ahead_m, extra_after, after_locked):
-        """전이 배치 탐색 → (delay, after, 진단). 막히면 delay None.
-
-        last_span_plan(기본 배치의 a, b, left) 위에서 시프트 폭 D(s)(planned_lateral_
-        offsets, 1 m 격자)와 cos 전이로 자차 중심 궤적 t_e(s) 를 그린다. 자차는 경로를
-        따르므로 각 종방향 지점 s 에서 차체 단면은 t_e(s) 를 중심으로 폭 hw/cosψ
-        (ψ = atan(dt_e/ds), 비스듬한 단면) + 사지타(κ·hl²/2, 직선 차체 대 곡선 경로)
-        의 띠다. 객체는 yaw 를 경로 접선에 대해 풀어 유효 반폭(ht)·종반폭(hs) 을 쓰고,
-        객체 종구간 |s − s_j| ≤ hs 안에서 이격 = |t_e − lat| − w_e − ht 의 최소를 본다.
-        OBB 대조(재구성 경로 100310): 기본 배치 −0.39 대 OBB −0.44, delay 5.5 에서
-        1.4 대 1.44. 임계는 percep.obstacle_clearance_m (회랑과 같은 축).
-        기본 배치(delay 0, after 현행)가 전부 임계 이상이면 그대로. 아니면
-        delay ∈ [0, max] × after ∈ [min, 현행] 격자에서 최소 이격 최대화(동률이면
-        기본에 가까운 쪽). after_locked(E-2 zone 연장)면 after 는 줄이지 않는다 —
-        연장은 교차로 출구 뒤로 끝을 미룬 것이라 줄이면 교차로 안에서 복귀한다.
-        전이 길이는 바꾸지 않는다 (_shift_speed_cap·geom need 와 같은 값).
-        """
-        a, b, left = self.last_span_plan
+    def _span_clear_model(self, planner, ap, b, left, trans_m):
+        """시프트 이격 계측 모델 — _shift_placement(진입·복귀 배치)와 _extend_span(연장)이
+        같은 식을 쓴다. 자차 인덱스부터 b 까지의 목표 오프셋 D(s)(현재 경로 대비로 보정)와
+        띠 안 객체를 모아, clear_at(s0, end) 가 cos 전이 프로파일의 최소 이격을 돌려준다.
+        못 재면 None (호출자가 관례대로 처리)."""
         ppm = float(getattr(planner, 'points_per_meter', 10))
         i0 = int(planner.route_index)
         try:
             d = np.asarray(planner.planned_lateral_offsets(i0, int(b), left, step_pts=int(ppm)),
                            dtype=float)
         except Exception:                                  # noqa: BLE001
-            return None, None, {}                          # 못 재면 통과 (관례)
+            return None
         if len(d) < 3:
-            return None, None, {}
+            return None
         # D 는 **원 경로점** 기준 목표 오프셋인데 객체 lat(_project)은 **현재 경로점**
         # 기준이다. 앞선 span 이 살아 있으면 둘이 다르다 (104648: 원 경로 +1 차로 위에
         # 서 있음). 실제 블렌드는 new = f·loc + (1−f)·cur 이므로 현재 경로 대비 이동은
@@ -1466,10 +1469,8 @@ class KrRules:
             d = d[:len(t_cur)] - t_cur
         except Exception:                                  # noqa: BLE001
             pass                                           # 목 플래너 등: 원 경로 = 현재 경로
-        clr = float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
         hw_e = float(self.cfg['vehicle']['width']) / 2.0
         hl_e = float(self.cfg['vehicle']['length']) / 2.0
-        a_rel = (int(a) - i0) / ppm
         b_rel = (int(b) - i0) / ppm
         L = float(trans_m)
         band = (min(0.0, float(d.min())), max(0.0, float(d.max())))
@@ -1501,9 +1502,8 @@ class KrRules:
         slope_cap = d_max * np.pi / (2.0 * L)
         kappa_cap = d_max * np.pi * np.pi / (2.0 * L * L)
 
-        def clear_for(delay, after):
-            s0 = max(a_rel, ahead_m + delay)
-            end = b_rel + (after - extra_after)
+        def clear_at(s0, end):
+            """전이 시작 s0·끝 end(자차 기준 m)의 최소 이격 → (min, {id: 이격})."""
             if end - s0 < 1.0:
                 return -1e9, {}
             t_e = D * self._shift_profile(s, s0, end, L)
@@ -1518,6 +1518,38 @@ class KrRules:
                     continue
                 per[oid] = float((np.abs(t_e[m] - lat_j) - w_e[m] - ht).min())
             return (min(per.values()) if per else float('inf')), per
+        return {'clear_at': clear_at, 'objs': objs, 'b_rel': b_rel}
+
+    def _shift_placement(self, planner, ap, trans_m, ahead_m, extra_after, after_locked):
+        """전이 배치 탐색 → (delay, after, 진단). 막히면 delay None.
+
+        last_span_plan(기본 배치의 a, b, left) 위에서 시프트 폭 D(s)(planned_lateral_
+        offsets, 1 m 격자)와 cos 전이로 자차 중심 궤적 t_e(s) 를 그린다. 자차는 경로를
+        따르므로 각 종방향 지점 s 에서 차체 단면은 t_e(s) 를 중심으로 폭 hw/cosψ
+        (ψ = atan(dt_e/ds), 비스듬한 단면) + 사지타(κ·hl²/2, 직선 차체 대 곡선 경로)
+        의 띠다. 객체는 yaw 를 경로 접선에 대해 풀어 유효 반폭(ht)·종반폭(hs) 을 쓰고,
+        객체 종구간 |s − s_j| ≤ hs 안에서 이격 = |t_e − lat| − w_e − ht 의 최소를 본다.
+        OBB 대조(재구성 경로 100310): 기본 배치 −0.39 대 OBB −0.44, delay 5.5 에서
+        1.4 대 1.44. 임계는 percep.obstacle_clearance_m (회랑과 같은 축).
+        기본 배치(delay 0, after 현행)가 전부 임계 이상이면 그대로. 아니면
+        delay ∈ [0, max] × after ∈ [min, 현행] 격자에서 최소 이격 최대화(동률이면
+        기본에 가까운 쪽). after_locked(E-2 zone 연장)면 after 는 줄이지 않는다 —
+        연장은 교차로 출구 뒤로 끝을 미룬 것이라 줄이면 교차로 안에서 복귀한다.
+        전이 길이는 바꾸지 않는다 (_shift_speed_cap·geom need 와 같은 값).
+        """
+        a, b, left = self.last_span_plan
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        i0 = int(planner.route_index)
+        model = self._span_clear_model(planner, ap, b, left, trans_m)
+        if model is None:
+            return None, None, {}                          # 못 재면 통과 (관례)
+        clr = float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
+        a_rel = (int(a) - i0) / ppm
+        b_rel = model['b_rel']
+        clear_at = model['clear_at']
+
+        def clear_for(delay, after):
+            return clear_at(max(a_rel, ahead_m + delay), b_rel + (after - extra_after))
 
         base_min, base_per = clear_for(0.0, extra_after)
         info = {'entry_base_clear': round(base_min, 2) if base_min < 1e8 else None,
@@ -1651,6 +1683,8 @@ class KrRules:
                 self.last_avoid = {'state': 'SHIFT_ACTIVE', 'span': list(self.ot_span),
                                    'blocker': corridor[0][3].id if corridor else None,
                                    's_rel': round(corridor[0][0], 1) if corridor else None}
+                if self.span_extend:
+                    self._extend_span(ap, planner, corridor, ego_speed)
             return False
 
         lg = getattr(planner, 'lg', None)
@@ -1797,6 +1831,114 @@ class KrRules:
             self.last_overtake = 'no_neighbor'
         return True
 
+    def _extend_span(self, ap, planner, corridor, ego_speed: float) -> None:
+        """활성 span 의 **끝만** 뒤로 연장 (2026-09-03 연쇄장애물_01). 4번 분기 전용.
+
+        네 조건을 모두 만족할 때만:
+          ① ot_span 활성 (호출처가 보장)
+          ② standoff 차단물이 span 끝 너머 — route_index + wait_target_d·ppm > ot_span[1]
+          ③ 막힌 채 정지 ot_blocked_ticks ≥ span_extend_stuck_s (BREAKOUT L1 과 같은 축)
+          ④ 연장 후 예상 최소 이격 ≥ percep.obstacle_clearance_m — _span_clear_model 로
+             새 span 전 구간의 모든 객체를 잰다 (새로 묶인 객체만이 아니다). 02_우회전:
+             엇갈린 id6/id7 에 연장하면 뒤쪽 id5 가 0.86→0.22 로 끌려든다 → 여기서 걸러 연장 안 함.
+        연장은 원복·재생성이 아니다. shift_route_smoothly(route_index, 새 끝) 를 같은 방향으로
+        다시 부르면 블렌드가 현재 경로점 기준(f·loc + (1−f)·cur)이고 f(시작)=0 이라 자차
+        발밑은 그대로, 앞쪽만 목표 차로로 다시 오른다(실측 발밑 변화 0.000000 m, 이음매
+        곡률 0.0605→0.0985 1/m, 스파이크 없음). 억제 규칙(활성 중 새 시프트 금지)은 그대로다.
+        새 끝은 plan_shift_span(무수정)으로 얻고, 경로 끝·정지 구역·횟수 상한을 넘으면 안 한다.
+        ④ 미달·가드 미달은 기각이 아니라 '연장 포기' 로 진단만 남기고 이전 동작(조기 반환)을
+        유지한다. route.py 는 수정하지 않는다 — 목 플래너는 getattr 가드로 건너뛴다.
+        """
+        if self.ot_span is None or self.wait_target_d is None or not corridor:
+            return
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        i0 = int(planner.route_index)
+        a, b = int(self.ot_span[0]), int(self.ot_span[1])
+        if i0 + self.wait_target_d * ppm <= b:              # ② 차단물이 span 안 = 정상 standoff
+            return
+        if self.ot_blocked_ticks < self.ext_stuck_ticks:  # ③
+            return
+        diag = {'span_before': [a, b], 'n': self.span_extend_n}
+        if self.span_extend_n >= self.ext_max_n:
+            self.last_avoid['extend_skip'] = dict(diag, reason='max_n')
+            return
+        shift = getattr(planner, 'shift_route_smoothly', None)
+        if shift is None or self.ot_side not in ('left', 'right'):
+            self.last_avoid['extend_skip'] = dict(diag, reason='no_planner')
+            return
+        # 새 끝: standoff 대상(회랑에서 id 일치, 없으면 첫 객체)과 그 연쇄로 plan_shift_span
+        actor = next((c[3] for c in corridor if c[3].id == self.standoff_id), corridor[0][3])
+        chain = self._chain(corridor, actor)
+        last = None if chain['last'] is actor else chain['last']
+        trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
+        side = self.ot_side
+        try:
+            _a2, b2, left = planner.plan_shift_span(
+                actor, last, obstacle_direction='right' if side == 'left' else 'left',
+                transition_length=trans_m * ppm,
+                extra_length_before=self.ot_before_m * ppm,
+                extra_length_after=self.ot_after_m * ppm,
+                min_start_ahead=self.shift_ahead_m * ppm)
+        except Exception:                                  # noqa: BLE001
+            self.last_avoid['extend_skip'] = dict(diag, reason='no_plan')
+            return
+        b2 = int(b2)
+        diag.update({'chain': list(chain['ids']), 'span_end_try': b2})
+        n_pts = len(planner.route_points)
+        if b2 <= b:
+            self.last_avoid['extend_skip'] = dict(diag, reason='not_longer')
+            return
+        if b2 >= n_pts - 1:                                # 경로 끝 가드
+            self.last_avoid['extend_skip'] = dict(diag, reason='route_end')
+            return
+        # 정지 구역 가드 — 생성 시(E-2)와 같은 규칙. 새 끝이 다음 정지선을 넘으면
+        # _zone_extension 이 판정한다: 교차로 없는 정지선(횡단보도)은 그대로 넘고, 교차로면
+        # 출구+여유까지 끝을 미루며, 불가 사유(zone_turn 등)면 연장하지 않는다. 실측 01:
+        # 615.8 은 신호·교차로 없는 추정 횡단보도라 새 끝 640.9 가 그대로 허용된다.
+        # E-2 스위치가 꺼져 있으면 생성 시와 같이 정지선을 넘지 않는다 (span_into_zone).
+        zone_lo = self._next_stopzone_s(planner)
+        end_s = float(planner.route_s[b2])
+        if zone_lo is not None and end_s > zone_lo:
+            lg = getattr(planner, 'lg', None)
+            if self.zone_extend and lg is not None:
+                route_s_now = float(planner.route_s[i0])
+                new_end, why, zinfo = self._zone_extension(planner, lg, side, route_s_now, end_s)
+                if why == 'zone_no_route':
+                    why = 'span_into_zone'
+            else:
+                new_end, why, zinfo = end_s, 'span_into_zone', {}
+            if why is not None:
+                self.last_avoid['extend_skip'] = dict(diag, reason=why, zone_lo=round(zone_lo, 1), **zinfo)
+                return
+            if new_end > end_s + 1e-6:                     # 교차로 출구 뒤로 끝을 미룸
+                b2 = int(np.searchsorted(planner.route_s, new_end))
+                diag['span_end_try'] = b2
+                if b2 >= n_pts - 1:
+                    self.last_avoid['extend_skip'] = dict(diag, reason='route_end')
+                    return
+            diag['zone'] = {'zone_lo': round(zone_lo, 1), **zinfo}
+        # ④ 사전 계측 — 자차(f=0)에서 시작해 b2 에서 끝나는 프로파일, 띠 안 모든 객체
+        model = self._span_clear_model(planner, ap, b2, left, trans_m)
+        if model is None:
+            self.last_avoid['extend_skip'] = dict(diag, reason='no_model')
+            return
+        c, per = model['clear_at'](0.0, model['b_rel'])
+        clr = float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
+        worst = min(per, key=per.get) if per else None
+        diag.update({'clear': round(c, 2) if abs(c) < 1e8 else None, 'worst_id': worst,
+                     'per': {k: round(v, 2) for k, v in per.items()}})
+        if c < clr:
+            self.last_avoid['extend_skip'] = dict(diag, reason='clearance')
+            return
+        shift(i0, b2, left, transition_length=trans_m * ppm)
+        planner._kd = _cKDTree(planner.route_points[:, :2])
+        self.ot_span = (a, b2)
+        self.span_extend_n += 1
+        self.last_avoid['span'] = [a, b2]
+        self.last_avoid['extend'] = dict(diag, span_after=[a, b2], n=self.span_extend_n)
+        print(f'[kr_rules] 회피 span 연장 — {side} 끝 {b}→{b2} (id={chain["ids"]}, '
+              f'예상 최소 이격 {c:.2f} m, {self.span_extend_n}회)', flush=True)
+
     def _restore_span(self, planner) -> None:
         """지나간 시프트 span 원복 (다음 장애물용) — E-6 으로 호출처가 둘이 됐다."""
         a, b = self.ot_span
@@ -1805,6 +1947,8 @@ class KrRules:
         planner.lat_shift[a:b] = planner._lat_build[a:b]
         planner._kd = _cKDTree(planner.route_points[:, :2])
         self.ot_span = None
+        self.ot_side = None
+        self.span_extend_n = 0
         self.last_overtake = 'restored'
 
     def _standoff_target(self, ap, planner, corridor) -> None:
@@ -2187,6 +2331,8 @@ class KrRules:
                 min_start_ahead=ahead_eff * ppm)
             planner._kd = _cKDTree(planner.route_points[:, :2])
             self.ot_span = span
+            self.ot_side = side                            # 연장이 같은 방향을 쓴다
+            self.span_extend_n = 0
             self.ot_blocked_ticks = 0
             self.preempt_latch_id = None                   # E-4 래치 해제 (시프트 성공)
             self.last_overtake = side
