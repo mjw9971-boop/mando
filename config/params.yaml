@@ -667,6 +667,15 @@ overtake:
   span_extend_enable: false
   span_extend_stuck_s: 4.0
   span_extend_max_n: 3
+  # ── span 탐색 국소화 (2026-09-04, route.py plan_shift_span) ─────────────
+  # PDM 원문은 차단물 최근접 경로점을 route_index 이후 전 구간에서 찾는다. 순환
+  # 코스에서 경로가 같은 자리를 두 번 지나면 한 바퀴 뒤 점이 잡혀 자차 앞이 아닌
+  # 4.5 km 뒤 구간이 밀렸다 (실측 100310/100458 14건, 4550.1~4595.2 m). 탐색을
+  # 자차 앞 leading_vehicles_maximum_detection_radius(80 m, 신규 상수 없음)로
+  # 제한해 처음부터 올바른 점만 나오게 한다. kr 가 넘기는 객체는 전부 detect_max_m
+  # (80 m) 안이라 정상 시프트(실측 5.0~34.7 m)는 그대로다. span_gate 는 판정 층의
+  # 안전망으로 남는다(계층이 다르며 대체 아님). false = PDM 원문 동작.
+  span_search_local_enable: false
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오
