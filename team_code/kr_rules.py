@@ -352,6 +352,11 @@ class KrRules:
         self.entry_max_delay_m = float(ot.get('shift_entry_max_delay_m', 15.0))
         self.entry_step_m = float(ot.get('shift_entry_step_m', 0.5))
         self.exit_min_after_m = float(ot.get('shift_exit_min_after_m', 0.0))
+        # side 선택 (2026-09-04 실주행 104648/104807) — _side_pass 의 좌측 고정 순서를
+        # "양측을 재고 고르기" 로 바꾼다. **shift_entry 가 켜져 있어야 의미가 있다** —
+        # 1차 키인 entry_plateau_ids 가 _shift_placement 산출물이라, 꺼져 있으면
+        # 기준 자체가 없어 현행(좌측 우선)으로 폴백한다. 자세한 근거는 _pick_side.
+        self.side_pick = bool(ot.get('side_pick_enable', False))
         # span 연장 (2026-09-03 배치 연쇄장애물_01). 시프트 생성 시 detect_max_m 밖이던
         # 연쇄 뒷부분(id6·id7)이 전진하며 보이는데, span 은 연쇄 한가운데(608.3)서 끝나
         # 복귀 직후 id7(618.9)을 만났다. 활성 span 은 새 시프트를 막고(요동 방지, 유지)
@@ -2175,6 +2180,11 @@ class KrRules:
         # (B-2). solid 는 두 바퀴 구조(B-3)가, occupied 는 lvl<1 이 그대로 본다.
         lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
         skip_solid = n_pass >= 2
+        # side 선택 — 게이트를 통과한 side 의 **적용 인자만** 모으고, 적용은 루프
+        # 밖에서 한 번만 한다. 게이트 본문은 그대로다. 스위치가 꺼져 있으면 첫 성공
+        # side 에서 break 하므로 현행(좌측 우선)과 글자 그대로 같다.
+        plans: dict = {}
+        pick_on = self.side_pick and self.shift_entry      # 기준(플래토)이 있어야 한다
         for side in ('left', 'right'):                     # 좌측 추월 우선
             def reject(gate, **extra):
                 self.last_overtake = f'{side}:{gate}@p{n_pass}'
@@ -2322,6 +2332,7 @@ class KrRules:
             # 인자(min_start_ahead / extra_length_after)로만 한다. 기록이 없으면
             # (plan 실패) 검사 없이 현행 배치.
             ahead_eff = ahead_m
+            pinfo = None
             if self.shift_entry and self.last_span_plan is not None:
                 delay, after_eff, pinfo = self._shift_placement(
                     planner, ap, trans_m, ahead_m, extra_after, zone_ext is not None)
@@ -2333,31 +2344,117 @@ class KrRules:
                 if delay is not None:
                     ahead_eff = ahead_m + delay
                     extra_after = after_eff
-            span = planner.shift_route_around_actors(
-                actor, chain_last,
-                obstacle_direction='right' if side == 'left' else 'left',
-                transition_length=trans_m * ppm,
-                extra_length_before=self.ot_before_m * ppm,
-                extra_length_after=extra_after * ppm,      # E-2 연장·복귀 단축 포함
-                # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
-                # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
-                min_start_ahead=ahead_eff * ppm)
-            planner._kd = _cKDTree(planner.route_points[:, :2])
-            self.ot_span = span
-            self.ot_side = side                            # 연장이 같은 방향을 쓴다
-            self.span_extend_n = 0
-            self.ot_blocked_ticks = 0
-            self.preempt_latch_id = None                   # E-4 래치 해제 (시프트 성공)
-            self.last_overtake = side
-            (self.last_avoid or {}).update(
-                {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
-                 'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
-                 'solid_relaxed': skip_solid, 'chain': list(chain['ids']),
-                 'span_m': round(span_m, 1), 'after_m': round(extra_after, 1)})
-            print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
-                  f'(id={chain["ids"]}, 구간 {span[0]}~{span[1]}, p{n_pass})', flush=True)
-            return True
-        return False
+            # 게이트 전부 통과 — 적용 인자와 이 side 의 계측을 담아 둔다.
+            plans[side] = {'trans_m': trans_m, 'ahead_eff': ahead_eff,
+                           'extra_after': extra_after, 'span_m': span_m,
+                           'pinfo': dict(pinfo or {}),
+                           'avoid': dict(self.last_avoid or {})}
+            if not pick_on or not plans[side]['pinfo'].get('entry_plateau_ids'):
+                # 단락 — 플래토가 비면 _pick_side 는 어느 경우에도 이 side 를 고른다
+                # (한쪽만 비면 그쪽, 둘 다 비면 좌측 유지). 반대쪽을 재지 않으므로
+                # 추가 비용이 0 이다. 스위치가 꺼져 있어도 여기서 끊어 현행과 같다.
+                break
+        if not plans:
+            return False
+        side, why = self._pick_side(plans, pick_on)
+        p = plans[side]
+        trans_m, ahead_eff = p['trans_m'], p['ahead_eff']
+        extra_after, span_m = p['extra_after'], p['span_m']
+        # 선택된 side 의 계측(κ·lc_var·배치)을 되살린다 — 반대쪽을 재는 동안 덮였다.
+        # 기각 누적(reject/rejects/pass)은 살아 있는 쪽 값을 그대로 둔다.
+        live = self.last_avoid if isinstance(self.last_avoid, dict) else {}
+        merged = dict(p['avoid'])
+        for k in ('reject', 'rejects', 'pass'):
+            if k in live:
+                merged[k] = live[k]
+        # 배치 키는 `.update()` 누적이라 앞 side 가 쓰고 뒤 side 가 안 쓰면 그대로
+        # 남는다 (예: 좌측 entry_plateau_ids 가 우측 진단에 섞인다). 승자가 쓰지
+        # 않은 키는 지우고 승자 값으로만 채운다.
+        for k in ('entry_base_clear', 'entry_block_ids', 'entry_clear',
+                  'entry_delay_m', 'entry_start_rel_m', 'exit_after_m',
+                  'entry_plateau_ids'):
+            merged.pop(k, None)
+        merged.update(p['pinfo'])
+        self.last_avoid = merged
+        span = planner.shift_route_around_actors(
+            actor, chain_last,
+            obstacle_direction='right' if side == 'left' else 'left',
+            transition_length=trans_m * ppm,
+            extra_length_before=self.ot_before_m * ppm,
+            extra_length_after=extra_after * ppm,          # E-2 연장·복귀 단축 포함
+            # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
+            # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
+            min_start_ahead=ahead_eff * ppm)
+        planner._kd = _cKDTree(planner.route_points[:, :2])
+        self.ot_span = span
+        self.ot_side = side                                # 연장이 같은 방향을 쓴다
+        self.span_extend_n = 0
+        self.ot_blocked_ticks = 0
+        self.preempt_latch_id = None                       # E-4 래치 해제 (시프트 성공)
+        self.last_overtake = side
+        order = [s for s in ('left', 'right') if s in plans]
+        self.last_avoid.update(
+            {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
+             'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
+             'solid_relaxed': skip_solid, 'chain': list(chain['ids']),
+             'span_m': round(span_m, 1), 'after_m': round(extra_after, 1)})
+        if pick_on:
+            # 스위치가 켜진 틱에만 남긴다 — off 에서 진단 키가 늘면 리플레이
+            # 동일성 비교가 "결정은 같은데 로그는 다르다" 가 되어 쓸모가 준다.
+            self.last_avoid['side_pick'] = {
+                'evaluated': order, 'picked': side, 'why': why,
+                'base_clear': {s: plans[s]['pinfo'].get('entry_base_clear')
+                               for s in order},
+                'plateau': {s: plans[s]['pinfo'].get('entry_plateau_ids')
+                            for s in order},
+                # 좌측 플래토가 비어 우측을 아예 재지 않은 틱 (추가 비용 0)
+                'short_circuit': bool(order == ['left']
+                                      and not plans['left']['pinfo']
+                                      .get('entry_plateau_ids'))}
+        print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
+              f'(id={chain["ids"]}, 구간 {span[0]}~{span[1]}, p{n_pass}, {why})',
+              flush=True)
+        return True
+
+    def _pick_side(self, plans: dict, pick_on: bool):
+        """게이트를 통과한 side 중 하나를 고른다 → (side, 근거).
+
+        확정 규칙 (2026-09-04 승인):
+          후보 1개          → 그것                       'single'
+          한쪽만 플래토 빔   → 그쪽                       'plateau_empty'
+          둘 다 플래토 빔    → 좌측 유지 (현행 동작)        'both_empty_keep_left'
+          둘 다 플래토 있음  → base_clear 큰 쪽 (동률 좌측)  'base_clear'
+
+        1차 키가 배치 점수가 아니라 `entry_plateau_ids` 인 이유: `_shift_placement`
+        는 "격자 어느 (delay, after) 에서도 임계를 못 넘는 객체" 를 목적함수에서
+        빼므로(플래토 제외), **막힌 쪽이 오히려 높은 점수를 낸다**. 실측
+        2026-09-03 104648 t=42.16: 좌측 점수 1.31(플래토 [5,6,8], 원본 최소 이격
+        −1.73) 대 우측 0.68(플래토 없음, +0.68). 플래토가 비었다는 것은 그 왜곡이
+        없다는 뜻이라 1차 키로 쓸 수 있다. 2차 키도 같은 이유로 플래토 제외 **전**
+        값인 base_clear 다.
+
+        "둘 다 비면 좌측 유지" 는 회귀 방지다 — 이격만으로 비교하면 지금 성공 중인
+        시프트가 뒤집힌다 (실측 2026-09-04 추월집중_01 t=10.60: 좌 +1.02 실측 OBB
+        1.02 인데 우 +1.20 으로 뒤집힘). 바꿀 이유가 없는 곳은 바꾸지 않는다.
+
+        pick_on 이 거짓(스위치 off 또는 shift_entry off)이면 plans 에는 단락으로
+        첫 성공 side 하나만 들어 있으므로 결과가 현행과 같다.
+        """
+        order = [s for s in ('left', 'right') if s in plans]
+        if len(order) == 1 or not pick_on:
+            return order[0], 'single'
+        empty = [s for s in order if not plans[s]['pinfo'].get('entry_plateau_ids')]
+        if len(empty) == 1:
+            return empty[0], 'plateau_empty'
+        if len(empty) == 2:
+            return 'left', 'both_empty_keep_left'
+
+        def bc(s):
+            v = plans[s]['pinfo'].get('entry_base_clear')
+            return -1e9 if v is None else float(v)
+
+        return (('left', 'base_clear') if bc('left') >= bc('right')
+                else ('right', 'base_clear'))
 
     @staticmethod
     def _ego_lane(lg, ap):
