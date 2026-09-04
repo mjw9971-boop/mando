@@ -744,7 +744,7 @@ overtake:
   # 로 원복만 기다리며 섰다(100310 158틱). 시프트 시작점이 자차보다 max_m 이상
   # 앞이면 기각(span_too_far). 정상 시프트 실측 5.0~34.7 m. route.py 근본 수정은
   # 범위 밖. false = 이전 동작(거리 무관). 기본 off.
-  span_gate_enable: true
+  span_gate_enable: false
   span_gate_max_m: 100.0
   # ── 전이 배치 (2026-09-03 실주행 100310/100458) ────────────────────────
   # 전이 시작이 자차 +shift_ahead_m 고정이라 우측 차로 11 m 의 id3 를 스쳤다(OBB
@@ -755,7 +755,7 @@ overtake:
   # 이상이면 현행 유지. 전부 미달이면 entry_block 기각. 전이 길이는 안 줄인다.
   # 재구성 경로 계산: 100310 delay 5.5~6 → id3 1.44/id4 1.55, 100458 after 0~4 →
   # id5 1.76~1.88. false = 이전 동작(기본 off, 실차 검증 전).
-  shift_entry_enable: true
+  shift_entry_enable: false
   shift_entry_max_delay_m: 15.0
   shift_entry_step_m: 0.5
   shift_exit_min_after_m: 0.0
