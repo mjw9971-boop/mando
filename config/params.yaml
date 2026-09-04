@@ -97,6 +97,22 @@ speed:
   ped_walkin_v: 0.5
   ped_walkin_s: 0.5
   ped_walkin_lat_m: 8.0
+  # ── 다중 보행자 회랑 홀드 (P4-M, 2026-09-04 실주행 101405). 기본 false. ───
+  # 실측: id4·id5 가 12 m 앞 회랑(|lat| < 2.5)을 횡단하는 동안(k205~266) 의도
+  # 후보는 정지 프로파일 √(2·a·(s_rel − 앞범퍼 − s0)) ≈ 5.1 m/s 였고, 적신호
+  # IDM 후보(1.2 → 2.3)가 더 낮아 그쪽이 winner 가 되며 정지(0.01 m/s)에서
+  # 재가속했다(k238~266, accel +0.7 → +0.95, 종거리 12.3 → 11.4 m). 판정은
+  # 보행자 전부를 보지만(최저 v_allow) 회랑 안이라도 v_allow 가 0 이 아니었다.
+  # true 면 회랑(ped_release_lat_m — A-1 해제와 같은 축) 안 보행자는 누구든
+  # 홀드 래치 → v_allow = 0 을 min() 후보로 낸다. 해제는 A-1 규칙 그대로
+  # (회랑 밖 ∧ 멀어짐 ∧ (멈춤 ∨ 차도 밖) 연속 ped_release_s, backstop 포함).
+  # 회랑 밖 의도 래치의 접근 프로파일은 바꾸지 않는다. reasons.ped 에 평가된
+  # 보행자 전부(all)와 홀드 id(hold)를 남긴다. false = 이전 동작.
+  ped_multi_enable: false
+  # 관측 드롭아웃 coast [s] — 이 시간 안의 미관측은 이탈이 아니다(직전 기여 유지).
+  # 만료 + 재관측 없음 → 해제. release(ped_release_s)는 관측된 틱에서만, coast 는
+  # 미관측 틱에서만 세므로 둘은 합산되지 않는다. ped_multi_enable 일 때만 의미.
+  ped_hold_coast_s: 0.5
   # ── 횡단보도 앞 서행 (A-3, 2026-09-03). 기본 false = 비활성. ─────────────
   # 전방 횡단보도(레인그래프 crosswalks, 없으면 정지선) ±ped_crosswalk_zone_m 안에
   # |lat| < ped_crosswalk_lat_m 로 **서 있는**(speed < ped_stop_v) 보행자가 있으면,
@@ -717,6 +733,26 @@ overtake:
   shift_entry_max_delay_m: 15.0
   shift_entry_step_m: 0.5
   shift_exit_min_after_m: 0.0
+  # ── span 연장 (2026-09-03 배치 연쇄장애물_01) ───────────────────────────
+  # 시프트 생성 시 detect_max_m 밖이던 연쇄 뒷부분이 전진하며 보이면 활성 span 의
+  # 끝만 뒤로 민다. 자차 인덱스에서 shift_route_smoothly 를 같은 방향으로 다시 불러
+  # 발밑은 그대로(f=0), 앞쪽만 목표 차로로 다시 오른다. 발동 조건 네 개: span 활성 ·
+  # standoff 차단물이 span 끝 너머 · 막힌 채 정지 stuck_s 이상 · 연장 후 예상 최소
+  # 이격 ≥ percep.obstacle_clearance_m(새 span 전 구간 모든 객체). 실측 01: 연장 후
+  # id6 1.45 / id7 0.95, 발밑 변화 0.000000 m. 02(엇갈린 배치)는 이격 미달로 연장 안 함.
+  # false = 이전 동작(기본 off, 실차 검증 전).
+  span_extend_enable: false
+  span_extend_stuck_s: 4.0
+  span_extend_max_n: 3
+  # ── span 탐색 국소화 (2026-09-04, route.py plan_shift_span) ─────────────
+  # PDM 원문은 차단물 최근접 경로점을 route_index 이후 전 구간에서 찾는다. 순환
+  # 코스에서 경로가 같은 자리를 두 번 지나면 한 바퀴 뒤 점이 잡혀 자차 앞이 아닌
+  # 4.5 km 뒤 구간이 밀렸다 (실측 100310/100458 14건, 4550.1~4595.2 m). 탐색을
+  # 자차 앞 leading_vehicles_maximum_detection_radius(80 m, 신규 상수 없음)로
+  # 제한해 처음부터 올바른 점만 나오게 한다. kr 가 넘기는 객체는 전부 detect_max_m
+  # (80 m) 안이라 정상 시프트(실측 5.0~34.7 m)는 그대로다. span_gate 는 판정 층의
+  # 안전망으로 남는다(계층이 다르며 대체 아님). false = PDM 원문 동작.
+  span_search_local_enable: false
 
 # 시나리오 생성 시작점 분산 (tools/gen_scenarios.py).
 # 역할 구분: configs/themes.yaml gen: 은 "완성 경로의 폐기 게이트 임계"(시나리오

@@ -160,6 +160,10 @@ class VtdRoutePlanner:
         # 정적 장애물 인식 (compute_leading_vehicles) — params 가 단일 출처
         self.obstacle_speed_max = float(cfg['percep']['obstacle_speed_max'])
         self.obstacle_clearance_m = float(cfg['percep']['obstacle_clearance_m'])
+        # plan_shift_span 의 최근접 경로점 탐색을 자차 앞 창으로 제한한다 (아래 참조).
+        # false = PDM 원문 그대로(앞쪽 전 구간 탐색).
+        self.span_search_local = bool(
+            cfg.get('overtake', {}).get('span_search_local_enable', False))
 
         self.route_index = 0
         self.last_route_index = 0
@@ -600,7 +604,19 @@ class VtdRoutePlanner:
         기하를 검사하려면(kr_rules 의 계단 불연속 계측) 같은 인덱스가 필요한데,
         계산을 복제하면 두 곳이 어긋난다. 반환은 (시작, 끝, 좌측시프트여부).
         """
-        tree = cKDTree(self.original_route_points[self.route_index:, :2])
+        # VTD: 원문은 route_index 이후 **전 구간**에 cKDTree 를 세운다
+        # (privileged_route_planner.py 447-453). 순환 코스에서 경로가 같은 자리를
+        # 두 번 지나면 한 바퀴 뒤 경로점이 근소하게 더 가까워 그쪽이 잡히고, 자차
+        # 앞이 아니라 4.5 km 뒤 구간이 밀린다 (실측 2026-09-03 100310/100458 14건,
+        # span 시작 − route_index = 4550.1~4595.2 m). 탐색 창을 자차 앞
+        # leading_vehicles_maximum_detection_radius(80 m — compute_leading_vehicles 가
+        # 쓰는 같은 상수)로 제한한다. kr 계층이 넘기는 actor 는 전부 detect_max_m(80 m)
+        # 안이라 참 최근접점이 창 안에 있고, 창 밖이면 창 끝으로 클램프된다(None·예외를
+        # 내면 shift_route_around_actors 의 튜플 언패킹이 깨진다). span_gate 는 그대로
+        # 안전망으로 남는다. 스위치가 꺼지면 아래 hi 가 None 이라 원문과 같은 슬라이스다.
+        hi = (self.route_index + self.leading_vehicles_maximum_detection_radius
+              if self.span_search_local else None)
+        tree = cKDTree(self.original_route_points[self.route_index:hi, :2])
         first_actor_location = np.array(
             [first_actor.get_location().x, first_actor.get_location().y])
         _, closest_idx = tree.query(first_actor_location, k=1)
