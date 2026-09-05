@@ -33,10 +33,17 @@ A_STOP = CFG['speed']['stop_profile_a']
 FRONT = VH['wheelbase'] + VH['front_overhang_m']                   # 뒷축 → 앞범퍼
 
 
-def rig(creep=True, half_len=0.075, d=20.0, cause=True):
-    """d [m] 앞에 반길이 half_len 인 정지 물체. `_ap` 를 붙여 크립 경로를 태운다."""
+def rig(creep=True, half_len=0.075, d=20.0, cause=True, delay_s=None):
+    """d [m] 앞에 반길이 half_len 인 정지 물체. `_ap` 를 붙여 크립 경로를 태운다.
+
+    delay_s: 크립 **지연 게이트**(2026-09-05 추가, test_standoff_creep_gate.py)를
+    끄고 싶을 때 0 을 준다. 이 파일은 지연이 아니라 **크립 바닥 자체**를 보므로
+    바닥을 재는 검사는 지연을 0 으로 두고 부른다.
+    """
     kr, p = make()
     kr.standoff_creep = creep
+    if delay_s is not None:
+        kr.creep_delay_ticks = int(round(delay_s * kr.hz))
     kr.wait_target_d = d
     kr.standoff_id = 2
     kr.standoff_half_len = half_len
@@ -70,7 +77,7 @@ def test_off_keeps_zero_inside_baseline():
 
 
 def test_on_gives_creep_inside_baseline():
-    kr, _p, _ap = rig(d=20.0)
+    kr, _p, _ap = rig(d=20.0, delay_s=0.0)
     assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
     assert kr._creep_diag['so_creep'] is True
 
@@ -157,7 +164,7 @@ def test_creep_is_a_min_candidate_not_an_override():
     apply 의 병합은 `so < candidate` 하나이므로, 여기서는 그 병합식을 그대로
     재현해 크립이 다른 후보를 덮지 못함을 본다.
     """
-    kr, _p, _ap = rig(d=20.0)
+    kr, _p, _ap = rig(d=20.0, delay_s=0.0)
     so = kr._standoff_profile(0.0)
     assert so == pytest.approx(OT['standoff_creep_v'])
     for other in (0.0, 0.3, 0.79):                                 # 신호·보행자 등
@@ -170,7 +177,7 @@ def test_creep_is_a_min_candidate_not_an_override():
 def test_diag_key_is_so_creep_not_creep():
     """BREAKOUT 진단이 같은 last_avoid 에 'creep' 을 나중에 쓴다 — 이름이 겹치면
     덮인다 (실측 02_직진3 27틱에서 발동이 False 로 뒤집혔다)."""
-    kr, _p, _ap = rig(d=20.0)
+    kr, _p, _ap = rig(d=20.0, delay_s=0.0)
     kr._standoff_profile(0.0)
     assert 'so_creep' in kr._creep_diag and 'creep' not in kr._creep_diag
     for k in ('creep_d', 'creep_standoff', 'creep_stop_m', 'creep_v'):
