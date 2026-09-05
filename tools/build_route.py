@@ -675,9 +675,14 @@ def junction_segments(n_points, offset=1):
 
 # ── 짝 해석 자동 판정 (작업21) ────────────────────────────────────────────
 def pair_auto_cfg():
-    """params.yaml route.pair_auto_* — 자동 판정 임계의 단일 출처."""
+    """params.yaml route.pair_auto_* — 자동 판정 임계의 단일 출처.
+
+    폴백 기본값은 params 의 값과 **같아야 한다**. 키가 항상 있어서 실제로는
+    안 쓰이지만, 두 곳에 다른 수가 적혀 있으면 나중에 읽는 사람이 어느 쪽이
+    사는 값인지 헷갈린다 (2026-09-05 임계 1.00 상향 때 0.75 로 남아 있었다).
+    """
     rc = route_cfg() or {}
-    return (float(rc.get('pair_auto_min_ratio', 0.75)),
+    return (float(rc.get('pair_auto_min_ratio', 1.00)),
             float(rc.get('pair_auto_min_margin', 0.50)))
 
 
