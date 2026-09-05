@@ -105,6 +105,16 @@ red_zone:
   #         붉은 구간의 감속은 red_zone(아래) 이 따로 책임진다.
   # true  = 이전 동작 (30 표시 = 제한속도 30).
   roadmark_30_as_limit: false
+  # 호환 모드 — red_spans 를 **읽지 않는** 제어기가 붉은 차로에서 최소한 30 을
+  # 읽게, 차로 단위 speed_limit 도 limit_kph 로 세운다 (speed_src='red_compat').
+  # 팀원 브랜치·구 배포가 이 lane_graph 를 그대로 쓸 수 있게 하는 안전망이다.
+  #
+  # 차로 단위라 **부분만 붉은 차로는 전 구간이 30 이 된다** — 예 (173,0,-1) 은
+  # 414.7 m 중 236.7 m 만 붉은데 전체가 30 이다. 과다 감속이지만 안전 쪽이다.
+  # red_spans 를 읽는 제어기(speed.red_span_enable)는 이 값을 무시하고 span 으로
+  # 판정하므로, 둘을 동시에 켜도 과다 감속이 생기지 않는다.
+  # false 면 붉은 차로의 speed_limit 은 노면표시 결과 그대로(대개 None)다.
+  lane_level_compat: true
   # 보호구역 법정 제한속도 [km/h]. 붉은 구간 안에서 이 값이 speed_limit 을
   # 대신한다 (채점기 항목 2 의 기준이고, 제어기는 여기서 speed.margin_kph 를
   # 뺀 값을 목표로 삼는다).

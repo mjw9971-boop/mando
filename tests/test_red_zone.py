@@ -114,20 +114,53 @@ def test_road_2312_is_one_direction_only(lg):
 
 
 def test_roadmark_30_is_not_a_speed_limit(lg):
-    """30 표시는 제한속도로 쓰지 않는다. 50 표시는 그대로다."""
-    assert not [k for k, r in lg.lanes.items() if r['speed_limit'] == 30]
+    """30 표시는 제한속도로 쓰지 않는다. 50 표시는 그대로다.
+
+    호환 모드가 켜져 있으면 **붉은 차로만** 30 이 남는다 — 노면표시에서 온 30 이
+    아니라 red_compat 에서 온 30 이다 (speed_src 로 구분한다).
+    """
+    from_mark = [k for k, r in lg.lanes.items()
+                 if r['speed_limit'] == 30 and r['speed_src'] != 'red_compat']
+    assert not from_mark, from_mark[:5]
     assert [k for k, r in lg.lanes.items() if r['speed_limit'] == 50]
 
 
-def test_red_lanes_with_no_speed_limit_are_still_covered(lg):
-    """붉은데 speed_limit 이 None 인 차로가 있다 — 감속은 red_spans 가 책임진다.
+# ── 호환 모드 (2a-2) ────────────────────────────────────────────────────
+def test_lane_level_compat_default_on():
+    assert CFG['red_zone']['lane_level_compat'] is True
 
-    실측 2026-09-05: 옛 그래프에서 그런 차로가 23개(742 m)였고, 그 구간은
-    carry 로 앞 도로 값(대개 50)을 물고 지나갔다.
+
+def test_compat_sets_limit_on_red_lanes_only(lg):
+    """red_spans 가 있는 차로만 차로 단위 30 을 갖는다.
+
+    red_spans 를 읽지 않는 제어기(팀원 브랜치·구 배포)가 붉은 차로에서 최소한
+    30 을 읽게 하는 안전망이다. 붉지 않은 차로에는 절대 붙으면 안 된다 —
+    그러면 이 작업이 푼 문제가 그대로 돌아온다.
     """
-    red_none = [k for k, r in lg.lanes.items() if r['red_spans'] and r['speed_limit'] is None]
-    assert red_none, '이 맵에 그런 차로가 있어야 이 테스트가 유효하다'
-    assert all(lg.lanes[k]['school_zone'] for k in red_none)
+    if not CFG['red_zone']['lane_level_compat']:
+        pytest.skip('호환 모드 off')
+    red = {k for k, r in lg.lanes.items() if r['red_spans']}
+    compat = {k for k, r in lg.lanes.items() if r['speed_src'] == 'red_compat'}
+    assert compat == red
+    assert all(lg.lanes[k]['speed_limit'] == float(CFG['red_zone']['limit_kph']) for k in compat)
+    # 붉지 않은 차로에 30 이 남아 있지 않다
+    assert not [k for k, r in lg.lanes.items() if k not in red and r['speed_limit'] == 30]
+
+
+def test_no_red_lane_falls_back_to_carry(lg):
+    """붉은 차로가 carry(앞 도로 값)로 새지 않는다.
+
+    옛 그래프에는 **붉은데 speed_limit 이 None** 인 차로가 23개(742 m) 있었고,
+    그 구간은 carry 로 앞 도로 값(대개 50)을 물고 45 km/h 로 지나갔다 — 항목 2
+    중대 후보다. 지금은 두 겹으로 막힌다:
+      · red_spans 가 그 구간을 표시하고 (제어기 2b·채점기가 읽는다)
+      · 호환 모드가 차로 단위 speed_limit 도 세운다 (red_spans 를 안 읽는 제어기용)
+    """
+    red = [k for k, r in lg.lanes.items() if r['red_spans']]
+    assert red
+    assert all(lg.lanes[k]['school_zone'] for k in red)
+    if CFG['red_zone']['lane_level_compat']:
+        assert not [k for k in red if lg.lanes[k]['speed_limit'] is None]
 
 
 # ── 채점기 독립 판정 ────────────────────────────────────────────────────

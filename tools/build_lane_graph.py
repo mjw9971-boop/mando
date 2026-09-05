@@ -270,6 +270,8 @@ def red_zone_cfg(reload=False):
             'gap_m': float(d.get('span_gap_m', 3.0)),
             'min_verts': int(d.get('min_verts', 20)),
             'min_len_m': float(d.get('min_len_m', 1.0)),
+            'lane_level_compat': bool(d.get('lane_level_compat', True)),
+            'limit_kph': float(d.get('limit_kph', 30.0)),
         }
     return _RED_CFG
 
@@ -1423,10 +1425,26 @@ def apply_red_spans(lanes, warnings):
     for rec in lanes.values():
         rec['school_zone'] = bool(rec['red_spans'])
 
+    # 호환 모드 — red_spans 를 **읽지 않는** 제어기(팀원 브랜치·구 배포)가 붉은
+    # 차로에서 최소한 30 을 읽게 차로 단위 speed_limit 도 세운다. 차로 단위라
+    # 부분만 붉은 차로(예: (173,0,-1) 236.7/414.7 m)는 전 구간이 30 이 되는
+    # **과다 감속**을 감수한다 — 안전 쪽 오차다.
+    # red_spans 를 읽는 제어기는 이 값을 무시하고 span 으로 판정한다
+    # (speed.red_span_enable). 그래서 이 모드는 둘을 동시에 켜도 안전하다.
+    n_compat = 0
+    if cfg['lane_level_compat']:
+        for rec in lanes.values():
+            if rec['red_spans']:
+                rec['speed_limit'] = cfg['limit_kph']
+                rec['speed_src'] = 'red_compat'
+                n_compat += 1
+
     n_lanes = sum(1 for r in lanes.values() if r['red_spans'])
     return {'file': path, 'found': True, 'verts': int(len(V)), 'lanes': n_lanes,
             'spans': n_span, 'length_m': round(len_span, 1),
-            'dropped_spans': n_drop, 'dropped_length_m': round(len_drop, 2)}
+            'dropped_spans': n_drop, 'dropped_length_m': round(len_drop, 2),
+            'lane_level_compat': bool(cfg['lane_level_compat']),
+            'compat_lanes': n_compat}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1499,6 +1517,7 @@ def build(xodr_path, ds=0.5, synth_stopline=True):
     print(f"[red  ] verts={red_stats['verts']} lanes={red_stats['lanes']} "
           f"spans={red_stats['spans']} len={red_stats['length_m']:.1f}m "
           f"(파편 {red_stats['dropped_spans']}개 {red_stats['dropped_length_m']:.1f}m 제외)"
+          f"{'  compat 차로 %d' % red_stats['compat_lanes'] if red_stats.get('lane_level_compat') else ''}"
           if red_stats['found'] else f"[red  ] 정점 파일 없음 — {red_stats['file']}")
 
     # 통계
