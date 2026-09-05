@@ -234,6 +234,19 @@ class KrRules:
         # 규칙 3 — 선제 회피
         self.detect_max_m = float(ot.get('detect_max_m', 80.0))
         self.shift_latest_m = float(ot.get('shift_latest_m', 10.0))
+        # standoff 프로파일 전용 바닥 — shift_latest_m 과 소비처를 나눈다.
+        # 그 값은 _shift_speed_cap 의 미리보기 창(look)과 _try_overtake 의
+        # PREEMPT 시간 예산에도 쓰이므로, standoff 정지 거리만 조정하려면
+        # 여기를 쓴다. 미지정이면 shift_latest_m 을 그대로 따른다(무변화).
+        self.standoff_floor_m = float(ot.get('standoff_floor_m', self.shift_latest_m))
+        # 기준선 안쪽 크립 바닥 (_standoff_creep). 꺼지면 이전 동작(0 고정).
+        self.standoff_creep = bool(ot.get('standoff_creep_enable', False))
+        self.standoff_creep_v = float(ot.get('standoff_creep_v', 0.8))
+        self.standoff_creep_gap_m = float(ot.get('standoff_creep_gap_m', 1.0))
+        # 크립 지연 게이트 (_creep_gate). 0 = 지연 없음(즉시 크립) = 이전 동작.
+        # 시간 축은 ot_blocked_ticks 를 그대로 쓴다 — 신규 시계를 만들지 않는다.
+        self.creep_delay_ticks = int(round(
+            float(ot.get('standoff_creep_delay_s', 0.0)) * self.hz))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -352,6 +365,11 @@ class KrRules:
         self.entry_max_delay_m = float(ot.get('shift_entry_max_delay_m', 15.0))
         self.entry_step_m = float(ot.get('shift_entry_step_m', 0.5))
         self.exit_min_after_m = float(ot.get('shift_exit_min_after_m', 0.0))
+        # side 선택 (2026-09-04 실주행 104648/104807) — _side_pass 의 좌측 고정 순서를
+        # "양측을 재고 고르기" 로 바꾼다. **shift_entry 가 켜져 있어야 의미가 있다** —
+        # 1차 키인 entry_plateau_ids 가 _shift_placement 산출물이라, 꺼져 있으면
+        # 기준 자체가 없어 현행(좌측 우선)으로 폴백한다. 자세한 근거는 _pick_side.
+        self.side_pick = bool(ot.get('side_pick_enable', False))
         # span 연장 (2026-09-03 배치 연쇄장애물_01). 시프트 생성 시 detect_max_m 밖이던
         # 연쇄 뒷부분(id6·id7)이 전진하며 보이는데, span 은 연쇄 한가운데(608.3)서 끝나
         # 복귀 직후 id7(618.9)을 만났다. 활성 span 은 새 시프트를 막고(요동 방지, 유지)
@@ -442,6 +460,16 @@ class KrRules:
         self.cw_wait: dict = {}                    # 보행자 id → 횡단보도 대기 정지 틱 (A-3)
         self._cw_zones: list | None = None         # 경로상 횡단보도 [route_s 구간] (1회)
         self.wait_target_d: float | None = None    # 관찰 감속 목표 (장애물까지 거리)
+        # standoff 대상의 반길이 [m] — 크립의 '진짜 정지 거리' 가 객체 크기에
+        # 비례해야 한다 (d 가 뒷축→객체 중심 축이라 앞범퍼+반길이를 더한다).
+        self.standoff_half_len: float | None = None
+        self._creep_diag: dict | None = None       # 크립 진단 (로그용, 판단 무관)
+        # 크립 지연 시계 — **크립이 실제로 열릴 수 있는 상태에서 보류한 틱만** 센다.
+        # ot_blocked_ticks 를 쓰면 안 된다: 그건 적신호 대기도 세므로 신호가
+        # 녹색으로 바뀌는 순간 이미 만료돼 지연이 무의미해진다 (실측 2026-09-05
+        # 155049 02_직진3: 녹색 복귀 시 hold_s 22.6 → 즉시 open_why=delay).
+        self._creep_hold_ticks = 0
+        self._creep_hold_id = None                 # 대상이 바뀌면 시계를 새로
         self.bo_paused = False                     # 적색·황색STOP 중 일시정지
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
@@ -1980,14 +2008,26 @@ class KrRules:
             if objs:
                 self.wait_target_d = objs[0][0]
                 self.standoff_id = objs[0][3].id
+                self.standoff_half_len = self._half_len(objs[0][3])
             return
         if self.standoff_stop_ticks > 0:
             so_objs = self._corridor_blockers(ap, planner, static_ok=self._stop_ok)
             if so_objs:
                 self.wait_target_d = so_objs[0][0]
                 self.standoff_id = so_objs[0][3].id
+                self.standoff_half_len = self._half_len(so_objs[0][3])
         elif corridor:
             self.wait_target_d = corridor[0][0]
+            self.standoff_half_len = self._half_len(corridor[0][3])
+
+    @staticmethod
+    def _half_len(actor) -> float | None:
+        """액터 반길이 [m]. 못 읽으면 None — 그때는 크립을 아예 걸지 않는다
+        (크기를 모르면 안전한 정지 거리를 정할 수 없다)."""
+        bb = getattr(actor, 'bounding_box', None)
+        ex = getattr(bb, 'extent', None) if bb is not None else None
+        x = getattr(ex, 'x', None) if ex is not None else None
+        return float(x) if x is not None else None
 
     def _blocked_account(self, ap, planner, ego_speed: float) -> None:
         """'막힌 채 정지' 회계 (B-10) — 자차 상태만으로 센다. span 활성 중에도 돈다."""
@@ -2175,6 +2215,11 @@ class KrRules:
         # (B-2). solid 는 두 바퀴 구조(B-3)가, occupied 는 lvl<1 이 그대로 본다.
         lvl = self.bo_level if self.bo_state == 'BREAKOUT' else 0
         skip_solid = n_pass >= 2
+        # side 선택 — 게이트를 통과한 side 의 **적용 인자만** 모으고, 적용은 루프
+        # 밖에서 한 번만 한다. 게이트 본문은 그대로다. 스위치가 꺼져 있으면 첫 성공
+        # side 에서 break 하므로 현행(좌측 우선)과 글자 그대로 같다.
+        plans: dict = {}
+        pick_on = self.side_pick and self.shift_entry      # 기준(플래토)이 있어야 한다
         for side in ('left', 'right'):                     # 좌측 추월 우선
             def reject(gate, **extra):
                 self.last_overtake = f'{side}:{gate}@p{n_pass}'
@@ -2322,6 +2367,7 @@ class KrRules:
             # 인자(min_start_ahead / extra_length_after)로만 한다. 기록이 없으면
             # (plan 실패) 검사 없이 현행 배치.
             ahead_eff = ahead_m
+            pinfo = None
             if self.shift_entry and self.last_span_plan is not None:
                 delay, after_eff, pinfo = self._shift_placement(
                     planner, ap, trans_m, ahead_m, extra_after, zone_ext is not None)
@@ -2333,31 +2379,117 @@ class KrRules:
                 if delay is not None:
                     ahead_eff = ahead_m + delay
                     extra_after = after_eff
-            span = planner.shift_route_around_actors(
-                actor, chain_last,
-                obstacle_direction='right' if side == 'left' else 'left',
-                transition_length=trans_m * ppm,
-                extra_length_before=self.ot_before_m * ppm,
-                extra_length_after=extra_after * ppm,      # E-2 연장·복귀 단축 포함
-                # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
-                # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
-                min_start_ahead=ahead_eff * ppm)
-            planner._kd = _cKDTree(planner.route_points[:, :2])
-            self.ot_span = span
-            self.ot_side = side                            # 연장이 같은 방향을 쓴다
-            self.span_extend_n = 0
-            self.ot_blocked_ticks = 0
-            self.preempt_latch_id = None                   # E-4 래치 해제 (시프트 성공)
-            self.last_overtake = side
-            (self.last_avoid or {}).update(
-                {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
-                 'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
-                 'solid_relaxed': skip_solid, 'chain': list(chain['ids']),
-                 'span_m': round(span_m, 1), 'after_m': round(extra_after, 1)})
-            print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
-                  f'(id={chain["ids"]}, 구간 {span[0]}~{span[1]}, p{n_pass})', flush=True)
-            return True
-        return False
+            # 게이트 전부 통과 — 적용 인자와 이 side 의 계측을 담아 둔다.
+            plans[side] = {'trans_m': trans_m, 'ahead_eff': ahead_eff,
+                           'extra_after': extra_after, 'span_m': span_m,
+                           'pinfo': dict(pinfo or {}),
+                           'avoid': dict(self.last_avoid or {})}
+            if not pick_on or not plans[side]['pinfo'].get('entry_plateau_ids'):
+                # 단락 — 플래토가 비면 _pick_side 는 어느 경우에도 이 side 를 고른다
+                # (한쪽만 비면 그쪽, 둘 다 비면 좌측 유지). 반대쪽을 재지 않으므로
+                # 추가 비용이 0 이다. 스위치가 꺼져 있어도 여기서 끊어 현행과 같다.
+                break
+        if not plans:
+            return False
+        side, why = self._pick_side(plans, pick_on)
+        p = plans[side]
+        trans_m, ahead_eff = p['trans_m'], p['ahead_eff']
+        extra_after, span_m = p['extra_after'], p['span_m']
+        # 선택된 side 의 계측(κ·lc_var·배치)을 되살린다 — 반대쪽을 재는 동안 덮였다.
+        # 기각 누적(reject/rejects/pass)은 살아 있는 쪽 값을 그대로 둔다.
+        live = self.last_avoid if isinstance(self.last_avoid, dict) else {}
+        merged = dict(p['avoid'])
+        for k in ('reject', 'rejects', 'pass'):
+            if k in live:
+                merged[k] = live[k]
+        # 배치 키는 `.update()` 누적이라 앞 side 가 쓰고 뒤 side 가 안 쓰면 그대로
+        # 남는다 (예: 좌측 entry_plateau_ids 가 우측 진단에 섞인다). 승자가 쓰지
+        # 않은 키는 지우고 승자 값으로만 채운다.
+        for k in ('entry_base_clear', 'entry_block_ids', 'entry_clear',
+                  'entry_delay_m', 'entry_start_rel_m', 'exit_after_m',
+                  'entry_plateau_ids'):
+            merged.pop(k, None)
+        merged.update(p['pinfo'])
+        self.last_avoid = merged
+        span = planner.shift_route_around_actors(
+            actor, chain_last,
+            obstacle_direction='right' if side == 'left' else 'left',
+            transition_length=trans_m * ppm,
+            extra_length_before=self.ot_before_m * ppm,
+            extra_length_after=extra_after * ppm,          # E-2 연장·복귀 단축 포함
+            # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
+            # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
+            min_start_ahead=ahead_eff * ppm)
+        planner._kd = _cKDTree(planner.route_points[:, :2])
+        self.ot_span = span
+        self.ot_side = side                                # 연장이 같은 방향을 쓴다
+        self.span_extend_n = 0
+        self.ot_blocked_ticks = 0
+        self.preempt_latch_id = None                       # E-4 래치 해제 (시프트 성공)
+        self.last_overtake = side
+        order = [s for s in ('left', 'right') if s in plans]
+        self.last_avoid.update(
+            {'shift': side, 'span': list(span), 'trans_m': round(trans_m, 1),
+             'ahead_m': round(ahead_m, 1), 'preempt': preempt, 'pass': n_pass,
+             'solid_relaxed': skip_solid, 'chain': list(chain['ids']),
+             'span_m': round(span_m, 1), 'after_m': round(extra_after, 1)})
+        if pick_on:
+            # 스위치가 켜진 틱에만 남긴다 — off 에서 진단 키가 늘면 리플레이
+            # 동일성 비교가 "결정은 같은데 로그는 다르다" 가 되어 쓸모가 준다.
+            self.last_avoid['side_pick'] = {
+                'evaluated': order, 'picked': side, 'why': why,
+                'base_clear': {s: plans[s]['pinfo'].get('entry_base_clear')
+                               for s in order},
+                'plateau': {s: plans[s]['pinfo'].get('entry_plateau_ids')
+                            for s in order},
+                # 좌측 플래토가 비어 우측을 아예 재지 않은 틱 (추가 비용 0)
+                'short_circuit': bool(order == ['left']
+                                      and not plans['left']['pinfo']
+                                      .get('entry_plateau_ids'))}
+        print(f'[kr_rules] 정적 장애물 회피 — {side} 로 경로 시프트 '
+              f'(id={chain["ids"]}, 구간 {span[0]}~{span[1]}, p{n_pass}, {why})',
+              flush=True)
+        return True
+
+    def _pick_side(self, plans: dict, pick_on: bool):
+        """게이트를 통과한 side 중 하나를 고른다 → (side, 근거).
+
+        확정 규칙 (2026-09-04 승인):
+          후보 1개          → 그것                       'single'
+          한쪽만 플래토 빔   → 그쪽                       'plateau_empty'
+          둘 다 플래토 빔    → 좌측 유지 (현행 동작)        'both_empty_keep_left'
+          둘 다 플래토 있음  → base_clear 큰 쪽 (동률 좌측)  'base_clear'
+
+        1차 키가 배치 점수가 아니라 `entry_plateau_ids` 인 이유: `_shift_placement`
+        는 "격자 어느 (delay, after) 에서도 임계를 못 넘는 객체" 를 목적함수에서
+        빼므로(플래토 제외), **막힌 쪽이 오히려 높은 점수를 낸다**. 실측
+        2026-09-03 104648 t=42.16: 좌측 점수 1.31(플래토 [5,6,8], 원본 최소 이격
+        −1.73) 대 우측 0.68(플래토 없음, +0.68). 플래토가 비었다는 것은 그 왜곡이
+        없다는 뜻이라 1차 키로 쓸 수 있다. 2차 키도 같은 이유로 플래토 제외 **전**
+        값인 base_clear 다.
+
+        "둘 다 비면 좌측 유지" 는 회귀 방지다 — 이격만으로 비교하면 지금 성공 중인
+        시프트가 뒤집힌다 (실측 2026-09-04 추월집중_01 t=10.60: 좌 +1.02 실측 OBB
+        1.02 인데 우 +1.20 으로 뒤집힘). 바꿀 이유가 없는 곳은 바꾸지 않는다.
+
+        pick_on 이 거짓(스위치 off 또는 shift_entry off)이면 plans 에는 단락으로
+        첫 성공 side 하나만 들어 있으므로 결과가 현행과 같다.
+        """
+        order = [s for s in ('left', 'right') if s in plans]
+        if len(order) == 1 or not pick_on:
+            return order[0], 'single'
+        empty = [s for s in order if not plans[s]['pinfo'].get('entry_plateau_ids')]
+        if len(empty) == 1:
+            return empty[0], 'plateau_empty'
+        if len(empty) == 2:
+            return 'left', 'both_empty_keep_left'
+
+        def bc(s):
+            v = plans[s]['pinfo'].get('entry_base_clear')
+            return -1e9 if v is None else float(v)
+
+        return (('left', 'base_clear') if bc('left') >= bc('right')
+                else ('right', 'base_clear'))
 
     @staticmethod
     def _ego_lane(lg, ap):
@@ -2908,14 +3040,136 @@ class KrRules:
 
         ④′ 정지선 프로파일과 같은 형태다: v_allow = √(2·a_stop·(d − standoff)).
         standoff 는 시프트 전이가 들어갈 공간이라 전이 길이 공식과 정합시킨다:
-            standoff = max(shift_latest_m, shift_k_s · v)
+            standoff = max(standoff_floor_m, shift_k_s · v)
+        바닥은 **standoff_floor_m** 이다 — shift_latest_m 이 아니다. 둘은 기본값이
+        같지만(25.0) 소비처가 다르다: shift_latest_m 은 _shift_speed_cap 의
+        미리보기 창과 _try_overtake 의 PREEMPT 시간 예산이 쓰고, 여기만 이 값을
+        읽는다. 정지 거리만 조정하려면 standoff_floor_m 을 움직인다.
         IDM 의 정지 gap 과 충돌하지 않는다 — 둘 다 상한이고 min() 이 낮은 쪽을 쓴다.
         """
         if self.wait_target_d is None or self.stop_profile_a <= 0.0:
             return None
-        standoff = max(self.shift_latest_m, self.shift_k_s * max(ego_speed, 0.1))
+        standoff = max(self.standoff_floor_m, self.shift_k_s * max(ego_speed, 0.1))
         d = self.wait_target_d - standoff
-        return _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d))
+        if d >= 0.0:
+            return _math.sqrt(2.0 * self.stop_profile_a * d)   # 기준선 밖 — 무수정
+        return self._standoff_creep(standoff, ego_speed)       # 기준선 안 — 바닥
+
+    def _creep_geom_need(self, ego_speed: float) -> float | None:
+        """기하 완성 게이트(⑥)의 need — `_side_pass` 와 **같은 식**이다.
+
+        need = trans_m + ahead_m + shift_geom_margin_m,
+        trans_m = max(transition_m, shift_k_s·v), ahead_m 은 BREAKOUT L3 이상에서
+        shift_ahead_l3_m. 상수를 복제하지 않고 같은 필드를 읽는다 — 어긋나면
+        "여기서 아직 가능하다고 본 것"과 "저기서 기각하는 것"이 달라진다.
+        게이트가 꺼져 있으면 기하상 못 간다는 판정 자체가 없으므로 None.
+        """
+        if not self.geom_gate:
+            return None
+        trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
+        ahead_m = (self.shift_ahead_l3_m if self.bo_level >= self.geom_relax_lvl
+                   else self.shift_ahead_m)
+        return trans_m + ahead_m + self.geom_margin_m
+
+    def _creep_gate(self, d: float, ego_speed: float):
+        """크립 지연 게이트 — (open_why, hold_why, need).
+
+        크립은 **비가역**이다: s_rel 이 geom need 아래로 내려가면 시프트가 영영
+        불가능해진다. 그래서 아직 기하상 가능한 동안에는 크립을 보류하고
+        시프트·BREAKOUT 사다리에 먼저 기회를 준다 (실측 2026-09-05 155735:
+        01 은 크립이 occupied 창을 4.95 s 로 잘랐고, 02 는 크립이 bo_stuck_ticks
+        를 리셋해 활성 span 이 안 풀려 시프트 시도가 0회였다).
+
+        여는 조건 (하나라도):
+          ① d < need      — 이미 기하적으로 불가. 기다릴 이유가 없다
+          ② BREAKOUT L4   — 사다리 끝까지 갔는데 시프트 실패
+          ③ 보류 누적 ≥ delay — 안전망 (사다리가 아예 안 도는 경우). 시계는
+             _creep_hold_ticks 로 **배제(적신호·보행자·큐)에 걸린 틱은 빼고**
+             센다 — ot_blocked_ticks 를 쓰면 적신호 대기가 그대로 쌓여 녹색
+             직후 지연이 이미 만료된다 (실측 155049 02: hold_s 22.6).
+        보류 중에는 v_allow = 0 이라 자차가 서 있고, 그래서 ot_blocked_ticks 와
+        bo_stuck_ticks 가 **정상적으로 쌓인다** — 지연이 사다리를 굶기지 않는다.
+        """
+        if self.creep_delay_ticks <= 0:
+            return 'no_gate', None, None                   # 지연 없음 (이전 동작)
+        need = self._creep_geom_need(ego_speed)
+        if need is not None and d < need:
+            return 'need', None, need                      # ①
+        if self.bo_level >= self.BO_CREEP:
+            return 'breakout', None, need                  # ②
+        if self._creep_hold_ticks >= self.creep_delay_ticks:
+            return 'delay', None, need                     # ③
+        why = 'need' if need is not None else 'breakout'
+        return None, why, need
+
+    def _standoff_creep(self, standoff: float, ego_speed: float = 0.0) -> float:
+        """기준선 **안쪽**(d < standoff)의 바닥 — 0 고정 대신 크립 [m/s].
+
+        왜 필요한가: d < standoff 이면 √(2a·max(0, d−standoff)) 가 항구적으로
+        0 이고 min() 사다리에 이를 되올릴 후보가 없다 → 영구 정지. 실측
+        2026-09-04 7건이 이 형태로 11.5~78.2 s 멈췄다. standoff_floor_m 을
+        낮춰도 사라지지 않는다 — 오버슛 0.7~2.6 m 로 매번 바닥을 넘어 들어가
+        잠금 **지점만** 앞으로 옮겨진다.
+
+        min() 안의 후보다. 이 함수는 `_standoff_profile` 의 **반환값만** 바꾸고,
+        호출처(apply)의 병합은 여전히 `so < candidate` 하나다 — 신호·보행자·
+        정지선·종점 후보가 더 낮으면 그쪽이 이긴다. 오버라이드가 아니다.
+
+        진짜 정지 거리는 객체 크기를 반영한다:
+            d_stop = front(뒷축→앞범퍼) + 객체 반길이 + standoff_creep_gap_m
+        d 가 **뒷축 → 객체 중심** 축이기 때문이다. 고정값(예: 2 m)으로 두면
+        앞범퍼가 객체 중심을 1.8 m 지나쳐 서서 충돌이 된다.
+
+        배제는 새로 만들지 않고 `_obstacle_cause` 를 그대로 쓴다 — 보행자
+        (walker_hazard/close)·적황 신호(traffic_light_hazard·y_decision·
+        cross_guard·sl_hold_left)·큐 대기(_tick_queue)·경로 종점(latched·
+        d_end ≤ active_m)·정지표지를 이미 전부 본다. `ped_hold_ids`(횡단보도
+        홀드 래치)는 PDM 플래그와 축이 달라 2차 방어로 따로 본다.
+        """
+        if not self.standoff_creep:
+            return 0.0          # 이전 동작. 진단도 남기지 않는다 — off 는 로그까지 동일
+        d = float(self.wait_target_d)
+        diag = {'creep_d': round(d, 1), 'creep_standoff': round(standoff, 1)}
+
+        # 진단 키가 'so_creep' 인 이유: BREAKOUT 진단이 같은 last_avoid 에 'creep'
+        # 을 나중에 써서(아래 bo_state 블록) 이름이 겹치면 덮인다 — 실측 02_직진3
+        # 27틱에서 크립 발동이 False 로 뒤집혔다 (2026-09-05).
+        def block(why):
+            # 배제로 막힌 틱은 지연 시계에 넣지 않는다 — 적신호 21 s 를 세면
+            # 녹색 직후 지연이 이미 만료된 상태가 된다 (위 _creep_hold_ticks 주석).
+            self._creep_hold_ticks = 0
+            self._creep_diag = dict(diag, so_creep=False, creep_block=why)
+            return 0.0
+
+        if self.standoff_half_len is None:
+            return block('no_size')                     # 크기 미상 → 정지 거리 불명
+        d_stop = self.front + self.standoff_half_len + self.standoff_creep_gap_m
+        diag['creep_stop_m'] = round(d_stop, 2)
+        if d <= d_stop:
+            return block('stop_gap')                    # 진짜 정지
+        if self.ped_hold_ids:
+            return block('ped_hold')
+        ap = self._ap
+        planner = getattr(ap, '_waypoint_planner', None) if ap is not None else None
+        if planner is None or not self._obstacle_cause(planner, ap):
+            return block('cause')
+        # 지연 게이트 — 시프트가 확실히 불가능해지기 전에는 열지 않는다 (_creep_gate).
+        if self.standoff_id != self._creep_hold_id:     # 대상이 바뀌면 새로 센다
+            self._creep_hold_ticks = 0
+            self._creep_hold_id = self.standoff_id
+        open_why, hold_why, need = self._creep_gate(d, ego_speed)
+        gate = {'creep_need_m': round(need, 1) if need is not None else None,
+                'creep_hold_s': round(self._creep_hold_ticks / self.hz, 1),
+                'creep_bo_lvl': self.bo_level}
+        if open_why is None:
+            self._creep_hold_ticks += 1
+            self._creep_diag = dict(diag, so_creep=False, creep_hold=True,
+                                    creep_hold_why=hold_why, **gate)
+            return 0.0
+        self._creep_hold_ticks = 0
+        self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+                                creep_open_why=open_why, **gate)
+        return self.standoff_creep_v
 
     def _stopline_profile(self, planner, ap) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
@@ -3020,6 +3274,8 @@ class KrRules:
         # → 시프트를 만들고도 정지).
         self.wait_target_d = None
         self.standoff_id = None
+        self.standoff_half_len = None
+        self._creep_diag = None
         self.last_d_end = d_end
         self._ap = ap
         self.last_yellow = None
@@ -3085,7 +3341,8 @@ class KrRules:
         if so is not None:
             self.last_avoid = dict(self.last_avoid or {'state': 'STANDOFF'},
                                    standoff_d=round(float(self.wait_target_d), 1),
-                                   standoff_id=self.standoff_id, standoff_v=round(so, 2))
+                                   standoff_id=self.standoff_id, standoff_v=round(so, 2),
+                                   **(self._creep_diag or {}))
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)

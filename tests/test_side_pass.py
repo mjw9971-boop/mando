@@ -42,6 +42,10 @@ ZONE_M = OT['zone_gate_margin_m']
 ZONE_LVL = OT['zone_gate_relax_level']
 GEOM_LVL = OT['geom_relax_level']
 STANDOFF = OT['shift_latest_m']
+# standoff 정지 프로파일의 바닥은 2026-09-05 부터 shift_latest_m 이 아니라 이 값이다
+# (소비처 분리 — shift_latest_m 은 _shift_speed_cap 의 미리보기 창과 PREEMPT
+#  시간 예산이 계속 쓴다). 프로파일을 재는 단언만 이쪽을 본다.
+FLOOR = OT['standoff_floor_m']
 A_STOP = CFG['speed']['stop_profile_a']
 FAR = 52.3                                       # geom·zone 을 넉넉히 통과하는 거리
 
@@ -259,8 +263,8 @@ def test_standoff_profile_uses_shift_latest_25():
     kr = KrRules(CFG)
     kr.wait_target_d = 50.0
     v = kr._standoff_profile(0.0)
-    assert v == pytest.approx(math.sqrt(2.0 * A_STOP * (50.0 - STANDOFF)))
-    kr.wait_target_d = STANDOFF                                    # 정지 위치에서 0
+    assert v == pytest.approx(math.sqrt(2.0 * A_STOP * (50.0 - FLOOR)))
+    kr.wait_target_d = FLOOR                                       # 정지 위치에서 0
     assert kr._standoff_profile(0.0) == pytest.approx(0.0)
 
 
@@ -348,4 +352,4 @@ def test_standoff_target_without_static_corridor():
         kr._update_obj_timers(ap)
     try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.wait_target_d == pytest.approx(30.0)
-    assert kr._standoff_profile(0.0) == pytest.approx(math.sqrt(2.0 * A_STOP * (30.0 - STANDOFF)))
+    assert kr._standoff_profile(0.0) == pytest.approx(math.sqrt(2.0 * A_STOP * (30.0 - FLOOR)))

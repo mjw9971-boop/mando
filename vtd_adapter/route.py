@@ -160,6 +160,11 @@ class VtdRoutePlanner:
         # 정적 장애물 인식 (compute_leading_vehicles) — params 가 단일 출처
         self.obstacle_speed_max = float(cfg['percep']['obstacle_speed_max'])
         self.obstacle_clearance_m = float(cfg['percep']['obstacle_clearance_m'])
+        # 시프트 목표 차로의 기준을 '원 경로 차로' 에서 '현재 경로가 놓인 차로' 로
+        # 옮긴다 (_shift_target_steps 참조). false = PDM 원문 그대로(원 경로 기준).
+        _ot = cfg.get('overtake', {})
+        self.shift_target_current = bool(_ot.get('shift_target_current_lane_enable', False))
+        self.shift_target_max_steps = int(_ot.get('shift_target_max_steps', 2))
         # plan_shift_span 의 최근접 경로점 탐색을 자차 앞 창으로 제한한다 (아래 참조).
         # false = PDM 원문 그대로(앞쪽 전 구간 탐색).
         self.span_search_local = bool(
@@ -560,17 +565,92 @@ class VtdRoutePlanner:
         """PDM 원문 — 0..1 선형 전이를 cos 전이로."""
         return -np.cos(value * np.pi) / 2.0 + 0.5
 
+    # ── VTD 추가: 시프트 목표 차로의 기준점 ──────────────────────────────
+    # 원문은 목표를 항상 `route_waypoints[idx]`(= 경로 **생성 시점**의 차로)의
+    # 이웃으로 잡는다. 이미 한 번 시프트해 옆 차로에 있는 상태에서 같은 쪽을
+    # 다시 고르면 목표가 **지금 있는 그 차로**가 되어 경로가 1 mm 도 안 움직인다
+    # (실측 2026-09-03 104648: 자차 (429,3,3), 원 경로 (429,3,2), 빈 차로는
+    #  (429,3,4). BREAKOUT L1 이 ot_span 을 풀고 다시 시프트를 만들었으나
+    #  좌측은 원 경로의 좌측 = 없음 → 폴백으로 원 경로에 되돌아갔다).
+    #
+    # 아래 두 헬퍼는 **적용(shift_route_smoothly)과 계측(planned_lateral_offsets)이
+    # 같은 목표를 쓰도록** 한 곳에 둔 것이다. 둘이 어긋나면 shift_entry·span_extend
+    # 의 사전 이격 계측이 실제로 갈 차로가 아닌 곳을 재게 된다.
+
+    def _shift_target_steps(self, shift_to_left_lane) -> int:
+        """목표까지 따라갈 이웃 차로 **단계 수**. 원문은 항상 1 이다.
+
+        현재 경로가 원 경로에서 그 방향으로 몇 칸 밀려 있는지(k)를 재어 k+1 을
+        돌려준다 — "지금 있는 차로에서 한 칸" 이다. 한 칸 제한은 그대로다.
+
+        k 는 차로폭으로 나누지 않고 **1칸 이웃까지의 오프셋 D1 로 나눈다** —
+        D1 은 planned_lateral_offsets 와 같은 외적 규약(CARLA 미러 프레임)이라
+        부호가 저절로 맞고, 차로폭이 구간마다 달라도(429 구간 3.20/3.75/2.48 m)
+        같은 축으로 잰다. 시프트가 없으면 t_cur = 0 → k = 0 → 1 단계이므로
+        원문과 **같은 좌표**가 나온다 (스위치 on 에서도 비트 동일).
+        반대쪽으로 밀려 있으면 k = −1 → 0 단계 = 목표가 원 경로 차로 자신
+        (= 지금 있는 차로의 한 칸 반대쪽)이라 좌우 어느 쪽도 맞게 동작한다.
+        """
+        if not self.shift_target_current:
+            return 1                                   # 원문 동작
+        i0 = int(self.route_index)
+        n = len(self.original_route_points)
+        if i0 >= n - 1:
+            return 1
+        wp = self.route_waypoints[i0]
+        nb = self.lg.neighbor(wp.key, 'left' if shift_to_left_lane else 'right')
+        if nb is None:
+            return 1                                   # 잴 기준이 없다 → 이전 동작
+        orig = self.original_route_points
+        tx, ty = orig[i0 + 1, :2] - orig[i0, :2]
+        d = _math.hypot(tx, ty)
+        if d < 1e-9:
+            return 1
+        loc = VtdWaypoint(self.lg, nb, min(wp.s, self.lg.length(nb))).transform.location
+        bx, by = orig[i0, :2]
+        d1 = (tx * (loc.y - by) - ty * (loc.x - bx)) / d          # 1칸 이웃 오프셋
+        if abs(d1) < 1.0:                              # 차로폭이라 보기 어렵다
+            return 1
+        cx, cy = self.route_points[i0, :2]
+        t_cur = (tx * (cy - by) - ty * (cx - bx)) / d             # 현재 경로 변위
+        k = int(round(t_cur / d1))                     # |비율| < 0.5 면 0 = 이전 동작
+        return int(np.clip(k + 1, 0, self.shift_target_max_steps))
+
+    def _shift_target_wp(self, idx, shift_to_left_lane, n_steps):
+        """목표 waypoint — 이웃을 n_steps 만큼 따라간다. 못 가면 None (원문 폴백).
+
+        n_steps == 1 이면 `route_waypoints[idx].get_left_lane()/get_right_lane()`
+        과 **같은 객체**다 (s 규약 min(self.s, length(nb)) 까지 동일).
+        n_steps == 0 이면 원 경로 차로 자신을 돌려준다.
+        """
+        wp = self.route_waypoints[idx]
+        side = 'left' if shift_to_left_lane else 'right'
+        key = wp.key
+        for _ in range(int(n_steps)):
+            key = self.lg.neighbor(key, side)
+            if key is None:
+                return None
+        if key == wp.key:
+            return wp
+        return VtdWaypoint(self.lg, key, min(wp.s, self.lg.length(key)))
+
     def shift_route_smoothly(self, start_index, end_index, shift_to_left_lane,
                              transition_length=120.0, lane_transition_factor=1.0):
         """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트."""
+        # VTD: 원문은 목표가 route_waypoints[idx].get_*_lane() 고정이다.
+        # 기준점만 현재 경로 차로로 옮긴다 (_shift_target_steps). off 면 1 단계 = 원문.
+        n_steps = self._shift_target_steps(shift_to_left_lane)
         for idx in range(start_index, end_index):
-            if shift_to_left_lane:
-                loc = self.route_waypoints[idx].get_left_lane()
+            wp_t = self._shift_target_wp(idx, shift_to_left_lane, n_steps)
+            if wp_t is None and n_steps != 1:
+                # VTD: 다단계 목표가 그 지점에서 끊겼다 (열 사슬이 짧아짐).
+                # 원문 폴백(원 경로 차로 중심)으로 가면 이미 밀려 있는 경로가
+                # 한 칸 되돌아가 계단이 생긴다 → 그 점은 그대로 둔다.
+                loc = np.array(self.route_points[idx], dtype=float)
             else:
-                loc = self.route_waypoints[idx].get_right_lane()
-            loc = (self.route_waypoints[idx].transform.location
-                   if loc is None else loc.transform.location)
-            loc = np.array([loc.x, loc.y, loc.z])
+                loc = (self.route_waypoints[idx].transform.location
+                       if wp_t is None else wp_t.transform.location)
+                loc = np.array([loc.x, loc.y, loc.z])
 
             transition_factor = 1.0
             if idx <= start_index + transition_length and idx - start_index < end_index - idx:
@@ -658,18 +738,28 @@ class VtdRoutePlanner:
         """
         out = []
         n = len(self.original_route_points)
+        # VTD: 원문 자리에서 목표 차로를 잡던 것을 shift_route_smoothly 와 **같은**
+        # 헬퍼로 바꾼다. 둘이 어긋나면 여기(계측)가 재는 차로와 저기(적용)가 미는
+        # 차로가 달라져, shift_entry·span_extend 의 사전 이격 계측이 무효가 된다.
+        # off 면 n_steps == 1 이라 원문과 완전히 같다.
+        n_steps = self._shift_target_steps(shift_to_left_lane)
         for i in range(int(start_index), min(int(end_index), n), max(1, int(step_pts))):
-            w = self.route_waypoints[i]
-            nb = w.get_left_lane() if shift_to_left_lane else w.get_right_lane()
-            if nb is None:
-                out.append(0.0)
+            wp_t = self._shift_target_wp(i, shift_to_left_lane, n_steps)
+            if wp_t is None and n_steps == 1:
+                out.append(0.0)                        # 원문 동작
                 continue
-            loc = nb.transform.location
             bx, by = self.original_route_points[i, :2]
             j = min(i + 1, n - 1)
             tx, ty = self.original_route_points[j, :2] - self.original_route_points[i, :2]
             d = _math.hypot(tx, ty) or 1.0
-            out.append((tx * (loc.y - by) - ty * (loc.x - bx)) / d)
+            if wp_t is None:
+                # 사슬이 끊긴 지점 — 적용 쪽이 그 점을 그대로 두므로 계측도 현재
+                # 경로점을 목표로 본다 (이동량 0 이 되도록).
+                lx, ly = self.route_points[i, :2]
+            else:
+                loc = wp_t.transform.location
+                lx, ly = loc.x, loc.y
+            out.append((tx * (ly - by) - ty * (lx - bx)) / d)
         return np.asarray(out, dtype=float)
 
     def shift_route_around_actors(self, first_actor, last_actor=None,

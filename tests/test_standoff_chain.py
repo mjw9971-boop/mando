@@ -36,6 +36,8 @@ from test_ped_intent import make_ap                                 # noqa: E402
 CFG = load_params_yaml(PARAMS_YAML)
 OT = CFG['overtake']
 STANDOFF = OT['shift_latest_m']
+# 프로파일 바닥은 2026-09-05 부터 별도 상수다 (소비처 분리) — 프로파일 단언만 이쪽.
+FLOOR = OT['standoff_floor_m']
 CHAIN = OT['chain_gap_m']
 TRANS = OT['transition_m']
 BEFORE, AFTER = OT['extra_before_m'], OT['extra_after_m']
@@ -247,7 +249,7 @@ def test_standoff_evaluated_while_span_active():
     assert kr.last_avoid['state'] == 'SHIFT_ACTIVE'
     assert kr.wait_target_d == pytest.approx(52.3)              # 가장 가까운 정지 객체
     assert kr._standoff_profile(0.0) == pytest.approx(
-        (2.0 * CFG['speed']['stop_profile_a'] * (52.3 - STANDOFF)) ** 0.5)
+        (2.0 * CFG['speed']['stop_profile_a'] * (52.3 - FLOOR)) ** 0.5)
     assert kr.ot_span is not None                                # 생성은 건너뛴다 (그대로)
     assert len(p.calls) == 1
 
