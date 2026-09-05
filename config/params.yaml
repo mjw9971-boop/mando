@@ -916,7 +916,7 @@ overtake:
   # 이상이면 현행 유지. 전부 미달이면 entry_block 기각. 전이 길이는 안 줄인다.
   # 재구성 경로 계산: 100310 delay 5.5~6 → id3 1.44/id4 1.55, 100458 after 0~4 →
   # id5 1.76~1.88. false = 이전 동작(기본 off, 실차 검증 전).
-  shift_entry_enable: false
+  shift_entry_enable: true
   shift_entry_max_delay_m: 15.0
   shift_entry_step_m: 0.5
   shift_exit_min_after_m: 0.0
