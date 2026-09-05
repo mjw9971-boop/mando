@@ -1502,8 +1502,15 @@ def report(lg, rt, radius, warn_dev=None):
             extra = (f"  window {e['window_s0']:.1f}-{e['window_s1']:.1f} m  ({w:.1f} m)"
                      + (f"  회랑 {corr:.1f} m" if corr is not None else ''))
             if w < MIN_LC_WINDOW_M:
-                # ERROR — 2026-08-21 실사고: 창 6.1 m LC 가 실패해 헤딩오차 46°,
-                # 조향 풀락 포화, 도로이탈 + courseRespawn. 지시등 선행 3 s 도 못 낸다.
+                # ERROR — 근거는 **횡이동 전이거리** 하나다. 2026-08-21 실사고:
+                # 창 6.1 m LC 가 실패해 헤딩오차 46°, 조향 풀락 포화, 도로이탈 +
+                # courseRespawn. MIN_LC_WINDOW_M 은 transition_min_m 20 m 에서 왔다.
+                # ※ 여기 있던 "지시등 선행 3 s 도 못 낸다" 는 **인과가 아니다**
+                #   (2026-09-05 반증, BACKLOG B-16). 지시등은 창 안이 아니라 창
+                #   **앞**의 도로에서 켜지므로(kr_rules._lane_shift 의 look 은
+                #   현재 위치 기준 전방 탐색이고 램프는 창 맨 앞에 놓인다) 창
+                #   길이와 lead 는 무관하다. 실측: on_s 3 s 미달 6건의 창 중앙값
+                #   51.2 m > 통과 38건의 47.1 m 이고, 통과 최소 창은 20.8 m 였다.
                 extra += (f'   <= [오류] 창이 {MIN_LC_WINDOW_M:.0f} m 미만 — '
                           f'전이거리(max(transition_s*v, transition_min_m))를 못 채운다')
                 errs += 1
