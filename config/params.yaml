@@ -71,10 +71,52 @@ vehicle:
   # 0.7 로 되돌리면 이전 동작이다.
   min_turn_margin: 1.0
 
+# 붉은 노면 = 감속(보호) 구간. **감속 구간의 단일 출처다.**
+# 붉은 포장은 xodr 에 없고 osgb 텍스처(StyleSrfBikeway, R131 G59 B59)로만 있어
+# 월드 정점을 미리 뽑아 두었다. tools/build_lane_graph.apply_red_spans 가 이걸
+# 차로 s 구간(red_spans)으로 바꾸고, school_zone bool 은 bool(red_spans) 로 남는다.
+# 파일이 없으면 red_spans 를 만들지 않고 경고만 남긴다 (이전 동작).
+red_zone:
+  verts_json: data/red_surface_verts.json
+  # 정점 하나마다 볼 kd 후보 점 수. 도로 전폭을 덮으므로 차로 여러 개에 동시에
+  # 귀속돼야 한다 — 최근접 하나만 보면 옆 차로가 빈다.
+  kd_candidates: 24
+  # 차로 반폭에 더할 여유 [m]. 차로 경계 위에 찍힌 정점을 흡수한다.
+  half_margin_m: 0.30
+  # s 구간 병합 간격 [m]. 이보다 벌어지면 다른 구간으로 끊는다.
+  span_gap_m: 3.0
+  # 잡음 파편 제외 임계. 인접 차로 끝점(s=0 · s=length)에 스치는 정점이 파편을
+  # 만든다. 실측 2026-09-05: 실체 124구간 4,252.9 m 대 파편 174개 합 **4.2 m** 로
+  # 1000배 갈려 임계 선택에 민감하지 않다.
+  min_verts: 20
+  min_len_m: 1.0
+  # 보호구역 법정 제한속도 [km/h]. 붉은 구간 안에서 이 값이 speed_limit 을
+  # 대신한다 (채점기 항목 2 의 기준이고, 제어기는 여기서 speed.margin_kph 를
+  # 뺀 값을 목표로 삼는다).
+  limit_kph: 30.0
+  # 구간 경계 여유 [m] — 채점기가 붉은 구간 판정에 쓸 이탈 쪽 마진.
+  # 정점 매핑 오차(최근접 거리 p95 1.72 m)와 차로 매칭 흔들림을 흡수한다.
+  boundary_margin_m: 2.0
+
 speed:
   # 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
   # (phase3: VtdRoutePlanner 가 speed_limits 에 반영)
   margin_kph: 5.0
+  # 30 노면표시(roadmark_speed_30 · RM_518)를 제한속도로 쓸지 (tools/build_lane_graph
+  # speed_cfg 가 읽는다 — lane_graph 를 다시 만들어야 반영된다).
+  #
+  # 대회 규칙상 **붉은 노면만** 보호구역이고, 붉지 않은 도로는 30 표시가 있어도
+  # 도로 기본 제한(50)이 적용된다. 이 맵의 30 표시는 붉은 포장과 일치하지 않는다 —
+  # 실측 2026-09-05: speed_limit=30 인 386 차로 14,548 m 중 **10,237 m 가 붉지 않다**
+  # (RM_518 이 붙었는데 안 붉은 차로도 81개다. 어느 표시도 프록시가 못 된다).
+  # 그 10 km 에서 27 km/h 로 묶여 완주 제한시간을 넘긴다 — replay 실측으로
+  # 비붉은 30 구간 주행거리의 60.8% 가 캡(25 km/h)에 붙어 있다.
+  #
+  # false = 30 표시를 제한속도로 쓰지 않는다. 그 도로에 다른 표시가 없으면
+  #         speed_limit 이 None 이 되어 런타임 carry 가 앞 값(대개 50)을 물고 간다.
+  #         붉은 구간의 감속은 red_zone(아래) 이 따로 책임진다.
+  # true  = 이전 동작 (30 표시 = 제한속도 30).
+  roadmark_30_as_limit: false
   # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
   a_max: 2.0
   a_min: -6.0
@@ -1335,9 +1377,16 @@ scoring:
   # 제어 정지 목표의 여유: 뒷축이 종료선을 이만큼 넘어 정지하도록 계획한다
   # (kr_rules.plan_stop_s). 채점 기준이 아니다 — 채점은 finish_s 통과 여부만 본다.
   finish_clearance_m: 2.0
-  # 제한속도 severity [km/h]: 초과 ≤allow 감점 없음 / ~major 경미 / >major 중대
+  # 항목 1 (일반 도로 속도 준수) severity [km/h]:
+  #   초과 ≤ allow 감점 없음 / allow~major 경미 / > major 중대
   speed_allow_kph: 1.0
   speed_major_kph: 20.0
+  # 항목 2 (보호구역 = 붉은 노면 속도 준수) severity [km/h]. 규칙이 더 엄하다:
+  #   초과 ≤ 1 허용 / 1 초과 경미 / 5 초과 중대
+  # 판정 구간은 lane_graph 의 red_spans 이고, 채점기가 후륜축 (x,y) 를 직접
+  # 차로에 투영해 독립적으로 본다 (제어기 로그의 school_zone 을 믿지 않는다).
+  speed_school_allow_kph: 1.0
+  speed_school_major_kph: 5.0
   # 대회 7번 적색신호 정지 품질 (detect_red_stop): 앞범퍼가 정지선 앞 stop_ok_m
   # 이내 정지 = 정상 / 그보다 멀면 경미 / 선 넘으면 침범(경미) / 통과는 중대.
   # 정지 판정은 v<score.stop_speed_mps 가 stop_hold_s 이상 지속.
@@ -1379,7 +1428,7 @@ score:
   collision_dist_m: 0.1    # 간격 ≤ 이 값 → 충돌로 집계
   near_dist_m: 1.5         # 간격 ≤ 이 값 → 근접 경고 (충돌 미만)
   stop_speed_mps: 0.5      # "정지 상태" 판정 속도 (정지선 침범 검출)
-  time_limit_s: 300.0      # 대회 완주 제한시간 (5분)
+  time_limit_s: 780.0      # 대회 완주 제한시간 (13분)
   # 초과 구간 병합: 이 시간 이하로 임계 아래로 내려갔다 다시 넘으면 같은 1건
   # (제어기가 임계 바로 밑에서 진동하면 1틱짜리 건이 수백 개로 쪼개진다)
   merge_gap_s: 1.0

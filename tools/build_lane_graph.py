@@ -30,10 +30,11 @@ build_lane_graph.py  ─  xodr(OpenDRIVE) → lane_graph.pkl   (대회 전 1번 
   - RM_518 = 어린이보호구역 속도제한 표시(30)로 가정 → 텍스처 확인 필요
   - 실제 횡단보도 객체는 2개(pelican)뿐. 교차로 횡단보도는 xodr에 없음 → 정지선 뒤 8m를 'inferred' 존으로 표시
 """
-import argparse, math, pickle, sys, time, collections
+import argparse, json, math, os, pickle, sys, time, collections
 import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
+from scipy.spatial import cKDTree
 
 DRIVING = ('driving',)  # 그래프 노드가 되는 lane type
 
@@ -241,6 +242,58 @@ def map_cfg(reload=False):
         except Exception:                            # noqa: BLE001 — 독립 실행 폴백
             _MAP_CFG = (True, 1e-3)
     return _MAP_CFG
+
+
+_RED_CFG = None
+_SPEED_CFG = None
+
+
+def red_zone_cfg(reload=False):
+    """params.yaml red_zone.* — 붉은 노면(감속 구간) 포장 정점 파일과 매핑 상수.
+
+    map_cfg 와 같은 관례로 params 없이도 동작한다 (현장 롤백·최소 환경).
+    """
+    global _RED_CFG
+    if _RED_CFG is None or reload:
+        d = {}
+        try:
+            import pathlib as _pl, sys as _sy
+            _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
+            from vtd_adapter.config import load_params_yaml
+            d = dict(load_params_yaml().get('red_zone') or {})
+        except Exception:                            # noqa: BLE001 — 독립 실행 폴백
+            d = {}
+        _RED_CFG = {
+            'verts_json': str(d.get('verts_json', 'data/red_surface_verts.json')),
+            'k': int(d.get('kd_candidates', 24)),
+            'half_margin_m': float(d.get('half_margin_m', 0.30)),
+            'gap_m': float(d.get('span_gap_m', 3.0)),
+            'min_verts': int(d.get('min_verts', 20)),
+            'min_len_m': float(d.get('min_len_m', 1.0)),
+        }
+    return _RED_CFG
+
+
+def speed_cfg(reload=False):
+    """params.yaml speed.roadmark_30_as_limit — 30 노면표시를 제한속도로 쓸지.
+
+    대회 규칙상 **붉은 노면만** 보호구역이고, 붉지 않은 도로는 30 표시가 있어도
+    도로 기본 제한(50)이 적용된다. 이 맵의 30 표시(roadmark_speed_30 · RM_518)는
+    붉은 포장과 일치하지 않는다 — 실측 2026-09-05: speed_limit=30 인 386 차로
+    14,548 m 중 **10,237 m 가 붉지 않다**. 그래서 기본을 false 로 둔다.
+    true 면 이전 동작(30 표시 = 제한속도 30).
+    """
+    global _SPEED_CFG
+    if _SPEED_CFG is None or reload:
+        try:
+            import pathlib as _pl, sys as _sy
+            _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
+            from vtd_adapter.config import load_params_yaml
+            sc = load_params_yaml().get('speed') or {}
+            _SPEED_CFG = bool(sc.get('roadmark_30_as_limit', False))
+        except Exception:                            # noqa: BLE001 — 독립 실행 폴백
+            _SPEED_CFG = False
+    return _SPEED_CFG
 
 
 def parse_pieces(el, tag, keys=('a', 'b', 'c', 'd'), skey='sOffset'):
@@ -1154,8 +1207,16 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None, synth_stopline=True):
             else:
                 rec['markings'].append((st, nm))
         # 제한속도: 도로+방향 단위 (표시 없으면 None → 런타임에서 이전 값 유지)
+        # speed.roadmark_30_as_limit 이 false 면 **값이 30 인 표시는 제한속도로
+        # 쓰지 않는다** (speed_cfg 주석 참조 — 붉은 포장과 일치하지 않는다).
+        # RM_517_50 같은 다른 값은 그대로다. 이 도로에 30 표시밖에 없으면
+        # speed_by_dir 가 None 이 되어 런타임 carry 가 앞 값(대개 50)을 물고 간다.
+        # speed_marks 원본은 지우지 않는다 — 진단·되돌리기 근거로 남긴다.
+        use30 = speed_cfg()
         road['speed_by_dir'] = {}
         for d, lst in side_speed.items():
+            if not use30:
+                lst = [t for t in lst if t[0] != 30]
             if not lst:
                 road['speed_by_dir'][d] = (None, False, None)
                 continue
@@ -1234,6 +1295,141 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None, synth_stopline=True):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# 5-b. 붉은 노면 (감속 구간) — osgb 텍스처에서 뽑은 월드 정점 → 차로 s 구간
+# ────────────────────────────────────────────────────────────────────────────
+def _seg_project(P, i, x, y):
+    """폴리라인 P 의 i-1·i 두 구간 중 (x,y) 에 가까운 쪽으로 투영.
+
+    반환 (구간 인덱스 j, 구간 내 비율 u, 부호 없는 횡거리). LaneGraph.project 와
+    같은 방식이다 — 여기서 다시 쓰는 이유는 build 시점에 LaneGraph 객체가 아직
+    없어서다 (그래프를 지금 만드는 중이다).
+    """
+    best = None
+    for j in (i - 1, i):
+        if j < 0 or j + 1 >= len(P):
+            continue
+        ax, ay = float(P[j][0]), float(P[j][1])
+        bx, by = float(P[j + 1][0]), float(P[j + 1][1])
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 <= 1e-12:
+            continue
+        u = ((x - ax) * dx + (y - ay) * dy) / L2
+        u = min(1.0, max(0.0, u))
+        px, py = ax + u * dx, ay + u * dy
+        d = math.hypot(x - px, y - py)
+        if best is None or d < best[2]:
+            best = (j, u, d)
+    return best
+
+
+def apply_red_spans(lanes, warnings):
+    """붉은 노면 정점 → rec['red_spans'] = [(s0, s1), …] (주행 s).
+
+    **이것이 감속 구간의 단일 출처다.** 붉은 포장은 xodr 에 없고 osgb 텍스처
+    (StyleSrfBikeway, R131 G59 B59)로만 있어 정점을 미리 뽑아 두었다. 이름은
+    Bikeway 지만 도로 **전폭**을 덮는다 — 실측 2026-09-05: 정점 64,914개의
+    최근접 차로 중심선 거리 p50 1.45 m 로 차로 반폭과 같은 축이고, 98.4% 가
+    차로 폭 안에 든다.
+
+    **차로 단위**로 판정한다. road 2312 는 dir −1 의 lane 2·3·4 만 붉고 반대
+    방향은 아니다 — road 단위로 묶으면 통행방향 하나가 통째로 잘못 감속한다.
+
+    잡음 걸러내기: 인접 차로 끝점에 스치는 정점이 s=0 또는 s=length 에 파편을
+    만든다. 실측으로 실체 124구간 4,252.9 m 대 파편 174개 합 4.2 m 로 1000배
+    갈리므로(min_verts 20 · min_len_m 1.0) 임계 선택에 민감하지 않다.
+
+    기존 `school_zone` bool 은 `bool(red_spans)` 로 남긴다 — 하위호환.
+    파일이 없으면 아무것도 하지 않고 경고만 남긴다 (이전 동작).
+    """
+    cfg = red_zone_cfg()
+    path = cfg['verts_json']
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path)
+    for rec in lanes.values():
+        rec['red_spans'] = []
+    if not os.path.exists(path):
+        warnings.append(f'붉은 노면 정점 파일이 없다: {path} — red_spans 를 만들지 않는다 '
+                        f'(school_zone 은 노면표시 기반 이전 값 유지)')
+        return {'file': path, 'found': False, 'verts': 0, 'lanes': 0, 'spans': 0,
+                'length_m': 0.0, 'dropped_spans': 0, 'dropped_length_m': 0.0}
+    with open(path, encoding='utf-8') as f:
+        V = json.load(f).get('verts') or []
+    if not V:
+        warnings.append(f'붉은 노면 정점 파일이 비어 있다: {path}')
+        return {'file': path, 'found': True, 'verts': 0, 'lanes': 0, 'spans': 0,
+                'length_m': 0.0, 'dropped_spans': 0, 'dropped_length_m': 0.0}
+    V = np.asarray(V, dtype=float)
+
+    keys = list(lanes.keys())
+    idx_of = {k: i for i, k in enumerate(keys)}
+    P, LI, PI = [], [], []
+    for k in keys:
+        pts = lanes[k]['pts']
+        P.append(pts[:, :2])
+        LI.append(np.full(len(pts), idx_of[k], dtype=np.int32))
+        PI.append(np.arange(len(pts), dtype=np.int32))
+    kd_pts = np.concatenate(P)
+    kd_lane = np.concatenate(LI)
+    kd_i = np.concatenate(PI)
+    tree = cKDTree(kd_pts)
+    _d, nn = tree.query(V, k=cfg['k'], workers=-1)
+
+    hit = {}
+    for vi in range(len(V)):
+        x, y = V[vi]
+        seen = set()
+        for i in np.atleast_1d(nn[vi]):
+            i = int(i)
+            if i >= len(kd_lane):
+                continue
+            key = keys[kd_lane[i]]
+            if key in seen:
+                continue
+            seen.add(key)
+            rec = lanes[key]
+            pr = _seg_project(rec['pts'], int(kd_i[i]), x, y)
+            if pr is None:
+                continue
+            j, u, d = pr
+            sv = float(rec['s'][j] + u * (rec['s'][j + 1] - rec['s'][j]))
+            hw = 0.5 * float(np.interp(sv, rec['s'], rec['width']))
+            if d <= hw + cfg['half_margin_m'] and 0.0 <= sv <= rec['length']:
+                hit.setdefault(key, []).append(sv)
+
+    n_span = n_drop = 0
+    len_span = len_drop = 0.0
+    for key, ss in hit.items():
+        ss = np.sort(np.asarray(ss))
+        runs, a, b = [], ss[0], ss[0]
+        for v in ss[1:]:
+            if v - b > cfg['gap_m']:
+                runs.append((a, b)); a = v
+            b = v
+        runs.append((a, b))
+        keep = []
+        for s0, s1 in runs:
+            n = int(((ss >= s0) & (ss <= s1)).sum())
+            if n < cfg['min_verts'] or (s1 - s0) < cfg['min_len_m']:
+                n_drop += 1; len_drop += float(s1 - s0)
+                continue
+            # 차로 길이를 넘지 않게 클램프 — round(,3) 이 length 를 5e-4 만큼
+            # 넘길 수 있고, 소비자(제어기·채점기)는 s ≤ length 를 전제한다.
+            keep.append((max(0.0, round(float(s0), 3)),
+                         min(float(lanes[key]['length']), round(float(s1), 3))))
+            n_span += 1; len_span += float(s1 - s0)
+        lanes[key]['red_spans'] = keep
+
+    for rec in lanes.values():
+        rec['school_zone'] = bool(rec['red_spans'])
+
+    n_lanes = sum(1 for r in lanes.values() if r['red_spans'])
+    return {'file': path, 'found': True, 'verts': int(len(V)), 'lanes': n_lanes,
+            'spans': n_span, 'length_m': round(len_span, 1),
+            'dropped_spans': n_drop, 'dropped_length_m': round(len_drop, 2)}
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # 6. 메인
 # ────────────────────────────────────────────────────────────────────────────
 def build(xodr_path, ds=0.5, synth_stopline=True):
@@ -1297,6 +1493,14 @@ def build(xodr_path, ds=0.5, synth_stopline=True):
                                                   'controller_ids': sig2ctrl.get(sg['id'], [])})
             e['lanes'].append(k)
 
+    # 붉은 노면 (감속 구간) — 노면표시가 아니라 **포장 정점**이 단일 출처다.
+    # 반드시 제한속도 부여 뒤에 온다: school_zone 을 red_spans 로 덮어쓴다.
+    red_stats = apply_red_spans(lanes, warnings)
+    print(f"[red  ] verts={red_stats['verts']} lanes={red_stats['lanes']} "
+          f"spans={red_stats['spans']} len={red_stats['length_m']:.1f}m "
+          f"(파편 {red_stats['dropped_spans']}개 {red_stats['dropped_length_m']:.1f}m 제외)"
+          if red_stats['found'] else f"[red  ] 정점 파일 없음 — {red_stats['file']}")
+
     # 통계
     dead = [k for k, r in lanes.items() if not r['next']]
     heads = [k for k, r in lanes.items() if not r['prev']]
@@ -1310,7 +1514,9 @@ def build(xodr_path, ds=0.5, synth_stopline=True):
             'assumptions': [
                 'signal side: validity > hOffset(0:+s lanes<0, pi:-s lanes>0) > t sign',
                 'speed limit from road-marking objects, per road & direction; None → runtime carries previous value',
-                'RM_518 assumed school-zone 30 (verify texture)',
+                'school_zone comes from red_surface_verts.json (red pavement), NOT RM_518',
+                'roadmark 30 marks (roadmark_speed_30 / RM_518) are ignored as speed limit '
+                'unless speed.roadmark_30_as_limit',
                 'crosswalk zones after stop lines are INFERRED (8 m); only 2 real crosswalk objects (pelican)',
                 'left_mark = mark toward road center, right_mark = outer mark (driver frame, both lane sides)',
                 '9910 light_id == xodr <controller> id (NOT signal id); stop_lines carry controller_ids',
@@ -1327,6 +1533,9 @@ def build(xodr_path, ds=0.5, synth_stopline=True):
             # --no-synth-stopline 으로 끄면 이전 동작(정지선 없음)으로 돌아간다.
             'stop_synthesized': synths,
             'stop_synth_enabled': bool(synth_stopline),
+            # 붉은 노면 (감속 구간) 반영 내역 — 파일 유무·건수·길이를 산출물에 남긴다.
+            'red_zone': red_stats,
+            'roadmark_30_as_limit': bool(speed_cfg()),
             'stop_repaired': so.get('stop_repaired', 0),
             'stop_repair_undecided': so.get('stop_repair_undecided', 0),
             'lanes_signal_no_stopline': so.get('lanes_signal_no_stopline', 0),

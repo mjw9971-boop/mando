@@ -1,0 +1,181 @@
+"""붉은 노면 = 감속(보호) 구간 — lane_graph red_spans 와 채점기 독립 판정.
+
+대회 규칙상 **붉은 노면만** 보호구역(항목 2)이고, 붉지 않은 도로는 30 표시가
+있어도 도로 기본 제한(50)이 적용된다. 붉은 포장은 xodr 에 없고 osgb 텍스처로만
+있어 월드 정점(data/red_surface_verts.json)을 뽑아 두었다.
+
+여기서 지키는 계약:
+  1. red_spans 는 **차로 단위**다 — road 2312 는 dir −1 만 붉다. road 단위로
+     묶으면 통행방향 하나가 통째로 잘못 감속한다.
+  2. school_zone bool 은 bool(red_spans) 로 남는다 (하위호환).
+  3. 30 노면표시는 speed.roadmark_30_as_limit 이 false 면 제한속도가 아니다.
+     RM_517_50 같은 다른 값은 그대로다.
+  4. 채점기는 lane_graph 를 **직접** 읽는다 — 제어기 로그의 world.speed_limit /
+     school_zone 을 판정에 쓰면 제어기가 구간을 놓칠 때 같이 놓친다.
+  5. 항목 1 과 항목 2 의 severity 임계가 다르다.
+"""
+import pathlib
+import sys
+
+import pytest
+
+from conftest import PARAMS_YAML, mk_tick
+from vtd_adapter.config import load_params_yaml
+from vtd_adapter.lanegraph import LaneGraph
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'tools'))
+
+import score as SC                                             # noqa: E402
+
+CFG = load_params_yaml(PARAMS_YAML)
+GRAPH = ROOT / 'data' / 'lane_graph.pkl'
+
+
+@pytest.fixture(scope='module')
+def lg():
+    if not GRAPH.exists():
+        pytest.skip('data/lane_graph.pkl 없음')
+    return LaneGraph(str(GRAPH))
+
+
+# ── params ──────────────────────────────────────────────────────────────
+def test_params_present():
+    rz = CFG['red_zone']
+    assert rz['verts_json'] == 'data/red_surface_verts.json'
+    assert float(rz['limit_kph']) == 30.0
+    assert float(rz['boundary_margin_m']) == 2.0
+    assert CFG['speed']['roadmark_30_as_limit'] is False
+
+
+def test_scoring_thresholds_split_by_item():
+    """항목 1(일반)과 항목 2(보호구역)의 임계가 분리돼 있다."""
+    sc = CFG['scoring']
+    assert (float(sc['speed_allow_kph']), float(sc['speed_major_kph'])) == (1.0, 20.0)
+    assert (float(sc['speed_school_allow_kph']), float(sc['speed_school_major_kph'])) == (1.0, 5.0)
+
+
+def test_time_limit_is_13_minutes():
+    assert float(CFG['score']['time_limit_s']) == 780.0
+
+
+# ── lane_graph ──────────────────────────────────────────────────────────
+def test_red_spans_field_exists(lg):
+    assert all('red_spans' in r for r in lg.lanes.values())
+
+
+def test_school_zone_is_derived_from_red_spans(lg):
+    for r in lg.lanes.values():
+        assert r['school_zone'] == bool(r['red_spans'])
+
+
+def test_red_spans_are_within_lane(lg):
+    for k, r in lg.lanes.items():
+        for s0, s1 in r['red_spans']:
+            assert 0.0 <= s0 < s1 <= r['length'] + 1e-6, (k, s0, s1, r['length'])
+
+
+def test_road_2312_is_one_direction_only(lg):
+    """편도만 붉은 실측 — dir −1 (lane 2·3·4) 만 붉고 반대는 아니다."""
+    plus = [k for k in lg.lanes if k[0] == 2312 and lg.lanes[k]['dir'] == 1]
+    minus_red = [k for k in lg.lanes if k[0] == 2312 and lg.lanes[k]['dir'] == -1
+                 and lg.lanes[k]['red_spans']]
+    assert plus, '도로 2312 에 dir=+1 차로가 있어야 이 테스트가 유효하다'
+    assert not [k for k in plus if lg.lanes[k]['red_spans']], \
+        '반대 방향(dir=+1)에 red_spans 가 붙었다 — road 단위로 묶인 것이다'
+    assert minus_red, 'dir=−1 쪽은 붉어야 한다'
+    assert all(k[2] > 0 for k in minus_red)
+
+
+def test_roadmark_30_is_not_a_speed_limit(lg):
+    """30 표시는 제한속도로 쓰지 않는다. 50 표시는 그대로다."""
+    assert not [k for k, r in lg.lanes.items() if r['speed_limit'] == 30]
+    assert [k for k, r in lg.lanes.items() if r['speed_limit'] == 50]
+
+
+def test_red_lanes_with_no_speed_limit_are_still_covered(lg):
+    """붉은데 speed_limit 이 None 인 차로가 있다 — 감속은 red_spans 가 책임진다.
+
+    실측 2026-09-05: 옛 그래프에서 그런 차로가 23개(742 m)였고, 그 구간은
+    carry 로 앞 도로 값(대개 50)을 물고 지나갔다.
+    """
+    red_none = [k for k, r in lg.lanes.items() if r['red_spans'] and r['speed_limit'] is None]
+    assert red_none, '이 맵에 그런 차로가 있어야 이 테스트가 유효하다'
+    assert all(lg.lanes[k]['school_zone'] for k in red_none)
+
+
+# ── 채점기 독립 판정 ────────────────────────────────────────────────────
+def _red_sample(lg):
+    """붉은 구간 하나를 골라 (lane_key, s0, s1, 중간점 xy, yaw) 를 준다."""
+    import numpy as np
+    for k, r in sorted(lg.lanes.items()):
+        for s0, s1 in r['red_spans']:
+            if s1 - s0 < 20.0:
+                continue
+            sm = 0.5 * (s0 + s1)
+            x, y, _z, h = lg.point_at(k, sm)
+            return k, s0, s1, float(x), float(y), float(h)
+    pytest.skip('20 m 넘는 붉은 구간이 없다')
+
+
+def test_speed_context_reads_red_span_from_graph(lg):
+    """붉은 구간 한복판에서 limit 이 red_zone.limit_kph 로 잡힌다.
+
+    로그에는 **일부러 틀린 값**(50 / school False)을 넣는다 — 채점기가 로그를
+    안 보고 lane_graph 를 본다는 것이 이 테스트의 요지다.
+    """
+    k, _s0, _s1, x, y, h = _red_sample(lg)
+    ticks = [mk_tick(t=0.0, x=x, y=y, yaw=h, speed=12.0, speed_limit=50 / 3.6, school_zone=False)]
+    ctx = SC.speed_context(ticks, lg, CFG)
+    assert ctx[0]['red'] is True
+    assert ctx[0]['limit_kph'] == round(float(CFG['red_zone']['limit_kph']))
+    assert ctx[0]['src'] == 'graph'
+    # 로그값은 진단으로 남는다
+    assert ctx[0]['log_limit_kph'] == 50
+    assert ctx[0]['log_school_zone'] is False
+
+
+def test_speed_context_falls_back_to_log_without_graph(lg):
+    ticks = [mk_tick(speed=10.0, speed_limit=30 / 3.6, school_zone=True)]
+    ctx = SC.speed_context(ticks, None, CFG)
+    assert ctx[0] == {'limit_kph': 30, 'red': True, 'lane': None, 's': None,
+                      'log_limit_kph': 30, 'log_school_zone': True, 'src': 'log'}
+
+
+def test_speed_context_carries_previous_limit(lg):
+    """speed_limit 이 None 인 차로는 직전 값을 유지한다 (ego.py 와 같은 규칙)."""
+    none_lane = next((k for k, r in lg.lanes.items()
+                      if r['speed_limit'] is None and not r['red_spans']), None)
+    lim_lane = next((k for k, r in lg.lanes.items() if r['speed_limit'] == 50), None)
+    assert none_lane and lim_lane
+    def xy(k, s):
+        x, y, _z, h = lg.point_at(k, s)
+        return float(x), float(y), float(h)
+    x1, y1, h1 = xy(lim_lane, 0.5 * lg.length(lim_lane))
+    x2, y2, h2 = xy(none_lane, 0.5 * lg.length(none_lane))
+    ctx = SC.speed_context([mk_tick(x=x1, y=y1, yaw=h1), mk_tick(x=x2, y=y2, yaw=h2)], lg, CFG)
+    assert ctx[0]['limit_kph'] == 50
+    assert ctx[1]['limit_kph'] == 50, 'carry 가 끊겼다'
+
+
+# ── severity ────────────────────────────────────────────────────────────
+def _sev(over, school):
+    return SC._severity('speed', {'max_over_kph': over, 'school_zone': school}, CFG['scoring'])
+
+
+def test_severity_item1_thresholds():
+    assert _sev(1.0, False) == 'none'
+    assert _sev(1.01, False) == 'minor'
+    assert _sev(20.0, False) == 'minor'
+    assert _sev(20.01, False) == 'major'
+
+
+def test_severity_item2_is_stricter():
+    """보호구역은 1 초과 경미 / 5 초과 중대."""
+    assert _sev(1.0, True) == 'none'
+    assert _sev(1.01, True) == 'minor'
+    assert _sev(5.0, True) == 'minor'
+    assert _sev(5.01, True) == 'major'
+    # 같은 초과량이 항목 1 에서는 경미, 항목 2 에서는 중대
+    assert _sev(11.0, False) == 'minor'
+    assert _sev(11.0, True) == 'major'

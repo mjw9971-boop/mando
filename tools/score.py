@@ -16,7 +16,11 @@ run_*.jsonl 을 **직접** 읽는다 (summarize_run 출력에 의존하지 않�
 독립). lane_graph/route/params 는 차로폭·완주 판정·임계에 쓴다.
 
 검출 항목 (각각 위반 횟수 + 구간(route_s·틱 범위) + 정도):
-  speed              법규 제한속도 초과 (구간별 50/30/스쿨존 구분, 연속 틱 = 1건)
+  speed              법규 제한속도 초과 (구간별 50/보호구역 구분, 연속 틱 = 1건).
+                     제한속도·보호구역은 **lane_graph 에서 직접** 읽는다
+                     (speed_context) — 제어기 로그의 world.speed_limit /
+                     school_zone 은 진단으로만 남는다. 로그값을 판정에 쓰면
+                     제어기가 구간을 놓칠 때 채점기도 같이 놓쳐 자기충족이 된다.
   speed_margin       [정보] params speed.margin_kph 여유 침범 — 위반 아님
   lane_departure     |t_off| > 차로폭/2 − 차체폭/2 (계획된 차선변경 창·테이퍼 차로 제외)
   solid_lane_change  실선(left_solid/right_solid) 구간에서의 차로 변경
@@ -73,6 +77,8 @@ SCORING_ITEM = {'stop_line_encroach': 'red_light', 'red_stop_far': 'red_light'}
 # 대회 안내문 평가항목 (번호, 채점 item 키, 한글명). key None = 미구현(검출기 없음).
 # · 1/2: speed 검출은 하나지만 항목은 둘 — _item_of 가 이벤트의 school_zone 으로
 #   가른다 ((항목)당 1회 규칙이 안내문 항목 단위로 적용되도록).
+#   school_zone 은 lane_graph 의 red_spans(붉은 노면 포장) 이고, severity 임계도
+#   항목별로 다르다 (scoring.speed_school_* 참조).
 # · 11: 충돌은 "장애물 대응" 단일 항목. 항목 14(도로 이용자 충돌)는 채점에서
 #   제거 — objects[] 인터페이스에 종류 필드가 없어 차량·장애물 구분이 불가하고,
 #   단일 항목이면 같은 접촉의 중복 감점이 원천 차단된다 (2026-08-28 결정).
@@ -177,21 +183,95 @@ def _ev(ticks: list[dict], t0: float, i0: int, i1: int, **extra) -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 # 1. 속도 초과 (+ 여유 침범 정보)
 # ══════════════════════════════════════════════════════════════════════════
+def speed_context(ticks: list[dict], lg, cfg: dict) -> list[dict]:
+    """틱마다 (제한속도, 보호구역 여부) 를 **lane_graph 에서 직접** 판정한다.
+
+    2026-09-05 이전에는 `t['world']['speed_limit']` · `t['world']['school_zone']`
+    을 그대로 읽었다. 그건 **제어기가 로그에 쓴 자기 판단**이라, 제어기가 차로를
+    잘못 잡거나 구간을 놓쳐도 채점기가 같이 놓친다 — 항목 1·2 무위반이 자기충족이
+    된다. 이제 채점기가 후륜축 (x,y) 를 직접 차로에 투영해 스스로 본다.
+    (ego x/y 는 뒷축이다 — AGENT_SPEC §1.3. 대회 규칙의 "뒷바퀴 축 기준" 과 같은 축.)
+
+    두 값의 출처가 다르다:
+      · 보호구역 = `lane_graph` 의 `red_spans` (붉은 노면 포장 정점이 단일 출처).
+        구간 안이면 제한속도는 `red_zone.limit_kph`.
+      · 그 밖 = 차로의 `speed_limit`. None 인 차로는 **직전 값 유지(carry)** 이고
+        carry 할 값도 없으면 `default_speed_kph` — ego.py `_resolve_speed_limit`
+        와 **같은 규칙**이다. 규칙까지 다르면 비교가 성립하지 않는다.
+        (출처가 독립일 뿐 규칙은 같다. 이 함수가 잡는 것은 제어기의 차로 매칭·
+         구간 판정 오류이지, carry 규칙 자체의 오류가 아니다.)
+
+    구간 이탈 쪽으로 `red_zone.boundary_margin_m` 만큼 **넓혀서** 본다 — 정점
+    매핑 오차(최근접 거리 p95 1.72 m)와 차로 매칭 흔들림 때문에 경계에서
+    빠져나가는 순간의 초과를 놓치지 않으려는 보수적 방향이다.
+
+    lane_graph 가 없으면 옛 동작(로그값)으로 폴백한다.
+    """
+    rz = cfg.get('red_zone') or {}
+    red_lim = float(rz.get('limit_kph', 30.0))
+    bmar = float(rz.get('boundary_margin_m', 2.0))
+    default_kph = float(cfg.get('default_speed_kph', 50.0))
+    out: list[dict] = []
+    carry = None
+    for t in ticks:
+        w = t.get('world') or {}
+        log_lim = round((w.get('speed_limit') or 0) * 3.6)
+        log_sz = bool(w.get('school_zone'))
+        if lg is None:
+            out.append({'limit_kph': log_lim, 'red': log_sz, 'lane': None, 's': None,
+                        'log_limit_kph': log_lim, 'log_school_zone': log_sz,
+                        'src': 'log'})
+            continue
+        e = t.get('ego') or {}
+        m = None
+        try:
+            m = lg.locate(float(e['x']), float(e['y']), float(e.get('yaw') or 0.0))
+        except Exception:                                  # noqa: BLE001
+            m = None
+        if m is None:
+            # 차로 밖(리스폰·이탈) — carry 를 유지하고 보호구역이 아니라고 본다.
+            kph = carry if carry is not None else default_kph
+            out.append({'limit_kph': round(kph), 'red': False, 'lane': None, 's': None,
+                        'log_limit_kph': log_lim, 'log_school_zone': log_sz,
+                        'src': 'nolane'})
+            continue
+        rec = lg.lanes[m.lane]
+        red = any(s0 - 0.0 <= m.s <= s1 + bmar for s0, s1 in (rec.get('red_spans') or []))
+        v = rec.get('speed_limit')
+        if v is not None:
+            carry = float(v)
+        if red:
+            kph = red_lim
+        else:
+            kph = carry if carry is not None else default_kph
+        out.append({'limit_kph': round(kph), 'red': red, 'lane': tuple(m.lane),
+                    's': round(float(m.s), 2),
+                    'log_limit_kph': log_lim, 'log_school_zone': log_sz,
+                    'src': 'graph'})
+    return out
+
+
 def detect_speed(ticks: list[dict], t0: float, margin_kph: float,
-                 merge_gap_s: float = 0.0) -> tuple[list, list, dict]:
+                 merge_gap_s: float = 0.0, ctx: list[dict] | None = None) -> tuple[list, list, dict]:
     """
     위반 기준은 **법규 제한속도 자체**다. params 의 speed.margin_kph 는 우리가
     스스로 둔 여유이므로 그걸 넘어도 위반이 아니다 — '여유 침범' 정보로만 센다.
     연속 초과 틱은 1건. 임계 바로 밑에서 진동하면 1틱짜리로 쪼개지므로,
     merge_gap_s 이하로 잠깐 내려갔다 다시 넘는 것도 같은 1건으로 병합한다.
-    제한속도 구간(50/30/스쿨존)이 바뀌면 건을 끊는다.
+    제한속도 구간(50/30/보호구역)이 바뀌면 건을 끊는다.
+
+    ctx: speed_context() 결과. 없으면 옛 동작(로그값)으로 폴백한다.
     """
-    def key(t):
-        return (round((t['world']['speed_limit'] or 0) * 3.6), bool(t['world']['school_zone']))
+    if ctx is None:
+        ctx = [{'limit_kph': round((t['world']['speed_limit'] or 0) * 3.6),
+                'red': bool(t['world']['school_zone']),
+                'log_limit_kph': round((t['world']['speed_limit'] or 0) * 3.6),
+                'log_school_zone': bool(t['world']['school_zone']), 'src': 'log'}
+               for t in ticks]
 
     over_mask, tight_mask, groups = [], [], {}
-    for t in ticks:
-        lim, sz = key(t)
+    for t, c in zip(ticks, ctx):
+        lim, sz = c['limit_kph'], c['red']
         v = t['ego']['speed'] * 3.6
         g = groups.setdefault((lim, sz), {'ticks': 0, 'over_ticks': 0, 'max_over': 0.0, 'v_max': 0.0})
         g['ticks'] += 1
@@ -217,8 +297,14 @@ def detect_speed(ticks: list[dict], t0: float, margin_kph: float,
         for i0, i1, (lim, sz) in merged:
             worst = max(range(i0, i1 + 1), key=lambda i: ticks[i]['ego']['speed'])
             v = ticks[worst]['ego']['speed'] * 3.6
+            cw = ctx[worst]
             out.append(_ev(ticks, t0, i0, i1, limit_kph=lim, school_zone=sz,
-                           max_kph=round(v, 1), max_over_kph=round(v - lim, 2)))
+                           max_kph=round(v, 1), max_over_kph=round(v - lim, 2),
+                           # 제어기가 그 틱에 믿고 있던 값 — 진단용이다. 판정에는 안 쓴다.
+                           log_limit_kph=cw.get('log_limit_kph'),
+                           log_school_zone=cw.get('log_school_zone'),
+                           lane=list(cw['lane']) if cw.get('lane') else None,
+                           lane_s=cw.get('s'), src=cw.get('src')))
         return out
 
     return events(over_mask), events(tight_mask), groups
@@ -1193,7 +1279,9 @@ def resolve_finish_xy(cfg: dict, route) -> list | None:
 def _severity(cat: str, ev: dict, sc: dict) -> str:
     """이벤트 → 'minor' | 'major' | 'none' (안내문 매핑, 작업3).
 
-    · speed: 초과 ≤ speed_allow_kph 감점 없음 / ~speed_major_kph 경미 / 초과 중대
+    · speed: 초과 ≤ allow 감점 없음 / ~major 경미 / 초과 중대.
+      항목 1(일반 도로)은 speed_allow_kph / speed_major_kph,
+      항목 2(보호구역=붉은 노면)는 speed_school_allow_kph / speed_school_major_kph.
     · lane_departure / solid_lane_change: 건당 경미 — 구간 내 2회 이상이면
       score_run 이 중대로 심화 (COUNT_ESCALATE)
     · red_light(정지선 통과·무정차): 중대.  stop_line_encroach(정지는 했으나
@@ -1204,9 +1292,17 @@ def _severity(cat: str, ev: dict, sc: dict) -> str:
     """
     if cat == 'speed':
         over = float(ev.get('max_over_kph', 0.0))
-        if over <= float(sc['speed_allow_kph']):
+        # 항목 1(일반)과 항목 2(보호구역)는 임계가 다르다 — 보호구역이 훨씬 엄하다
+        # (1 초과 경미 / 5 초과 중대 대 1 초과 경미 / 20 초과 중대).
+        if ev.get('school_zone'):
+            allow = float(sc['speed_school_allow_kph'])
+            major = float(sc['speed_school_major_kph'])
+        else:
+            allow = float(sc['speed_allow_kph'])
+            major = float(sc['speed_major_kph'])
+        if over <= allow:
             return 'none'
-        return 'major' if over > float(sc['speed_major_kph']) else 'minor'
+        return 'major' if over > major else 'minor'
     if cat in COUNT_ESCALATE:
         return 'minor'
     if cat == 'turn_signal':
@@ -1333,12 +1429,29 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     margin_kph = float(cfg['speed']['margin_kph'])
     V = rep['violations']
 
+    # 속도 판정 맥락 — lane_graph 를 직접 읽는다 (제어기 로그값은 진단으로만).
+    sp_ctx = speed_context(span, lg, cfg)
+    if lg is None:
+        rep['warnings'].append('lane_graph 없음 — 속도 판정이 제어기 로그값 폴백이다 '
+                               '(항목 1·2 가 독립 판정이 아니다)')
     over, tight, groups = detect_speed(span, t0, margin_kph,
-                                       float(cfg['score'].get('merge_gap_s', 0.0)))
+                                       float(cfg['score'].get('merge_gap_s', 0.0)),
+                                       ctx=sp_ctx)
     V['speed'] = {'count': len(over), 'events': over}
     V['speed_margin'] = {'count': len(tight), 'events': tight}
-    rep['speed_groups'] = {f'{lim}{"/스쿨존" if sz else ""}': g
+    rep['speed_groups'] = {f'{lim}{"/보호구역" if sz else ""}': g
                            for (lim, sz), g in sorted(groups.items())}
+    # 독립 판정과 제어기 로그값이 갈린 틱 — 제어기의 차로 매칭·구간 판정 오류가
+    # 여기 쌓인다. 판정에는 쓰지 않고 리포트에만 남긴다.
+    mm_lim = sum(1 for c in sp_ctx if c['limit_kph'] != c.get('log_limit_kph'))
+    mm_sz = sum(1 for c in sp_ctx if bool(c['red']) != bool(c.get('log_school_zone')))
+    rep['speed_source'] = {
+        'basis': 'lane_graph' if lg is not None else 'log',
+        'ticks': len(sp_ctx),
+        'limit_mismatch_ticks': mm_lim,
+        'red_mismatch_ticks': mm_sz,
+        'nolane_ticks': sum(1 for c in sp_ctx if c.get('src') == 'nolane'),
+    }
 
     if lg is not None:
         V['lane_departure'] = {'count': 0, 'events': detect_lane_departure(
@@ -1468,7 +1581,7 @@ LABEL = {
 }
 
 _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
-    'speed': ('limit_kph', 'school_zone', 'max_kph', 'max_over_kph'),
+    'speed': ('limit_kph', 'school_zone', 'max_kph', 'max_over_kph', 'log_limit_kph'),
     'speed_margin': ('limit_kph', 'school_zone', 'max_kph'),
     'lane_departure': ('lane', 'max_t_off', 'exceed_m'),
     'solid_lane_change': ('side', 'from_lane', 'to_lane', 'n_crossings'),
