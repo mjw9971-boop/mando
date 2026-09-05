@@ -171,11 +171,18 @@ def test_official_route_sets(lg, field_on):
 def test_empty_pair_set_means_banned_connector(lg, field_on):
     """target='pair' 인데 빈 집합 = 통행 금지 연결로뿐이라는 뜻이다.
 
-    waypoints.csv 는 R 5.43 m / R 4.52 m 연결로를 지난다(회전 불가 기하).
+    픽스처는 R 5.43 m / R 4.52 m 연결로를 지난다(회전 불가 기하).
     turn_connect 에 banned 가 들어가므로 유효 진입 차로가 0 이 되고, 경로는
     대안이 없어 그대로 통과한다 — 그 사실은 infeasible_forced 에 남는다.
+
+    **저장소 루트의 `waypoints.csv` 를 쓰지 않는다** (2026-09-05). 그 파일은
+    커밋 883382d "루트 생성" 에서 경유점 32개 → 10개로 통째로 교체되어 이 전제
+    (빈 집합이 있는 경로)가 사라졌다. 아래 `assert empty` 가 그 사실을 잡아
+    실패하고 있었다 — 테스트도 코드도 아닌 **픽스처가 움직인 것**이다.
+    그래서 옛 내용을 `tests/fixtures/waypoints_pair_banned.csv` 로 보존하고
+    그쪽을 본다. 루트 CSV 는 연습 경로라 앞으로도 바뀐다.
     """
-    csv = 'waypoints.csv'
+    csv = 'tests/fixtures/waypoints_pair_banned.csv'
     if not (ROOT / csv).exists():
         pytest.skip('없음')
     rt = _build(lg, csv)
