@@ -134,7 +134,7 @@ speed:
   # (회랑 밖 ∧ 멀어짐 ∧ (멈춤 ∨ 차도 밖) 연속 ped_release_s, backstop 포함).
   # 회랑 밖 의도 래치의 접근 프로파일은 바꾸지 않는다. reasons.ped 에 평가된
   # 보행자 전부(all)와 홀드 id(hold)를 남긴다. false = 이전 동작.
-  ped_multi_enable: false
+  ped_multi_enable: true
   # 관측 드롭아웃 coast [s] — 이 시간 안의 미관측은 이탈이 아니다(직전 기여 유지).
   # 만료 + 재관측 없음 → 해제. release(ped_release_s)는 관측된 틱에서만, coast 는
   # 미관측 틱에서만 세므로 둘은 합산되지 않는다. ped_multi_enable 일 때만 의미.
