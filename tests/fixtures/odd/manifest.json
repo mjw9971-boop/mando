@@ -1,0 +1,1439 @@
+[
+ {
+  "sample": "data-official_route__B.csv",
+  "path": "tests/fixtures/odd/data-official_route__B.csv",
+  "source": "data/official_route.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2,
+   4
+  ]
+ },
+ {
+  "sample": "data-official_route__C.csv",
+  "path": "tests/fixtures/odd/data-official_route__C.csv",
+  "source": "data/official_route.csv",
+  "kind": "C",
+  "dropped_index": 7,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3,
+   5
+  ]
+ },
+ {
+  "sample": "data-official_route__D1.csv",
+  "path": "tests/fixtures/odd/data-official_route__D1.csv",
+  "source": "data/official_route.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "data-official_route__D2.csv",
+  "path": "tests/fixtures/odd/data-official_route__D2.csv",
+  "source": "data/official_route.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "data-official_route__D6.csv",
+  "path": "tests/fixtures/odd/data-official_route__D6.csv",
+  "source": "data/official_route.csv",
+  "kind": "D",
+  "dropped_index": 6,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_01_좌회전2__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_01_좌회전2__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_01_좌회전2.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_01_좌회전2__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_01_좌회전2__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_01_좌회전2.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_01_좌회전2__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_01_좌회전2__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_01_좌회전2.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_01_좌회전2__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_01_좌회전2__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_01_좌회전2.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_01_좌회전2__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_01_좌회전2__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_01_좌회전2.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_02_직진3__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_02_직진3__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_02_직진3.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_02_직진3__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_02_직진3__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_02_직진3.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_02_직진3__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_02_직진3__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_02_직진3.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_02_직진3__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_02_직진3__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_02_직진3.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_02_직진3__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_02_직진3__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_02_직진3.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_03_우회전5__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_03_우회전5__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_03_우회전5.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_03_우회전5__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_03_우회전5__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_03_우회전5.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_03_우회전5__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_03_우회전5__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_03_우회전5.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_03_우회전5__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_03_우회전5__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_03_우회전5.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_03_우회전5__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_03_우회전5__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_03_우회전5.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_04_좌회전6__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_04_좌회전6__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_04_좌회전6.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_04_좌회전6__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_04_좌회전6__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_04_좌회전6.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_04_좌회전6__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_04_좌회전6__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_04_좌회전6.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_04_좌회전6__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_04_좌회전6__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_04_좌회전6.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_04_좌회전6__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_04_좌회전6__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_04_좌회전6.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_05_좌회전7__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_05_좌회전7__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_05_좌회전7.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_05_좌회전7__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_05_좌회전7__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_05_좌회전7.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_05_좌회전7__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_05_좌회전7__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_05_좌회전7.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_05_좌회전7__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_05_좌회전7__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_05_좌회전7.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_05_좌회전7__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_05_좌회전7__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_05_좌회전7.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_07_직진10__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_07_직진10__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_07_직진10.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_07_직진10__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_07_직진10__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_07_직진10.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_07_직진10__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_07_직진10__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_07_직진10.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_07_직진10__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_07_직진10__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_07_직진10.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_07_직진10__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_07_직진10__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_07_직진10.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_08_직진11__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_08_직진11__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_08_직진11.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_08_직진11__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_08_직진11__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_08_직진11.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_08_직진11__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_08_직진11__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_08_직진11.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_08_직진11__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_08_직진11__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_08_직진11.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_08_직진11__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_08_직진11__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_08_직진11.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_09_직진12__B.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_09_직진12__B.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_09_직진12.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_09_직진12__C.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_09_직진12__C.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_09_직진12.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_09_직진12__D1.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_09_직진12__D1.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_09_직진12.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_09_직진12__D2.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_09_직진12__D2.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_09_직진12.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "정적회피집중-정적회피집중_09_직진12__D4.csv",
+  "path": "tests/fixtures/odd/정적회피집중-정적회피집중_09_직진12__D4.csv",
+  "source": "scenarios/정적회피집중/정적회피집중_09_직진12.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_01_직진__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_01_직진__B.csv",
+  "source": "scenarios/추월집중/추월집중_01_직진.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_01_직진__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_01_직진__C.csv",
+  "source": "scenarios/추월집중/추월집중_01_직진.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_01_직진__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_01_직진__D1.csv",
+  "source": "scenarios/추월집중/추월집중_01_직진.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_01_직진__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_01_직진__D2.csv",
+  "source": "scenarios/추월집중/추월집중_01_직진.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_01_직진__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_01_직진__D4.csv",
+  "source": "scenarios/추월집중/추월집중_01_직진.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_02_직진2__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_02_직진2__B.csv",
+  "source": "scenarios/추월집중/추월집중_02_직진2.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_02_직진2__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_02_직진2__C.csv",
+  "source": "scenarios/추월집중/추월집중_02_직진2.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_02_직진2__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_02_직진2__D1.csv",
+  "source": "scenarios/추월집중/추월집중_02_직진2.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_02_직진2__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_02_직진2__D2.csv",
+  "source": "scenarios/추월집중/추월집중_02_직진2.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_02_직진2__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_02_직진2__D4.csv",
+  "source": "scenarios/추월집중/추월집중_02_직진2.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_03_직진3__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_03_직진3__B.csv",
+  "source": "scenarios/추월집중/추월집중_03_직진3.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_03_직진3__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_03_직진3__C.csv",
+  "source": "scenarios/추월집중/추월집중_03_직진3.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_03_직진3__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_03_직진3__D1.csv",
+  "source": "scenarios/추월집중/추월집중_03_직진3.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_03_직진3__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_03_직진3__D2.csv",
+  "source": "scenarios/추월집중/추월집중_03_직진3.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_03_직진3__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_03_직진3__D4.csv",
+  "source": "scenarios/추월집중/추월집중_03_직진3.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_04_직진5__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_04_직진5__B.csv",
+  "source": "scenarios/추월집중/추월집중_04_직진5.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_04_직진5__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_04_직진5__C.csv",
+  "source": "scenarios/추월집중/추월집중_04_직진5.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_04_직진5__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_04_직진5__D1.csv",
+  "source": "scenarios/추월집중/추월집중_04_직진5.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_04_직진5__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_04_직진5__D2.csv",
+  "source": "scenarios/추월집중/추월집중_04_직진5.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_04_직진5__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_04_직진5__D4.csv",
+  "source": "scenarios/추월집중/추월집중_04_직진5.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_05_직진6__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_05_직진6__B.csv",
+  "source": "scenarios/추월집중/추월집중_05_직진6.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_05_직진6__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_05_직진6__C.csv",
+  "source": "scenarios/추월집중/추월집중_05_직진6.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_05_직진6__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_05_직진6__D1.csv",
+  "source": "scenarios/추월집중/추월집중_05_직진6.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_05_직진6__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_05_직진6__D2.csv",
+  "source": "scenarios/추월집중/추월집중_05_직진6.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_05_직진6__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_05_직진6__D4.csv",
+  "source": "scenarios/추월집중/추월집중_05_직진6.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_06_직진7__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_06_직진7__B.csv",
+  "source": "scenarios/추월집중/추월집중_06_직진7.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_06_직진7__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_06_직진7__C.csv",
+  "source": "scenarios/추월집중/추월집중_06_직진7.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_06_직진7__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_06_직진7__D1.csv",
+  "source": "scenarios/추월집중/추월집중_06_직진7.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_06_직진7__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_06_직진7__D2.csv",
+  "source": "scenarios/추월집중/추월집중_06_직진7.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_06_직진7__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_06_직진7__D4.csv",
+  "source": "scenarios/추월집중/추월집중_06_직진7.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_07_직진8__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_07_직진8__B.csv",
+  "source": "scenarios/추월집중/추월집중_07_직진8.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_07_직진8__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_07_직진8__C.csv",
+  "source": "scenarios/추월집중/추월집중_07_직진8.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_07_직진8__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_07_직진8__D1.csv",
+  "source": "scenarios/추월집중/추월집중_07_직진8.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_07_직진8__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_07_직진8__D2.csv",
+  "source": "scenarios/추월집중/추월집중_07_직진8.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_07_직진8__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_07_직진8__D4.csv",
+  "source": "scenarios/추월집중/추월집중_07_직진8.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_08_직진9__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_08_직진9__B.csv",
+  "source": "scenarios/추월집중/추월집중_08_직진9.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_08_직진9__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_08_직진9__C.csv",
+  "source": "scenarios/추월집중/추월집중_08_직진9.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_08_직진9__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_08_직진9__D1.csv",
+  "source": "scenarios/추월집중/추월집중_08_직진9.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_08_직진9__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_08_직진9__D2.csv",
+  "source": "scenarios/추월집중/추월집중_08_직진9.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_08_직진9__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_08_직진9__D4.csv",
+  "source": "scenarios/추월집중/추월집중_08_직진9.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_09_직진10__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_09_직진10__B.csv",
+  "source": "scenarios/추월집중/추월집중_09_직진10.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_09_직진10__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_09_직진10__C.csv",
+  "source": "scenarios/추월집중/추월집중_09_직진10.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_09_직진10__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_09_직진10__D1.csv",
+  "source": "scenarios/추월집중/추월집중_09_직진10.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_09_직진10__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_09_직진10__D2.csv",
+  "source": "scenarios/추월집중/추월집중_09_직진10.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_09_직진10__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_09_직진10__D4.csv",
+  "source": "scenarios/추월집중/추월집중_09_직진10.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_10_직진11__B.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_10_직진11__B.csv",
+  "source": "scenarios/추월집중/추월집중_10_직진11.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_10_직진11__C.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_10_직진11__C.csv",
+  "source": "scenarios/추월집중/추월집중_10_직진11.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "추월집중-추월집중_10_직진11__D1.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_10_직진11__D1.csv",
+  "source": "scenarios/추월집중/추월집중_10_직진11.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_10_직진11__D2.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_10_직진11__D2.csv",
+  "source": "scenarios/추월집중/추월집중_10_직진11.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "추월집중-추월집중_10_직진11__D4.csv",
+  "path": "tests/fixtures/odd/추월집중-추월집중_10_직진11__D4.csv",
+  "source": "scenarios/추월집중/추월집중_10_직진11.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-pair_lane_offset_waypoints__B.csv",
+  "path": "tests/fixtures/odd/fixtures-pair_lane_offset_waypoints__B.csv",
+  "source": "tests/fixtures/pair_lane_offset_waypoints.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2
+  ]
+ },
+ {
+  "sample": "fixtures-pair_lane_offset_waypoints__C.csv",
+  "path": "tests/fixtures/odd/fixtures-pair_lane_offset_waypoints__C.csv",
+  "source": "tests/fixtures/pair_lane_offset_waypoints.csv",
+  "kind": "C",
+  "dropped_index": 5,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3
+  ]
+ },
+ {
+  "sample": "fixtures-pair_lane_offset_waypoints__D1.csv",
+  "path": "tests/fixtures/odd/fixtures-pair_lane_offset_waypoints__D1.csv",
+  "source": "tests/fixtures/pair_lane_offset_waypoints.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-pair_lane_offset_waypoints__D2.csv",
+  "path": "tests/fixtures/odd/fixtures-pair_lane_offset_waypoints__D2.csv",
+  "source": "tests/fixtures/pair_lane_offset_waypoints.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-pair_lane_offset_waypoints__D4.csv",
+  "path": "tests/fixtures/odd/fixtures-pair_lane_offset_waypoints__D4.csv",
+  "source": "tests/fixtures/pair_lane_offset_waypoints.csv",
+  "kind": "D",
+  "dropped_index": 4,
+  "n_src": 6,
+  "n": 5,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-venue_20260903_waypoints__B.csv",
+  "path": "tests/fixtures/odd/fixtures-venue_20260903_waypoints__B.csv",
+  "source": "tests/fixtures/venue_20260903_waypoints.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 10,
+  "n": 9,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2,
+   4,
+   6
+  ]
+ },
+ {
+  "sample": "fixtures-venue_20260903_waypoints__C.csv",
+  "path": "tests/fixtures/odd/fixtures-venue_20260903_waypoints__C.csv",
+  "source": "tests/fixtures/venue_20260903_waypoints.csv",
+  "kind": "C",
+  "dropped_index": 9,
+  "n_src": 10,
+  "n": 9,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3,
+   5,
+   7
+  ]
+ },
+ {
+  "sample": "fixtures-venue_20260903_waypoints__D1.csv",
+  "path": "tests/fixtures/odd/fixtures-venue_20260903_waypoints__D1.csv",
+  "source": "tests/fixtures/venue_20260903_waypoints.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 10,
+  "n": 9,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-venue_20260903_waypoints__D2.csv",
+  "path": "tests/fixtures/odd/fixtures-venue_20260903_waypoints__D2.csv",
+  "source": "tests/fixtures/venue_20260903_waypoints.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 10,
+  "n": 9,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-venue_20260903_waypoints__D8.csv",
+  "path": "tests/fixtures/odd/fixtures-venue_20260903_waypoints__D8.csv",
+  "source": "tests/fixtures/venue_20260903_waypoints.csv",
+  "kind": "D",
+  "dropped_index": 8,
+  "n_src": 10,
+  "n": 9,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-waypoints__B.csv",
+  "path": "tests/fixtures/odd/fixtures-waypoints__B.csv",
+  "source": "tests/fixtures/waypoints.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2,
+   4
+  ]
+ },
+ {
+  "sample": "fixtures-waypoints__C.csv",
+  "path": "tests/fixtures/odd/fixtures-waypoints__C.csv",
+  "source": "tests/fixtures/waypoints.csv",
+  "kind": "C",
+  "dropped_index": 7,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3,
+   5
+  ]
+ },
+ {
+  "sample": "fixtures-waypoints__D1.csv",
+  "path": "tests/fixtures/odd/fixtures-waypoints__D1.csv",
+  "source": "tests/fixtures/waypoints.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-waypoints__D2.csv",
+  "path": "tests/fixtures/odd/fixtures-waypoints__D2.csv",
+  "source": "tests/fixtures/waypoints.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "fixtures-waypoints__D6.csv",
+  "path": "tests/fixtures/odd/fixtures-waypoints__D6.csv",
+  "source": "tests/fixtures/waypoints.csv",
+  "kind": "D",
+  "dropped_index": 6,
+  "n_src": 8,
+  "n": 7,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "waypoints__B.csv",
+  "path": "tests/fixtures/odd/waypoints__B.csv",
+  "source": "waypoints.csv",
+  "kind": "B",
+  "dropped_index": 0,
+  "n_src": 32,
+  "n": 31,
+  "expect_offset": 0,
+  "expect_pairs": [
+   0,
+   2,
+   4,
+   6,
+   8,
+   10,
+   12,
+   14,
+   16,
+   18,
+   20,
+   22,
+   24,
+   26,
+   28
+  ]
+ },
+ {
+  "sample": "waypoints__C.csv",
+  "path": "tests/fixtures/odd/waypoints__C.csv",
+  "source": "waypoints.csv",
+  "kind": "C",
+  "dropped_index": 31,
+  "n_src": 32,
+  "n": 31,
+  "expect_offset": 1,
+  "expect_pairs": [
+   1,
+   3,
+   5,
+   7,
+   9,
+   11,
+   13,
+   15,
+   17,
+   19,
+   21,
+   23,
+   25,
+   27,
+   29
+  ]
+ },
+ {
+  "sample": "waypoints__D1.csv",
+  "path": "tests/fixtures/odd/waypoints__D1.csv",
+  "source": "waypoints.csv",
+  "kind": "D",
+  "dropped_index": 1,
+  "n_src": 32,
+  "n": 31,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "waypoints__D2.csv",
+  "path": "tests/fixtures/odd/waypoints__D2.csv",
+  "source": "waypoints.csv",
+  "kind": "D",
+  "dropped_index": 2,
+  "n_src": 32,
+  "n": 31,
+  "expect_offset": null,
+  "expect_pairs": null
+ },
+ {
+  "sample": "waypoints__D30.csv",
+  "path": "tests/fixtures/odd/waypoints__D30.csv",
+  "source": "waypoints.csv",
+  "kind": "D",
+  "dropped_index": 30,
+  "n_src": 32,
+  "n": 31,
+  "expect_offset": null,
+  "expect_pairs": null
+ }
+]
