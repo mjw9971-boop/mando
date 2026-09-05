@@ -146,7 +146,7 @@ speed:
   # 따라가 **붉지 않은 구간 2,913.5 m** 가 25 km/h 로 묶였다. 채점기도 같은
   # 값을 봐서 붉은 적 없는 차로 3곳에 항목 1 위반 7건이 났다.
   # false = 이전 동작 (구역 값이 carry 에 들어간다).
-  red_limit_no_carry: false
+  red_limit_no_carry: true
   # 붉은 구간(보호구역) **진입 전** 감속 — kr_rules._red_approach_profile.
   #     v_ceiling = sqrt(red_zone_target_kph² + 2 · approach_decel_mps2 · d)
   # d 는 다음 구간 진입점까지 남은 경로거리다. 구간 안에서는 후보를 안 낸다 —
