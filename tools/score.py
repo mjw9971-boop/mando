@@ -205,11 +205,17 @@ def speed_context(ticks: list[dict], lg, cfg: dict) -> list[dict]:
     엄해져 우리 리포트가 실채점과 어긋난다 — 여유는 제어기 쪽(`red_zone.
     exit_margin_m`, 캡 해제를 늦추는 방향)에 두는 것이 맞다. 2026-09-05 결정.
 
+    carry 에 넣는 값은 `speed.red_limit_no_carry` 를 제어기와 **같이** 본다 —
+    켜면 구역 값(붉은 구간 limit_kph · 호환 모드 red_compat 30)은 carry 에
+    들어가지 않고 `road_limit_at` 의 표시값만 들어간다. 규칙이 서로 다르면
+    `speed_source` 대조가 성립하지 않는다.
+
     lane_graph 가 없으면 옛 동작(로그값)으로 폴백한다.
     """
     rz = cfg.get('red_zone') or {}
     red_lim = float(rz.get('limit_kph', 30.0))
     default_kph = float(cfg.get('default_speed_kph', 50.0))
+    no_carry = bool((cfg.get('speed') or {}).get('red_limit_no_carry', False))
     out: list[dict] = []
     carry = None
     for t in ticks:
@@ -236,11 +242,16 @@ def speed_context(ticks: list[dict], lg, cfg: dict) -> list[dict]:
             continue
         rec = lg.lanes[m.lane]
         red = any(s0 <= m.s <= s1 for s0, s1 in (rec.get('red_spans') or []))
-        v = rec.get('speed_limit')
+        # carry 에 넣는 값은 제어기와 **같은 분리**를 쓴다 (speed.red_limit_no_carry).
+        # 구역 값(붉은 구간의 limit_kph · 호환 모드의 red_compat 30)은 그 구간
+        # 안에서만 유효한데 carry 가 물고 나가면 붉은 적 없는 차로를 30 으로
+        # 판정해 항목 1 오탐이 난다 (2026-09-05 실측 7건).
+        # 규칙이 제어기와 달라지면 비교가 성립하지 않으므로 스위치를 같이 본다.
+        v = lg.road_limit_at(m.lane)[0] if no_carry else rec.get('speed_limit')
         if v is not None:
             carry = float(v)
         if red:
-            kph = red_lim
+            kph = min(carry, red_lim) if (no_carry and carry is not None) else red_lim
         else:
             kph = carry if carry is not None else default_kph
         out.append({'limit_kph': round(kph), 'red': red, 'lane': tuple(m.lane),
