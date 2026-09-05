@@ -239,6 +239,10 @@ class KrRules:
         # PREEMPT 시간 예산에도 쓰이므로, standoff 정지 거리만 조정하려면
         # 여기를 쓴다. 미지정이면 shift_latest_m 을 그대로 따른다(무변화).
         self.standoff_floor_m = float(ot.get('standoff_floor_m', self.shift_latest_m))
+        # 기준선 안쪽 크립 바닥 (_standoff_creep). 꺼지면 이전 동작(0 고정).
+        self.standoff_creep = bool(ot.get('standoff_creep_enable', False))
+        self.standoff_creep_v = float(ot.get('standoff_creep_v', 0.8))
+        self.standoff_creep_gap_m = float(ot.get('standoff_creep_gap_m', 1.0))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -452,6 +456,10 @@ class KrRules:
         self.cw_wait: dict = {}                    # 보행자 id → 횡단보도 대기 정지 틱 (A-3)
         self._cw_zones: list | None = None         # 경로상 횡단보도 [route_s 구간] (1회)
         self.wait_target_d: float | None = None    # 관찰 감속 목표 (장애물까지 거리)
+        # standoff 대상의 반길이 [m] — 크립의 '진짜 정지 거리' 가 객체 크기에
+        # 비례해야 한다 (d 가 뒷축→객체 중심 축이라 앞범퍼+반길이를 더한다).
+        self.standoff_half_len: float | None = None
+        self._creep_diag: dict | None = None       # 크립 진단 (로그용, 판단 무관)
         self.bo_paused = False                     # 적색·황색STOP 중 일시정지
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
@@ -1990,14 +1998,26 @@ class KrRules:
             if objs:
                 self.wait_target_d = objs[0][0]
                 self.standoff_id = objs[0][3].id
+                self.standoff_half_len = self._half_len(objs[0][3])
             return
         if self.standoff_stop_ticks > 0:
             so_objs = self._corridor_blockers(ap, planner, static_ok=self._stop_ok)
             if so_objs:
                 self.wait_target_d = so_objs[0][0]
                 self.standoff_id = so_objs[0][3].id
+                self.standoff_half_len = self._half_len(so_objs[0][3])
         elif corridor:
             self.wait_target_d = corridor[0][0]
+            self.standoff_half_len = self._half_len(corridor[0][3])
+
+    @staticmethod
+    def _half_len(actor) -> float | None:
+        """액터 반길이 [m]. 못 읽으면 None — 그때는 크립을 아예 걸지 않는다
+        (크기를 모르면 안전한 정지 거리를 정할 수 없다)."""
+        bb = getattr(actor, 'bounding_box', None)
+        ex = getattr(bb, 'extent', None) if bb is not None else None
+        x = getattr(ex, 'x', None) if ex is not None else None
+        return float(x) if x is not None else None
 
     def _blocked_account(self, ap, planner, ego_speed: float) -> None:
         """'막힌 채 정지' 회계 (B-10) — 자차 상태만으로 센다. span 활성 중에도 돈다."""
@@ -3021,7 +3041,60 @@ class KrRules:
             return None
         standoff = max(self.standoff_floor_m, self.shift_k_s * max(ego_speed, 0.1))
         d = self.wait_target_d - standoff
-        return _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d))
+        if d >= 0.0:
+            return _math.sqrt(2.0 * self.stop_profile_a * d)   # 기준선 밖 — 무수정
+        return self._standoff_creep(standoff)                  # 기준선 안 — 바닥
+
+    def _standoff_creep(self, standoff: float) -> float:
+        """기준선 **안쪽**(d < standoff)의 바닥 — 0 고정 대신 크립 [m/s].
+
+        왜 필요한가: d < standoff 이면 √(2a·max(0, d−standoff)) 가 항구적으로
+        0 이고 min() 사다리에 이를 되올릴 후보가 없다 → 영구 정지. 실측
+        2026-09-04 7건이 이 형태로 11.5~78.2 s 멈췄다. standoff_floor_m 을
+        낮춰도 사라지지 않는다 — 오버슛 0.7~2.6 m 로 매번 바닥을 넘어 들어가
+        잠금 **지점만** 앞으로 옮겨진다.
+
+        min() 안의 후보다. 이 함수는 `_standoff_profile` 의 **반환값만** 바꾸고,
+        호출처(apply)의 병합은 여전히 `so < candidate` 하나다 — 신호·보행자·
+        정지선·종점 후보가 더 낮으면 그쪽이 이긴다. 오버라이드가 아니다.
+
+        진짜 정지 거리는 객체 크기를 반영한다:
+            d_stop = front(뒷축→앞범퍼) + 객체 반길이 + standoff_creep_gap_m
+        d 가 **뒷축 → 객체 중심** 축이기 때문이다. 고정값(예: 2 m)으로 두면
+        앞범퍼가 객체 중심을 1.8 m 지나쳐 서서 충돌이 된다.
+
+        배제는 새로 만들지 않고 `_obstacle_cause` 를 그대로 쓴다 — 보행자
+        (walker_hazard/close)·적황 신호(traffic_light_hazard·y_decision·
+        cross_guard·sl_hold_left)·큐 대기(_tick_queue)·경로 종점(latched·
+        d_end ≤ active_m)·정지표지를 이미 전부 본다. `ped_hold_ids`(횡단보도
+        홀드 래치)는 PDM 플래그와 축이 달라 2차 방어로 따로 본다.
+        """
+        if not self.standoff_creep:
+            return 0.0          # 이전 동작. 진단도 남기지 않는다 — off 는 로그까지 동일
+        d = float(self.wait_target_d)
+        diag = {'creep_d': round(d, 1), 'creep_standoff': round(standoff, 1)}
+
+        # 진단 키가 'so_creep' 인 이유: BREAKOUT 진단이 같은 last_avoid 에 'creep'
+        # 을 나중에 써서(아래 bo_state 블록) 이름이 겹치면 덮인다 — 실측 02_직진3
+        # 27틱에서 크립 발동이 False 로 뒤집혔다 (2026-09-05).
+        def block(why):
+            self._creep_diag = dict(diag, so_creep=False, creep_block=why)
+            return 0.0
+
+        if self.standoff_half_len is None:
+            return block('no_size')                     # 크기 미상 → 정지 거리 불명
+        d_stop = self.front + self.standoff_half_len + self.standoff_creep_gap_m
+        diag['creep_stop_m'] = round(d_stop, 2)
+        if d <= d_stop:
+            return block('stop_gap')                    # 진짜 정지
+        if self.ped_hold_ids:
+            return block('ped_hold')
+        ap = self._ap
+        planner = getattr(ap, '_waypoint_planner', None) if ap is not None else None
+        if planner is None or not self._obstacle_cause(planner, ap):
+            return block('cause')
+        self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v)
+        return self.standoff_creep_v
 
     def _stopline_profile(self, planner, ap) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
@@ -3126,6 +3199,8 @@ class KrRules:
         # → 시프트를 만들고도 정지).
         self.wait_target_d = None
         self.standoff_id = None
+        self.standoff_half_len = None
+        self._creep_diag = None
         self.last_d_end = d_end
         self._ap = ap
         self.last_yellow = None
@@ -3191,7 +3266,8 @@ class KrRules:
         if so is not None:
             self.last_avoid = dict(self.last_avoid or {'state': 'STANDOFF'},
                                    standoff_d=round(float(self.wait_target_d), 1),
-                                   standoff_id=self.standoff_id, standoff_v=round(so, 2))
+                                   standoff_id=self.standoff_id, standoff_v=round(so, 2),
+                                   **(self._creep_diag or {}))
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)
