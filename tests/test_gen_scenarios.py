@@ -186,10 +186,23 @@ def test_routes_build_clean(outputs):
 
 
 def test_warned_csv_route_rejected():
-    """경고 있는 csv 경로(현재의 waypoints.csv 기본)는 풀에서 사유와 함께 탈락한다.
+    """문제 있는 csv 경로(현재의 waypoints.csv 기본)는 풀에서 사유와 함께 탈락한다.
 
-    waypoints.csv 가 나중에 경고 0 으로 고쳐지면 이 테스트는 '탈락하지 않음' 분기로
+    waypoints.csv 가 나중에 깨끗해지면 이 테스트는 '탈락하지 않음' 분기로
     지나간다 — 그때는 기본 경로 재사용이 다시 허용되는 것이 맞다.
+
+    **탈락 사유는 세 갈래다** (2026-09-05 보강). RoutePool.get 은
+      ① route_check 경고           -> '... build_route 경고 N건 - ...'
+      ② spawn_gate                 -> '... 경로 게이트 탈락 - 스폰 ...'
+      ③ polyline_gate              -> '... 경로 게이트 탈락 - 경로 폴리라인 불연속 ...'
+    순으로 본다. 이 테스트(d8dd205, 2026-08-25)는 ③ 이 들어오기(f6b0e86,
+    2026-08-27) 전에 쓰여 ①② 만 나열했고, 커밋 883382d 가 루트 waypoints.csv
+    를 교체해 실제로 ③ 을 타게 되자 실패했다 — 경로는 정상적으로 탈락했고
+    **assert 가 사유 목록을 덜 적고 있었다**.
+    (실측: 옛 CSV 는 'build_route 경고 3건 - R_min 5.43 m' 로 통과했고,
+     현재 CSV 는 '경로 폴리라인 불연속 2.08 m (>0.3 m) - route_s~695.1 m' 다.
+     그 불연속 자체는 BACKLOG B-14 소관이고 여기서 고칠 것이 아니다.)
+    사유 **문구**가 아니라 "사유와 함께 탈락한다" 가 이 테스트가 지키는 것이다.
     """
     lg = gs.LaneGraph(str(ROOT / 'data' / 'lane_graph.pkl'))
     _routes, _themes, gen_cfg = gs.load_themes()
@@ -197,7 +210,8 @@ def test_warned_csv_route_rejected():
     try:
         route = pool.get('기본')
     except gs.GenError as e:
-        assert 'build_route 경고' in str(e) or '스폰 게이트' in str(e)
+        assert ('build_route 경고' in str(e) or '스폰 게이트' in str(e)
+                or '경로 게이트 탈락' in str(e))
         with pytest.raises(gs.GenError):     # 두 번째 조회도 같은 사유로 즉시 탈락(캐시)
             pool.get('기본')
     else:
