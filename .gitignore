@@ -22,3 +22,7 @@ scenarios/
 data/route_*.pkl
 !data/route_example.pkl
 !data/route_official_route.pkl
+
+# ===== 작업용 임시 (분석 스크립트·리플레이 산출물) =====
+# f36f191 이 실수로 313개 파일을 담았다. 파일은 로컬에 남기고 추적만 뺀다.
+scratchpad/
