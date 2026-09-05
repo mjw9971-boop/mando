@@ -362,6 +362,10 @@ class KrRules:
         # 최대화한다. 기본 배치가 이미 임계(percep.obstacle_clearance_m) 이상이면 현행
         # 그대로. 전이 길이는 줄이지 않는다. false = 이전 동작.
         self.shift_entry = bool(ot.get('shift_entry_enable', False))
+        # gap_fit — 옆 차로 빈 구간에 맞춰 (전이, 앞뒤 여유) 를 다시 고른다.
+        self.gap_fit = bool(ot.get('gap_fit_enable', False))
+        self.gap_fit_clear_m = float(ot.get('gap_fit_clear_m', 0.6))
+        self.gap_fit_step_m = float(ot.get('gap_fit_trans_step_m', 2.0))
         self.entry_max_delay_m = float(ot.get('shift_entry_max_delay_m', 15.0))
         self.entry_step_m = float(ot.get('shift_entry_step_m', 0.5))
         self.exit_min_after_m = float(ot.get('shift_exit_min_after_m', 0.0))
@@ -1561,6 +1565,114 @@ class KrRules:
             return (min(per.values()) if per else float('inf')), per
         return {'clear_at': clear_at, 'objs': objs, 'b_rel': b_rel}
 
+    def _gap_free_span(self, objs, s_b, hs_b):
+        """목표 차로 객체 사이의 **빈 구간** 중 차단물(s_b)을 덮는 것 → (lo, hi).
+
+        objs 는 `_span_clear_model` 이 이미 모아 둔 (s_rel, lat, ht, hs, id) 다 —
+        `_corridor_blockers(lat_band=...)` 로 목표 오프셋까지 휩쓰는 띠 안에서
+        걸러진 것이라 새 탐색을 만들지 않는다. 여유는 자차 반길이 + 회랑과 같은
+        임계(obstacle_clearance_m). 못 찾으면 None.
+
+        이 값은 **판정에 쓰지 않는다** — 진단·탐색 범위 축소용이다. span 을 빈
+        구간 안에 넣는 규칙은 너무 엄격하다(202508: 빈 구간 21.3 m → 최대 전이
+        6.0 < transition_m 12.0 이라 기각돼 버린다). 전이 시작·끝에서는 횡변위가
+        0 이라 옆 차로 객체와 무관하기 때문이다.
+        """
+        pad = float(self.cfg['vehicle']['length']) / 2.0 + \
+            float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
+        occ = sorted((s - hs - pad, s + hs + pad) for s, _lat, _ht, hs, _oid in objs
+                     if abs(s - s_b) > hs_b + hs)      # 차단물 자신은 뺀다
+        lo = 0.0
+        for o0, o1 in occ:
+            if o0 > s_b:
+                return (round(lo, 1), round(o0, 1))
+            lo = max(lo, o1)
+        return (round(lo, 1), None)
+
+    @staticmethod
+    def _gap_fit_place(pr0, ext_x, extent, ahead_m, trans_m, eb, ea):
+        """(전이, 앞여유, 뒤여유) → 자차 기준 (전이 시작 s0, span 끝) [m].
+
+        zone 게이트의 `start_est` 와 **같은 식**이다 (span 시작 = 첫 객체 − 반길이 −
+        앞여유 − 전이, 자차 앞 ahead 로 클램프). 끝은 그 대칭 — 마지막 객체(첫 객체
+        + 연쇄 extent) + 반길이 + 뒤여유 + 전이.
+
+        `_side_pass` 의 `span_m`(= 2·trans + before + after + extent)을 쓰면 안 된다.
+        그건 점선 커버리지 게이트용 근사라 **객체 반길이 2·ext_x 가 빠져 있다** —
+        202508 에서 실제 87.7 대신 83.3 이 나와 gap_fit 이 최적 배치를 놓쳤다
+        (2026-09-05 실측).
+        """
+        s0 = max(pr0 - ext_x - trans_m - eb, ahead_m)
+        return s0, pr0 + extent + ext_x + ea + trans_m
+
+    def _gap_fit_search(self, planner, ap, actor, chain, trans_m, ahead_m, extra_after,
+                        span_plan=None):
+        """옆 차로 빈 구간에 맞춰 (전이, 앞여유, 뒤여유) 를 다시 고른다 → (사용값, 진단).
+
+        왜: span 은 차단물 하나를 중심으로 대칭으로 그려지고 전이 길이가 **결정
+        시점 속도**에 비례한다(trans = max(transition_m, shift_k_s·v)). 빠를수록
+        span 이 길어져 목표 차로에 정차한 차를 삼킨다 — 실주행 3건이 이 형태로
+        고착했다 (2026-09-05 202508/211215/212101: entry_base_clear −1.16~−1.81,
+        entry_plateau_ids [2], chain [3] → 전부 CREEP_FAIL. 계속 주행한 3건은
+        +1.12~+1.13, 플래토 없음).
+
+        판정은 기존 `_span_clear_model.clear_at` 하나로 한다. 202508 실측:
+            현행 trans 21.2, span 45.1~106.9 → 이격 0.00 (id2·id4 두 대)
+            최적 trans 12.0, eb 0, ea 0, span 59.3~87.7 → 이격 0.86
+            전이 21.2 로는 (a,b) 를 어떻게 잡아도 통과 조합이 하나도 없다.
+
+        **기각하지 않는다.** 더 나은 배치를 못 찾으면 현행 값을 그대로 돌려준다 —
+        clear_at 이 실제보다 보수적인 경우가 있어(211630/211718 2번째 시프트:
+        clear_at 0.08 인데 실제 통과 이격 1.09/1.06) 기각으로 쓰면 잘 가던 케이스를
+        막는다. 전이를 줄이는 방향이므로 geom need(trans+ahead+margin)도 함께
+        줄어 이미 통과한 게이트를 다시 깨지 않는다.
+        """
+        base = (trans_m, self.ot_before_m, extra_after)
+        plan = span_plan if span_plan is not None else self.last_span_plan
+        if not self.gap_fit or plan is None:
+            return base, None
+        pr = self._project(planner, actor.get_location().x, actor.get_location().y)
+        if pr is None:
+            return base, None                              # 못 재면 통과 (관례)
+        bb = getattr(actor, 'bounding_box', None)
+        ext_x = float(getattr(getattr(bb, 'extent', None), 'x', 0.0) or 0.0)
+        pr0, extent = float(pr[0]), float(chain.get('extent_m', 0.0))
+        b0, left = int(plan[1]), bool(plan[2])
+        m0 = self._span_clear_model(planner, ap, b0, left, trans_m)
+        if m0 is None:
+            return base, None                              # 못 재면 통과 (관례)
+        clr = self.gap_fit_clear_m
+
+        def score(model, cand):
+            s0, end = self._gap_fit_place(pr0, ext_x, extent, ahead_m, *cand)
+            v, _per = model['clear_at'](s0, min(end, model['b_rel']))
+            return v
+
+        cur = score(m0, base)
+        diag = {'gap_fit_on': True,
+                'gap_clear_base': round(cur, 2) if abs(cur) < 1e8 else None,
+                'gap_free_span': self._gap_free_span(m0['objs'], pr0, ext_x)}
+        if cur >= clr:
+            return base, dict(diag, gap_fallback='base_ok')
+        best = (cur, base)
+        t = trans_m
+        while t > self.ot_trans_m + 1e-6:
+            t = max(self.ot_trans_m, t - self.gap_fit_step_m)
+            m = self._span_clear_model(planner, ap, b0, left, t)
+            if m is None:
+                continue
+            for cand in ((t, 0.0, 0.0), (t, self.ot_before_m, extra_after)):
+                v = score(m, cand)
+                if v > best[0] + 1e-9:
+                    best = (v, cand)
+            if best[0] >= clr:
+                break
+        if best[1] == base:
+            return base, dict(diag, gap_fallback='no_better')
+        t, eb, ea = best[1]
+        return best[1], dict(diag, gap_T_sel=round(t, 1), gap_eb=round(eb, 1),
+                             gap_ea=round(ea, 1), gap_clear=round(best[0], 2))
+
     def _shift_placement(self, planner, ap, trans_m, ahead_m, extra_after, after_locked):
         """전이 배치 탐색 → (delay, after, 진단). 막히면 delay None.
 
@@ -2383,6 +2495,11 @@ class KrRules:
             plans[side] = {'trans_m': trans_m, 'ahead_eff': ahead_eff,
                            'extra_after': extra_after, 'span_m': span_m,
                            'pinfo': dict(pinfo or {}),
+                           # 이 side 의 span 계획 — 양측을 다 재면 last_span_plan 은
+                           # **마지막(진) side** 것으로 남는다. gap_fit 이 그걸 읽으면
+                           # 목표 차로가 반대쪽이라 옆 차로 객체를 못 본다 (실측
+                           # 2026-09-05 202508: objs 에 id3 만 남아 no_better).
+                           'span_plan': self.last_span_plan,
                            'avoid': dict(self.last_avoid or {})}
             if not pick_on or not plans[side]['pinfo'].get('entry_plateau_ids'):
                 # 단락 — 플래토가 비면 _pick_side 는 어느 경우에도 이 side 를 고른다
@@ -2411,11 +2528,22 @@ class KrRules:
             merged.pop(k, None)
         merged.update(p['pinfo'])
         self.last_avoid = merged
+        # ⑧ gap_fit — 옆 차로 빈 구간에 맞춰 (전이, 앞뒤 여유) 를 다시 고른다.
+        # 게이트가 아니다: 기각하지 않고, 더 나은 배치를 못 찾으면 현행 그대로 간다.
+        # 전이를 줄이는 방향이라 geom need(trans+ahead+margin)도 함께 줄어 이미
+        # 통과한 게이트를 다시 깨지 않는다. 적용은 아래 route.py 인자뿐이다.
+        gap_before = self.ot_before_m
+        (trans_m, gap_before, extra_after), ginfo = self._gap_fit_search(
+            planner, ap, actor, chain, trans_m, ahead_eff, extra_after,
+            span_plan=p.get('span_plan'))
+        if ginfo:
+            self.last_avoid.update(ginfo)
+        span_m = 2.0 * trans_m + gap_before + extra_after + chain['extent_m']
         span = planner.shift_route_around_actors(
             actor, chain_last,
             obstacle_direction='right' if side == 'left' else 'left',
             transition_length=trans_m * ppm,
-            extra_length_before=self.ot_before_m * ppm,
+            extra_length_before=gap_before * ppm,
             extra_length_after=extra_after * ppm,          # E-2 연장·복귀 단축 포함
             # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
             # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
