@@ -118,8 +118,16 @@ def test_single_hop_into_short_lane_not_flagged(lg):
     (2801,0,3)->(2801,0,2) 는 차로 17.07 m 로 gap 20 m 보다 짧지만 회랑이
     20.8 m 라 후행 차로에서 전이가 끝난다 — 점열 계단이 0 이다. 차로 길이만
     보고 첫 hop 까지 재면 이런 정상 경로를 버린다.
+
+    **저장소 루트의 `waypoints.csv` 를 쓰지 않는다** (2026-09-05). 커밋
+    883382d "루트 생성" 이 그 파일을 통째로 교체하면서 위 hop 이 사라져
+    `assert short` 에서 실패했다 — 픽스처가 움직인 것이고 테스트도 코드도
+    틀리지 않았다. 옛 내용을 보존한
+    `tests/fixtures/waypoints_pair_banned.csv` 가 같은 hop 을 그대로 가진다
+    (test_valid_entry_lanes 와 같은 파일 — 하나가 두 전제를 다 만족하므로
+    나누지 않는다. 나누면 한쪽만 갱신되는 드리프트가 또 생긴다).
     """
-    rt = _build(lg, 'waypoints.csv')
+    rt = _build(lg, 'tests/fixtures/waypoints_pair_banned.csv')
     short = [h for h in BR.hop_room(lg, rt) if h[4] > h[5] + 1e-9]
     assert short, '이 CSV 에 짧은 차로 hop 이 있어야 이 테스트가 유효하다'
     assert all(h[6] == 0 for h in short), short          # 전부 단발
