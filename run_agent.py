@@ -323,7 +323,9 @@ class Runner:
                    'ped': self.kr.last_ped,
                    # 회피 진단 — 상태/기각·억제 사유. 이게 없어서 이전에는
                    # 기각 이유를 알려면 리플레이를 계측해야 했다 (2026-08-30).
-                   'avoid': self.kr.last_avoid}
+                   'avoid': self.kr.last_avoid,
+                   # 붉은 구간 진입 전 감속 후보 (2b-B) — 후보가 산 틱에만 채워진다.
+                   'red_zone': self.kr.last_red_zone}
         if reduced is not None and reduced[1] is not None:
             reasons['speed_reduced_by'] = {
                 'type': reduced[1], 'id': reduced[2],

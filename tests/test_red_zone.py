@@ -323,3 +323,120 @@ def test_plain_lane_is_untouched(lg):
     """붉은 구간이 없는 차로는 s 를 줘도 값이 그대로다."""
     k = next(k for k, r in lg.lanes.items() if not r['red_spans'] and r['speed_limit'] == 50)
     assert lg.speed_limit_at(k, 0.5 * lg.length(k)) == (50, False)
+
+
+# ── 2b-B: 진입 전 감속 ──────────────────────────────────────────────────
+def _kr(**over):
+    import copy
+    import sys as _s
+    _s.path.insert(0, str(ROOT / 'team_code'))
+    from kr_rules import KrRules
+    cfg = copy.deepcopy(CFG)
+    cfg['speed'].update(over)
+    return KrRules(cfg)
+
+
+class _FakePlanner:
+    """route_s 축만 있는 최소 플래너 — 후보 공식만 검증한다."""
+    def __init__(self, ivals, route_s=0.0):
+        self._ivals = ivals
+        self.route_index = 0
+        self.route_s = [route_s]
+
+
+def test_approach_params_present():
+    sp = CFG['speed']
+    assert sp['red_approach_enable'] is True
+    assert float(sp['red_zone_target_kph']) == 27.0
+    assert float(sp['approach_decel_mps2']) == 2.0
+    assert float(sp['red_lookahead_m']) == 60.0
+
+
+def test_approach_formula(monkeypatch):
+    """v_ceiling = sqrt(v_zone^2 + 2 a d). 25 m 앞이면 45 km/h 쯤이 나온다."""
+    import math
+    k = _kr()
+    pl = _FakePlanner([(100.0, 130.0)], route_s=75.0)
+    k.red_ivals = pl._ivals
+    v = k._red_approach_profile(pl)
+    vz = float(CFG['speed']['red_zone_target_kph']) / 3.6
+    a = float(CFG['speed']['approach_decel_mps2'])
+    assert v == pytest.approx(math.sqrt(vz * vz + 2 * a * 25.0))
+    assert 44.0 < v * 3.6 < 46.0
+
+
+def test_no_candidate_inside_span():
+    """구간 안에서는 후보를 안 낸다 — 거기선 제한속도가 상한이다."""
+    k = _kr()
+    pl = _FakePlanner([(100.0, 130.0)], route_s=110.0)
+    k.red_ivals = pl._ivals
+    assert k._red_approach_profile(pl) is None
+
+
+def test_no_candidate_beyond_lookahead():
+    k = _kr()
+    pl = _FakePlanner([(100.0, 130.0)], route_s=0.0)   # 100 m 앞 > 60 m
+    k.red_ivals = pl._ivals
+    assert k._red_approach_profile(pl) is None
+
+
+def test_switch_off_gives_no_candidate():
+    k = _kr(red_approach_enable=False)
+    pl = _FakePlanner([(100.0, 130.0)], route_s=90.0)
+    k.red_ivals = pl._ivals
+    assert k._red_approach_profile(pl) is None
+
+
+def test_ceiling_at_entry_equals_zone_target():
+    """진입점(d=0)에서 천장이 정확히 v_zone 이다 — 임계 31 아래다."""
+    k = _kr()
+    pl = _FakePlanner([(100.0, 130.0)], route_s=100.0 - 1e-9)
+    k.red_ivals = pl._ivals
+    v = k._red_approach_profile(pl)
+    assert v * 3.6 == pytest.approx(float(CFG['speed']['red_zone_target_kph']), abs=1e-3)
+    assert v * 3.6 < 31.0
+
+
+def test_short_gap_between_spans_is_capped():
+    """실측 3건 — 앞 구간 끝과 다음 진입 사이 틈이 1.0 / 9.0 m 뿐이다.
+
+    그 틈에서 50(45 km/h)까지 가속하면 25 m 가 없어 되돌릴 수 없다.
+    이 후보가 천장을 눌러 애초에 못 올라가게 하는지 본다.
+    """
+    import math
+    k = _kr()
+    vz = float(CFG['speed']['red_zone_target_kph']) / 3.6
+    a = float(CFG['speed']['approach_decel_mps2'])
+    for gap, want_kph in ((1.0, 27.9), (9.0, 34.6)):
+        pl = _FakePlanner([(100.0, 130.0)], route_s=100.0 - gap)
+        k.red_ivals = pl._ivals
+        v = k._red_approach_profile(pl)
+        assert v == pytest.approx(math.sqrt(vz * vz + 2 * a * gap))
+        assert v * 3.6 == pytest.approx(want_kph, abs=0.1)
+        assert v * 3.6 < 45.0, '틈에서 50 도로 속도까지 올라간다'
+
+
+def test_intervals_use_exit_margin(lg):
+    """구간 간격은 speed_limit_at 이 캡을 푸는 지점과 같은 축이어야 한다."""
+    k = _kr()
+    k.red_ivals = None
+    class PL:
+        pass
+    pl = PL()
+    pl.lg = lg
+    pl.route_index = 0
+    # 붉은 구간 하나를 그대로 경로로 삼는다
+    kk, s1 = _partial_red_lane(lg)
+    span = next(sp for sp in lg.lanes[kk]['red_spans'] if sp[1] == s1)
+    import numpy as np
+    ss = np.arange(0.0, lg.length(kk), 0.1)
+    pl.route_s = ss
+    class WP:
+        def __init__(self, key, s):
+            self.key, self.s = key, s
+    pl.route_waypoints = [WP(kk, float(v)) for v in ss]
+    ivals = k._red_intervals(pl)
+    assert ivals, ivals
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    assert ivals[0][0] == pytest.approx(span[0], abs=0.2)
+    assert ivals[0][1] == pytest.approx(span[1] + mar, abs=0.3)

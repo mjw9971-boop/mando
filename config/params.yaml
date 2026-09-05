@@ -137,6 +137,27 @@ speed:
   # false = 차로 단위 speed_limit 을 그대로 쓴다 (호환 모드면 전 구간 30).
   # 기본 on — 못 읽으면 항목 2 중대라 조용히 꺼지는 쪽이 더 위험하다.
   red_span_enable: true
+  # 붉은 구간(보호구역) **진입 전** 감속 — kr_rules._red_approach_profile.
+  #     v_ceiling = sqrt(red_zone_target_kph² + 2 · approach_decel_mps2 · d)
+  # d 는 다음 구간 진입점까지 남은 경로거리다. 구간 안에서는 후보를 안 낸다 —
+  # 거기서는 제한속도(red_zone.limit_kph − margin_kph)가 이미 상한이다.
+  #
+  # 왜: 50 도로(45 km/h)에서 27 km/h 로 줄이려면 a=2.0 에 25 m 가 든다. 붉은
+  # 구간은 중앙 25.1 m 이고 124개 중 43개가 18 m 미만이라, 진입 뒤에 줄이면
+  # 구간 안에서 초과가 난다 (항목 2 는 1 km/h 초과 경미 / 5 초과 중대).
+  # 실측 2026-09-05: 27경로 진입 19건 중 3건은 앞 구간과의 틈이 1.0~9.0 m 뿐이라
+  # 그 사이에서 50 으로 가속하면 되돌릴 방법이 없다. 이 후보가 그 틈에서 천장을
+  # 27.9 / 34.6 km/h 로 눌러 애초에 못 올라가게 한다.
+  # false = 이전 동작 (진입 전 감속 없음).
+  red_approach_enable: true
+  # 진입 목표 속도 [km/h]. 위반 임계 31(=30+1)에 여유 4 를 뒀다. 구간 안 상한은
+  # 이 값이 아니라 제한속도 − margin_kph (= 25 km/h) 다.
+  red_zone_target_kph: 27.0
+  # 진입 감속에 쓸 감속도 [m/s²]. speed.a_min(-6.0) 보다 훨씬 완만하다 — 미리
+  # 눌러 두는 천장이지 제동이 아니다.
+  approach_decel_mps2: 2.0
+  # 진입점 탐색 거리 [m]. 45 km/h → 27 km/h 에 25 m 이므로 60 이면 충분하다.
+  red_lookahead_m: 60.0
   # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
   a_max: 2.0
   a_min: -6.0

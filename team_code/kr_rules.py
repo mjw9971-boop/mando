@@ -173,6 +173,13 @@ class KrRules:
                                       * float(cfg['comm']['send_hz'])))
         # 정지선 정지 프로파일 (④′). 0 이면 완전 비활성 — 되돌리는 스위치다.
         self.stop_profile_a = float(sp.get('stop_profile_a', 0.0))
+        # 붉은 구간(보호구역) 진입 전 감속 (작업 2b-B). ④′ 와 같은 형태의 min() 후보.
+        self.red_approach = bool(sp.get('red_approach_enable', True))
+        self.red_a = float(sp.get('approach_decel_mps2', 2.0))
+        self.red_look_m = float(sp.get('red_lookahead_m', 60.0))
+        self.red_v_zone = float(sp.get('red_zone_target_kph', 27.0)) / 3.6
+        self.red_ivals: list | None = None            # 경로당 1회 캐시 [(진입 s, 이탈 s)]
+        self.last_red_zone = None                     # 진단
         # 황색 딜레마 원샷 판정 (C). 0 이면 비활성 = 황색을 PDM 원문에만 맡긴다.
         self.a_yellow = float(sp.get('a_yellow', 0.0))
         # 보행자 의도 감지 (P4). 0 이면 비활성 = PDM forecast_walkers 에만 맡긴다.
@@ -3213,6 +3220,90 @@ class KrRules:
             return _math.sqrt(2.0 * self.stop_profile_a * d)   # 기준선 밖 — 무수정
         return self._standoff_creep(standoff, ego_speed)       # 기준선 안 — 바닥
 
+    def _red_intervals(self, planner) -> list:
+        """경로 위 붉은 구간 [(진입 route_s, 이탈 route_s)] — 경로당 1회.
+
+        `turn_intervals` 와 같은 관례로 시작 시 한 번만 만든다. 재료는
+        `route_waypoints[i].key/.s` 와 lane_graph 의 `red_spans` 다 — 제한속도
+        배열(`speed_limits`)로 역추정하지 않는다. 그 배열은 carry 가 섞여 있어
+        "구간에서 물고 나온 30" 과 "구간 안" 이 구분되지 않는다.
+
+        이탈 쪽은 `red_zone.exit_margin_m` 을 얹은 지점이다 —
+        `speed_limit_at` 이 캡을 푸는 지점과 같은 축이라야 후보가 어긋나지 않는다.
+        """
+        lg = getattr(planner, 'lg', None)
+        wps = getattr(planner, 'route_waypoints', None)
+        rs = getattr(planner, 'route_s', None)
+        if lg is None or not wps or rs is None:
+            return []
+        try:
+            from vtd_adapter.lanegraph import red_span_cfg
+            _on, _kph, exit_m = getattr(lg, '_red_cfg', None) or red_span_cfg()
+        except Exception:                                  # noqa: BLE001 — 목 플래너
+            exit_m = 0.0
+        out: list = []
+        inside = False
+        for i in range(min(len(wps), len(rs))):
+            wp = wps[i]
+            try:
+                spans = lg.lanes[wp.key].get('red_spans') or []
+            except Exception:                              # noqa: BLE001
+                spans = []
+            hit = any(s0 <= wp.s <= s1 + exit_m for s0, s1 in spans)
+            if hit and not inside:
+                out.append([float(rs[i]), float(rs[i])])
+                inside = True
+            elif hit:
+                out[-1][1] = float(rs[i])
+            else:
+                inside = False
+        return [(a, b) for a, b in out]
+
+    def _red_approach_profile(self, planner) -> float | None:
+        """붉은 구간 **진입 전** 감속 상한 — min() 후보. ④′ 와 같은 형태다.
+
+            v_ceiling = √(v_zone² + 2·a·d)        d = 진입점까지 남은 경로거리
+
+        구간 안에서는 후보를 내지 않는다 — 거기서는 제한속도(`red_zone.limit_kph`
+        − `speed.margin_kph`)가 이미 상한이고, 두 상한을 겹치면 어느 쪽이 묶는지
+        로그에서 갈리지 않는다.
+
+        왜 필요한가: 50 도로(45 km/h)에서 27 km/h 로 줄이려면 a=2.0 에 **25 m** 가
+        든다. 붉은 구간은 중앙 25.1 m 이고 124개 중 43개가 18 m 미만이라, 진입
+        **뒤에** 줄이기 시작하면 구간 안에서 초과가 난다 (항목 2 는 초과 1 km/h
+        넘으면 경미, 5 넘으면 중대다).
+        실측 2026-09-05: 27경로 붉은 구간 진입 19건 중 3건은 앞 구간과의 틈이
+        1.0~9.0 m 뿐이라, 그 사이에서 50 으로 가속하면 되돌릴 방법이 없다.
+        이 후보는 그 틈에서 천장을 각각 27.9 / 34.6 km/h 로 눌러 애초에 못
+        올라가게 한다.
+        """
+        if not self.red_approach or self.red_a <= 0.0:
+            return None
+        if self.red_ivals is None:
+            self.red_ivals = self._red_intervals(planner)
+        if not self.red_ivals:
+            return None
+        try:
+            route_s = float(planner.route_s[planner.route_index])
+        except Exception:                                  # noqa: BLE001
+            return None
+        nxt = None
+        for a, b in self.red_ivals:
+            if a <= route_s <= b:
+                return None                                # 구간 안 — 제한속도 소관
+            if a > route_s:
+                nxt = a
+                break
+        if nxt is None:
+            return None
+        d = nxt - route_s
+        if d > self.red_look_m:
+            return None
+        v = _math.sqrt(self.red_v_zone * self.red_v_zone + 2.0 * self.red_a * max(0.0, d))
+        self.last_red_zone = {'d': round(d, 1), 'v_allow': round(v, 2),
+                              'entry_s': round(nxt, 1)}
+        return v
+
     def _creep_geom_need(self, ego_speed: float) -> float | None:
         """기하 완성 게이트(⑥)의 need — `_side_pass` 와 **같은 식**이다.
 
@@ -3425,6 +3516,7 @@ class KrRules:
         ego_speed = ap._vehicle.get_velocity().length()
         self.last_candidate = None
         self.last_stop_profile = None
+        self.last_red_zone = None
         # standoff 대상은 **매 틱 새로** 정한다 (B-8). 예전에는 _try_overtake 의
         # 회랑 블록에서만 리셋해, 억제 반환·SHIFT_HOLD·span 활성 조기 반환 틱마다
         # 직전 값이 얼어붙었다 (실측 2026-09-03 5로그 전부: standoff_d 39.0/37.2/
@@ -3502,6 +3594,11 @@ class KrRules:
                                    standoff_d=round(float(self.wait_target_d), 1),
                                    standoff_id=self.standoff_id, standoff_v=round(so, 2),
                                    **(self._creep_diag or {}))
+
+        # 붉은 구간 진입 전 감속 (2b-B) — 구간 **밖**에서만 산다. min() 후보.
+        rz = self._red_approach_profile(planner)
+        if rz is not None and (candidate is None or rz < candidate):
+            candidate = rz
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)
