@@ -341,10 +341,29 @@ class EgoTracker(EgoSpeedEstimator):
         `s` 를 주면 `speed_limit_at` 이 붉은 구간(red_spans)을 s 로 판정한다.
         구간 안이면 `red_zone.limit_kph`, 붉은 차로인데 구간 밖이면 None 이 와서
         **carry 규칙이 그대로 앞 값을 물고 간다** — carry 는 손대지 않았다.
+
+        `speed.red_limit_no_carry` 를 켜면 carry 에 넣는 값만 갈린다:
+        carry 는 `road_limit_at` (표시값, 구역 값 제외) 으로 채우고, 구역 값은
+        그 위에 **min 으로 얹는다**. carry 규칙 자체("None 이면 직전 값")는
+        그대로다. 끄면 아래 옛 경로가 그대로 돌아 **이전과 완전히 같다**.
         """
         limit_kph, school = (None, False)
         if lane is not None:
             limit_kph, school = self.lg.speed_limit_at(lane, s)
+
+        if bool(self.cfg.get('speed', {}).get('red_limit_no_carry', False)):
+            road_kph, road_school = (None, False)
+            if lane is not None:
+                road_kph, road_school = self.lg.road_limit_at(lane)
+            if road_kph is not None:
+                self._carry_limit = float(road_kph)
+                self._carry_school = bool(road_school)
+            base = self._carry_limit if self._carry_limit is not None \
+                else float(self.cfg.get('default_speed_kph', 50))
+            # school 참은 붉은 구간 **안** 일 때뿐이다 (speed_limit_at ①).
+            kph = min(base, float(limit_kph)) \
+                if (school and limit_kph is not None) else base
+            return kph / 3.6, bool(school)
 
         if limit_kph is not None:
             self._carry_limit = float(limit_kph)

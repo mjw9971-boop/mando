@@ -137,6 +137,16 @@ speed:
   # false = 차로 단위 speed_limit 을 그대로 쓴다 (호환 모드면 전 구간 30).
   # 기본 on — 못 읽으면 항목 2 중대라 조용히 꺼지는 쪽이 더 위험하다.
   red_span_enable: true
+  # 구역 제한속도를 **carry 에 넣지 않는다** (2b-C).
+  # carry 규칙("표시 없는 도로는 직전 값 유지")은 그대로다. 바뀌는 것은 carry 를
+  # 먹이는 값뿐 — lanegraph.road_limit_at (표시값만, 붉은 구간의 limit_kph 와
+  # 호환 모드의 red_compat 30 제외) 이 carry 를 채우고, 구역 값은 그 위에 min 으로
+  # 얹는다.
+  # 왜: 켜기 전 실측(replay 54)에서 붉은 구간을 나온 뒤에도 30 이 carry 로
+  # 따라가 **붉지 않은 구간 2,913.5 m** 가 25 km/h 로 묶였다. 채점기도 같은
+  # 값을 봐서 붉은 적 없는 차로 3곳에 항목 1 위반 7건이 났다.
+  # false = 이전 동작 (구역 값이 carry 에 들어간다).
+  red_limit_no_carry: false
   # 붉은 구간(보호구역) **진입 전** 감속 — kr_rules._red_approach_profile.
   #     v_ceiling = sqrt(red_zone_target_kph² + 2 · approach_decel_mps2 · d)
   # d 는 다음 구간 진입점까지 남은 경로거리다. 구간 안에서는 후보를 안 낸다 —

@@ -320,17 +320,33 @@ class VtdRoutePlanner:
         default_kph = float(self.cfg.get('default_speed_kph', 50.0))
         carry_kph: float | None = None
 
+        red_no_carry = bool(self.cfg.get('speed', {})
+                            .get('red_limit_no_carry', False))
+
         def limit_mps(key, s_in_lane=None) -> float:
             """경로점 하나의 목표 상한 [m/s].
 
             `s_in_lane` 을 주면 붉은 구간(red_spans)이 s 로 반영된다 — 같은
             차로 안에서도 구간 안팎이 갈린다. carry 규칙은 그대로다.
+
+            `speed.red_limit_no_carry` 를 켜면 carry 를 `road_limit_at`
+            (표시값, 구역 값 제외) 으로 채우고 구역 값은 그 위에 min 으로
+            얹는다 — 구역의 30 이 붉지 않은 다음 도로까지 따라가지 않는다.
+            끄면 아래 else 가 그대로 돌아 이전과 완전히 같다.
             """
             nonlocal carry_kph
-            v, _sc = lg.speed_limit_at(key, s_in_lane)
-            if v is not None:
-                carry_kph = float(v)
-            kph = carry_kph if carry_kph is not None else default_kph
+            v, sc = lg.speed_limit_at(key, s_in_lane)
+            if red_no_carry:
+                rv, _rsc = lg.road_limit_at(key)
+                if rv is not None:
+                    carry_kph = float(rv)
+                kph = carry_kph if carry_kph is not None else default_kph
+                if sc and v is not None:
+                    kph = min(kph, float(v))
+            else:
+                if v is not None:
+                    carry_kph = float(v)
+                kph = carry_kph if carry_kph is not None else default_kph
             return max(0.0, kph - margin_kph) / 3.6
 
         def collect_stops(key, i, s_from, s_to) -> None:

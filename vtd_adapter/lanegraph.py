@@ -323,6 +323,33 @@ class LaneGraph:
             v = None                                       # ② 호환값 무시
         return v, False
 
+    def road_limit_at(self, key: LaneKey):
+        """(도로 표시 제한속도 kph 또는 None, 보호구역 여부) — **carry 에 넣을 값**.
+
+        `speed_limit_at` 과 갈리는 점은 하나다: **구역 값을 빼고** 노면표시에서
+        온 값만 준다. 구역 값(붉은 구간의 `red_zone.limit_kph`, 호환 모드가
+        차로 단위로 세운 `speed_src == 'red_compat'`)은 그 구간 안에서만
+        유효한데, carry 규칙("None 이면 직전 값")이 그걸 물고 나가면 **붉지
+        않은 도로까지 30 으로 묶인다**.
+        2026-09-05 실측(replay 54): 그렇게 묶인 붉지 않은 구간이 2,913.5 m
+        (plain_lane 2,270.4 + out_span 643.2), 채점기에서는 붉은 적 없는 차로
+        3곳에 항목 1 위반 7건.
+
+        carry **규칙**은 그대로다 — 바뀌는 것은 carry 를 **먹이는 값**이다.
+        호출부는 이 값으로 carry 를 채우고, `speed_limit_at(key, s)` 의 구역
+        값을 그 위에 min 으로 얹는다 (`speed.red_limit_no_carry`).
+
+        red_compat 차로가 원래 노면표시를 갖고 있었다면 그 표시가 여기서 함께
+        사라진다. 현재 지도에서는 그런 차로가 **없다** — 붉은 122 차로는 전부
+        호환 모드 이전에 `speed_limit=None` 이었다 (2026-09-05 실측,
+        `tests/test_red_zone.py::test_red_compat_lanes_had_no_own_marking` 이
+        지도가 바뀌면 이 전제를 깬다).
+        """
+        r = self.lanes[key]
+        if r.get('speed_src') == 'red_compat':
+            return None, False
+        return r['speed_limit'], r['school_zone']
+
     def red_spans_of(self, key: LaneKey) -> List[tuple]:
         """이 차로의 붉은 구간 [(s0, s1) …] (주행 s). 없으면 빈 리스트."""
         return list(self.lanes[key].get('red_spans') or [])

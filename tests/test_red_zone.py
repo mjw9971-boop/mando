@@ -440,3 +440,127 @@ def test_intervals_use_exit_margin(lg):
     mar = float(CFG['red_zone']['exit_margin_m'])
     assert ivals[0][0] == pytest.approx(span[0], abs=0.2)
     assert ivals[0][1] == pytest.approx(span[1] + mar, abs=0.3)
+
+
+# ── 2b-C: 구역 제한속도를 carry 에 넣지 않는다 ──────────────────────────
+def _cfg_nc(on: bool):
+    import copy
+    c = copy.deepcopy(CFG)
+    c['speed']['red_limit_no_carry'] = on
+    return c
+
+
+def test_red_limit_no_carry_param_present():
+    """스위치가 params 에 있다."""
+    assert 'red_limit_no_carry' in CFG['speed']
+    assert isinstance(CFG['speed']['red_limit_no_carry'], bool)
+
+
+def test_road_limit_at_drops_zone_value(lg):
+    """붉은 차로에서 road_limit_at 은 구역 값을 빼고 준다.
+
+    speed_limit_at(k, 구간 안) 은 30 을 주지만, carry 에 넣을 값은 None 이라야
+    구간을 나간 뒤 30 이 따라가지 않는다.
+    """
+    if not CFG['red_zone']['lane_level_compat']:
+        pytest.skip('호환 모드 off')
+    k, s1 = _partial_red_lane(lg)
+    assert lg.speed_limit_at(k, 0.5 * s1) == (float(CFG['red_zone']['limit_kph']), True)
+    assert lg.road_limit_at(k) == (None, False)
+
+
+def test_road_limit_at_is_identity_on_plain_lane(lg):
+    """붉지 않은 차로는 저장값 그대로 — 표시값을 잃지 않는다."""
+    for k, r in lg.lanes.items():
+        if r.get('speed_src') == 'red_compat':
+            continue
+        assert lg.road_limit_at(k) == (r['speed_limit'], r['school_zone'])
+
+
+def test_red_compat_lanes_had_no_own_marking(lg):
+    """red_compat 차로는 호환 모드 이전에 표시값이 없었다 (2026-09-05 실측 122/122).
+
+    road_limit_at 이 red_compat 차로를 통째로 None 으로 보는 근거다. 지도가
+    바뀌어 붉은 차로에 실제 표시(RM_517_50 등)가 생기면 이 테스트가 먼저 깨진다
+    — 그때는 생성기가 표시값을 따로 남겨야 한다.
+    """
+    compat = [k for k, r in lg.lanes.items() if r.get('speed_src') == 'red_compat']
+    assert compat, 'red_compat 차로가 없다 (호환 모드 off?)'
+    kept = []
+    for k in compat:
+        r = lg.lanes[k]
+        road = lg.roads[r['road']]
+        v = road['speed_by_dir'].get(r['dir'], (None, False, None))[0]
+        if v is None and road['speed_limit'] is not None:
+            v = road['speed_limit']          # build_lane_graph 의 other_side 폴백
+        if v is not None:
+            kept.append((k, v))
+    assert kept == [], f'붉은 차로에 표시값이 생겼다: {kept[:5]}'
+
+
+def _ego(cfg, lg):
+    from vtd_adapter.ego import EgoTracker
+    return EgoTracker(lg, None, cfg)
+
+
+def test_ego_carry_keeps_zone_limit_when_off(lg):
+    """스위치 off = 이전 동작. 구간을 나가도 30 이 carry 로 따라간다."""
+    k, s1 = _partial_red_lane(lg)
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    e = _ego(_cfg_nc(False), lg)
+    assert round(e._resolve_speed_limit(k, 0.5 * s1)[0] * 3.6) == 30
+    assert round(e._resolve_speed_limit(k, s1 + mar + 1.0)[0] * 3.6) == 30
+
+
+def test_ego_carry_drops_zone_limit_when_on(lg):
+    """스위치 on. 50 도로 → 붉은 구간(30) → 같은 차로 구간 밖 = 다시 50.
+
+    carry 규칙 자체는 그대로다 — 구간 밖에서 None 이 오면 **직전 값**을 쓰는데,
+    그 직전 값이 이제 구역의 30 이 아니라 표시값 50 이다.
+    """
+    plain50 = next(k for k, r in lg.lanes.items()
+                   if not r['red_spans'] and r['speed_limit'] == 50)
+    k, s1 = _partial_red_lane(lg)
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    e = _ego(_cfg_nc(True), lg)
+    assert round(e._resolve_speed_limit(plain50, 1.0)[0] * 3.6) == 50
+    v, school = e._resolve_speed_limit(k, 0.5 * s1)
+    assert round(v * 3.6) == 30 and school is True, '구간 안은 여전히 30'
+    v, school = e._resolve_speed_limit(k, s1 + mar + 1.0)
+    assert round(v * 3.6) == 50, '구간을 나갔는데 30 이 따라온다'
+    assert school is False
+
+
+def test_ego_zone_limit_is_a_ceiling_not_a_floor(lg):
+    """구역 값은 carry 위에 **min 으로** 얹힌다 — 더 느린 도로를 30 으로 올리지 않는다."""
+    k, s1 = _partial_red_lane(lg)
+    cfg = _cfg_nc(True)
+    e = _ego(cfg, lg)
+    e._carry_limit = 20.0                     # 표시 20 도로를 지나온 상태
+    assert round(e._resolve_speed_limit(k, 0.5 * s1)[0] * 3.6) == 20
+
+
+def test_scorer_carry_drops_zone_limit_when_on(lg):
+    """채점기도 같은 분리 — 붉은 차로를 지난 뒤 표시 없는 차로가 30 으로 안 잡힌다."""
+    lim_lane = next(k for k, r in lg.lanes.items()
+                    if not r['red_spans'] and r['speed_limit'] == 50)
+    red_lane, s0, s1, xr, yr, hr = _red_sample(lg)
+    none_lane = next(k for k, r in lg.lanes.items()
+                     if r['speed_limit'] is None and not r['red_spans'])
+
+    def xy(k, s):
+        x, y, _z, h = lg.point_at(k, s)
+        return float(x), float(y), float(h)
+
+    x1, y1, h1 = xy(lim_lane, 0.5 * lg.length(lim_lane))
+    x3, y3, h3 = xy(none_lane, 0.5 * lg.length(none_lane))
+    ticks = [mk_tick(x=x1, y=y1, yaw=h1),
+             mk_tick(x=xr, y=yr, yaw=hr),
+             mk_tick(x=x3, y=y3, yaw=h3)]
+
+    off = SC.speed_context(ticks, lg, _cfg_nc(False))
+    on = SC.speed_context(ticks, lg, _cfg_nc(True))
+    assert [c['limit_kph'] for c in off][:2] == [50, 30]
+    assert [c['limit_kph'] for c in on][:2] == [50, 30], '구간 안 판정은 그대로'
+    assert off[2]['limit_kph'] == 30, 'off = 이전 동작 (구역 값이 carry 로 샌다)'
+    assert on[2]['limit_kph'] == 50, 'on 인데 30 이 carry 로 샌다'
