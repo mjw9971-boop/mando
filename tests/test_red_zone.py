@@ -44,8 +44,34 @@ def test_params_present():
     rz = CFG['red_zone']
     assert rz['verts_json'] == 'data/red_surface_verts.json'
     assert float(rz['limit_kph']) == 30.0
-    assert float(rz['boundary_margin_m']) == 2.0
-    assert CFG['speed']['roadmark_30_as_limit'] is False
+    assert float(rz['exit_margin_m']) == 2.0
+    assert rz['roadmark_30_as_limit'] is False
+    # 이탈 여유는 제어기 몫이다 — speed.* 로 흩어져 있으면 안 된다
+    assert 'roadmark_30_as_limit' not in CFG['speed']
+
+
+def test_scorer_uses_exact_span_boundary(lg):
+    """채점기는 구간을 넓히지 않는다 — 실제 경계(마진 0)로 판정한다.
+
+    exit_margin_m 은 제어기가 캡 해제를 늦추는 값이다. 채점기가 같이 넓히면
+    규칙보다 엄해져 우리 리포트가 실채점과 어긋난다.
+    """
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    # 구간 끝 뒤에 여유가 남는 차로를 고른다 (차로 끝에서 끝나는 구간이 다수다)
+    pick = None
+    for kk, r in sorted(lg.lanes.items()):
+        for a, b in r['red_spans']:
+            if b + mar + 1.0 < r['length']:
+                pick = (kk, b); break
+        if pick:
+            break
+    if pick is None:
+        pytest.skip('구간 끝 뒤에 여유가 남는 차로가 없다')
+    k, s1 = pick
+    out_s = s1 + 0.5 * mar          # 구간 끝을 살짝 지난 지점
+    x, y, _z, h = lg.point_at(k, out_s)
+    ctx = SC.speed_context([mk_tick(x=float(x), y=float(y), yaw=float(h))], lg, CFG)
+    assert ctx[0]['red'] is False
 
 
 def test_scoring_thresholds_split_by_item():

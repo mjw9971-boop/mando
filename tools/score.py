@@ -201,15 +201,14 @@ def speed_context(ticks: list[dict], lg, cfg: dict) -> list[dict]:
         (출처가 독립일 뿐 규칙은 같다. 이 함수가 잡는 것은 제어기의 차로 매칭·
          구간 판정 오류이지, carry 규칙 자체의 오류가 아니다.)
 
-    구간 이탈 쪽으로 `red_zone.boundary_margin_m` 만큼 **넓혀서** 본다 — 정점
-    매핑 오차(최근접 거리 p95 1.72 m)와 차로 매칭 흔들림 때문에 경계에서
-    빠져나가는 순간의 초과를 놓치지 않으려는 보수적 방향이다.
+    구간은 **실제 경계 그대로** 본다 (마진 0). 채점기가 구간을 넓히면 규칙보다
+    엄해져 우리 리포트가 실채점과 어긋난다 — 여유는 제어기 쪽(`red_zone.
+    exit_margin_m`, 캡 해제를 늦추는 방향)에 두는 것이 맞다. 2026-09-05 결정.
 
     lane_graph 가 없으면 옛 동작(로그값)으로 폴백한다.
     """
     rz = cfg.get('red_zone') or {}
     red_lim = float(rz.get('limit_kph', 30.0))
-    bmar = float(rz.get('boundary_margin_m', 2.0))
     default_kph = float(cfg.get('default_speed_kph', 50.0))
     out: list[dict] = []
     carry = None
@@ -236,7 +235,7 @@ def speed_context(ticks: list[dict], lg, cfg: dict) -> list[dict]:
                         'src': 'nolane'})
             continue
         rec = lg.lanes[m.lane]
-        red = any(s0 - 0.0 <= m.s <= s1 + bmar for s0, s1 in (rec.get('red_spans') or []))
+        red = any(s0 <= m.s <= s1 for s0, s1 in (rec.get('red_spans') or []))
         v = rec.get('speed_limit')
         if v is not None:
             carry = float(v)

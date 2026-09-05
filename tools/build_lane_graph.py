@@ -275,7 +275,7 @@ def red_zone_cfg(reload=False):
 
 
 def speed_cfg(reload=False):
-    """params.yaml speed.roadmark_30_as_limit — 30 노면표시를 제한속도로 쓸지.
+    """params.yaml red_zone.roadmark_30_as_limit — 30 노면표시를 제한속도로 쓸지.
 
     대회 규칙상 **붉은 노면만** 보호구역이고, 붉지 않은 도로는 30 표시가 있어도
     도로 기본 제한(50)이 적용된다. 이 맵의 30 표시(roadmark_speed_30 · RM_518)는
@@ -289,7 +289,7 @@ def speed_cfg(reload=False):
             import pathlib as _pl, sys as _sy
             _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))
             from vtd_adapter.config import load_params_yaml
-            sc = load_params_yaml().get('speed') or {}
+            sc = load_params_yaml().get('red_zone') or {}
             _SPEED_CFG = bool(sc.get('roadmark_30_as_limit', False))
         except Exception:                            # noqa: BLE001 — 독립 실행 폴백
             _SPEED_CFG = False
@@ -1207,7 +1207,7 @@ def assign_objects(lanes, roads, warnings, sig2ctrl=None, synth_stopline=True):
             else:
                 rec['markings'].append((st, nm))
         # 제한속도: 도로+방향 단위 (표시 없으면 None → 런타임에서 이전 값 유지)
-        # speed.roadmark_30_as_limit 이 false 면 **값이 30 인 표시는 제한속도로
+        # red_zone.roadmark_30_as_limit 이 false 면 **값이 30 인 표시는 제한속도로
         # 쓰지 않는다** (speed_cfg 주석 참조 — 붉은 포장과 일치하지 않는다).
         # RM_517_50 같은 다른 값은 그대로다. 이 도로에 30 표시밖에 없으면
         # speed_by_dir 가 None 이 되어 런타임 carry 가 앞 값(대개 50)을 물고 간다.
