@@ -1,0 +1,120 @@
+pass=869 fail=15 skip=104 error=0
+FAIL	test_camera_scp::test_missing_key_raises	AssertionError: DID NOT RAISE <class 'KeyError'>
+FAIL	test_camera_scp::test_preset_builds_exact_string	KeyError: 'camera'
+FAIL	test_camera_scp::test_show_owner_false	KeyError: 'camera'
+FAIL	test_overtake::test_shift_once_then_restore	TypeError: cannot unpack non-iterable NoneType object
+FAIL	test_overtake::test_shift_updates_lat_shift_for_signal	TypeError: cannot unpack non-iterable NoneType object
+FAIL	test_shift_entry::test_off_no_placement_keys_and_same_call	AssertionError: 
+FAIL	test_shift_entry::test_params_present_default_off	AssertionError: 
+FAIL	test_side_pass::test_standoff_profile_uses_shift_latest_25	AssertionError: 
+FAIL	test_side_pass::test_standoff_target_without_static_corridor	AssertionError: 
+FAIL	test_side_pick::test_params_present_and_default_off	AssertionError: 
+FAIL	test_span_gate::test_kill_switch_off_ignores_distance	AssertionError: 
+FAIL	test_span_gate::test_params_present_and_default_off	AssertionError: 
+FAIL	test_standoff_chain::test_standoff_evaluated_while_span_active	AssertionError: 
+FAIL	test_standoff_floor::test_profile_floor_default_equals_shift_latest	AssertionError: 
+FAIL	test_turn_signal::test_turn_lead_and_hold	AssertionError: 
+SKIP	test_batch_lists::test_duplicate_names_write_nothing	fixture 미지원: tmp_path
+SKIP	test_batch_lists::test_rebuild_is_idempotent_and_reads_disk	fixture 미지원: tmp_path
+SKIP	test_batch_lists::test_rebuild_lists_cli	fixture 미지원: tmp_path
+SKIP	test_batch_lists::test_rebuild_merges_all_themes	fixture 미지원: tmp_path
+SKIP	test_batch_lists::test_unknown_theme_leaves_lists_untouched	fixture 미지원: tmp_path
+SKIP	test_build_route_candidates::test_centerline_csvs_unchanged	fixture 미지원: monkeypatch
+SKIP	test_build_route_candidates::test_default_is_ball_query	fixture 미지원: monkeypatch
+SKIP	test_build_route_candidates::test_max_points_truncates	fixture 미지원: capsys
+SKIP	test_build_route_candidates::test_pair_choice_rescues_k40_venue	fixture 미지원: monkeypatch
+SKIP	test_build_route_candidates::test_venue_csv_builds_with_ball	fixture 미지원: monkeypatch
+SKIP	test_build_route_candidates::test_venue_csv_fails_with_k40	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_connect_cap_rejects_detours	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=tests/fixtures/venue_20260903_waypoints.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=data/official_route.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=data/test_route_waypoints.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=tests/fixtures/waypoints.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=waypoints.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=scenarios/정적회피집중/정적회피집중_01_좌회전2.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=scenarios/정적회피집중/정적회피집중_02_직진3.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_every_pair_entry_can_perform_the_turn[path=scenarios/정적회피집중/정적회피집중_03_우회전5.csv]	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_non_pair_segments_untouched	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_params_defaults	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_pool_is_superset_of_candidates	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_switch_off_is_previous_behaviour	fixture 미지원: monkeypatch
+SKIP	test_build_route_pair::test_turn_threshold_is_single_source	fixture 미지원: monkeypatch
+SKIP	test_build_route_start_lane::test_locate_none_falls_back_to_candidates	fixture 미지원: monkeypatch
+SKIP	test_build_route_start_lane::test_override_fires_and_recovers	fixture 미지원: monkeypatch
+SKIP	test_build_route_start_lane::test_real_csvs_do_not_trigger	fixture 미지원: monkeypatch
+SKIP	test_build_route_start_lane::test_switch_default_is_on	fixture 미지원: monkeypatch
+SKIP	test_build_route_start_lane::test_switch_off_keeps_locate	fixture 미지원: monkeypatch
+SKIP	test_camera_scp::test_camera_order_per_scenario	lane_graph.pkl 또는 완주속도 시나리오 csv 없음
+SKIP	test_csv_warn_gate::test_clean_build_proceeds	fixture 미지원: fake_build
+SKIP	test_csv_warn_gate::test_hard_failure_aborts_even_with_flag	fixture 미지원: fake_build
+SKIP	test_csv_warn_gate::test_warning_aborts	fixture 미지원: fake_build
+SKIP	test_csv_warn_gate::test_warning_can_be_overridden	fixture 미지원: fake_build
+SKIP	test_finish_target::test_resolve_falls_back_without_finish_xy	fixture 미지원: capsys
+SKIP	test_finish_target::test_resolve_warns_and_clips_on_short_tail	fixture 미지원: capsys
+SKIP	test_finish_xy_route::test_kr_rules_params_wins_over_route	fixture 미지원: capsys
+SKIP	test_finish_xy_route::test_kr_rules_switch_off_ignores_route	fixture 미지원: capsys
+SKIP	test_finish_xy_route::test_kr_rules_uses_route_finish_xy	fixture 미지원: capsys
+SKIP	test_finish_xy_route::test_tail_extension_removes_clip	fixture 미지원: capsys
+SKIP	test_gen_scenarios::test_batch_json	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_batch_run_merge_and_dup_check	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_build_route_from_outputs	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_csv_competition_format	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_free_start	fixture 미지원: tmp_path
+SKIP	test_gen_scenarios::test_from_yaml_regen	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_no_lateral_warning	fixture 미지원: tmp_path
+SKIP	test_gen_scenarios::test_path_waypoints_interior	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_ped_crossing_ends_off_roadway	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_reproducible	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_routes_build_clean	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_signal_phases_applied	fixture 미지원: outputs
+SKIP	test_gen_scenarios::test_xml_parse_all	fixture 미지원: outputs
+SKIP	test_narrow_pulk_guard::test_guard_rejects_narrow_with_pulk	fixture 미지원: monkeypatch
+SKIP	test_narrow_pulk_guard::test_guard_switch_off_restores_old_behaviour	fixture 미지원: monkeypatch
+SKIP	test_narrow_pulk_guard::test_narrow_without_pulk_is_untouched	fixture 미지원: monkeypatch
+SKIP	test_narrow_pulk_guard::test_other_events_pass_with_pulk	fixture 미지원: monkeypatch
+SKIP	test_obstacle_chain_multi_lane::test_gate_off_reproduces_the_old_placement	fixture 미지원: monkeypatch
+SKIP	test_obstacle_chain_multi_lane::test_gate_on_no_can_lands_in_a_single_lane_stretch	fixture 미지원: monkeypatch
+SKIP	test_obstacle_chain_multi_lane::test_gate_raises_unfeasible_when_route_has_no_multi_lane_span	fixture 미지원: monkeypatch
+SKIP	test_obstacle_chain_multi_lane::test_whole_chain_stays_inside_one_multi_lane_span	fixture 미지원: monkeypatch
+SKIP	test_ped_release::test_unprojectable_tick_resets_clear_keeps_hold	fixture 미지원: monkeypatch
+SKIP	test_ped_trigger::test_check_scenario_counts_unreached	fixture 미지원: tmp_path
+SKIP	test_ped_trigger::test_claim_covers_trigger_point	fixture 미지원: patched
+SKIP	test_ped_trigger::test_dropped_when_needed_speed_out_of_range	fixture 미지원: patched
+SKIP	test_ped_trigger::test_dropped_when_start_already_inside_lane	fixture 미지원: patched
+SKIP	test_ped_trigger::test_dropped_when_trigger_point_before_route_start	fixture 미지원: patched
+SKIP	test_ped_trigger::test_expectation_reproduces_generator_for_new_scenarios	fixture 미지원: patched
+SKIP	test_ped_trigger::test_left_side_uses_left_edge	fixture 미지원: patched
+SKIP	test_ped_trigger::test_legacy_scenario_gets_real_verdict_not_placeholder	fixture 미지원: tmp_path
+SKIP	test_ped_trigger::test_meet_lat_lands_inside_lane	fixture 미지원: patched
+SKIP	test_ped_trigger::test_trigger_matches_hand_computed_formula	fixture 미지원: patched
+SKIP	test_ped_trigger::test_trigger_scales_with_road_width	fixture 미지원: patched
+SKIP	test_ped_trigger::test_unreached_events_still_counted_before_expectation	fixture 미지원: tmp_path
+SKIP	test_ped_trigger::test_walk_speed_lowered_when_trigger_would_undershoot_min	fixture 미지원: patched
+SKIP	test_ped_trigger::test_walk_speed_raised_when_trigger_would_exceed_max	fixture 미지원: patched
+SKIP	test_route_check_pair::test_error_forced_infeasible	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_error_infeasible_turn_geometry	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_error_junction_lane_change	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_error_lane_change_window_too_short	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_error_turn_incapable_pair_is_rc	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=tests/fixtures/venue_20260903_waypoints.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=data/official_route.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=tests/fixtures/waypoints.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=waypoints.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=scenarios/정적회피집중/정적회피집중_01_좌회전2.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=scenarios/정적회피집중/정적회피집중_02_직진3.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_no_warnings[path=scenarios/정적회피집중/정적회피집중_03_우회전5.csv]	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_non_pair_uses_max_dist	fixture 미지원: monkeypatch
+SKIP	test_route_check_pair::test_pair_waypoints_exempted_and_turn_reported	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_switch_off_restores_halfwidth	fixture 미지원: monkeypatch
+SKIP	test_route_check_pair::test_turn_incapable_pair_warns	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_warn_affects_rc_switch	fixture 미지원: monkeypatch
+SKIP	test_route_check_pair::test_warn_dev_still_overrides	fixture 미지원: capsys
+SKIP	test_route_check_pair::test_warn_does_not_affect_rc	fixture 미지원: monkeypatch
+SKIP	test_solid_lc::test_no_dashed_warns_and_keeps_geometry	fixture 미지원: capsys
+SKIP	test_static_vehicle_multi_lane::test_gate_off_reproduces_the_old_placement	fixture 미지원: monkeypatch
+SKIP	test_static_vehicle_multi_lane::test_gate_on_never_places_in_a_single_lane_stretch	fixture 미지원: monkeypatch
+SKIP	test_static_vehicle_multi_lane::test_left_lane_request_never_falls_back_to_blocking_the_ego_lane	fixture 미지원: monkeypatch
+SKIP	test_traffic::test_broken_sum_is_gen_error_not_silent_fix[key=area_f]	fixture 미지원: monkeypatch
+SKIP	test_traffic::test_broken_sum_is_gen_error_not_silent_fix[key=cars]	fixture 미지원: monkeypatch
+SKIP	test_traffic::test_check_scenario_omits_traffic_without_pulk	fixture 미지원: tmp_path
+SKIP	test_traffic::test_check_scenario_reports_traffic_from_pulk_count	fixture 미지원: tmp_path

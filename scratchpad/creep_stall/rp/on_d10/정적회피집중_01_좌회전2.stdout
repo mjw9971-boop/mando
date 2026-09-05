@@ -1,0 +1,37 @@
+[kr_rules] finish_xy 출처: route.pkl(CSV 마지막 행)
+t=   0.0  road/lane=  2467/-1  s_route=    0.5m  v= 0.00→ 1.18 m/s  steer=-0.000  accel=+0.10  lead
+t=   1.0  road/lane=  2467/-1  s_route=   20.3m  v= 6.14→ 7.22 m/s  steer=-0.000  accel=+0.87  lead
+t=   2.0  road/lane=  2467/-1  s_route=   82.0m  v= 4.84→ 8.33 m/s  steer=-0.002  accel=+2.00  none
+t=   3.0  road/lane=  2542/-1  s_route=  133.6m  v= 8.01→ 8.13 m/s  steer=+0.354  accel=-0.05  lead
+t=   4.0  road/lane=   2533/2  s_route=  185.5m  v=10.13→10.74 m/s  steer=-0.000  accel=+0.49  light
+[kr_rules] 정적 장애물 회피 — right 로 경로 시프트 (id=[16, 2], 구간 2175~3094, p1, single)
+t=   5.0  road/lane=   2533/2  s_route=  230.4m  v= 0.07→10.13 m/s  steer=-0.013  accel=+0.10  route_end
+t=   6.0  road/lane=   2533/2  s_route=  297.5m  v= 9.82→ 3.50 m/s  steer=-0.025  accel=-2.87  route_end
+t=   7.0  road/lane=   2533/2  s_route=  309.3m  v= 0.00→ 0.00 m/s  steer=-0.036  accel=-1.00  route_end
+t=   8.0  road/lane=   2533/2  s_route=  309.3m  v= 0.00→ 0.00 m/s  steer=-0.036  accel=-1.00  route_end
+t=   9.0  road/lane=   2533/2  s_route=  309.4m  v= 0.03→ 0.00 m/s  steer=-0.034  accel=-1.00  route_end
+t=  10.1  road/lane=   2533/2  s_route=  313.2m  v= 0.73→ 0.80 m/s  steer=+0.001  accel=-2.10  route_end
+[kr_rules] 데드락 해제 진입 — BREAKOUT L1 (기각 4.0 s)
+[kr_rules] BREAKOUT 단계 상승 → L2
+[kr_rules] BREAKOUT 단계 상승 → L3
+t=  11.1  road/lane=   2533/2  s_route=  317.4m  v= 0.00→ 0.00 m/s  steer=+0.007  accel=-1.00  lead
+t=  12.1  road/lane=   2533/2  s_route=  317.4m  v= 0.00→ 0.00 m/s  steer=+0.007  accel=-1.00  lead
+t=  13.1  road/lane=   2533/2  s_route=  317.4m  v= 0.00→ 0.00 m/s  steer=+0.007  accel=-1.00  route_end
+t=  14.1  road/lane=   2533/2  s_route=  317.4m  v= 0.00→ 0.00 m/s  steer=+0.007  accel=-1.00  route_end
+t=  15.1  road/lane=   2533/2  s_route=  317.5m  v= 0.08→ 0.13 m/s  steer=+0.007  accel=+0.04  lead
+[kr_rules] 데드락 해제 진입 — BREAKOUT L1 (기각 4.0 s)
+[kr_rules] BREAKOUT 단계 상승 → L2
+t=  16.1  road/lane=   2533/2  s_route=  317.6m  v= 0.00→ 0.00 m/s  steer=+0.007  accel=-1.00  lead
+[kr_rules] BREAKOUT 단계 상승 → L3
+[kr_rules] BREAKOUT 단계 상승 → L4
+t=  17.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+t=  18.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+t=  19.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+t=  20.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+t=  21.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+t=  22.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+[kr_rules] 데드락 해제 진입 — BREAKOUT L1 (기각 4.0 s)
+t=  23.1  road/lane=   2533/2  s_route=  319.2m  v= 0.00→ 0.00 m/s  steer=+0.004  accel=-1.00  lead
+[kr_rules] BREAKOUT 단계 상승 → L2
+[kr_rules] BREAKOUT 단계 상승 → L3
+[main] 틱 2399회 종료

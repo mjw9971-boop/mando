@@ -1,0 +1,21 @@
+[kr_rules] finish_xy 출처: route.pkl(CSV 마지막 행)
+t=   0.0  road/lane=  2467/-1  s_route=    0.5m  v= 0.00→ 1.19 m/s  steer=+0.000  accel=+0.10  lead
+t=   1.0  road/lane=  2467/-1  s_route=   14.7m  v= 5.18→ 6.31 m/s  steer=+0.000  accel=+0.90  lead
+t=   2.0  road/lane=  2467/-2  s_route=   58.8m  v= 9.20→ 8.80 m/s  steer=+0.000  accel=-1.04  route_end
+t=   3.0  road/lane=  2467/-1  s_route=   82.6m  v= 5.99→ 8.33 m/s  steer=+0.001  accel=+1.88  none
+t=   4.0  road/lane=  2542/-1  s_route=  107.7m  v= 1.68→ 2.76 m/s  steer=-0.001  accel=-0.10  lead
+t=   5.0  road/lane=  2542/-1  s_route=  119.4m  v= 4.38→ 5.41 m/s  steer=+0.012  accel=+0.83  lead
+t=   6.0  road/lane=  2542/-1  s_route=  145.3m  v= 7.97→ 8.33 m/s  steer=-0.033  accel=-0.04  none
+t=   7.1  road/lane=   2533/2  s_route=  190.1m  v=12.07→12.50 m/s  steer=+0.003  accel=+0.22  none
+[kr_rules] 정적 장애물 회피 — right 로 경로 시프트 (id=[2], 구간 2296~3038, p1, single)
+t=   8.1  road/lane=   2533/2  s_route=  235.3m  v= 3.39→ 8.41 m/s  steer=-0.061  accel=+1.80  route_end
+[kr_rules] 정적 장애물 회피 — right 로 경로 시프트 (id=[7, 3, 4], 구간 3101~4067, p1, single)
+t=   9.1  road/lane=   2533/2  s_route=  305.1m  v= 8.30→ 7.43 m/s  steer=-0.031  accel=-0.42  route_end
+t=  10.1  road/lane=   2533/3  s_route=  341.8m  v= 7.04→ 8.07 m/s  steer=-0.017  accel=+0.83  light
+t=  11.1  road/lane=   2533/3  s_route=  374.8m  v= 2.42→ 3.62 m/s  steer=-0.000  accel=+0.95  light
+t=  12.2  road/lane=   2533/3  s_route=  414.1m  v= 8.15→12.50 m/s  steer=+0.013  accel=+2.00  none
+t=  13.2  road/lane=   2533/3  s_route=  477.2m  v= 6.55→ 8.33 m/s  steer=-0.000  accel=-2.90  none
+t=  14.2  road/lane=  2765/-2  s_route=  506.2m  v= 7.47→ 7.81 m/s  steer=-0.000  accel=+0.27  route_end
+t=  15.2  road/lane=   2756/2  s_route=  553.5m  v= 9.11→ 9.38 m/s  steer=-0.001  accel=+0.22  route_end
+t=  16.2  road/lane=   2756/2  s_route=  623.4m  v= 9.80→ 9.73 m/s  steer=-0.001  accel=-0.88  route_end
+[main] 틱 1822회 종료
