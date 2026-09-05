@@ -183,7 +183,7 @@ class Runner:
         if not route_path:
             raise SystemExit('--route 또는 --csv 를 줘야 한다')
 
-        self.lg = LaneGraph(args.graph)
+        self.lg = LaneGraph(args.graph, cfg=self.cfg)   # 붉은 구간 스위치가 --config 를 따라오게
         self.route = load_route(route_path) if pathlib.Path(route_path).exists() else None
         if self.route is None:
             raise SystemExit(f'route 파일 없음: {route_path}')

@@ -238,3 +238,88 @@ def test_severity_item2_is_stricter():
     # 같은 초과량이 항목 1 에서는 경미, 항목 2 에서는 중대
     assert _sev(11.0, False) == 'minor'
     assert _sev(11.0, True) == 'major'
+
+
+# ── 2b-A: 차로 s 로 붉은 구간 조회 ──────────────────────────────────────
+def test_red_span_switch_default_on():
+    """기본 on 이다 — 못 읽으면 항목 2 중대라 조용히 꺼지는 쪽이 더 위험하다."""
+    assert CFG['speed']['red_span_enable'] is True
+
+
+def test_speed_limit_at_without_s_is_unchanged(lg):
+    """s 를 안 주면 예전 그대로 — 기존 호출부가 하나도 안 바뀐다."""
+    for k, r in list(lg.lanes.items())[:200]:
+        assert lg.speed_limit_at(k) == (r['speed_limit'], r['school_zone'])
+
+
+def _partial_red_lane(lg):
+    """구간이 차로 일부만 덮는 차로 (구간 뒤에 여유가 남는 것)."""
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    for k, r in sorted(lg.lanes.items()):
+        for _s0, s1 in r['red_spans']:
+            if s1 + mar + 5.0 < r['length']:
+                return k, s1
+    pytest.skip('부분만 붉은 차로가 없다')
+
+
+def test_inside_span_returns_zone_limit(lg):
+    k, s1 = _partial_red_lane(lg)
+    v, sc = lg.speed_limit_at(k, 0.5 * s1)
+    assert (v, sc) == (float(CFG['red_zone']['limit_kph']), True)
+
+
+def test_exit_margin_delays_release(lg):
+    """구간 끝 + exit_margin_m 까지는 아직 보호구역이다."""
+    k, s1 = _partial_red_lane(lg)
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    assert lg.speed_limit_at(k, s1 + 0.5 * mar)[1] is True
+    assert lg.speed_limit_at(k, s1 + mar + 0.5)[1] is False
+
+
+def test_outside_span_ignores_compat_value(lg):
+    """부분만 붉은 차로의 구간 밖은 호환 30 을 무시하고 None → carry.
+
+    이게 없으면 (173,0,-1) 처럼 414.7 m 중 236.7 m 만 붉은 차로가 전 구간
+    30 으로 묶인다.
+    """
+    if not CFG['red_zone']['lane_level_compat']:
+        pytest.skip('호환 모드 off')
+    k, s1 = _partial_red_lane(lg)
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    assert lg.lanes[k]['speed_src'] == 'red_compat'
+    assert lg.lanes[k]['speed_limit'] == float(CFG['red_zone']['limit_kph'])
+    assert lg.speed_limit_at(k, s1 + mar + 1.0) == (None, False)
+
+
+def test_switch_off_uses_lane_level_value(lg):
+    """킬 스위치 off 면 s 를 줘도 차로 단위 값 그대로 = 이전 동작."""
+    import copy
+    from vtd_adapter.lanegraph import LaneGraph as LG
+    off = copy.deepcopy(CFG)
+    off['speed']['red_span_enable'] = False
+    lg_off = LG(str(GRAPH), cfg=off)
+    k, s1 = _partial_red_lane(lg)
+    mar = float(CFG['red_zone']['exit_margin_m'])
+    assert lg_off.speed_limit_at(k, s1 + mar + 1.0) == (lg.lanes[k]['speed_limit'],
+                                                        lg.lanes[k]['school_zone'])
+
+
+def test_cfg_follows_explicit_params(lg):
+    """LaneGraph(cfg=...) 가 --config override 를 따라간다.
+
+    2026-09-05 실측: 이게 없어서 replay 의 red_span_enable=false 가 무시됐고
+    킬 스위치 off 검증이 통과하지 않았다 (모듈 폴백이 저장소 params 를 읽었다).
+    """
+    import copy
+    from vtd_adapter.lanegraph import LaneGraph as LG
+    alt = copy.deepcopy(CFG)
+    alt['red_zone']['limit_kph'] = 22.0
+    lg_alt = LG(str(GRAPH), cfg=alt)
+    k, s1 = _partial_red_lane(lg)
+    assert lg_alt.speed_limit_at(k, 0.5 * s1)[0] == 22.0
+
+
+def test_plain_lane_is_untouched(lg):
+    """붉은 구간이 없는 차로는 s 를 줘도 값이 그대로다."""
+    k = next(k for k, r in lg.lanes.items() if not r['red_spans'] and r['speed_limit'] == 50)
+    assert lg.speed_limit_at(k, 0.5 * lg.length(k)) == (50, False)

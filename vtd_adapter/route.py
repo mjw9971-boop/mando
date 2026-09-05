@@ -320,9 +320,14 @@ class VtdRoutePlanner:
         default_kph = float(self.cfg.get('default_speed_kph', 50.0))
         carry_kph: float | None = None
 
-        def limit_mps(key) -> float:
+        def limit_mps(key, s_in_lane=None) -> float:
+            """경로점 하나의 목표 상한 [m/s].
+
+            `s_in_lane` 을 주면 붉은 구간(red_spans)이 s 로 반영된다 — 같은
+            차로 안에서도 구간 안팎이 갈린다. carry 규칙은 그대로다.
+            """
             nonlocal carry_kph
-            v, _sc = lg.speed_limit_at(key)
+            v, _sc = lg.speed_limit_at(key, s_in_lane)
             if v is not None:
                 carry_kph = float(v)
             kph = carry_kph if carry_kph is not None else default_kph
@@ -411,7 +416,7 @@ class VtdRoutePlanner:
                 keys.append((cur_key, cur_s))
                 cmds.append(int(cmd))
                 rs_list.append(rs)
-                limits.append(limit_mps(cur_key))
+                limits.append(limit_mps(cur_key, cur_s))
                 lat.append(off)
                 s += step
                 rs += step
@@ -444,7 +449,7 @@ class VtdRoutePlanner:
             keys.append((key, s))
             cmds.append(int(RoadOption.LANEFOLLOW))
             rs_list.append(rs)
-            limits.append(limit_mps(key))
+            limits.append(limit_mps(key, s))
             lat.append(lat_acc)
             s += step
             rs += step

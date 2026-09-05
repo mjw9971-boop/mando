@@ -279,8 +279,8 @@ class EgoTracker(EgoSpeedEstimator):
             ahead = self.lg.lookahead(self.route, idx, m.s, horizon)
             summ = self.lg.summarize(ahead)
 
-        # 4) 제한속도 carry + 노면표시
-        speed_limit, school = self._resolve_speed_limit(m.lane)
+        # 4) 제한속도 carry + 노면표시 (붉은 구간은 s 로 판정 — m.s 를 넘긴다)
+        speed_limit, school = self._resolve_speed_limit(m.lane, m.s)
         left_typ, _lc, left_ok = self.lg.mark_at(m.lane, m.s, 'left')
         right_typ, _rc, right_ok = self.lg.mark_at(m.lane, m.s, 'right')
 
@@ -329,17 +329,22 @@ class EgoTracker(EgoSpeedEstimator):
         return float(self.cfg.get('default_speed_kph', 50)) / 3.6
 
     # ── 제한속도 ──────────────────────────────────────────────────────────
-    def _resolve_speed_limit(self, lane: LaneKey | None) -> tuple[float, bool]:
+    def _resolve_speed_limit(self, lane: LaneKey | None,
+                             s: float | None = None) -> tuple[float, bool]:
         """
-        현재 유효 제한속도 [m/s] 와 스쿨존 여부.
+        현재 유효 제한속도 [m/s] 와 보호구역(붉은 노면) 여부.
 
         SPEC §1.5: xodr 에 표준 <speed> 가 없어 노면표시로 부여했고, 표시 없는
         도로는 None 이다 → **직전 값 유지(carry)**. carry 할 값도 없으면
         config `default_speed_kph`.
+
+        `s` 를 주면 `speed_limit_at` 이 붉은 구간(red_spans)을 s 로 판정한다.
+        구간 안이면 `red_zone.limit_kph`, 붉은 차로인데 구간 밖이면 None 이 와서
+        **carry 규칙이 그대로 앞 값을 물고 간다** — carry 는 손대지 않았다.
         """
         limit_kph, school = (None, False)
         if lane is not None:
-            limit_kph, school = self.lg.speed_limit_at(lane)
+            limit_kph, school = self.lg.speed_limit_at(lane, s)
 
         if limit_kph is not None:
             self._carry_limit = float(limit_kph)

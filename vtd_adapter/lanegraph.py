@@ -48,10 +48,48 @@ class Ahead:
     data: Dict[str, Any] = field(default_factory=dict)
 
 
+_RED_CFG = None
+
+
+def red_span_from_cfg(cfg):
+    """params dict → (스위치, 보호구역 제한 kph, 이탈 여유 m)."""
+    sp = (cfg or {}).get('speed') or {}
+    rz = (cfg or {}).get('red_zone') or {}
+    return (bool(sp.get('red_span_enable', True)),
+            float(rz.get('limit_kph', 30.0)),
+            float(rz.get('exit_margin_m', 2.0)))
+
+
+def red_span_cfg(reload=False):
+    """붉은 구간(감속 구간) 조회 상수의 **폴백** — `config/params.yaml` 을 읽는다.
+
+    `LaneGraph(path, cfg=...)` 로 params 를 받으면 그쪽이 우선이다. 이 폴백은
+    cfg 없이 만든 LaneGraph(도구·테스트)를 위한 것이다. **`--config` 로 다른
+    params 를 준 실행에서는 반드시 cfg 를 넘겨야 한다** — 안 넘기면 저장소
+    기본 파일을 읽어 스위치가 따라오지 않는다 (2026-09-05 실측: replay 의
+    red_span_enable=false 가 무시돼 off 검증이 통과하지 않았다).
+
+    params 없이도 동작해야 해서 실패는 기본값으로 삼킨다 — 기본값은
+    **스위치 on** 이다. 붉은 구간을 못 읽으면 항목 2 중대라, 조용히 꺼지는
+    쪽이 더 위험하다.
+    """
+    global _RED_CFG
+    if _RED_CFG is None or reload:
+        try:
+            from vtd_adapter.config import load_params_yaml
+            _RED_CFG = red_span_from_cfg(load_params_yaml())
+        except Exception:                                  # noqa: BLE001 — 독립 실행 폴백
+            _RED_CFG = (True, 30.0, 2.0)
+    return _RED_CFG
+
+
 class LaneGraph:
-    def __init__(self, path='lane_graph.pkl'):
+    def __init__(self, path='lane_graph.pkl', cfg=None):
+        """cfg: params dict. 주면 붉은 구간 상수를 여기서 읽는다 (`--config`
+        override 가 따라오도록). 없으면 저장소 기본 params 폴백."""
         with open(path, 'rb') as f:
             g = pickle.load(f)
+        self._red_cfg = red_span_from_cfg(cfg) if cfg is not None else None
         self.g = g
         self.lanes: Dict[LaneKey, dict] = g['lanes']
         self.roads = g['roads']
@@ -249,9 +287,45 @@ class LaneGraph:
             return False
         return bool(self.mark_at(key, s, side)[2])
 
-    def speed_limit_at(self, key: LaneKey):
+    def speed_limit_at(self, key: LaneKey, s: Optional[float] = None):
+        """(제한속도 kph 또는 None, 보호구역 여부).
+
+        `s` 를 주면 **붉은 구간(red_spans)** 을 s 로 판정한다. 판정 순서:
+
+          ① 구간 안 (`s0 ≤ s ≤ s1 + red_zone.exit_margin_m`)
+             → `red_zone.limit_kph`, 보호구역 참.
+             이탈 쪽 여유는 정점 매핑 오차(최근접 거리 p95 1.72 m)와 차로 매칭
+             흔들림 때문이다 — 경계 직후 재가속하면 실제로는 아직 구간 안일 수
+             있다. **채점기는 이 여유를 쓰지 않는다**(실제 경계로 판정).
+          ② 붉은 구간이 있는 차로인데 s 가 구간 밖
+             → 호환 모드가 세운 차로 단위 값(`speed_src == 'red_compat'`)은
+             **무시하고 None** 으로 본다. 그래야 부분만 붉은 차로가 전 구간
+             과다 감속되지 않는다 (예 (173,0,-1) 은 414.7 m 중 236.7 m 만 붉다).
+             None 이면 호출부의 carry 규칙이 앞 값을 물고 간다 — 무수정이다.
+          ③ 그 외 → 저장된 값 그대로.
+
+        `s` 를 주지 않으면(기존 호출) ③ 만 적용되어 **예전과 완전히 같다**.
+        스위치 `speed.red_span_enable` 이 false 여도 마찬가지다.
+        """
         r = self.lanes[key]
-        return r['speed_limit'], r['school_zone']
+        spans = r.get('red_spans') or []
+        if s is None or not spans:
+            return r['speed_limit'], r['school_zone']
+        on, red_kph, exit_m = self._red_cfg or red_span_cfg()
+        if not on:
+            return r['speed_limit'], r['school_zone']
+        sv = float(s)
+        for s0, s1 in spans:
+            if s0 <= sv <= s1 + exit_m:
+                return red_kph, True
+        v = r['speed_limit']
+        if r.get('speed_src') == 'red_compat':
+            v = None                                       # ② 호환값 무시
+        return v, False
+
+    def red_spans_of(self, key: LaneKey) -> List[tuple]:
+        """이 차로의 붉은 구간 [(s0, s1) …] (주행 s). 없으면 빈 리스트."""
+        return list(self.lanes[key].get('red_spans') or [])
 
     def width_at(self, key: LaneKey, s: float) -> float:
         r = self.lanes[key]
@@ -405,9 +479,12 @@ class LaneGraph:
         lanes = route['lanes']
         acc = 0.0
         cur_limit, cur_school = None, False
-        # 현재 차로 이전 값 (carry) 찾기: 뒤로 거슬러
+        # 현재 차로 이전 값 (carry) 찾기: 뒤로 거슬러.
+        # 붉은 구간은 s 로 갈리므로, 현재 차로는 s_in_lane 으로 · 지나온 차로는
+        # 그 **끝**(자차에 가장 가까운 지점)으로 본다.
         for j in range(idx, -1, -1):
-            v, sc = self.speed_limit_at(lanes[j])
+            sj = s_in_lane if j == idx else self.lanes[lanes[j]]['length']
+            v, sc = self.speed_limit_at(lanes[j], sj)
             if v is not None:
                 cur_limit, cur_school = v, sc
                 break
@@ -422,14 +499,31 @@ class LaneGraph:
             r = self.lanes[key]
             L = r['length']
             base = acc - s0  # 차로 s → 거리: dist = base + s
-            # 제한속도 변경
-            v, sc = self.speed_limit_at(key)
-            if v is not None and (v != cur_limit or sc != cur_school):
-                if i != idx or s0 <= 1e-6:
-                    items.append(Ahead(max(0.0, base + 0.0), 'speed', key, 0.0, {'limit': v, 'school_zone': sc, 'prev': cur_limit}))
-                cur_limit, cur_school = v, sc
-            elif i == idx:
-                pass
+            # 제한속도 변경. 붉은 구간은 **차로 안에서도** 값이 갈리므로 차로
+            # 시작점 하나만 보지 않고 구간 경계마다 본다 (구간 시작 · 구간 끝 +
+            # 이탈 여유). 붉은 구간이 없는 차로는 브레이크포인트가 차로 시작
+            # 하나뿐이라 예전과 같은 항목이 나온다.
+            # 브레이크포인트는 **보이는 구간의 시작점**(현재 차로는 s0, 그 뒤
+            # 차로는 0.0)을 항상 포함한다 — 이게 빠지면 그 차로에서 cur_limit
+            # 갱신 자체가 일어나지 않아 뒤 차로의 판정이 어긋난다.
+            _on, _kph, _exit_m = self._red_cfg or red_span_cfg()
+            start_s = s0 if i == idx else 0.0
+            brks = {start_s}
+            if _on:
+                for _s0, _s1 in (r.get('red_spans') or []):
+                    for b in (float(_s0), min(float(_s1) + _exit_m, L)):
+                        if start_s + 1e-6 < b <= L + 1e-6:
+                            brks.add(b)
+            for bs in sorted(brks):
+                v, sc = self.speed_limit_at(key, bs)
+                if v is not None and (v != cur_limit or sc != cur_school):
+                    # 시작점 항목은 예전 게이트 그대로(현재 차로 중간이면 안 낸다).
+                    # 구간 경계 항목은 자차 앞이므로 항상 낸다.
+                    if bs > start_s + 1e-6 or i != idx or s0 <= 1e-6:
+                        items.append(Ahead(max(0.0, base + bs), 'speed', key,
+                                           bs if bs > start_s + 1e-6 else 0.0,
+                                           {'limit': v, 'school_zone': sc, 'prev': cur_limit}))
+                    cur_limit, cur_school = v, sc
             # 정지선/신호
             for sl in r['stop_lines']:
                 if sl['s'] >= s0 - 1e-6:

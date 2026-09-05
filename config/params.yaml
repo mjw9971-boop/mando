@@ -130,6 +130,13 @@ speed:
   # 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
   # (phase3: VtdRoutePlanner 가 speed_limits 에 반영)
   margin_kph: 5.0
+  # 붉은 구간(감속 구간)을 **차로 s 로** 판정할지 (lanegraph.speed_limit_at).
+  # true = red_spans 안이면 red_zone.limit_kph, 붉은 차로인데 구간 밖이면
+  #        호환값(speed_src='red_compat')을 무시하고 None → carry.
+  #        부분만 붉은 차로가 전 구간 과다 감속되지 않는다.
+  # false = 차로 단위 speed_limit 을 그대로 쓴다 (호환 모드면 전 구간 30).
+  # 기본 on — 못 읽으면 항목 2 중대라 조용히 꺼지는 쪽이 더 위험하다.
+  red_span_enable: true
   # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
   a_max: 2.0
   a_min: -6.0
