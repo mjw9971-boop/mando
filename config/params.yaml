@@ -497,7 +497,7 @@ overtake:
   # 0.7~2.6 m 로 매번 바닥을 넘어 들어가므로 잠금 **지점만** 앞으로 옮겨진다.
   # 기준선 **바깥**(d ≥ standoff) 프로파일은 건드리지 않는다.
   # false = 이전 동작(안쪽에서 0 고정). 기본 off (실차 검증 전).
-  standoff_creep_enable: true
+  standoff_creep_enable: false
   # 크립 속도 [m/s]. 제동거리 0.08 m + 1틱 반응 0.04 = 0.12 m 로 아래 정지
   # 여유(1.0 m)의 1/8. BREAKOUT creep_v(1.0)보다 낮게 잡는다 — 그쪽은 사다리
   # 4단계를 통과해야 열리지만 이건 d < standoff 면 언제나 열린다.
