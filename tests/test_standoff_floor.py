@@ -8,6 +8,7 @@
 shift_cap 발동 시점이 같이 바뀐다. 그래서 ① 전용 상수 `standoff_floor_m` 을
 두고 기본값을 `shift_latest_m` 과 같게(25.0) 잡아 **분리 자체는 무변화**로 둔다.
 """
+import copy
 import math
 import pathlib
 import sys
@@ -64,9 +65,16 @@ def test_profile_uses_floor_not_shift_latest():
         math.sqrt(2.0 * A_STOP * (30.0 - 20.0)))
 
 
-def test_profile_floor_default_equals_shift_latest():
-    """기본값에서는 분리 전과 완전히 같은 값을 낸다."""
-    kr, _p = make()
+def test_profile_floor_defaults_to_shift_latest_when_key_absent():
+    """키가 없으면 shift_latest_m 을 그대로 따른다 = 분리 전과 완전히 같은 값.
+
+    params 의 현재 값이 아니라 **기본값 규약**을 본다 — 값이 나중에 바뀌어도
+    이 성질은 유지돼야 한다.
+    """
+    cfg = copy.deepcopy(CFG)
+    cfg['overtake'].pop('standoff_floor_m', None)
+    kr, _p = make(cfg)
+    assert kr.standoff_floor_m == pytest.approx(cfg['overtake']['shift_latest_m'])
     kr.wait_target_d = 40.0
     assert kr._standoff_profile(0.0) == pytest.approx(
-        math.sqrt(2.0 * A_STOP * (40.0 - OT['shift_latest_m'])))
+        math.sqrt(2.0 * A_STOP * (40.0 - cfg['overtake']['shift_latest_m'])))
