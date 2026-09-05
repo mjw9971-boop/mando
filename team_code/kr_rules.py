@@ -366,6 +366,10 @@ class KrRules:
         self.gap_fit = bool(ot.get('gap_fit_enable', False))
         self.gap_fit_clear_m = float(ot.get('gap_fit_clear_m', 0.6))
         self.gap_fit_step_m = float(ot.get('gap_fit_trans_step_m', 2.0))
+        # gap_fit 이 고른 전이를 실제로 만들 수 있는 속도까지 먼저 줄인다.
+        self.gap_fit_speed = bool(ot.get('gap_fit_speed_enable', False))
+        self.gap_v_req: float | None = None        # 이번 틱 전이 길이 기반 속도 상한
+        self.gap_hold_ticks = 0                    # span 생성 보류 누적 (진단용)
         self.entry_max_delay_m = float(ot.get('shift_entry_max_delay_m', 15.0))
         self.entry_step_m = float(ot.get('shift_entry_step_m', 0.5))
         self.exit_min_after_m = float(ot.get('shift_exit_min_after_m', 0.0))
@@ -2538,6 +2542,32 @@ class KrRules:
             span_plan=p.get('span_plan'))
         if ginfo:
             self.last_avoid.update(ginfo)
+        # ⑨ gap_fit 속도 연동 — 고른 전이는 v ≤ trans / shift_k_s 에서만 실제로
+        # 만들어진다 (trans_m = max(transition_m, shift_k_s·v)). 지금 만들면 다음
+        # 틱에 trans 가 다시 3·v 로 늘어 같은 span 이 되므로, **속도를 먼저 줄이고**
+        # 생성을 보류한다. 속도는 위 apply 의 min() 후보(gap_v_req)로만 낮춘다 —
+        # 여기서 제어에 직접 손대지 않는다.
+        # 보류는 자기제한적이다: s_rel 이 새 전이의 geom need 밑으로 내려가면
+        # 더 기다릴 이유가 없어 현행 배치로 즉시 생성한다. 무한 대기가 없다.
+        if (self.gap_fit_speed and ginfo and ginfo.get('gap_T_sel') is not None):
+            v_req = trans_m / max(self.shift_k_s, 1e-6)
+            pr_h = self._project(planner, actor.get_location().x,
+                                 actor.get_location().y)
+            need_new = trans_m + ahead_eff + self.geom_margin_m
+            room = (pr_h[0] > need_new) if pr_h is not None else False
+            if ego_speed > v_req and room:
+                self.gap_v_req = v_req
+                self.gap_hold_ticks += 1
+                self.last_avoid.update(
+                    {'gap_v_req': round(v_req, 2), 'gap_speed_hold': True,
+                     'gap_speed_hold_s': round(self.gap_hold_ticks / self.hz, 1),
+                     'gap_need_new': round(need_new, 1)})
+                return True                                # 기각이 아니다 — 보류
+            self.last_avoid.update(
+                {'gap_v_req': round(v_req, 2), 'gap_speed_hold': False,
+                 'gap_speed_hold_s': round(self.gap_hold_ticks / self.hz, 1),
+                 'gap_speed_release': 'v_ok' if ego_speed <= v_req else 'no_room'})
+        self.gap_hold_ticks = 0
         span_m = 2.0 * trans_m + gap_before + extra_after + chain['extent_m']
         span = planner.shift_route_around_actors(
             actor, chain_last,
@@ -3404,6 +3434,7 @@ class KrRules:
         self.standoff_id = None
         self.standoff_half_len = None
         self._creep_diag = None
+        self.gap_v_req = None
         self.last_d_end = d_end
         self._ap = ap
         self.last_yellow = None
@@ -3478,6 +3509,12 @@ class KrRules:
             candidate = cap
         if cap is not None:
             self.last_avoid = dict(self.last_avoid or {}, shift_cap=round(cap, 2))
+        # gap_fit 속도 연동 — 짧은 전이를 만들려면 v ≤ trans / shift_k_s 여야 한다.
+        # `_shift_speed_cap` 과 **같은 자리·같은 방식**의 min() 후보다. 오버라이드가
+        # 아니라 상한이라, 신호·보행자·standoff 가 더 낮으면 그쪽이 이긴다.
+        vr = self.gap_v_req
+        if vr is not None and (candidate is None or vr < candidate):
+            candidate = vr
 
         # BREAKOUT 크립 — 훅이 PDM 후보를 무효화한 뒤, 상한은 여전히 min() 이다.
         if self.breakout_creep() and (candidate is None or self.bo_creep_v < candidate):
