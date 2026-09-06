@@ -271,6 +271,20 @@ class KrRules:
         self.suppress_mode = str(ot.get('suppress_mode', 'queue_only'))
         self.q_green_release_ticks = int(round(float(ot.get('q_green_release_s', 3.0)) * self.hz))
         self.q_nosig_release_ticks = int(round(float(ot.get('q_nosignal_release_s', 10.0)) * self.hz))
+        # 신호 미보고 큐 판정 (2026-09-06, 020738/13 근거) — kill switch 기본 off.
+        # 9910 은 교차로 연결로 위에서 신호를 보내지 않는다 (실측 16런: in_junction
+        # 틱 보고율 0.0~2.8 %). 못 받은 신호는 플래너 기본값 Green 으로 남아, 교차로
+        # 출구 정지선의 적신호 대기열이 큐(green_expired 로 해제)가 아니라 장애물로
+        # 보였다 → 회피 → junction 기각 → 고착. 다음 정지선 controller 가
+        # signal_stale_s 이상 미보고면 UNKNOWN 으로 보고 큐 판정에서 Red 와 같이
+        # 다룬다. 정지 후보·SHIFT_HOLD 는 건드리지 않는다 — UNKNOWN 은 Green 을
+        # 만들지도 Red 를 풀지도 않는다. 보고 시각은 observe_lights (run_agent) 가
+        # 준다 — 신호 state 갱신은 그대로 플래너(route.update_lights) 몫이다.
+        self.sig_stale_queue = bool(ot.get('signal_stale_queue_enable', False))
+        self.sig_stale_ticks = int(round(float(ot.get('signal_stale_s', 1.0)) * self.hz))
+        self._obs_tick = 0                          # observe_lights 호출 수 (= 9910 프레임)
+        self._light_seen: dict = {}                 # controller id → 마지막 보고 _obs_tick
+        self.last_signal: dict | None = None        # 진단 — 스위치 on 일 때만 채운다
         # WAIT — 앞차 출발 기회
         self.wait_s = float(ot.get('wait_before_shift_s', 6.0))
         self.ot_dash_slack_m = float(ot.get('dash_slack_m', 2.0))
@@ -1171,6 +1185,34 @@ class KrRules:
                 return True
         return False
 
+    def observe_lights(self, lights) -> None:
+        """9910 lights [(id, state)] 를 틱마다 받는다 (run_agent). state 는 플래너가
+        갱신하고 여기서는 **보고 시각만** 센다 — `_signal_stale` 의 입력."""
+        self._obs_tick += 1
+        for lid, _state in lights or []:
+            self._light_seen[int(lid)] = self._obs_tick
+
+    def _signal_stale(self, planner) -> dict | None:
+        """다음 정지선 신호의 미보고 판정 → 진단 dict, 대상 없음/스위치 off 면 None.
+
+        stale = controller 전부가 signal_stale_s 이상 안 보임 (한 번도 안 보인 것
+        포함 — 그때 나이는 첫 관측부터 센다). 관측이 한 번도 없으면(테스트·
+        observe_lights 미호출) 판정하지 않는다 — off 와 같다.
+        """
+        if not self.sig_stale_queue or self._obs_tick <= 0:
+            return None
+        tls = getattr(planner, 'next_traffic_lights', None)
+        tl = tls[planner.route_index] if tls is not None else None
+        if tl is None:
+            return None
+        ids = [int(i) for i in (getattr(tl, 'controller_ids', None) or [getattr(tl, 'id', -1)])]
+        seen = max((self._light_seen.get(i, 0) for i in ids), default=0)
+        age = self._obs_tick - seen
+        return {'signal_stale': age >= self.sig_stale_ticks,
+                'signal_stale_s': round(age / self.hz, 1),
+                'signal_last_state': getattr(getattr(tl, 'state', None), 'name', None),
+                'signal_ctrl': ids}
+
     def _is_queue_v2(self, blockers, planner, ap, lg, ego_lane) -> bool:
         """큐 (queue_only, C-3): 정지 객체 ≥ 1 ∧ (A 선두가 정지선 25 m 안
         ∨ B 신호 Red/Yellow ∧ 정지 객체 전부가 자차~정지선 사이).
@@ -1184,6 +1226,9 @@ class KrRules:
         가드 아님. 옛 15 s hold 는 없다 — 적색 38 s 에서 큐를 철회해 버렸다.
         """
         self.q_info = None
+        # 신호 미보고 → UNKNOWN (스위치 off 면 None 이라 아래 unknown 은 항상 거짓)
+        self.last_signal = self._signal_stale(planner) if planner is not None else None
+        unknown = bool(self.last_signal and self.last_signal['signal_stale'])
         if blockers and self.obs_fastpath:
             # E-1: 큐는 차량만이다. 박스가 선두든 사이에 끼었든 큐 형태에서 뺀다.
             veh = [b for b in blockers if not self._is_obstacle(b[3])]
@@ -1217,7 +1262,8 @@ class KrRules:
         # B 는 녹색 첫 틱에 사라지지 않는다 — 직전 틱까지 큐였다면(q_ticks > 0) 녹색
         # q_green_release_s 까지 유지한다. 그래야 "녹색 3 s 경과 ∧ 선두 정지 → 해제"
         # 가 성립한다 (실측 003759/05 t=103.9: 녹색 첫 틱에 PREEMPT → standoff 급정지).
-        sig_hold = (state in ('Red', 'Yellow')
+        # UNKNOWN 은 큐 조건 B 에서 Red 와 같다 — 못 본 신호는 적색으로 가정한다.
+        sig_hold = (unknown or state in ('Red', 'Yellow')
                     or (state == 'Green' and self.q_ticks > 0
                         and self.green_since_ticks < self.q_green_release_ticks))
         # E-7: 정지선이 red_pause_max_m 보다 멀면 그 신호의 대기열일 수 없다.
@@ -1243,6 +1289,14 @@ class KrRules:
                 # E-7 진단 — 정지선까지(자차·선두) 거리. 큐 B 오판 사후 판정 근거.
                 'd_sl': None if d_sl is None else round(d_sl, 1),
                 'head_sl': None if d_sl is None else round(d_sl - head[0], 1)}
+        if unknown:
+            # 해제 시한이 없다 — 녹색(green_expired)도 무신호(hold_expired)도 적용하지
+            # 않는다. 선두가 떠나면 blockers 에서 빠져 그 틱에 저절로 풀린다:
+            # "앞차가 서면 서고, 가면 따라간다".
+            info['queue_by_unknown'] = True
+            self.q_reject = None
+            self.q_info = info
+            return True
         if signaled:
             # 선두 '여전히 정지' 는 blockers 자체가 보장한다 (정지 객체만 들어온다).
             if self.green_since_ticks >= self.q_green_release_ticks:

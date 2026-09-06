@@ -265,6 +265,7 @@ class Runner:
 
         self.world.update(pkt, world_state.ego)
         self.planner.update_lights(pkt.lights)
+        self.kr.observe_lights(pkt.lights)        # 보고 시각만 (stale 판정 입력)
 
         control = self.agent.run_step(world_state, pkt.t_recv)
         # 지시등은 kr_rules 가 경로 이벤트로 판단한다 (run_step 안에서 갱신됨)
@@ -326,6 +327,9 @@ class Runner:
                    'avoid': self.kr.last_avoid,
                    # 붉은 구간 진입 전 감속 후보 (2b-B) — 후보가 산 틱에만 채워진다.
                    'red_zone': self.kr.last_red_zone}
+        # 신호 미보고 진단 — 스위치 on 일 때만 키가 생긴다 (off 는 로그까지 동일).
+        if self.kr.last_signal is not None:
+            reasons['signal'] = self.kr.last_signal
         if reduced is not None and reduced[1] is not None:
             reasons['speed_reduced_by'] = {
                 'type': reduced[1], 'id': reduced[2],
