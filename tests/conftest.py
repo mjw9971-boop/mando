@@ -40,3 +40,28 @@ def mk_tick(t=0.0, speed=0.0, x=0.0, y=0.0, yaw=0.0, s=0.0, route_s=0.0, t_off=0
                      'n_path': 0, 'reasons': dict(reasons or {})},
         'cmd': {'steering': 0.0, 'accel': 0.0, 'turn_signal': turn_signal},
     }
+
+
+# ── 전역 DP 의 짝 대조를 테스트에서는 끈다 ──────────────────────────────────
+# route.dp_compare_enable 은 **운영 기본이 true** 다 (대회 당일 짝 대조 WARN 을
+# 봐야 한다). 그런데 대조는 경로를 한 벌 더 짓고 폴리라인까지 재샘플하므로
+# 테스트 전체가 두 배 가까이 느려진다 (실측 525 s → 303 s).
+# 대조 자체를 검증하는 테스트는 BR._DP_CFG 를 직접 세팅하므로 이 기본값을 덮는다.
+import pytest                                                    # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _dp_compare_off():
+    try:
+        import build_route as BR
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+    old = BR._DP_CFG
+    cfg = list(BR.dp_cfg())
+    cfg[7] = False
+    BR._DP_CFG = tuple(cfg)
+    try:
+        yield
+    finally:
+        BR._DP_CFG = old

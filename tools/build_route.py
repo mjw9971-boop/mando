@@ -1340,10 +1340,16 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         # 건너뛴 점이 있으면 그 구간들을 한 세그먼트로 본다 (앞 wi 로 기록)
         for wi in range(idx[t - 1], idx[t]):
             seg_span.append((wi, i0, len(seq) - 1))
-    forced = []
-    for wi, (k, _s) in enumerate(seq):
-        if k in banned:
-            forced.append((wi, k, banned[k]))
+    # 회전 불가 연결로를 불가피하게 포함했으면 **구간 인덱스**로 기록한다.
+    # 리포트가 "구간 {wi}" 로 찍으므로 seq 인덱스를 넣으면 엉뚱한 번호가 된다
+    # (end_pos 와 같은 종류의 실수 — 2026-09-06 감사).
+    forced, seen_bad = [], set()
+    for wi, i0, i1 in seg_span:
+        for j in range(i0, min(i1 + 1, len(seq))):
+            k = seq[j][0]
+            if k in banned and k not in seen_bad:
+                seen_bad.add(k)
+                forced.append((wi, k, banned[k]))
     # 마지막 경유점이 실제로 앉은 (차로, s). 꼬리 계산이 이걸 봐야 한다 —
     # seq[-1] 은 마지막 차로에 **진입한** s 라 경유점 위치가 아니다.
     k_end, s_end, _d_end = cands[idx[-1]][picks[-1]]
