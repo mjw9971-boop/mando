@@ -210,6 +210,11 @@ class EgoTracker(EgoSpeedEstimator):
         if route:
             self._prefer = list(route['lanes']) + [
                 k for k in self._lc_lanes if k not in set(route['lanes'])]
+        # 소멸 차로 → successor 인계 첫 틱: 자차가 successor 시작점 **앞**에 있는데
+        # 매칭이 s=0 으로 클램프되면 t_off 에 종방향 부족분이 섞여 −1.3 m 로 튄다
+        # (2026-09-06 배치 01 rs 1007/1067/1823, 실제 +0.06). 켜면 끝점 밖의 t 를
+        # 접선 연장 기준으로 잰다. 차로 선택·s 는 불변. 기본 off = 이전 로그와 동일.
+        self._tangent_ends = bool((cfg.get('ego') or {}).get('handover_tangent_enable', False))
 
     def _mark_reset(self, flags: dict, **kw) -> None:
         super()._mark_reset(flags, **kw)
@@ -231,7 +236,7 @@ class EgoTracker(EgoSpeedEstimator):
         speed, accel = self._estimate_motion(x, y, yaw, pkt.t_recv, flags)
 
         # 2) 차로 매칭
-        m = self.lg.locate(x, y, yaw, prefer=self._prefer)
+        m = self.lg.locate(x, y, yaw, prefer=self._prefer, tangent_ends=self._tangent_ends)
 
         valid = m is not None
         if not valid:

@@ -294,6 +294,13 @@ speed:
   # 관측되지 않아도 이 거리를 지나면 가드를 푼다 (고착 방지).
   yellow_guard_max_m: 60.0
 
+ego:
+  # 소멸 차로 → successor 인계 첫 틱의 t_off 클램프 산물 보정 (vtd_adapter/ego.py).
+  # 자차가 successor 시작점 앞에 있으면 끝점까지 거리 대신 접선 연장 기준으로 t 를 잰다.
+  # 2026-09-06 배치 01: 로그 t_off −1.34 vs 실제 +0.06 (rs 1007/1067/1823).
+  # false = 이전과 동일. 옛 로그 재채점은 scoring.lane_departure_taper_handover_m.
+  handover_tangent_enable: false
+
 percep:
   horizon_m: 200.0
   coast_s: 1.5

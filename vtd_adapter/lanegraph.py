@@ -440,8 +440,18 @@ class LaneGraph:
         return None
 
     # ── 위치 매칭 ───────────────────────────────────────────────────────
-    def project(self, key: LaneKey, x: float, y: float, idx_hint: Optional[int] = None):
-        """점 (x,y) 를 차로 key 폴리라인에 투영 → (s, t, dist, idx)"""
+    def project(self, key: LaneKey, x: float, y: float, idx_hint: Optional[int] = None,
+                tangent_ends: bool = False):
+        """점 (x,y) 를 차로 key 폴리라인에 투영 → (s, t, dist, idx)
+
+        tangent_ends: 점이 폴리라인 **끝점 밖**(첫 세그먼트 앞 / 마지막 세그먼트 뒤)에
+        있으면 t 를 끝점까지 거리가 아니라 그 세그먼트 **접선 연장에 대한 수직 거리**로
+        잰다. 기본(False)은 u 를 [0,1] 로 클램프해 종방향 부족분이 t 에 섞인다 —
+        소멸 차로 → successor 인계 첫 틱에 successor s=0 으로 붙으면서 t_off 가
+        −1.34 m 로 튀는 원인 (2026-09-06 배치 01, rs 1007/1067/1823; 실제 오프셋
+        +0.06). s 와 dist(차로 선택 점수) 는 그대로 클램프값 — 어느 차로에 붙는지는
+        바뀌지 않고 t 만 바뀐다.
+        """
         r = self.lanes[key]
         P = r['pts']
         if idx_hint is None:
@@ -450,6 +460,7 @@ class LaneGraph:
         else:
             i = int(np.clip(idx_hint, 0, len(P) - 1))
         best = None
+        last = len(P) - 2
         for j in (i - 1, i):
             if j < 0 or j + 1 >= len(P):
                 continue
@@ -460,11 +471,15 @@ class LaneGraph:
             if L2 < 1e-12:
                 continue
             u = ((x - ax) * vx + (y - ay) * vy) / L2
+            outside = (u < 0.0 and j == 0) or (u > 1.0 and j == last)
             u = min(1.0, max(0.0, u))
             px, py = ax + u * vx, ay + u * vy
             dist = math.hypot(x - px, y - py)
             cross = vx * (y - ay) - vy * (x - ax)   # >0 이면 왼쪽
-            t = math.copysign(dist, cross)
+            if tangent_ends and outside:
+                t = cross / math.sqrt(L2)
+            else:
+                t = math.copysign(dist, cross)
             s = float(r['s'][j] + u * (r['s'][j + 1] - r['s'][j]))
             if best is None or dist < best[2]:
                 best = (s, t, dist, j)
@@ -475,9 +490,11 @@ class LaneGraph:
 
     def locate(self, x: float, y: float, yaw: Optional[float] = None, k: int = 16,
                max_dist: float = 8.0, max_heading_err: float = math.radians(70),
-               prefer: Optional[List[LaneKey]] = None, prefer_bonus: float = 1.5) -> Optional[LaneMatch]:
+               prefer: Optional[List[LaneKey]] = None, prefer_bonus: float = 1.5,
+               tangent_ends: bool = False) -> Optional[LaneMatch]:
         """(x,y[,yaw]) → 가장 그럴듯한 차로. yaw 주면 반대 방향 차로 배제.
-        prefer: 경로 차로 리스트 (같은 거리면 경로 차로 우선, prefer_bonus[m] 만큼 유리)"""
+        prefer: 경로 차로 리스트 (같은 거리면 경로 차로 우선, prefer_bonus[m] 만큼 유리)
+        tangent_ends: project() 참조 — 끝점 밖의 t 를 접선 기준으로 (선택은 불변)"""
         d, ii = self.kd.query((x, y), k=k)
         cand = {}
         for dist, i in zip(np.atleast_1d(d), np.atleast_1d(ii)):
@@ -486,7 +503,8 @@ class LaneGraph:
             key = self.lane_keys[self.kd_lane[i]]
             if key in cand:
                 continue
-            s, t, dd, j = self.project(key, x, y, idx_hint=int(self.kd_i[i]))
+            s, t, dd, j = self.project(key, x, y, idx_hint=int(self.kd_i[i]),
+                                       tangent_ends=tangent_ends)
             r = self.lanes[key]
             hd = float(np.interp(s, r['s'], np.unwrap(r['hdg'].astype(float))))
             herr = wrap(yaw - hd) if yaw is not None else 0.0
