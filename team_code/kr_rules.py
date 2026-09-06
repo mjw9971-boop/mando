@@ -285,6 +285,19 @@ class KrRules:
         self._obs_tick = 0                          # observe_lights 호출 수 (= 9910 프레임)
         self._light_seen: dict = {}                 # controller id → 마지막 보고 _obs_tick
         self.last_signal: dict | None = None        # 진단 — 스위치 on 일 때만 채운다
+        # B-3(b) 미보고 적신호 시한 출발 (2026-09-06 승인) — kill switch 기본 off.
+        # 앞차 없음 ∧ controller 미보고 ∧ 정지 중이 signal_unknown_timeout_s 이상이면
+        # 신호 정지 후보(_stop_target·PDM 적신호 IDM)를 놓고 min() 이 다른 후보로
+        # 속도를 정하게 둔다. **적신호 통과를 만들 수 있는 유일한 경로다**: 71 s
+        # 주기·적색 60 s 인 controller(167/168)에서는 시한이 얼마든 85 % 확률로
+        # 적색 통과다. 회랑 안 signal_timeout_clear_m 이동 차량·보행자 래치가 있으면
+        # 보류. 020738 16런에서 성립 틱 0 (Red 로 선 뒤 끊긴 사례 없음).
+        self.sig_timeout_go = bool(ot.get('signal_timeout_go_enable', False))
+        self.sig_timeout_ticks = int(round(float(ot.get('signal_unknown_timeout_s', 10.0)) * self.hz))
+        self.sig_timeout_clear_m = float(ot.get('signal_timeout_clear_m', 30.0))
+        self._sig_wait_ticks = 0                    # 조건 성립 연속 틱
+        self._sig_go = False                        # 시한 만료 → 신호 정지 후보 해제 (래치)
+        self._sig_go_tl = None                      # 래치가 붙은 신호 id
         # WAIT — 앞차 출발 기회
         self.wait_s = float(ot.get('wait_before_shift_s', 6.0))
         self.ot_dash_slack_m = float(ot.get('dash_slack_m', 2.0))
@@ -1199,7 +1212,7 @@ class KrRules:
         포함 — 그때 나이는 첫 관측부터 센다). 관측이 한 번도 없으면(테스트·
         observe_lights 미호출) 판정하지 않는다 — off 와 같다.
         """
-        if not self.sig_stale_queue or self._obs_tick <= 0:
+        if not (self.sig_stale_queue or self.sig_timeout_go) or self._obs_tick <= 0:
             return None
         tls = getattr(planner, 'next_traffic_lights', None)
         tl = tls[planner.route_index] if tls is not None else None
@@ -1228,7 +1241,8 @@ class KrRules:
         self.q_info = None
         # 신호 미보고 → UNKNOWN (스위치 off 면 None 이라 아래 unknown 은 항상 거짓)
         self.last_signal = self._signal_stale(planner) if planner is not None else None
-        unknown = bool(self.last_signal and self.last_signal['signal_stale'])
+        unknown = bool(self.sig_stale_queue and self.last_signal
+                       and self.last_signal['signal_stale'])
         if blockers and self.obs_fastpath:
             # E-1: 큐는 차량만이다. 박스가 선두든 사이에 끼었든 큐 형태에서 뺀다.
             veh = [b for b in blockers if not self._is_obstacle(b[3])]
@@ -2830,6 +2844,9 @@ class KrRules:
         self.ped_miss.clear()
         self.ped_last.clear()
         self._creep_open_latched = False              # 크립 delay 래치 (문맥 불연속)
+        self._sig_go = False                          # B-3(b) 시한 출발 래치
+        self._sig_go_tl = None
+        self._sig_wait_ticks = 0
         self._creep_hold_ticks = 0
 
     def _s0(self, ap) -> float:
@@ -2881,10 +2898,51 @@ class KrRules:
           · 교차로 통과 가드 — 앞범퍼가 이미 정지선을 넘었다. 여기서 제동하면
             걸친 채로 선다.
         보행자·선행차 후보는 min() 의 다른 갈래라 그대로 살아 있다.
+        B-3(b) 미보고 적신호 시한 출발(_sig_go, 기본 off)도 같은 자리에서 푼다.
         """
-        return bool(self.y_decision == 'go' or self.cross_guard)
+        return bool(self.y_decision == 'go' or self.cross_guard or self._sig_go)
+
+    def _signal_timeout_tick(self, ap, planner, ego_speed: float) -> None:
+        """B-3(b) 시계 — apply 가 틱당 1회 부른다 (_tick_cache 뒤: 회랑·stale 필요).
+
+        성립 조건 (전부): 스위치 on ∧ 다음 신호 controller 미보고(stale) ∧ 그 신호가
+        정지 후보를 만드는 상태(Red / 황색 STOP) ∧ 정지 중(v < latch_v) ∧ 앞차 없음
+        (정지 회랑 객체 0 ∧ signal_timeout_clear_m 안 이동 차량 0) ∧ 보행자 래치·
+        PDM 보행자 플래그 없음. 하나라도 깨지면 시계 0. signal_unknown_timeout_s 를
+        채우면 _sig_go 래치 — 같은 신호 id 이고 여전히 stale 인 동안만 산다 (신호가
+        다시 보고되면 그 state 가 즉시 우선한다).
+        """
+        if not self.sig_timeout_go:
+            return
+        sig = self.last_signal
+        nxt = self._next_stopline(planner)
+        tl_id = nxt[2] if nxt else None
+        stale = bool(sig and sig['signal_stale'])
+        if self._sig_go and (not stale or tl_id != self._sig_go_tl):
+            self._sig_go = False                          # 보고 재개 / 다음 신호로 넘어감
+            self._sig_go_tl = None
+        ok = stale and self._stop_target_raw(planner, ap) is not None \
+            and ego_speed < self.latch_v and not self._tick_corridor \
+            and not (self.ped_intent or self.ped_hold_ids) \
+            and not (getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False))
+        if ok:
+            moving = self._corridor_blockers(ap, planner, static_ok=lambda _a: True)
+            ok = not any(b[0] <= self.sig_timeout_clear_m for b in moving)
+        self._sig_wait_ticks = self._sig_wait_ticks + 1 if ok else 0
+        if ok and self._sig_wait_ticks >= self.sig_timeout_ticks and not self._sig_go:
+            self._sig_go = True
+            self._sig_go_tl = tl_id
+        if sig is not None:
+            sig['timeout_s'] = round(self._sig_wait_ticks / self.hz, 1)
+            sig['timeout_go'] = self._sig_go
 
     def _stop_target(self, planner, ap) -> tuple | None:
+        """정지 후보 대상 — B-3(b) 시한 출발 래치가 살아 있으면 None (그 외는 raw)."""
+        if self._sig_go:
+            return None
+        return self._stop_target_raw(planner, ap)
+
+    def _stop_target_raw(self, planner, ap) -> tuple | None:
         """정지 후보를 만들 대상이면 (뒷축거리, 실행 감속 a_eff), 아니면 None.
 
         색 해석의 **단일 출처**다 — 프로파일과 홀드가 같은 판정을 본다.
@@ -3643,6 +3701,7 @@ class KrRules:
         # 틱당 두 번 세어 해제 시한이 절반이 된다. legacy 는 계산하지 않는다
         # (그쪽은 _try_overtake 안에서 옛 위치·옛 횟수로 부른다).
         self._tick_cache(ap, planner)
+        self._signal_timeout_tick(ap, planner, ego_speed)
         if self.bo_enabled:
             self._breakout_tick(planner, ap, ego_speed)
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
