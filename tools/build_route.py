@@ -220,8 +220,12 @@ def pair_cfg(reload=False):
     return _PAIR_CFG
 
 
-def road_lane_pool(lg, cands, x, y, yaw):
+def road_lane_pool(lg, cands, x, y, yaw, all_sections=False):
     """후보집합에 등장한 **모든 도로**의 같은 섹션·같은 통행방향 driving 차로.
+
+    all_sections=True 면 섹션 제한을 푼다 (같은 도로·같은 방향 전체 차로).
+    짝 탐색이 0개로 끝나 폴백하기 직전에만 쓴다 —
+    route.pair_fallback_widen_enable. 기본 False = 이전 동작.
 
     경유점이 어느 차로에 찍혔는지는 정보가 아니다 (주최측 2026-09-03). 도로를
     하나로 확정하지도 않는다 — 최근접 후보의 도로만 보면 경유점을 1.5 m 흔들었을
@@ -242,7 +246,7 @@ def road_lane_pool(lg, cands, x, y, yaw):
             continue
         seen_road.add(k0[0])
         for kk in lg.lanes_of_road(k0[0]):
-            if kk in seen_key or kk[1] != k0[1]:
+            if kk in seen_key or (not all_sections and kk[1] != k0[1]):
                 continue
             r = lg.lanes[kk]
             if r.get('type') != 'driving' or (kk[2] > 0) != (k0[2] > 0):
@@ -822,7 +826,8 @@ def _fmt_pair_diag(diag):
     return '\n              '.join(rows)
 
 
-def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label, seqs):
+def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label, seqs,
+                 fallbacks=None):
     """교차로 짝 (진입, 진출) 차로를 함께 고른다.
 
     스텝 (2026-09-03 주최측 답변 반영):
@@ -835,6 +840,14 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
       4. cost(앞→진입) + cost(진입→진출) + W×진입거리 + W×진출거리 최소.
          거리 항은 동점 깨기지 결정 요인이 아니다.
       5. 짝이 0개면 None 을 돌려 호출부가 기존 탐욕으로 폴백하게 한다 (+WARN).
+         route.pair_fallback_widen_enable 이면 폴백 **직전에** 진출 풀을 같은
+         도로·같은 방향 **전체 차로**(섹션 제한 해제)로 넓혀 한 번 더 찾는다.
+         왜: 짝 사이는 차선변경 금지라 진출 경유점이 찍힌 섹션에 연결 가능한
+         차로가 없으면 후보가 통째로 죽는데, 같은 도로의 다른 섹션 차로는
+         successor 만으로 이어지는 경우가 많다 (2026-09-06 재현: 진입
+         [2152,2190] → 진출 [2012] 좌회전. 폴백 경로가 205 m 대신 2226 m).
+
+    fallbacks: 폴백이 나면 진단을 append 할 리스트 (호출부가 리포트에 쓴다).
 
     tier 층은 쓰지 않는다 — 실패를 만든 게 "가까운 후보부터 좁게 본다" 였고,
     거리는 이미 4의 비용에 들어 있다.
@@ -868,11 +881,25 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
                     best = (score, pre[1], ka, sa, c[1], kb, sb)
         return best
 
+    widen_enable, _is_err = pair_fallback_cfg()
     best, used_banned = search(banned), []
+    widened = False
     if best is None:
         # 금지 연결로를 풀면 되는가 — 기존 탐욕과 같은 취급(불가피하면 허용 + 기록)
         best = search(frozenset())
+        if best is None and widen_enable:
+            # 진출 풀을 같은 도로·같은 방향 전체 차로로 넓혀 한 번 더 (제안②)
+            wide = road_lane_pool(lg, cb, x2, y2, ay_out, all_sections=True)
+            if len(wide) > len(pool_out):
+                pool_out = wide
+                widened = True
+                best = search(banned)
+                if best is None:
+                    best = search(frozenset())
+                else:
+                    used_banned = []
         if best is None:
+            widened = False
             roads_in = sorted({k[0] for k, _s, _d in pool_in})
             roads_out = sorted({k[0] for k, _s, _d in pool_out})
             h0, _ = road_heading(lg, ca[0][0][0], ca[0][0])
@@ -884,10 +911,46 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
                   f'연결 상한 {cap:g}m. 기존 탐욕으로 폴백한다\n'
                   f'              {_fmt_pair_diag(_pair_diag(lg, pool_in, pool_out, starts, allow_prev, banned, cap))}',
                   file=sys.stderr)
+            if fallbacks is not None:
+                # wi 는 **짝 구간의 세그먼트 인덱스**로 남긴다 (= wi+1).
+                # report() 의 [2] 가 junction_segments 를 그 인덱스로 돈다.
+                fallbacks.append({'wi': wi + 1, 'label': f'{label(wi + 1)}→{label(wi + 2)}',
+                                  'roads_in': roads_in, 'roads_out': roads_out,
+                                  'kind': kind, 'cap_m': float(cap),
+                                  'widen_tried': bool(widen_enable),
+                                  'connectors': []})
             return None
         used_banned = [kk for kk, _ in (best[1] + best[4]) if kk in banned]
+    if widened:
+        print(f'  [주의] {label(wi + 1)}→{label(wi + 2)} 진출 풀을 같은 도로 전체 '
+              f'차로로 넓혀 짝을 찾았다 (route.pair_fallback_widen_enable) — '
+              f'진입 {best[2]} → 진출 {best[5]}', file=sys.stderr)
     _sc, path_in, k_in, s_in, path_out, k_out, s_out = best
     return path_in, k_in, s_in, path_out, k_out, s_out, used_banned
+
+
+_PAIRFB_CFG = None
+
+
+def pair_fallback_cfg(reload=False):
+    """(widen_enable, is_error) — route.pair_fallback_widen_enable ·
+    route_check.pair_fallback_is_error. 둘 다 기본 False = 이전 동작."""
+    global _PAIRFB_CFG
+    if _PAIRFB_CFG is None or reload:
+        from vtd_adapter.config import load_params_yaml
+        cfg = load_params_yaml()
+        _PAIRFB_CFG = (bool((cfg.get('route') or {}).get('pair_fallback_widen_enable', False)),
+                       bool((cfg.get('route_check') or {}).get('pair_fallback_is_error', False)))
+    return _PAIRFB_CFG
+
+
+def _fmt_fb_connectors(fb, n=3):
+    """폴백이 고른 연결로 요약 — 앞 n 개만 R_min 과 함께, 나머지는 개수로."""
+    cs = fb.get('connectors') or []
+    if not cs:
+        return '(없음)'
+    head = '  '.join(f'{tuple(k)} R_min {r:.2f} m' for k, r in cs[:n])
+    return head + (f'  … 총 {len(cs)}개' if len(cs) > n else '')
 
 
 def valid_entry_lanes_enable():
@@ -1013,6 +1076,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
     # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
     banned, turn_thr = infeasible_connectors(lg)
     forced_infeasible: list = []   # 대안이 없어 불가피하게 포함시킨 연결로
+    pair_fallbacks: list = []      # 짝 탐색이 0개라 기존 탐욕으로 폴백한 구간
     seq = []   # [(lane, s_enter)]
     wp_s = []
     total = 0.0
@@ -1080,7 +1144,8 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         # 진입이 틀리면 복구가 없고, 현재 탐욕은 진출점을 보지 않는다.
         if pair_hint and (wi + 1) in junction_segs and wi + 2 < len(waypoints):
             got = _pair_choice(lg, starts, waypoints, wi, radius, junction_segs,
-                               banned, turn_cap, label, seqs)
+                               banned, turn_cap, label, seqs,
+                               fallbacks=pair_fallbacks)
             if got is not None:
                 (pa, k_in, s_in, pb, k_out, s_out, ub) = got
                 for kk in ub:
@@ -1298,6 +1363,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
 
     rt = {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
             'infeasible_forced': forced_infeasible, 'turn_radius_thr_m': turn_thr,
+            'pair_fallbacks': pair_fallbacks,
             'finish_xy': [float(waypoints[-1][0]), float(waypoints[-1][1])],
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
             'waypoint_seq': list(seqs) if seqs else list(range(1, len(waypoints) + 1)),
@@ -1306,6 +1372,29 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             'pair_offset': (pair_meta or {}).get('offset'),
             'pair_offset_source': (pair_meta or {}).get('source', 'caller'),
             'pair_offset_why': (pair_meta or {}).get('why', '')}
+    # 폴백 구간이 **실제로 무엇을 골랐는지** 채운다 (제안③). 경고만 보고는
+    # 사후 추적이 안 됐다 — 경고는 stderr 로만 나가고 어느 연결로를 탔는지는
+    # 어디에도 안 남았다 (2026-09-06 G 분석).
+    if pair_fallbacks:
+        span = {}
+        for wi_s, i0, i1 in seg_span:
+            a, b = span.get(wi_s, (i1, i0))
+            span[wi_s] = (min(a, i0), max(b, i1))
+        for fb in pair_fallbacks:
+            got_span = span.get(fb['wi'])
+            if got_span is None:
+                continue
+            i0, i1 = got_span
+            fb['connectors'] = [[list(k), round(lane_r_min(lg, k), 2)]
+                                for k in lanes[i0:i1 + 1]
+                                if lg.lanes[k]['junction'] != -1]
+            fb['segment_m'] = round(float(cum[min(i1, len(cum) - 1)] - cum[i0]), 1)
+        if pair_fallback_cfg()[0]:
+            for fb in pair_fallbacks:
+                print(f"  [경고] {fb['label']} 폴백이 고른 연결로: "
+                      f"{_fmt_fb_connectors(fb)}  구간 {fb.get('segment_m', '?')} m",
+                      file=sys.stderr)
+
     # ── 직선 구간 유효 차로 집합 (작업10) — 정보 필드다. 경로 계산에 안 쓴다.
     # 아무도 안 읽으면 영향 0 이어야 하므로 여기서 **덧붙이기만** 한다.
     if valid_entry_lanes_enable():
@@ -1343,6 +1432,9 @@ def report(lg, rt, radius, warn_dev=None):
     #   WARN   경유점 이탈 / junction 차로 미경유 / 총 길이 비율
     # warn_affects_rc=true 면 WARN 도 rc=1 을 낸다 (이전 동작).
     warn_rc = bool(rc.get('warn_affects_rc', False))
+    # 짝 폴백을 ERROR 로 볼지 (route_check.pair_fallback_is_error, 기본 false).
+    # 대회 당일은 rc=1 로 시나리오가 통째로 버려지는 것보다 '큰 WARN' 이 낫다.
+    fb_is_err = pair_fallback_cfg()[1]
     errs = 0
     lanes, cum = rt['lanes'], rt['cum_s']
     jsegs = set(rt.get('junction_segments') or [])
@@ -1458,6 +1550,19 @@ def report(lg, rt, radius, warn_dev=None):
             errs += 1
         # 짝 경유점의 진짜 판정 기준 — 고른 진입 차로에서 진출 차로로 차선변경
         # 없이 갈 수 있는가. 경유점과의 거리가 아니라 이게 성립해야 정상이다.
+        # 짝 탐색이 0개라 기존 탐욕으로 폴백한 구간인가 (제안①·③).
+        fb = next((f for f in rt.get('pair_fallbacks') or [] if f.get('wi') == wi), None)
+        # 둘 다 off 면 이전과 같이 아무 줄도 안 낸다 (킬 스위치 규칙).
+        if fb is not None and (fb_is_err or pair_fallback_cfg()[0]):
+            note = (f"   <= [{'오류' if fb_is_err else '경고'}] 회전 가능한 (진입,진출) 짝이 "
+                    f"없어 탐욕 폴백 — 진입 도로 {fb['roads_in']} 진출 도로 "
+                    f"{fb['roads_out']} {fb['kind']}, 폴백 연결로 "
+                    f"{_fmt_fb_connectors(fb)}, 구간 {fb.get('segment_m', '?')} m")
+            flag += note
+            if fb_is_err:
+                errs += 1
+            else:
+                warns += 1
         ok, k_in, k_out, cost = pair_turn_ok(lg, rt, wi, banned, turn_cap)
         turn_txt = ''
         if ok is None:
