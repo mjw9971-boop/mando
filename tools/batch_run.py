@@ -115,7 +115,78 @@ CROSSING_WINNERS = ('walker', 'bicycle')
 CROSSING_TYPES = ('walker', 'pedestrian')
 
 
-def stop_excused(tick: dict, intent_mps: float) -> bool:
+def _light_hold(tick: dict) -> bool:
+    light = (tick.get('world') or {}).get('light')
+    return bool(light) and int(light[1]) in HOLD_LIGHT_STATES
+
+
+def _crossing(tick: dict) -> bool:
+    reasons = (tick.get('decision') or {}).get('reasons') or {}
+    if str(reasons.get('winner') or 'none') in CROSSING_WINNERS:
+        return True
+    src = (reasons.get('speed_reduced_by') or {}).get('type') or ''
+    return any(k in str(src) for k in CROSSING_TYPES)
+
+
+def _standoff_target_stopped(tick: dict) -> bool:
+    a = ((tick.get('decision') or {}).get('reasons') or {}).get('avoid') or {}
+    sid = a.get('standoff_id')
+    if sid is None:
+        return False
+    return any(o.get('id') == sid and float(o.get('speed') or 0.0) < 0.5
+               for o in tick.get('objects') or [])
+
+
+def queue_head_gap_m(tick: dict) -> float | None:
+    """standoff 대상(큐 머리 후보)과 정지선 사이 거리 [m]. 못 재면 None.
+
+    자차→정지선(world.summ.dist_stop_line) − 자차→대상(avoid.standoff_d).
+    01 실측: 24.4 − 20.5 = 3.9 (= avoid.queue.head_sl). 주차 장애물 시나리오
+    (추월집중_05)는 112.6 − ~10 ≈ 100 m — 큐가 아니다.
+    """
+    a = ((tick.get('decision') or {}).get('reasons') or {}).get('avoid') or {}
+    dsl = ((tick.get('world') or {}).get('summ') or {}).get('dist_stop_line')
+    d = a.get('standoff_d')
+    if dsl is None or d is None:
+        return None
+    return float(dsl) - float(d)
+
+
+def red_queue_wait(tick: dict, head_gap_m: float = 10.0) -> bool:
+    """적(황·점멸)신호 **앞 큐** 뒤에서 서 있는가 — "누가 세웠나"가 아니라 "왜 못 가나".
+
+    2026-09-06 실측(실전주행_교통류_01_좌회전24, rs 1895.3): 적신호 선행차 뒤
+    24.4 m 에 정상 대기 중인데 PDM 의 red_light 후보가 1.14 m/s 라(정지선이 멀다)
+    `stop_excused` 의 `red_light < stall_intent_mps` 가 실패해 30 s 뒤 blocked.
+    실제로 차를 세운 건 kr_rules standoff(0.0)였고 신호는 부차 후보였다.
+
+    셋 중 하나면 큐 대기다 (전부 kr_rules 의 회피 진단 `reasons.avoid` 에서 온다):
+      · avoid.suppress == 'queue'            — kr_rules 가 큐로 판정(_tick_queue)
+      · avoid.queue.green_s == 0             — 큐 진단이 있고 녹색을 아직 못 봄
+      · standoff 대상이 **정지 차량**이고 그 대상이 정지선에서 `head_gap_m` 안
+        (큐 머리는 정지선 바로 뒤에 있다). 거리 조건이 없으면 **주차 장애물 뒤
+        정지**(추월집중_05: 정지선 112 m 앞 · 정적회피집중_02_직진3: 88 m 앞)까지
+        큐로 잡아, 제어기가 추월에 실패한 진짜 막힘을 120 s 씩 봐주게 된다
+        (2026-09-06 54 로그 재판정에서 4건).
+    단 어느 경우든 **마주본 신호가 정지 신호**여야 한다 — 신호 없는 큐(정지 차량
+    뒤)는 여전히 blocked 대상이다 (앞차가 영원히 안 움직이면 우리도 못 간다).
+    """
+    if not _light_hold(tick):
+        return False
+    a = ((tick.get('decision') or {}).get('reasons') or {}).get('avoid') or {}
+    if a.get('suppress') == 'queue':
+        return True
+    q = a.get('queue')
+    if isinstance(q, dict) and float(q.get('green_s') or 0.0) <= 0.0:
+        return True
+    if _standoff_target_stopped(tick):
+        gap = queue_head_gap_m(tick)
+        return gap is not None and gap <= float(head_gap_m)
+    return False
+
+
+def stop_excused(tick: dict, intent_mps: float, queue_excuse: bool = False,
+                 head_gap_m: float = 10.0) -> bool:
     """이 정차가 **곧 스스로 풀리는 정상 정차**인가 — 종료 타이머를 돌리지 않는다.
 
     예외는 둘뿐이다.
@@ -126,21 +197,114 @@ def stop_excused(tick: dict, intent_mps: float) -> bool:
 
     선행차는 예외가 **아니다** — 앞차가 영원히 안 움직이면 우리도 못 간다
     (2026-08-30: 정지 차량 두 대 사이에 끼어 배치가 다음으로 못 넘어감).
+    **단 그 선행차가 적신호 큐의 일부면** 예외다 (`queue_excuse`,
+    params batch.stall_excuse_queue) — `red_queue_wait` 참조. 기본 off 는 이전
+    판정과 같다.
 
     winner 만 보지 않는 이유: 정지 중 winner 가 route_end 등 허위값으로 튄다
     (실측 완주속도_01: route_s 2346 m 인데 route_end 후보 0.0).
     """
     reasons = (tick.get('decision') or {}).get('reasons') or {}
-    light = (tick.get('world') or {}).get('light')
-    if light and int(light[1]) in HOLD_LIGHT_STATES:
+    if _light_hold(tick):
         red = reasons.get('red_light')
         if red is not None and float(red) < intent_mps:      # 그 신호가 우리를 세운다
             return True
-    winner = str(reasons.get('winner') or 'none')
-    if winner in CROSSING_WINNERS:
+    if _crossing(tick):
         return True
-    src = (reasons.get('speed_reduced_by') or {}).get('type') or ''
-    return any(k in str(src) for k in CROSSING_TYPES)
+    return bool(queue_excuse) and red_queue_wait(tick, head_gap_m)
+
+
+# blocked 사유 어휘 — report.json 의 blocked_reason. 우선순위 순(앞이 이긴다).
+#   red_queue    적신호 앞 큐 대기 (배치 오판 대상 — 스위치 on 이면 면제)
+#   pedestrian   보행자·자전거 횡단
+#   breakout     회피 BREAKOUT 상태에서 못 나감 (교차로 안 기각 연속 등 — 제어기)
+#   standoff     standoff 대상 뒤 정지 (큐 머리 거리 조건 불충족 — 대개 주차 장애물)
+#   stopped_lead PDM 선행차(speed_reduced_by vehicle)가 정지 차량 — 회피 억제 중
+#   red_light    정지선 앞 적신호 대기 (red_light 후보가 낮음 — 원래 면제 대상)
+STOP_CAUSES = ('red_queue', 'pedestrian', 'breakout', 'standoff', 'stopped_lead',
+               'red_light', 'unknown')
+
+
+def stop_cause(tick: dict, intent_mps: float, head_gap_m: float = 10.0) -> str:
+    """정차 틱 하나의 원인 분류 (STOP_CAUSES 중 하나). 판정이 아니라 **기록**용이다."""
+    reasons = (tick.get('decision') or {}).get('reasons') or {}
+    a = reasons.get('avoid') or {}
+    if red_queue_wait(tick, head_gap_m):
+        return 'red_queue'
+    if _crossing(tick):
+        return 'pedestrian'
+    if a.get('state') == 'BREAKOUT':
+        return 'breakout'
+    if a.get('standoff_id') is not None:
+        return 'standoff'
+    rb = reasons.get('speed_reduced_by') or {}
+    if 'vehicle' in str(rb.get('type') or ''):
+        if any(o.get('id') == rb.get('id') and float(o.get('speed') or 0.0) < 0.5
+               for o in tick.get('objects') or []):
+            return 'stopped_lead'
+    if _light_hold(tick):
+        red = reasons.get('red_light')
+        if red is not None and float(red) < intent_mps:
+            return 'red_light'
+    return 'unknown'
+
+
+def tail_ticks(path: pathlib.Path, seconds: float = 30.0, max_bytes: int = 8 << 20) -> list[dict]:
+    """jsonl 꼬리에서 마지막 틱 기준 `seconds` 안의 완전한 틱들 (시간순)."""
+    try:
+        size = path.stat().st_size
+        with open(path, 'rb') as f:
+            f.seek(max(0, size - max_bytes))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return []
+    ticks: list[dict] = []
+    for line in lines[1:] if size > max_bytes else lines:   # 첫 줄은 잘렸을 수 있다
+        if '"raw"' not in line:
+            continue
+        try:
+            ticks.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if not ticks:
+        return []
+    t_end = float(ticks[-1].get('t') or 0.0)
+    return [t for t in ticks if float(t.get('t') or 0.0) >= t_end - seconds]
+
+
+def blocked_reason(ticks: list[dict], intent_mps: float, head_gap_m: float = 10.0) -> dict:
+    """마지막 구간 틱들 → {'blocked_reason', 'end_avoid_state', 'end_light', ...}.
+
+    사유는 틱별 `stop_cause` 의 **최빈값**, avoid.state 도 최빈값이다. 아침에 표를
+    볼 때 "blocked" 한 단어로는 적신호 큐(배치 오판)와 교차로 안 자기잠금
+    (제어기 결함)을 못 가른다 — 2026-09-06 두 런이 정확히 그 둘이었다.
+    """
+    if not ticks:
+        return {'blocked_reason': 'unknown', 'end_avoid_state': None, 'end_light': None,
+                'end_ticks': 0}
+    from collections import Counter
+
+    def avoid(t):
+        return ((t.get('decision') or {}).get('reasons') or {}).get('avoid') or {}
+
+    causes = Counter(stop_cause(t, intent_mps, head_gap_m) for t in ticks)
+    states = Counter(str(avoid(t).get('state')) for t in ticks)
+    lights = Counter(tuple((t.get('world') or {}).get('light') or ()) for t in ticks)
+    last = ticks[-1]
+    a = avoid(last)
+    dsl = ((last.get('world') or {}).get('summ') or {}).get('dist_stop_line')
+    gap = queue_head_gap_m(last)
+    return {'blocked_reason': causes.most_common(1)[0][0],
+            'blocked_reason_ticks': dict(causes),
+            'end_avoid_state': states.most_common(1)[0][0],
+            'end_suppress': a.get('suppress'),
+            'end_reject': a.get('reject'),
+            'end_light': list(lights.most_common(1)[0][0]) or None,
+            'end_standoff_id': a.get('standoff_id'),
+            'end_standoff_v': a.get('standoff_v'),
+            'end_stop_line_m': None if dsl is None else round(float(dsl), 1),
+            'end_head_gap_m': None if gap is None else round(gap, 1),
+            'end_ticks': len(ticks)}
 
 
 class EndJudge:
@@ -174,11 +338,16 @@ class EndJudge:
         self.v_stop = float(b['stall_speed_mps'])
         self.v_intent = float(b['stall_intent_mps'])
         self.eps = float(b['progress_eps_m'])
+        # 적신호 큐 면제 (2026-09-06). off 면 stop_t 만 셀 뿐 판정은 이전과 같다.
+        self.queue_excuse = bool(b.get('stall_excuse_queue', False))
+        self.red_wait_max_s = float(b.get('red_wait_max_s', 120.0))
+        self.head_gap_m = float(b.get('queue_head_gap_m', 10.0))
         self.reached_at = None
         self.best_rs = -math.inf
         self.progress_t = None
         self.stall_t = None
         self.blocked_t = None
+        self.stop_t = None            # 연속 정지(v < stall_speed_mps) 시작 시각
 
     def feed(self, now: float, tick: dict) -> str | None:
         """로그 틱 한 줄 → 종료 사유 또는 None.
@@ -209,15 +378,25 @@ class EndJudge:
 
         moving = v >= self.v_stop
         if moving:
-            self.stall_t = self.blocked_t = None
+            self.stall_t = self.blocked_t = self.stop_t = None
             return None
+        if self.stop_t is None:
+            self.stop_t = now
         if v_target >= self.v_intent:          # 계획은 가려는데 못 간다
             self.blocked_t = None
             self.stall_t = now if self.stall_t is None else self.stall_t
             return 'stall' if now - self.stall_t > self.stall_s else None
         # 계획도 정지 — 사유가 신호·보행자면 정상 정차라 타이머를 돌리지 않는다
         self.stall_t = None
-        if stop_excused(tick, self.v_intent):
+        excused = stop_excused(tick, self.v_intent, queue_excuse=self.queue_excuse,
+                               head_gap_m=self.head_gap_m)
+        # 적색 대기 면제 상한 (스위치 on 에서만) — 신호가 영원히 적색이거나 큐가
+        # 영원히 안 빠지면 진짜 잠금이다. 상한을 넘기면 면제를 거두고 blocked
+        # 타이머를 돌린다 (no_progress 안전망보다 먼저 '왜'를 남기기 위해서다).
+        if (excused and self.queue_excuse and _light_hold(tick)
+                and now - self.stop_t > self.red_wait_max_s):
+            excused = False
+        if excused:
             self.blocked_t = None
             return None
         self.blocked_t = now if self.blocked_t is None else self.blocked_t
@@ -705,6 +884,11 @@ class Runner:
         res['status'] = status
         if agent_log.exists():
             res['log'] = str(agent_log)
+            if status == 'blocked':
+                # 마지막 blocked_end_s 의 정차 원인 — "blocked" 한 단어로는 적신호
+                # 큐(배치 오판)와 자기잠금(제어기)을 못 가른다.
+                res.update(blocked_reason(tail_ticks(agent_log, judge.blocked_s),
+                                          judge.v_intent, judge.head_gap_m))
         return res
 
     # ── 결과 수집 ─────────────────────────────────────────────────────────

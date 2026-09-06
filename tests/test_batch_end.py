@@ -207,3 +207,117 @@ def test_stop_excused_direct():
     assert stop_excused(RED(100.0), intent)
     assert not stop_excused(tk(100.0, 0.0, 0.0, winner='lead',
                                lead_type='vehicle.vtd.object'), intent)
+
+
+# ── 적신호 큐 면제 (batch.stall_excuse_queue, 2026-09-06) ─────────────────
+from batch_run import red_queue_wait, stop_cause, blocked_reason      # noqa: E402
+
+
+def qtk(route_s=1895.3, *, light=(59, 1), red_light=1.14, avoid=None, objects=None,
+        dsl=24.4, v=0.0, v_target=0.0, reduced=None):
+    """적신호 선행차 뒤 대기 틱 (2026-09-06 실전주행_교통류_01 rs 1895.3 실측값이 기본)."""
+    reasons = {'winner': 'route_end', 'red_light': red_light, 'avoid': avoid}
+    if reduced:
+        reasons['speed_reduced_by'] = reduced
+    return {'ego': {'route_s': route_s, 'speed': v},
+            'decision': {'v_target': v_target, 'reasons': reasons},
+            'world': {'light': list(light) if light else None, 'summ': {'dist_stop_line': dsl}},
+            'objects': objects or []}
+
+
+QUEUE_AVOID = {'state': 'SUPPRESS', 'suppress': 'queue',
+               'queue': {'cond': 'AB', 'head_id': 15, 'n': 1, 'q_s': 35.8, 'green_s': 0.0,
+                         'd_sl': 24.4, 'head_sl': 3.9},
+               'standoff_d': 20.5, 'standoff_id': 15, 'standoff_v': 0.0}
+STOPPED_15 = [{'id': 15, 'cls': 'vehicle', 'speed': 0.0}]
+
+
+def test_params_present_queue_excuse_default_off():
+    assert BATCH['stall_excuse_queue'] is False
+    assert float(BATCH['red_wait_max_s']) > 0
+    assert float(BATCH['queue_head_gap_m']) > 0
+
+
+def test_red_queue_needs_hold_light():
+    """신호 없는 큐(정지 차량 뒤)는 면제가 아니다 — 앞차가 영원히 안 가면 우리도 못 간다."""
+    assert red_queue_wait(qtk(avoid=QUEUE_AVOID, objects=STOPPED_15))
+    assert not red_queue_wait(qtk(light=None, avoid=QUEUE_AVOID, objects=STOPPED_15))
+    assert not red_queue_wait(qtk(light=(59, 3), avoid=QUEUE_AVOID, objects=STOPPED_15))
+
+
+def test_red_queue_three_conditions():
+    # ① kr_rules 큐 판정
+    assert red_queue_wait(qtk(avoid={'suppress': 'queue'}))
+    # ② 큐 진단 + green_s 0
+    assert red_queue_wait(qtk(avoid={'queue': {'green_s': 0.0}}))
+    assert not red_queue_wait(qtk(avoid={'queue': {'green_s': 2.5}}))
+    # ③ standoff 대상이 정지 차량이고 정지선 head_gap 안
+    so = {'standoff_id': 15, 'standoff_d': 20.5}
+    assert red_queue_wait(qtk(avoid=so, objects=STOPPED_15, dsl=24.4))          # gap 3.9
+    assert not red_queue_wait(qtk(avoid=so, objects=[{'id': 15, 'speed': 3.0}], dsl=24.4))
+    # 주차 장애물: 정지선 112.6 m 앞, 대상 10 m 앞 → gap 102.6 → 큐 아님 (추월집중_05)
+    assert not red_queue_wait(qtk(avoid={'standoff_id': 2, 'standoff_d': 10.0},
+                                  objects=[{'id': 2, 'speed': 0.0}], dsl=112.6))
+
+
+def test_stop_excused_queue_only_with_switch():
+    """옛 조건(red_light < intent)은 실패하는 틱 — 스위치 off 면 이전과 같이 면제 안 됨."""
+    t = qtk(avoid=QUEUE_AVOID, objects=STOPPED_15)
+    intent = float(BATCH['stall_intent_mps'])
+    assert not stop_excused(t, intent)
+    assert not stop_excused(t, intent, queue_excuse=False)
+    assert stop_excused(t, intent, queue_excuse=True)
+
+
+def test_judge_red_queue_blocked_when_off_excused_when_on():
+    """01 실측 재현: off → 30 s 뒤 blocked, on → 면제."""
+    t = qtk(route_s=500.0, avoid=QUEUE_AVOID, objects=STOPPED_15)
+    j_off = judge(stall_excuse_queue=False)
+    j_on = judge(stall_excuse_queue=True)
+    for j in (j_off, j_on):
+        assert j.feed(0.0, tk(480.0, 8.0, 8.0)) is None
+    out_off = [j_off.feed(10.0 + s, t) for s in range(0, 40)]
+    out_on = [j_on.feed(10.0 + s, t) for s in range(0, 40)]
+    assert 'blocked' in out_off
+    assert out_on == [None] * 40
+
+
+def test_judge_red_wait_cap_ends_the_excuse():
+    """상한: 연속 정지가 red_wait_max_s 를 넘으면 면제를 거두고 blocked 타이머가 돈다."""
+    t = qtk(route_s=500.0, avoid=QUEUE_AVOID, objects=STOPPED_15)
+    j = judge(stall_excuse_queue=True, red_wait_max_s=50.0, blocked_end_s=30.0,
+              no_progress_end_s=1000.0)
+    assert j.feed(0.0, tk(480.0, 8.0, 8.0)) is None
+    res = {s: j.feed(10.0 + s, t) for s in range(0, 100)}
+    assert all(res[s] is None for s in range(0, 50))
+    assert res[85] == 'blocked' or 'blocked' in [res[s] for s in range(80, 100)]
+
+
+def test_judge_cap_does_not_apply_when_off():
+    """off 는 상한도 안 본다 — 판정이 이전과 바이트 단위로 같아야 한다."""
+    t = RED(100.0)
+    j = judge(stall_excuse_queue=False, red_wait_max_s=5.0, no_progress_end_s=1000.0)
+    assert all(j.feed(float(s), t) is None for s in range(0, 60))
+
+
+def test_stop_cause_vocabulary():
+    assert stop_cause(qtk(avoid=QUEUE_AVOID, objects=STOPPED_15), 0.5) == 'red_queue'
+    assert stop_cause(qtk(light=None, avoid={'state': 'BREAKOUT', 'standoff_id': 15}), 0.5) == 'breakout'
+    assert stop_cause(qtk(light=None, avoid={'state': 'REACTIVE', 'standoff_id': 2}), 0.5) == 'standoff'
+    assert stop_cause(qtk(light=None, avoid={'state': 'SUPPRESS'},
+                          reduced={'type': 'vehicle.vtd.object', 'id': 3, 'dist': 4.4},
+                          objects=[{'id': 3, 'speed': 0.0}]), 0.5) == 'stopped_lead'
+    assert stop_cause(RED(100.0), 0.5) == 'red_light'
+    assert stop_cause(tk(100.0, 0.0, 0.0, winner='walker'), 0.5) == 'pedestrian'
+    assert stop_cause(tk(100.0, 0.0, 0.0), 0.5) == 'unknown'
+
+
+def test_blocked_reason_is_the_mode():
+    ticks = [qtk(light=None, avoid={'state': 'BREAKOUT', 'standoff_id': 15})] + \
+            [qtk(avoid=QUEUE_AVOID, objects=STOPPED_15)] * 3
+    r = blocked_reason(ticks, 0.5)
+    assert r['blocked_reason'] == 'red_queue'
+    assert r['end_avoid_state'] == 'SUPPRESS'
+    assert r['end_standoff_id'] == 15
+    assert r['end_head_gap_m'] == 3.9
+    assert blocked_reason([], 0.5)['blocked_reason'] == 'unknown'

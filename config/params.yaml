@@ -1342,6 +1342,24 @@ batch:
   stall_intent_mps: 0.5     # v_target 이 이 값 이상이면 '계획은 진행'으로 본다
   progress_eps_m: 0.5       # route_s 가 이만큼 늘면 '전진'으로 인정 (no_progress 리셋)
 
+  # ── 적신호 큐 대기 면제 (2026-09-06) ────────────────────────────────────
+  # blocked 면제를 "누가 세웠나"(reasons.red_light < stall_intent_mps)가 아니라
+  # "왜 못 가나"로도 본다: 정지 신호 앞 큐(avoid.suppress=='queue' / queue.green_s
+  # ==0 / standoff 대상이 정지 차량)면 면제. 실측 2026-09-06 실전주행_교통류_01:
+  # 적신호 선행차 뒤 24.4 m 정상 대기(red_light 후보 1.14 m/s)를 blocked 로 잘랐다.
+  # false = 이전 판정 그대로.
+  stall_excuse_queue: false
+  # 적색 대기 면제 상한 [s] — 위 스위치 on 에서만. 연속 정지가 이보다 길면 면제를
+  # 거두고 blocked 타이머를 돌린다 (신호 고장·영원한 큐는 진짜 잠금이다).
+  # no_progress_end_s(120) 와 같은 값이면 사실상 그쪽이 먼저 끝내므로, 이 상한의
+  # 몫은 '왜'를 blocked_reason 으로 남기는 것이다.
+  red_wait_max_s: 120.0
+  # 큐 머리 판정 거리 [m] — standoff 대상(정지 차량)이 정지선에서 이 안이면 큐.
+  # 01 실측 3.9 m. 이 조건이 없으면 주차 장애물 뒤 정지(추월집중_05: 정지선 112 m
+  # 앞, 정적회피집중_02_직진3: 88 m)까지 큐로 봐서 제어기의 추월 실패를 숨긴다.
+  # kr_rules 가 스스로 큐로 판정한 경우(avoid.suppress=='queue')는 이 거리를 안 본다.
+  queue_head_gap_m: 10.0
+
 report:
   # tools/batch_run.py 의 logs/batch/<ts>/report.txt 표 — 밤샘 배치를 아침에
   # 한 화면에서 훑기 위한 요약이다. 상세는 <시나리오>.score.txt / report.json 에
