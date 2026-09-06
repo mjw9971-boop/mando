@@ -485,6 +485,14 @@ class KrRules:
         # 155049 02_직진3: 녹색 복귀 시 hold_s 22.6 → 즉시 open_why=delay).
         self._creep_hold_ticks = 0
         self._creep_hold_id = None                 # 대상이 바뀌면 시계를 새로
+        # 'delay' 로 연 크립의 래치 (2026-09-06, 020738/13 t=30.8·44.2 근거). 지연
+        # 만료로 열면 그 틱에 _creep_hold_ticks 를 0 으로 되돌렸고, 다음 틱은 ③ 이
+        # 다시 미달이라 닫혔다 — 1틱 개방, 이동 0 m, 10 s 뒤 반복. need·breakout
+        # 은 조건 자체가 지속되므로 리셋이 무해했지만 delay 는 시계가 곧 조건이다.
+        # 해제 = standoff 대상 변경 / 시프트 성립(ot_span 변화) / 배제(cause·
+        # ped_hold — 기존 시계도 거기서 0 이 된다). stop_gap 은 크립 완료라 유지.
+        self._creep_open_latched = False
+        self._creep_latch_span = None              # 래치 시점의 ot_span
         self.bo_paused = False                     # 적색·황색STOP 중 일시정지
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
@@ -2767,6 +2775,8 @@ class KrRules:
         self.ped_hold_ids.clear()
         self.ped_miss.clear()
         self.ped_last.clear()
+        self._creep_open_latched = False              # 크립 delay 래치 (문맥 불연속)
+        self._creep_hold_ticks = 0
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -3388,6 +3398,12 @@ class KrRules:
             # 녹색 직후 지연이 이미 만료된 상태가 된다 (위 _creep_hold_ticks 주석).
             self._creep_hold_ticks = 0
             self._creep_diag = dict(diag, so_creep=False, creep_block=why)
+            # 배제(신호·보행자·큐)는 문맥이 바뀐 것이다 — delay 래치도 시계와 같이
+            # 버린다 (비용은 최대 지연 1회). stop_gap·no_size 는 크립 완료·크기
+            # 미상이라 문맥이 그대로다 — 래치 유지.
+            if self._creep_open_latched and why in ('cause', 'ped_hold'):
+                self._creep_open_latched = False
+                self._creep_diag['creep_latch_why'] = 'release:' + why
             return 0.0
 
         if self.standoff_half_len is None:
@@ -3406,6 +3422,20 @@ class KrRules:
         if self.standoff_id != self._creep_hold_id:     # 대상이 바뀌면 새로 센다
             self._creep_hold_ticks = 0
             self._creep_hold_id = self.standoff_id
+            self._creep_open_latched = False              # 래치도 대상별이다
+        if self._creep_open_latched and self.ot_span != self._creep_latch_span:
+            self._creep_open_latched = False              # 시프트가 성립했다 — 새 문맥
+            self._creep_hold_ticks = 0                    # 시계도 새로 (만료값이 남으면 즉시 재래치)
+        if self._creep_open_latched:
+            # delay 래치 — 게이트를 다시 묻지 않고 시계도 건드리지 않는다.
+            need = self._creep_geom_need(ego_speed)
+            self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+                                    creep_open_why='delay', creep_open_latched=True,
+                                    creep_latch_why='delay',
+                                    creep_need_m=round(need, 1) if need is not None else None,
+                                    creep_hold_s=round(self._creep_hold_ticks / self.hz, 1),
+                                    creep_bo_lvl=self.bo_level)
+            return self.standoff_creep_v
         open_why, hold_why, need = self._creep_gate(d, ego_speed)
         gate = {'creep_need_m': round(need, 1) if need is not None else None,
                 'creep_hold_s': round(self._creep_hold_ticks / self.hz, 1),
@@ -3415,7 +3445,15 @@ class KrRules:
             self._creep_diag = dict(diag, so_creep=False, creep_hold=True,
                                     creep_hold_why=hold_why, **gate)
             return 0.0
-        self._creep_hold_ticks = 0
+        if open_why == 'delay':
+            # 시계가 곧 조건이다 — 0 으로 되돌리면 다음 틱에 닫힌다. 래치로 연다.
+            self._creep_open_latched = True
+            self._creep_latch_span = self.ot_span
+            self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+                                    creep_open_why=open_why, creep_open_latched=True,
+                                    creep_latch_why='delay', **gate)
+            return self.standoff_creep_v
+        self._creep_hold_ticks = 0                       # need·breakout: 조건이 지속된다
         self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
                                 creep_open_why=open_why, **gate)
         return self.standoff_creep_v
