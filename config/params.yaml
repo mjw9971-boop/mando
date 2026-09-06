@@ -1453,6 +1453,10 @@ scoring:
   # 실전주행_교통류_01 rs 1007.2/1067.4/1823.2, 차로유지 4건 중 3건, 각 2~4틱).
   # 0 = 이전 판정(제외 없음). 주최측 기준을 모르므로 기본은 보수적으로 둔다.
   lane_departure_taper_handover_m: 0.0
+  # 적신호 원거리 정지(red_stop_far)에 원인 태그(pedestrian / queue / pure)를 붙일지.
+  # 판정은 그대로다 — 9/6 실측에서 원거리 정지 2건이 보행자 정지와 적신호 큐 뒤
+  # standoff 로 원인이 달라 구분이 필요했다. false = 이전 출력.
+  red_stop_far_cause_tag: false
   # 완주 = 뒷바퀴 축이 종료 지점 좌표 통과 (경로 투영 route_s 로 환산 판정).
   # 주행 정지 위치 값. kr_rules._resolve_stop_s 가 읽는다. null 이면 CSV 마지막
   # 행 자동 (build_route 가 route.pkl 에 넣은 finish_xy;
@@ -1513,6 +1517,13 @@ score:
   collision_dist_m: 0.1    # 간격 ≤ 이 값 → 충돌로 집계
   near_dist_m: 1.5         # 간격 ≤ 이 값 → 근접 경고 (충돌 미만)
   stop_speed_mps: 0.5      # "정지 상태" 판정 속도 (정지선 침범 검출)
+  # 정지 지표 '전환' 을 저크 부호 변화(이전)가 아니라 **가속도 부호 전환**(양↔음,
+  # 데드밴드 안은 무시)으로 셀지. 이전 지표는 미세 떨림까지 다 세서(2026-09-06
+  # rs 693.2 접근 119회) 정지 프로파일의 품질과 무관하게 커진다. 옛 값은 jerk_flips,
+  # 새 값은 accel_flips 로 항상 함께 남고, 이 스위치는 cmd_reversals 가 무엇을
+  # 가리키느냐만 정한다. false = 이전(저크).
+  cmd_reversals_accel_sign: false
+  cmd_reversals_deadband_mps2: 0.1
   time_limit_s: 780.0      # 대회 완주 제한시간 (13분)
   # 초과 구간 병합: 이 시간 이하로 임계 아래로 내려갔다 다시 넘으면 같은 1건
   # (제어기가 임계 바로 밑에서 진동하면 1틱짜리 건이 수백 개로 쪼개진다)

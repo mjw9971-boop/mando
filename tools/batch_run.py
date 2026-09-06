@@ -942,8 +942,12 @@ class Runner:
             # 정지선 정지 지표 — report 에 실어 **로그가 지워져도 남긴다**
             # (위 ticks 는 raw 줄만 고른 것이라 다르다 — stop_metrics 는 전 틱이 필요)
             stop_ticks = score_tool.load_ticks(res['log'])
-            res['stops'] = (score_tool.stop_metrics(stop_ticks, stop_ticks[0]['t'])
-                            if stop_ticks else [])
+            _sc = load_cfg().get('score') or {}
+            res['stops'] = (score_tool.stop_metrics(
+                stop_ticks, stop_ticks[0]['t'],
+                accel_sign=bool(_sc.get('cmd_reversals_accel_sign', False)),
+                deadband=float(_sc.get('cmd_reversals_deadband_mps2', 0.1)))
+                if stop_ticks else [])
         except Exception as e:                          # noqa: BLE001
             res['n_violations'] = None
             res['deduction'] = None

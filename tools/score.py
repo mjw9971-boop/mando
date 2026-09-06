@@ -809,7 +809,8 @@ def detect_red_light(ticks: list[dict], t0: float, stop_speed: float) -> tuple[l
     return viol, right
 
 
-def stop_metrics(ticks: list[dict], t0: float, stop_speed: float = 0.5) -> list[dict]:
+def stop_metrics(ticks: list[dict], t0: float, stop_speed: float = 0.5,
+                 accel_sign: bool = False, deadband: float = 0.1) -> list[dict]:
     """정지선 정지 지표 — 이벤트별 (앞범퍼 slf, 감속 커맨드 방향 전환 횟수).
 
     batch_run 이 report.txt/.json 에 실어 **로그가 지워져도 지표는 남긴다**
@@ -848,6 +849,18 @@ def stop_metrics(ticks: list[dict], t0: float, stop_speed: float = 0.5) -> list[
                 if len(acc) > 2:
                     d = [b - a for a, b in zip(acc, acc[1:])]
                     rev = sum(1 for a, b in zip(d, d[1:]) if (a > 0) != (b > 0))
+                # 가속도 **부호** 전환 (양↔음, 데드밴드 안은 무시). 위 rev 는 저크
+                # 부호 전환이라 initial 25.0 vs PDM red_light 24.1~25.4 의 미세 떨림
+                # (2026-09-06 실전주행_교통류_01 rs 693.2: 119회) 까지 다 센다.
+                # score.cmd_reversals_accel_sign 이면 cmd_reversals 가 이 값이다.
+                acc_flips = 0
+                sign = 0
+                for a in acc:
+                    sg = 1 if a > deadband else (-1 if a < -deadband else 0)
+                    if sg and sign and sg != sign:
+                        acc_flips += 1
+                    if sg:
+                        sign = sg
                 # 녹색 전환 → 출발까지 [s] — **관측 항목이지 판정 항목이 아니다**.
                 # _stopline_hold 리필(적색 동안 매 틱 재무장)이 남긴 잔여 홀드가
                 # 녹색 뒤에도 목표 0 을 유지한다 (실측 1.2 s). 리필 수정을
@@ -869,7 +882,9 @@ def stop_metrics(ticks: list[dict], t0: float, stop_speed: float = 0.5) -> list[
                     'ctrl_ids': list(ctrl),
                     'states': _ctrl_states(ticks[i]) or [],
                     'approach_kph': round(max(t['ego']['speed'] for t in ticks[k:i + 1]) * 3.6, 1),
-                    'cmd_reversals': rev,
+                    'cmd_reversals': acc_flips if accel_sign else rev,
+                    'jerk_flips': rev,
+                    'accel_flips': acc_flips,
                     'hold_s': round(ticks[j]['t'] - ticks[i]['t'], 1),
                 })
         i = j + 1
@@ -902,8 +917,29 @@ def _tick_red(t: dict) -> bool | None:
         (any(s == LEFT_ARROW for s in got) and not (turn == 'turn_left' and near_turn))
 
 
+def _stop_cause_tag(seg: list[dict]) -> str:
+    """적신호 정지 에피소드의 원인 태그 (판정 아님 — 기록).
+      pedestrian  에피소드 중 보행자·자전거 후보가 이긴 틱이 있다
+      queue       회피 진단이 큐 억제이거나 standoff 대상이 있다 (선행차 뒤 정지)
+      pure        둘 다 아님 — 정지선을 겨냥한 정지
+    2026-09-06 실측: 02_직진11 rs 295.1 원거리 정지(−12.57 m)는 보행자 때문이고,
+    01_좌회전24 rs 1537.3(−20.66 m)은 적신호 큐 뒤 standoff 였다. 둘 다 항목 7 로
+    찍혔는데 원인이 다르다 — 주최측 기준을 모르므로 판정은 두고 태그만 남긴다."""
+    ped = queue = False
+    for t in seg:
+        r = (t.get('decision') or {}).get('reasons') or {}
+        w = str(r.get('winner') or '')
+        src = str((r.get('speed_reduced_by') or {}).get('type') or '')
+        if w in ('walker', 'bicycle') or 'walker' in src or 'pedestrian' in src:
+            ped = True
+        a = r.get('avoid') or {}
+        if a.get('suppress') == 'queue' or a.get('standoff_id') is not None:
+            queue = True
+    return 'pedestrian' if ped else ('queue' if queue else 'pure')
+
+
 def detect_red_stop(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
-                    merge_gap_s: float = 0.0) -> tuple[list, list, list]:
+                    merge_gap_s: float = 0.0, cause_tag: bool = False) -> tuple[list, list, list]:
     """적신호 정지 이벤트 (대회 항목 7 — 정지 품질).
 
     전방 정지선 존재(stop_line_front_m) + 적색(_tick_red) 에서 v<stop_speed 가
@@ -939,6 +975,8 @@ def detect_red_stop(ticks: list[dict], t0: float, stop_speed: float, sc: dict,
             ev['encroach_m'] = round(f, 2)
             enc.append(ev)
         elif f < -ok_m:
+            if cause_tag:
+                ev['cause'] = _stop_cause_tag(ticks[i0:i1 + 1])
             far.append(ev)
         else:
             ok.append(ev)
@@ -1512,7 +1550,8 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     V['red_light'] = {'count': 0, 'events': red}
     V['red_right_turn'] = {'count': 0, 'events': red_right}
     rs_ok, rs_far, rs_enc = detect_red_stop(span, t0, stop_speed, cfg['scoring'],
-                                            float(cfg['score'].get('merge_gap_s', 0.0)))
+                                            float(cfg['score'].get('merge_gap_s', 0.0)),
+                                            bool(cfg['scoring'].get('red_stop_far_cause_tag', False)))
     V['red_stop_ok'] = {'count': 0, 'events': rs_ok}
     V['red_stop_far'] = {'count': 0, 'events': rs_far}
     V['stop_line_encroach'] = {'count': 0, 'events': rs_enc}
@@ -1623,7 +1662,7 @@ _EXTRA = {          # 이벤트 상세에 덧붙일 항목별 필드
     'red_light': ('ctrl_ids', 'states', 'v_kph', 'next_turn'),
     'red_right_turn': ('states', 'v_kph', 'stopped_before'),
     'red_stop_ok': ('front_m',),
-    'red_stop_far': ('front_m',),
+    'red_stop_far': ('front_m', 'cause'),
     'stop_line_encroach': ('front_m', 'encroach_m'),
     'green_stall': ('front_m', 'winner'),
     'blink_stop': ('ctrl_ids', 'front_m', 'min_v_kph', 'v_kph'),
