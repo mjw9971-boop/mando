@@ -37,7 +37,7 @@ from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
 CSVS = ['data/official_route.csv', 'tests/fixtures/venue_20260903_waypoints.csv',
         'tests/fixtures/pair_lane_offset_waypoints.csv',
-        'scenarios/정적회피집중/정적회피집중_01_좌회전2.csv']
+        'tests/fixtures/static_avoid_01_waypoints.csv']
 
 
 @pytest.fixture(scope='module')
