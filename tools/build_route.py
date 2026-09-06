@@ -369,6 +369,46 @@ def min_hop_gap_m():
     return float((route_cfg() or {}).get('min_hop_gap_m', MIN_LC_WINDOW_M))
 
 
+_HOPSEP_CFG = None
+
+
+def hop_sep_cfg(reload=False):
+    """(sep_m, speed_enable) — route.lc_hop_sep_m · lc_hop_sep_speed_enable.
+
+    **연속 차선변경 hop 사이에 필요한 간격**이다. min_hop_gap_m 과 축이 다르다:
+    저쪽은 "전이 하나가 목표 차로에서 먹는 진행거리"(dijkstra 비용식), 이쪽은
+    "앞 전이가 끝나고 다음이 시작되기까지 필요한 거리"(제어기 램프 + 지시등 선행).
+
+    speed_enable 이면 구간 제한속도로 계산한다 —
+    lc_move_len(v) + v x signal.lc_lead_s.
+    실측(2026-09-06): 50 km/h 에서 37.5 + 37.5 = 75 m 가 필요한데 상수 45 는
+    30 m 모자라고, min_hop_gap_m 20 m 는 1.60 s 로 규정 3 s 의 절반이다.
+    기본 false = 상수(45, 현재 동작).
+    """
+    global _HOPSEP_CFG
+    if _HOPSEP_CFG is None or reload:
+        r = route_cfg() or {}
+        _HOPSEP_CFG = (float(r.get('lc_hop_sep_m', 45.0)),
+                       bool(r.get('lc_hop_sep_speed_enable', False)))
+    return _HOPSEP_CFG
+
+
+def hop_sep_for(lg, key):
+    """차로 key 에서의 연속 차선변경 필요 간격 [m]. hop_sep_cfg 참조."""
+    sep, speed_on = hop_sep_cfg()
+    if not speed_on:
+        return sep
+    from vtd_adapter.config import load_params_yaml
+    cfg = load_params_yaml()
+    r = cfg['route']
+    kph, _sc = lg.speed_limit_at(key)
+    kph = float(kph) if kph is not None else float(cfg.get('default_speed_kph', 50.0))
+    v = max(0.0, kph - float((cfg.get('speed') or {}).get('margin_kph', 0.0))) / 3.6
+    ramp = min(float(r['lc_move_max_m']), max(float(r['lc_move_min_m']),
+                                              v * float(r['lc_move_s'])))
+    return ramp + v * float((cfg.get('signal') or {}).get('lc_lead_s', 3.0))
+
+
 def hop_spacing_cost_enable():
     """탐색이 hop 간격을 비용으로 보는가 (작업19-3). false = 이전 동작."""
     return bool((route_cfg() or {}).get('hop_spacing_cost_enable', True))
@@ -392,6 +432,8 @@ def hop_room(lg, rt, gap=None):
     보는 여기서 첫 hop 까지 재면 그런 정상 경로를 과탐한다
     (실측: (2801,0,3)->(2801,0,2) 차로 17.07 m / 회랑 20.8 m, 계단 0).
     """
+    # gap=None 이면 dijkstra 비용식과 같은 축(min_hop_gap_m). 호출부가
+    # route.lc_hop_sep_speed_enable 을 켜면 차로별 필요 간격을 넘겨 준다.
     if gap is None:
         gap = min_hop_gap_m()
     lanes = [tuple(k) for k in rt['lanes']]
@@ -405,7 +447,7 @@ def hop_room(lg, rt, gap=None):
             cur, nth = 0.0, 0                    # successor -> 커서 리셋
             continue
         room = lg.length(b)
-        need = cur + gap
+        need = cur + (gap(b) if callable(gap) else gap)
         out.append((i + 1, float(cum[i + 1]), a, b, need, room, nth))
         cur = min(need, room)
         nth += 1
@@ -1170,7 +1212,7 @@ def dp_cfg(reload=False):
                    float(r.get('dp_detour_floor_m', 400.0)),
                    float(r.get('dp_detour_penalty', 10.0)),
                    float(r.get('dp_step_penalty', 0.0)),
-                   float(r.get('lc_move_max_m', 45.0)),
+                   None,                      # 간격은 hop_sep_for 가 차로별로 준다
                    bool(r.get('dp_compare_enable', True)))
     return _DP_CFG
 
@@ -1191,12 +1233,12 @@ def polyline_max_step(lg, rt):
     return float(d[i]), float(pl.route_s[i])
 
 
-def lc_stack_excess(lg, path, sep_m):
+def lc_stack_excess(lg, path, sep_m=None):
     """경로 조각 안에서 연속 차선변경 hop 사이 **간격 부족분** 합 [m].
 
     폴리라인 불연속의 실제 원인이다. 차선변경 hop 은 route_s 를 진행시키지 않아
     (advance()=0) 두 번을 같은 자리에서 겹칠 수 있는데, 제어기 램프는 한 번에
-    lc_move_max_m(45 m) 까지 쓴다 — 앞 램프가 끝나기 전에 다음 램프가 시작하면
+    필요 간격(route.lc_hop_sep_m) 까지 쓴다 — 앞 램프가 끝나기 전에 다음이 시작하면
     재샘플 폴리라인이 튄다 (2026-09-06 실측: 간격 0.0 m → 3.14 m, 31.8 m → 0.42 m).
     """
     s = 0.0
@@ -1206,7 +1248,8 @@ def lc_stack_excess(lg, path, sep_m):
         k, k2 = path[i][0], path[i + 1][0]
         if k2 not in lg.lanes[k]['next']:
             if last is not None:
-                ex += max(0.0, sep_m - (s - last))
+                need = sep_m if sep_m is not None else hop_sep_for(lg, k2)
+                ex += max(0.0, need - (s - last))
             last = s
         s += advance(lg, k, k2, lg.length(k))
     return ex
@@ -1378,7 +1421,7 @@ def start_yaw_of(rt):
 
 
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
-                seqs=None, finish_tail_m=0.0, pair_meta=None, _dp=True):
+                seqs=None, finish_tail_m=0.0, pair_meta=None, _dp=True, dp_radius=None):
     """pair_meta: {'offset','source','why'} — 짝 해석을 pkl 에 기록만 한다.
     경로 계산에는 쓰지 않는다 (계산은 junction_segs 가 전부다)."""
     # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
@@ -1402,8 +1445,12 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
     dp_on = dp_cfg()[0] and _dp and len(waypoints) >= 2
     dp_info = None
     if dp_on:
-        seq, seg_span, dp_info = dp_chain(lg, waypoints, radius, start_yaw, banned,
+        # 후보 반경은 route.dp_match_radius_m 이 단일 출처다. CLI --radius 를
+        # 사람이 준 경우에만 그쪽이 이긴다 (dp_radius 로 넘어온다).
+        r_dp = float(dp_radius) if dp_radius is not None else float(dp_cfg()[1])
+        seq, seg_span, dp_info = dp_chain(lg, waypoints, r_dp, start_yaw, banned,
                                           seqs=seqs)
+        dp_info['radius_m'] = r_dp
         wp_s = [0.0] + [None] * (len(waypoints) - 1)
         prev_end = dp_info['end_pos']       # 마지막 경유점이 앉은 (차로, s) — 꼬리 계산용
         forced_infeasible.extend(dp_info.pop('forced_infeasible', []))
@@ -1728,7 +1775,8 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         try:
             with contextlib.redirect_stdout(cmp_out), contextlib.redirect_stderr(cmp_out):
                 rt_p = build_route(lg, waypoints, radius, start_yaw, junction_segs,
-                                   seqs, finish_tail_m, pair_meta, _dp=False)
+                                   seqs, finish_tail_m, pair_meta, _dp=False,
+                                   dp_radius=dp_radius)
             same = ([tuple(k) for k in rt_p['lanes']] == [tuple(k) for k in rt['lanes']])
             dp_info['pair_cmp'] = {
                 'ok': True, 'same': same,
@@ -2088,11 +2136,16 @@ def report(lg, rt, radius, warn_dev=None):
     # ── 차선변경 여유 적합 (작업19-2 도입 / 19-3 축 교체) ─────────────────
     # 위 창 검사와 축이 다르다. 창은 "이 전이를 어디서 시작할 수 있나" 이고,
     # 여기는 "앞 전이가 끝나기 전에 다음이 시작되지 않나" 다.
-    rooms = hop_room(lg, rt)
+    sep_m, sep_speed = hop_sep_cfg()
+    # 속도 의존 스위치가 켜졌을 때만 게이트 축을 필요 간격으로 바꾼다.
+    # 끄면 이전과 같은 축(min_hop_gap_m)이다 — 물리적으로 불가능한 구간
+    # (도로 418 의 3연속 차선변경)에 새 오류를 만들지 않기 위해서다.
+    rooms = hop_room(lg, rt, (lambda k: hop_sep_for(lg, k)) if sep_speed else None)
     if rooms:
-        thr = min_hop_gap_m()
         gap_on = bool(rc.get('hop_gap_enable', True))
-        print(f"  ── 차선변경 여유 적합 (전이 하나에 {thr:g} m"
+        thr_txt = ('구간 제한속도별 (램프+지시등)' if sep_speed
+                   else f'{min_hop_gap_m():g} m')
+        print(f"  ── 차선변경 여유 적합 (전이 하나에 {thr_txt}"
               f"{'' if gap_on else ', 검사 꺼짐'})")
         for _i, cum_i, fl, tl, need, room, nth in rooms:
             note = ''
@@ -2164,7 +2217,9 @@ def main():
     ap.add_argument('pkl')
     ap.add_argument('waypoints', help='csv: seq,x,y (헤더 있어도 됨)')
     ap.add_argument('-o', '--out', default='route.pkl')
-    ap.add_argument('--radius', type=float, default=8.0, help='[m] 경유점 매칭 반경')
+    ap.add_argument('--radius', type=float, default=None,
+                    help='[m] 경유점 매칭 반경 (기본 8. 주면 DP 후보 반경'
+                         ' route.dp_match_radius_m 보다 우선한다)')
     ap.add_argument('--start-yaw', type=float, default=None,
                     help='[rad] 출발 헤딩. 없으면 seq1→seq2 방향으로 자동 추정')
     ap.add_argument('--ego-yaw', type=float, default=None,
@@ -2181,6 +2236,8 @@ def main():
     ap.add_argument('--yaw-min-dist', type=float, default=2.0,
                     help='[m] 헤딩 자동추정에 쓸 최소 거리. 이보다 가까운 경유점은 건너뛴다')
     a = ap.parse_args()
+    # 매칭 반경 기본 8 m — 안 주면 그 값을 쓰고, DP 후보 반경은 params 키가 정한다.
+    radius = 8.0 if a.radius is None else float(a.radius)
 
     lg = LaneGraph(a.pkl)
     rows = read_waypoints_csv(a.waypoints)
@@ -2224,7 +2281,7 @@ def main():
     if mode == 'none':
         offset, why, src = None, '--pair-offset none (짝 해석 안 함)', 'forced'
     elif mode == 'auto':
-        offset, why, _ev = pair_offset_auto(lg, wps, a.radius, start_yaw, seqs, tail_m)
+        offset, why, _ev = pair_offset_auto(lg, wps, radius, start_yaw, seqs, tail_m)
         src = 'auto'
     else:
         offset, why, src = int(mode), f'--pair-offset {mode} (사람이 지정)', 'forced'
@@ -2239,14 +2296,15 @@ def main():
     elif offset is not None:
         print('  경유점이 시작/종료뿐 — 교차로 짝 없음')
 
-    rt = build_route(lg, wps, a.radius, start_yaw, junction_segs=jsegs, seqs=seqs,
+    rt = build_route(lg, wps, radius, start_yaw, junction_segs=jsegs, seqs=seqs,
+                     dp_radius=a.radius,
                      finish_tail_m=tail_m,
                      pair_meta={'offset': offset, 'source': src, 'why': why})
 
     with open(a.out, 'wb') as f:
         pickle.dump(rt, f, protocol=4)
 
-    warns = report(lg, rt, a.radius, a.warn_dev)
+    warns = report(lg, rt, radius, a.warn_dev)
     print(f'saved {a.out}')
     return 1 if warns else 0
 
