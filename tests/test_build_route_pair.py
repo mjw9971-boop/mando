@@ -37,6 +37,14 @@ CSVS = ['tests/fixtures/venue_20260903_waypoints.csv', 'data/official_route.csv'
     str(p.relative_to(ROOT)) for p in (ROOT / 'scenarios').glob('*/*.csv'))
 
 
+# 이 파일은 **짝/탐욕 파이프라인의 계약**을 검사한다. 전역 DP(작업 R,
+# route.global_dp_enable 기본 true)가 켜지면 차로 열을 DP 가 정하므로 여기서
+# 보려는 동작 자체가 일어나지 않는다 — 파일 단위로 DP 를 끄고 본다.
+# DP 쪽 검증은 tests/test_global_dp.py 가 따로 한다.
+@pytest.fixture(autouse=True)
+def _dp_off(monkeypatch):
+    monkeypatch.setattr(BR, '_DP_CFG', (False,) + tuple(BR.dp_cfg()[1:]))
+
 @pytest.fixture(scope='module')
 def lg():
     if not GRAPH.exists():

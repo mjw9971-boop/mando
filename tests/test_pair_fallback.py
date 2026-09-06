@@ -41,6 +41,13 @@ def lg():
     return LaneGraph(str(GRAPH), cfg=CFG)
 
 
+# 이 파일은 짝 파이프라인의 계약을 검사한다 — 전역 DP(작업 R)가 켜지면 차로 열을
+# DP 가 정해서 여기서 보려는 동작이 일어나지 않는다. 파일 단위로 DP 를 끈다.
+@pytest.fixture(autouse=True)
+def _dp_off(monkeypatch):
+    monkeypatch.setattr(BR, '_DP_CFG', (False,) + tuple(BR.dp_cfg()[1:]))
+
+
 @contextlib.contextmanager
 def switches(widen, is_error):
     """pair_fallback_cfg 캐시를 직접 갈아끼운다 (params 파일을 안 건드린다)."""

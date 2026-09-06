@@ -1133,6 +1133,18 @@ def valid_entry_lanes(lg, rt, radius=8.0, banned=None, cap=None):
 _DP_CFG = None
 
 
+def polyline_step_thr():
+    """폴리라인 연속성 임계 [m] — configs/themes.yaml gen.max_polyline_step_m 이
+    단일 출처다 (생성기 게이트와 같은 값을 봐야 한다). 없으면 0 = 검사 안 함."""
+    try:
+        import yaml
+        p = _pathlib.Path(__file__).resolve().parent.parent / 'configs' / 'themes.yaml'
+        g = (yaml.safe_load(open(p, encoding='utf-8')) or {}).get('gen') or {}
+        return float(g.get('max_polyline_step_m', 0.0))
+    except Exception:                                # noqa: BLE001
+        return 0.0
+
+
 def dp_cfg(reload=False):
     """(enable, radius_m, detour_ratio, detour_floor_m) — route.global_dp_*.
 
@@ -1156,8 +1168,48 @@ def dp_cfg(reload=False):
                    float(r.get('dp_match_radius_m', 8.0)),
                    float(r.get('dp_detour_ratio', 3.0)),
                    float(r.get('dp_detour_floor_m', 400.0)),
-                   float(r.get('dp_detour_penalty', 10.0)))
+                   float(r.get('dp_detour_penalty', 10.0)),
+                   float(r.get('dp_step_penalty', 0.0)),
+                   float(r.get('lc_move_max_m', 45.0)),
+                   bool(r.get('dp_compare_enable', True)))
     return _DP_CFG
+
+
+def polyline_max_step(lg, rt):
+    """제어기가 실제로 따라갈 재샘플(VtdRoutePlanner, 10 cm)의 최대 점 간격 [m].
+
+    생성기 폴리라인 게이트(gen_scenarios.polyline_gate)와 **같은 잣대**다.
+    DP 가 고른 차로 열이 그 게이트에 걸리면 시나리오가 통째로 폐기되므로,
+    여기서 미리 재 보고 탐욕 경로가 더 매끈하면 그쪽을 쓴다.
+    """
+    from vtd_adapter.config import load_params_yaml
+    from vtd_adapter.route import VtdRoutePlanner
+    pl = VtdRoutePlanner(lg, rt, load_params_yaml())
+    pts = np.asarray(pl.route_points)
+    d = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+    i = int(np.argmax(d))
+    return float(d[i]), float(pl.route_s[i])
+
+
+def lc_stack_excess(lg, path, sep_m):
+    """경로 조각 안에서 연속 차선변경 hop 사이 **간격 부족분** 합 [m].
+
+    폴리라인 불연속의 실제 원인이다. 차선변경 hop 은 route_s 를 진행시키지 않아
+    (advance()=0) 두 번을 같은 자리에서 겹칠 수 있는데, 제어기 램프는 한 번에
+    lc_move_max_m(45 m) 까지 쓴다 — 앞 램프가 끝나기 전에 다음 램프가 시작하면
+    재샘플 폴리라인이 튄다 (2026-09-06 실측: 간격 0.0 m → 3.14 m, 31.8 m → 0.42 m).
+    """
+    s = 0.0
+    last = None
+    ex = 0.0
+    for i in range(len(path) - 1):
+        k, k2 = path[i][0], path[i + 1][0]
+        if k2 not in lg.lanes[k]['next']:
+            if last is not None:
+                ex += max(0.0, sep_m - (s - last))
+            last = s
+        s += advance(lg, k, k2, lg.length(k))
+    return ex
 
 
 def dp_candidates(lg, waypoints, radius, start_yaw=None):
@@ -1206,7 +1258,7 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
     반환 seq/seg_span 은 탐욕 경로가 만드는 것과 같은 형식이다 — 뒤쪽
     조립(누적거리·이벤트·valid_entry_lanes·리포트)은 손대지 않는다.
     """
-    _en, _r, ratio, floor, dpen = cfg or dp_cfg()
+    _en, _r, ratio, floor, dpen, spen, sep_m, _cmp = cfg or dp_cfg()
     cands, notes = dp_candidates(lg, waypoints, radius, start_yaw)
     idx = [k for k, c in enumerate(cands) if c]
     if len(idx) < 2:
@@ -1242,6 +1294,8 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
                         continue
                     # 우회 벌점 — 막지 않고 값을 매긴다 (dp_cfg 참조)
                     pen = dpen * max(0.0, res[0] - lim)
+                    if spen > 0.0:
+                        pen += spen * lc_stack_excess(lg, res[1], sep_m)
                     c = best[i][0] + res[0] + pen
                     d = best[i][1] + dj
                     if c < bc - 1e-9 or (abs(c - bc) <= 1e-9 and d < bd - 1e-9):
@@ -1290,8 +1344,12 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
     for wi, (k, _s) in enumerate(seq):
         if k in banned:
             forced.append((wi, k, banned[k]))
+    # 마지막 경유점이 실제로 앉은 (차로, s). 꼬리 계산이 이걸 봐야 한다 —
+    # seq[-1] 은 마지막 차로에 **진입한** s 라 경유점 위치가 아니다.
+    k_end, s_end, _d_end = cands[idx[-1]][picks[-1]]
     info = {
         'used': True,
+        'end_pos': (k_end, float(s_end)),
         'forced_infeasible': forced,
         'n_points': len(waypoints),
         'n_used_points': len(idx),
@@ -1341,7 +1399,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         seq, seg_span, dp_info = dp_chain(lg, waypoints, radius, start_yaw, banned,
                                           seqs=seqs)
         wp_s = [0.0] + [None] * (len(waypoints) - 1)
-        prev_end = seq[-1]                  # 마지막 경유점이 앉은 (차로, s) — 꼬리 계산용
+        prev_end = dp_info['end_pos']       # 마지막 경유점이 앉은 (차로, s) — 꼬리 계산용
         forced_infeasible.extend(dp_info.pop('forced_infeasible', []))
     skip_next = False
     for wi in range(len(waypoints) - 1):
@@ -1659,7 +1717,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
 
     # ── 짝 해석 대조 (DP 로 지었을 때만) ──────────────────────────────────
     # 선택은 자동이다 — DP 결과를 쓰고, 짝 해석은 **다르면 알리기 위해서만** 돈다.
-    if dp_on and junction_segs:
+    if dp_on and junction_segs and dp_cfg()[7]:
         cmp_out = io.StringIO()
         try:
             with contextlib.redirect_stdout(cmp_out), contextlib.redirect_stderr(cmp_out):
@@ -1672,6 +1730,21 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
                 'pair_lanes': len(rt_p['lanes']),
                 'pair_fallbacks': len(rt_p.get('pair_fallbacks') or []),
             }
+            # 연속성 안전망 — DP 가 고른 차로 열이 폴리라인 게이트에 걸리면
+            # 시나리오가 통째로 폐기된다. 탐욕 쪽이 더 매끈하면 그쪽을 쓴다.
+            thr = polyline_step_thr()
+            if not same and thr > 0:
+                with contextlib.redirect_stdout(cmp_out), contextlib.redirect_stderr(cmp_out):
+                    d_dp, s_dp = polyline_max_step(lg, rt)
+                    d_p, _s_p = polyline_max_step(lg, rt_p)
+                dp_info['polyline_step_m'] = round(d_dp, 3)
+                dp_info['pair_cmp']['polyline_step_m'] = round(d_p, 3)
+                if d_dp > thr and d_p < d_dp:
+                    dp_info['fallback_to_pair'] = (
+                        f'DP 경로 폴리라인 불연속 {d_dp:.2f} m (>{thr:g}, route_s≈{s_dp:.0f} m) — '
+                        f'짝 경로({d_p:.2f} m)를 쓴다')
+                    rt_p['dp'] = dp_info
+                    return rt_p
         except RouteError as e:
             dp_info['pair_cmp'] = {'ok': False, 'same': False,
                                    'error': str(e).splitlines()[0][:160]}
@@ -1770,7 +1843,9 @@ def report(lg, rt, radius, warn_dev=None):
     dpi = rt.get('dp')
     if dpi:
         cc = dpi.get('cand_counts') or []
-        print(f"\n[DP] 형식 무관 전역 탐색 채택 (route.global_dp_enable)")
+        fb = dpi.get('fallback_to_pair')
+        print(f"\n[DP] 형식 무관 전역 탐색 "
+              f"{'— 짝 경로로 복귀' if fb else '채택'} (route.global_dp_enable)")
         print(f"  경유점 {dpi['n_points']}개 중 {dpi['n_used_points']}개 사용"
               f"{'' if not dpi['skipped_points'] else '  건너뜀 ' + str([i + 1 for i in dpi['skipped_points']])}"
               f"   후보 {min(cc) if cc else 0}~{max(cc) if cc else 0}개"
@@ -1782,8 +1857,13 @@ def report(lg, rt, radius, warn_dev=None):
         for n in (dpi.get('relaxed') or []):
             print(f'  · {n}   <= [경고] 제약 해제')
             warns += 1
+        if fb:
+            print(f'  · {fb}   <= [경고] 연속성 안전망')
+            warns += 1
         cm = dpi.get('pair_cmp')
-        if cm is None:
+        if fb:
+            pass                     # 최종 경로가 짝 경로다 — 아래 대조 문구는 오해를 부른다
+        elif cm is None:
             print('  짝 대조: 안 함 (짝 해석 없음)')
         elif not cm.get('ok'):
             print(f"  짝 대조: 짝 해석은 경로를 못 짓는다 — {cm.get('error')}")

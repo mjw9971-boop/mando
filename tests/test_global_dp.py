@@ -29,8 +29,10 @@ from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
 CFG = load_params_yaml()
 FIX = ROOT / 'tests' / 'fixtures' / 'dp'
-DP_ON = (True, 8.0, 3.0, 400.0, 10.0)
-DP_OFF = (False, 8.0, 3.0, 400.0, 10.0)
+# (enable, radius, detour_ratio, detour_floor, detour_penalty,
+#  step_penalty, lc_sep_m, compare_enable)
+DP_ON = (True, 8.0, 3.0, 400.0, 10.0, 1.0, 45.0, True)
+DP_OFF = (False, 8.0, 3.0, 400.0, 10.0, 1.0, 45.0, True)
 
 
 @pytest.fixture(scope='module')
@@ -69,12 +71,13 @@ def max_wp_dev(lg, rt):
     return max(min(lg.project(k, x, y)[2] for k in lanes) for x, y in rt['waypoints'])
 
 
-def test_params_present_default_off():
+def test_params_present():
     r = CFG['route']
-    assert r['global_dp_enable'] is False
+    assert r['global_dp_enable'] is True          # 2026-09-06 검증 뒤 기본 채택
+    assert r['dp_compare_enable'] is True
     assert float(r['dp_match_radius_m']) == 8.0
     BR._DP_CFG = None
-    assert BR.dp_cfg(reload=True) == (False, 8.0, 3.0, 400.0, 10.0)
+    assert BR.dp_cfg(reload=True)[:5] == (True, 8.0, 3.0, 400.0, 10.0)
 
 
 def test_off_does_not_touch_route(lg):
@@ -149,7 +152,7 @@ def test_detour_is_penalised_not_blocked(lg):
     pts = wps(FIX / 'dp_03_one_per_junction.csv')
     with dp(DP_ON):
         good = build(lg, pts)
-    with dp((True, 8.0, 3.0, 400.0, 0.0)):
+    with dp((True, 8.0, 3.0, 400.0, 0.0, 1.0, 45.0, True)):
         free = build(lg, pts)
     assert good['total_length'] <= free['total_length'] + 1e-6
     assert free['dp']['used']
