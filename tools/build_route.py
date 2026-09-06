@@ -59,6 +59,37 @@ TARGET_DIST_W = 5.0
 # 되돌릴 때만 쓴다 (현장 롤백용) — 이 값이 왜 부족한지는 candidates() 주석 참고.
 CANDIDATES_K = 40
 
+_TAPER_CFG = None
+
+
+def taper_cfg(reload=False):
+    """params.yaml route.taper_* + vehicle.width — 소멸(테이퍼) 차로 판정의 단일 출처.
+
+    소멸 차로 = 끝 폭 < vehicle.width. vtd_adapter/route.py 의 taper_blend 와
+    tools/score.py 의 차로유지 제외가 같은 기준을 쓴다 — 셋이 어긋나면 "경로는
+    피하지 않는데 채점은 제외" 같은 틈이 생긴다.
+      taper_penalty_enable  탐색(dijkstra)에서 소멸 차로 진입에 벌점을 줄지
+      taper_penalty_m       그 벌점 [m 환산]
+    dijkstra 는 경유점마다 여러 번 불리므로 한 번 읽고 캐시한다.
+    """
+    global _TAPER_CFG
+    if _TAPER_CFG is None or reload:
+        from vtd_adapter.config import load_params_yaml
+        cfg = load_params_yaml()
+        rc = cfg.get('route') or {}
+        _TAPER_CFG = (bool(rc.get('taper_penalty_enable', False)),
+                      float(rc.get('taper_penalty_m', 0.0)),
+                      float(cfg['vehicle']['width']))
+    return _TAPER_CFG
+
+
+def is_taper_lane(lg, key, veh_width=None) -> bool:
+    """끝 폭이 차폭 미만으로 소멸하는 차로인가 (route.py taper_blend · score.py 와 같은 기준)."""
+    if veh_width is None:
+        veh_width = taper_cfg()[2]
+    return lg.width_at(key, lg.length(key)) < veh_width
+
+
 _CAND_CFG = None
 
 
@@ -534,6 +565,14 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
     heap = []
     # 전이 하나가 먹는 진행거리 [m]. 0 이면 이전 동작(간격을 비용에서 무시).
     hop_gap = min_hop_gap_m() if hop_spacing_cost_enable() else 0.0
+    # 소멸(테이퍼) 차로 진입 벌점 [m 환산]. 0 이면 이전 동작.
+    # 왜: 2026-09-06 실전주행_교통류_01 junction 7 우회전이 끝 폭 0.05 m 로
+    # 소멸하는 연결로 (1154,0,-2) 를 탔다. 옆에 폭이 유지되는 (1154,0,-3) 이 있고
+    # 지도 전체에 같은 꼴의 연결로가 29개, 그중 28개에 오른쪽 대안이 있다.
+    # 벌점은 successor 진입에만 붙는다 — 같은 도로 안 소멸 차로(차로 수 감소)는
+    # 대안이 차선변경뿐이라 LC 비용 축과 섞이지 않게 둔다.
+    tp_on, tp_m, veh_w = taper_cfg()
+    taper_pen = tp_m if (tp_on and tp_m > 0.0) else 0.0
     for key, s in starts:
         if key in tgt and tgt[key] >= s - 1e-6:
             # 같은 차로 안에서 도달
@@ -558,9 +597,11 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
             if (k2, False) in best and (k2, True) in best:
                 continue
             L2 = lg.length(k2)
+            pen = taper_pen if (taper_pen > 0.0 and lg.lanes[k2].get('junction', -1) != -1
+                                and is_taper_lane(lg, k2, veh_w)) else 0.0
             if k2 in tgt:
-                heapq.heappush(heap, (cost + tgt[k2], k2, 0.0, (key, s_enter), root, True))
-            heapq.heappush(heap, (cost + L2, k2, 0.0, (key, s_enter), root, False))
+                heapq.heappush(heap, (cost + tgt[k2] + pen, k2, 0.0, (key, s_enter), root, True))
+            heapq.heappush(heap, (cost + L2 + pen, k2, 0.0, (key, s_enter), root, False))
         # 차선변경: 같은 s 로 옆 차로에 진입 (진입 지점은 이 차로 시작 s_enter 이후 아무 데나 → 여기선 s_enter 로 근사)
         if not allow_lane_change:
             continue
@@ -1433,6 +1474,27 @@ def report(lg, rt, radius, warn_dev=None):
         print(f"  seq {sq_in:>3}→{sq_out:<3}  junction={jids if jids else '없음'}  "
               f"Δheading={dh:+7.1f}°  {turn_kind(dh)}  차로 {len(seg_lanes)}개"
               f"{turn_txt}{flag}")
+
+    # ── 2b) 소멸(테이퍼) 차로 통과 — WARN ─────────────────────────────────
+    # 끝 폭이 차폭 미만으로 사라지는 차로. 제어기(route.py taper_blend 15 m)가
+    # successor 중심선으로 블렌드해 주행은 되지만(2026-09-06 실측: 끝점에서
+    # successor 선 기준 ±0.06 m), 인계 첫 틱의 차로 매칭 t_off 가 −1.3 m 로 튀어
+    # 채점 차로유지에 잡힌다 (같은 날 4건 중 3건). 대안 연결로가 합법 도달 가능한지는
+    # 여기서 판정하지 않는다 — 포켓 진입 창이 MIN_LC_WINDOW_M 미만인 곳이 있어
+    # (146,0,2: 점선 13.2 m) 불가피한 경우가 실재한다. 그래서 ERROR 가 아니다.
+    _tp_on, _tp_m, _veh_w = taper_cfg()
+    tapers = [(i, k) for i, k in enumerate(lanes) if is_taper_lane(lg, k, _veh_w)]
+    if tapers:
+        print(f"\n[2b] 소멸 차로 통과 (끝 폭 < 차폭 {_veh_w:.3f} m; 탐색 벌점 "
+              f"{'on %.0f m' % _tp_m if _tp_on else 'off'})")
+        for i, k in tapers:
+            L = lg.length(k)
+            kind = '연결로' if lg.lanes[k].get('junction', -1) != -1 else '도로 안'
+            nxt = lanes[i + 1] if i + 1 < len(lanes) else None
+            print(f"  route_s {cum[i]:7.1f}  {k}  {kind}  len {L:5.1f}  폭 "
+                  f"{lg.width_at(k, 0.0):.2f}→{lg.width_at(k, L):.2f}  → {nxt}"
+                  f"   <= [경고] 소멸 차로 통과 (인계 지점 차로유지 판정 주의)")
+            warns += 1
 
     # ── 3) 총계 ──────────────────────────────────────────────────────────
     ev = rt['events']
