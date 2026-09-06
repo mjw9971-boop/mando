@@ -866,13 +866,43 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
     pool_out = road_lane_pool(lg, cb, x2, y2, ay_out)
     allow_prev = wi not in junction_segs
 
-    def search(bans):
+    # ── 연속 짝 공동 선택 (2교차로 lookahead) ──────────────────────────────
+    # 다음 짝이 바로 이어지고 그 사이 도로가 짧으면, 진출 차로를 **다음 짝
+    # 진입 차로에 차선변경 없이 닿는 것**으로 좁힌다. 좁혀서 아무것도 안
+    # 남으면 좁히기 전 결과를 쓴다 — 이 필터가 경로를 없애지는 않는다.
+    chain_keep = None
+    ch_on, ch_gap = pair_chain_cfg()
+    if (ch_on and (wi + 3) in junction_segs and wi + 4 < len(wps)
+            and math.hypot(wps[wi + 3][0] - x2, wps[wi + 3][1] - y2) < ch_gap):
+        x3, y3 = wps[wi + 3]
+        x4, y4 = wps[wi + 4]
+        ay3 = math.atan2(y3 - y2, x3 - x2)
+        ay4 = math.atan2(y4 - y3, x4 - x3)
+        c3 = candidates(lg, x3, y3, radius, ay3)
+        c4 = candidates(lg, x4, y4, radius, ay4)
+        pool3 = road_lane_pool(lg, c3, x3, y3, ay3) if c3 else []
+        pool4 = road_lane_pool(lg, c4, x4, y4, ay4) if c4 else []
+        # 다음 짝의 진입 차로 중 **그 회전을 실제로 끝낼 수 있는** 것만 본다.
+        # 진입 풀 전체로 보면 걸러지는 게 없다 — 직진 차로도 풀에 들어 있어서다.
+        need = [(kc, sc) for kc, sc, _dc in pool3
+                if any(turn_connect(lg, kc, sc, kd, sd, banned, cap) is not None
+                       for kd, sd, _dd in pool4)]
+        if need:
+            chain_keep = {kb for kb, sb, _d in pool_out
+                          if any(turn_connect(lg, kb, sb, kc, sc, banned, cap) is not None
+                                 for kc, sc in need)}
+            if not chain_keep or len(chain_keep) == len({k for k, _s, _d in pool_out}):
+                chain_keep = None          # 걸러지는 게 없으면 이전과 같은 길
+
+    def search(bans, keep=None):
         best = None
         for ka, sa, da in pool_in:
             pre = dijkstra(lg, starts, {ka: sa}, allow_lane_change=allow_prev, banned=bans)
             if pre is None:
                 continue
             for kb, sb, db in pool_out:
+                if keep is not None and kb not in keep:
+                    continue
                 c = turn_connect(lg, ka, sa, kb, sb, bans, cap)
                 if c is None:
                     continue
@@ -882,7 +912,13 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
         return best
 
     widen_enable, _is_err = pair_fallback_cfg()
-    best, used_banned = search(banned), []
+    best, used_banned = None, []
+    chained = False
+    if chain_keep is not None:
+        best = search(banned, chain_keep)
+        chained = best is not None
+    if best is None:
+        best = search(banned)
     widened = False
     if best is None:
         # 금지 연결로를 풀면 되는가 — 기존 탐욕과 같은 취급(불가피하면 허용 + 기록)
@@ -921,6 +957,10 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
                                   'connectors': []})
             return None
         used_banned = [kk for kk, _ in (best[1] + best[4]) if kk in banned]
+    if chained:
+        print(f'  [주의] {label(wi + 1)}→{label(wi + 2)} 다음 교차로까지 보고 진출 차로를 '
+              f'{best[5]} 로 골랐다 (route.pair_chain_enable, 사이 도로 '
+              f'{math.hypot(wps[wi + 3][0] - x2, wps[wi + 3][1] - y2):.1f} m)', file=sys.stderr)
     if widened:
         print(f'  [주의] {label(wi + 1)}→{label(wi + 2)} 진출 풀을 같은 도로 전체 '
               f'차로로 넓혀 짝을 찾았다 (route.pair_fallback_widen_enable) — '
@@ -930,6 +970,27 @@ def _pair_choice(lg, starts, wps, wi, radius, junction_segs, banned, cap, label,
 
 
 _PAIRFB_CFG = None
+_PAIRCHAIN_CFG = None
+
+
+def pair_chain_cfg(reload=False):
+    """(enable, gap_m) — route.pair_chain_enable · route.pair_chain_gap_m.
+
+    연속 짝 공동 선택(2교차로 lookahead): 앞 교차로 진출 차로를 고를 때 **다음
+    교차로 진입 차로까지** 본다. 왜: 교차로 사이 도로가 짧으면 진출 차로를
+    잘못 고른 뒤 차선변경할 자리가 없다. 짝 사이는 차선변경 금지라 다음 짝의
+    후보가 통째로 죽고 탐욕 폴백으로 넘어간다 (2026-09-06 G-2: 도로 2152 는
+    27.6 m 인데 진입 후보의 목표 s 가 27.57 이라, 차선변경 착지점 s+20 이
+    3 cm 차이로 목표를 지나쳐 후보가 탈락한다).
+    기본 false = 이전 동작.
+    """
+    global _PAIRCHAIN_CFG
+    if _PAIRCHAIN_CFG is None or reload:
+        from vtd_adapter.config import load_params_yaml
+        r = load_params_yaml().get('route') or {}
+        _PAIRCHAIN_CFG = (bool(r.get('pair_chain_enable', False)),
+                          float(r.get('pair_chain_gap_m', 30.0)))
+    return _PAIRCHAIN_CFG
 
 
 def pair_fallback_cfg(reload=False):
