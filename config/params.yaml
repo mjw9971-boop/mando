@@ -808,7 +808,7 @@ overtake:
   # Red 와 같이 다룬다(해제 시한 없음 — 선두가 떠나면 저절로 풀린다). 정지
   # 후보(_stop_target)·SHIFT_HOLD(_red_ahead)는 건드리지 않는다: UNKNOWN 은
   # Green 을 만들지도 Red 를 풀지도 않는다. false = 이전 동작(로그까지 동일).
-  signal_stale_queue_enable: false
+  signal_stale_queue_enable: true
   # 미보고 판정 시간 [s]. 실측(16런): 정지선 100 m 안·교차로 밖에서 "보였다가
   # 끊긴" 구간 0건 — 깜빡임은 없다. 1.0 s = 20틱이면 충분히 안전하다.
   signal_stale_s: 1.0
