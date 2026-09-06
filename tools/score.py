@@ -324,7 +324,8 @@ def detect_speed(ticks: list[dict], t0: float, margin_kph: float,
 # 2. 차선 이탈
 # ══════════════════════════════════════════════════════════════════════════
 def detect_lane_departure(ticks: list[dict], t0: float, lg, veh_width: float,
-                          route=None, merge_gap_s: float = 0.0) -> list:
+                          route=None, merge_gap_s: float = 0.0,
+                          handover_m: float = 0.0) -> list:
     """|t_off| > 차로폭/2 − 차체폭/2. 차로폭은 lanegraph 의 해당 s 값.
 
     제외 3종 (2026-08-26 오탐 분석):
@@ -335,13 +336,23 @@ def detect_lane_departure(ticks: list[dict], t0: float, lg, veh_width: float,
         기준 t_off 판정은 무의미하다 (임계도 0 근처로 붕괴해 cm 단위 오탐)
       · reset 틱
     진동이 경계를 여러 번 넘으면 잘게 쪼개지므로 merge_gap_s 이하 끊김은
-    같은 1건으로 병합한다 (speed/off_route 와 같은 규칙)."""
+    같은 1건으로 병합한다 (speed/off_route 와 같은 규칙).
+
+    handover_m > 0 이면 **소멸 차로의 successor 첫 handover_m** 도 제외한다
+    (scoring.lane_departure_taper_handover_m, 기본 0 = 이전 판정). 왜: 인계 첫
+    틱들은 자차가 아직 successor 시작점 앞(종거리 −1.3 m)인데 매칭이 successor
+    s=0.0 으로 클램프돼 t_off 가 −1.34 m 로 튄다. 자차의 실제 횡오프셋은
+    successor 접선 기준 +0.06 m 다 (2026-09-06 실전주행_교통류_01 rs 1007.2 /
+    1067.4 / 1823.2 — 그날 차로유지 4건 중 3건, 각 2~4틱). 54 로그 재채점에서는
+    85건 중 5건이 같은 꼴이다. 판정 근거는 t_off 인데 그 t_off 가 클램프 산물이라
+    제외한다 — 소멸 차로 제외와 같은 이유다."""
     windows = []
     if route:
         windows = [(float(e['window_s0']), float(e['window_s1']))
                    for e in route.get('events', [])
                    if e['kind'].startswith('lane_change') and 'window_s0' in e]
     taper_cache: dict = {}      # lane -> 끝 폭 < 차폭 (소멸 차로)
+    after_taper_cache: dict = {}   # lane -> predecessor 중 소멸 차로가 있나
 
     def is_taper(key) -> bool:
         if key not in taper_cache:
@@ -350,6 +361,12 @@ def detect_lane_departure(ticks: list[dict], t0: float, lg, veh_width: float,
             except KeyError:
                 taper_cache[key] = False
         return taper_cache[key]
+
+    def after_taper(key) -> bool:
+        if key not in after_taper_cache:
+            preds = [k for k in lg.lanes if key in lg.successors(k)]
+            after_taper_cache[key] = any(is_taper(k) for k in preds)
+        return after_taper_cache[key]
 
     mask = []
     for t in ticks:
@@ -360,6 +377,9 @@ def detect_lane_departure(ticks: list[dict], t0: float, lg, veh_width: float,
               and not any(a - 1e-6 <= rs <= b + 1e-6 for a, b in windows)
               and not t['world']['flags'].get('reset')
               and not is_taper(tuple(e['lane'])))
+        if ok and handover_m > 0.0 and float(e.get('s') or 0.0) < handover_m \
+                and after_taper(tuple(e['lane'])):
+            ok = False
         thr = None
         if ok:
             try:
@@ -1466,7 +1486,8 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
     if lg is not None:
         V['lane_departure'] = {'count': 0, 'events': detect_lane_departure(
             span, t0, lg, float(cfg['vehicle']['width']), route,
-            float(cfg['score'].get('merge_gap_s', 0.0)))}
+            float(cfg['score'].get('merge_gap_s', 0.0)),
+            float(cfg['scoring'].get('lane_departure_taper_handover_m', 0.0)))}
         V['solid_lane_change'] = {'count': 0, 'events': detect_solid_lane_change(
             span, t0, lg, float(cfg['score'].get('merge_gap_s', 0.0)))}
         changes = detect_lane_change_signal(span, t0, lg, cfg['scoring'],

@@ -1438,6 +1438,12 @@ scoring:
   minor_penalty: 3
   major_penalty: 6
   respawn_free_per_section: 1
+  # 차로유지: 소멸(테이퍼) 차로의 successor 첫 이 거리 [m] 를 판정에서 제외 (P7).
+  # 인계 첫 틱들은 자차가 successor 시작점 앞(종거리 −1.3 m)인데 매칭이 s=0.0 으로
+  # 클램프돼 t_off 가 −1.34 m 로 튄다 — 자차 실제 횡오프셋은 +0.06 m (2026-09-06
+  # 실전주행_교통류_01 rs 1007.2/1067.4/1823.2, 차로유지 4건 중 3건, 각 2~4틱).
+  # 0 = 이전 판정(제외 없음). 주최측 기준을 모르므로 기본은 보수적으로 둔다.
+  lane_departure_taper_handover_m: 0.0
   # 완주 = 뒷바퀴 축이 종료 지점 좌표 통과 (경로 투영 route_s 로 환산 판정).
   # 주행 정지 위치 값. kr_rules._resolve_stop_s 가 읽는다. null 이면 CSV 마지막
   # 행 자동 (build_route 가 route.pkl 에 넣은 finish_xy;
