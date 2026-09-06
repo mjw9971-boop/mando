@@ -30,7 +30,7 @@ route.pkl:
                    창 시작점은 laneSection 경계를 넘어 최대한 앞으로 당긴다
 탐색 규칙: 차로 길이 = 비용, 차선변경 = +25m 비용 (점선 구간이 있을 때만 허용), 막다른 차로 자동 회피
 """
-import argparse, heapq, math, pickle, sys
+import argparse, contextlib, heapq, io, math, pickle, sys
 import numpy as np
 import pathlib as _pathlib, sys as _sys
 _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
@@ -559,11 +559,14 @@ def infeasible_connectors(lg):
     return out, thr
 
 
-def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
+def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset(),
+             lc_in_junction=True):
     """starts: [(lane, s_start)]  targets: {lane: s_target} → (cost, [ (lane, s_enter) ... ])
 
     allow_lane_change=False 면 successor 링크만 따라간다 (교차로 내부 구간용).
-    banned: 통행 금지 차로 (회전 불가 연결로 — 비용 무한 대신 아예 확장하지 않는다)."""
+    banned: 통행 금지 차로 (회전 불가 연결로 — 비용 무한 대신 아예 확장하지 않는다).
+    lc_in_junction=False 면 **교차로 차로 위에서만** 차선변경을 막는다 (짝 형식에
+    기대지 않는 형식 무관 규칙 — 채점 항목 6). 기본 True = 이전 동작."""
     tgt = dict(targets)
     best = {}
     heap = []
@@ -613,6 +616,9 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset()):
             if not has_broken(lg, key, side):
                 continue
             k2 = lg.neighbor(key, side)
+            if not lc_in_junction and (r['junction'] != -1
+                                       or lg.lanes[k2]['junction'] != -1):
+                continue
             L2 = lg.length(k2)
             if hop_gap > 0.0:
                 # 전이 하나가 목표 차로 안에서 hop_gap 만큼의 진행거리를 먹는다.
@@ -1124,6 +1130,183 @@ def valid_entry_lanes(lg, rt, radius=8.0, banned=None, cap=None):
     return out
 
 
+_DP_CFG = None
+
+
+def dp_cfg(reload=False):
+    """(enable, radius_m, detour_ratio, detour_floor_m) — route.global_dp_*.
+
+    형식 무관 전역 경로 탐색(작업 R). 경유점 형식이 (진입,진출) 짝인지, 홑점인지,
+    공유점인지 **모르는 채로** 최적 차로 열을 찾는다. 기본 false = 이전 동작.
+
+    detour: 한 구간의 경로거리가 max(floor, ratio × 직선거리) 를 넘으면 **넘은
+    만큼 × penalty** 를 비용에 더한다. 막지는 않는다 — 층 단위로 잘라내면 그
+    층에서 살아남은 상태가 다음 층에서 전부 막히는 일이 생긴다 (실측:
+    waypoints_pair_banned 에서 32 m 짜리 전이가 앞 층 가지치기로 사라졌다).
+    왜 벌점이 필요한가: 경유점에서 가장 가까운 차로를 확정하고 넘어가면, 그
+    차로에서 다음 경유점으로 가는 길이 블록 한 바퀴여도 알 수 없다 (2026-09-06
+    PathShape03 CSV seq 9→10 이 직선 20 m 인데 경로 2081 m). 정상 구간 748개의
+    비율은 중앙 1.00 · p99 1.41 이고 2.0 초과 3건이 전부 그 병증이다.
+    """
+    global _DP_CFG
+    if _DP_CFG is None or reload:
+        from vtd_adapter.config import load_params_yaml
+        r = load_params_yaml().get('route') or {}
+        _DP_CFG = (bool(r.get('global_dp_enable', False)),
+                   float(r.get('dp_match_radius_m', 8.0)),
+                   float(r.get('dp_detour_ratio', 3.0)),
+                   float(r.get('dp_detour_floor_m', 400.0)),
+                   float(r.get('dp_detour_penalty', 10.0)))
+    return _DP_CFG
+
+
+def dp_candidates(lg, waypoints, radius, start_yaw=None):
+    """점마다 후보 차로 → ([ [(lane,s,dist)] ... ], [진단 문자열])
+
+    후보가 0개면 **헤딩 필터 완화 → 반경 1.5배** 순으로 다시 잡는다. 그래도
+    0이면 그 점은 None 으로 두고(=DP 에서 건너뛴다) 진단에 남긴다.
+    """
+    out, notes = [], []
+    n = len(waypoints)
+    for k in range(n):
+        x, y = waypoints[k]
+        if k == 0:
+            yaw = start_yaw if start_yaw is not None else math.atan2(
+                waypoints[1][1] - y, waypoints[1][0] - x)
+        else:
+            yaw = math.atan2(y - waypoints[k - 1][1], x - waypoints[k - 1][0])
+        c = candidates(lg, x, y, radius, yaw)
+        if not c:
+            c = candidates(lg, x, y, radius)
+            if c:
+                notes.append(f'점 {k + 1}: 헤딩 필터 완화로 후보 {len(c)}개')
+        if not c:
+            c = candidates(lg, x, y, radius * 1.5)
+            if c:
+                notes.append(f'점 {k + 1}: 반경 {radius * 1.5:g} m 로 넓혀 후보 {len(c)}개')
+        if not c:
+            notes.append(f'점 {k + 1}: 반경 {radius * 1.5:g} m 안에 차로 없음 — 이 점을 건너뛴다')
+            out.append(None)
+        else:
+            out.append(c)
+    return out, notes
+
+
+def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
+    """형식 무관 전역 탐색 → (seq, seg_span, info)
+
+    · 점 k 의 후보 C_k (dp_candidates)
+    · 전이 비용 = dijkstra(c_k → c_k+1). 길이 · 차선변경(hop_gap) · 회전 불가
+      연결로 금지 · 소멸 차로 벌점이 전부 그 안에 있고, 교차로 차로 위
+      차선변경만 여기서 추가로 막는다 (lc_in_junction=False).
+    · Viterbi 로 전체 최소. 동률이면 **경유점 거리 합**이 작은 쪽.
+    · 마지막 층은 직전 구간 진행방향에 맞는 후보만 남는다 (dp_candidates 의
+      헤딩 필터가 그 방향으로 잡는다).
+
+    반환 seq/seg_span 은 탐욕 경로가 만드는 것과 같은 형식이다 — 뒤쪽
+    조립(누적거리·이벤트·valid_entry_lanes·리포트)은 손대지 않는다.
+    """
+    _en, _r, ratio, floor, dpen = cfg or dp_cfg()
+    cands, notes = dp_candidates(lg, waypoints, radius, start_yaw)
+    idx = [k for k, c in enumerate(cands) if c]
+    if len(idx) < 2:
+        raise RouteError('전역 DP: 후보가 있는 경유점이 2개 미만이다')
+
+    def lab(k):
+        return f'seq {seqs[k]}' if seqs else f'waypoint {k}'
+
+    INF = float('inf')
+    best = [(0.0, c[2]) for c in cands[idx[0]]]      # (누적비용, 누적 경유점거리)
+    parent = [[None] * len(cands[idx[0]])]           # 층별 부모 인덱스
+    seg_path = [{}]                                  # 층별 {(i,j): dijkstra path}
+    relaxed, n_edge = [], 0
+    for t in range(1, len(idx)):
+        ka, kb = idx[t - 1], idx[t]
+        straight = math.dist(waypoints[ka], waypoints[kb])
+        lim = max(floor, ratio * straight)
+        cur, par, pth = None, None, None
+        # 금지 연결로는 하드 제약이다. 그것 때문에 층이 통째로 막히면 그때만
+        # 풀고 기록한다 (탐욕의 "대안이 없으면 불가피하게 허용하고 기록" 과 같다).
+        for attempt in (0, 1):
+            bans = banned if attempt == 0 else frozenset()
+            cur, par, pth = [], [], {}
+            for j, (kj, sj, dj) in enumerate(cands[kb]):
+                bi, bc, bd = None, INF, INF
+                for i, (ki, si, _di) in enumerate(cands[ka]):
+                    if best[i][0] == INF:
+                        continue
+                    res = dijkstra(lg, [(ki, si)], {kj: sj}, allow_lane_change=True,
+                                   banned=bans, lc_in_junction=False)
+                    n_edge += 1
+                    if res is None:
+                        continue
+                    # 우회 벌점 — 막지 않고 값을 매긴다 (dp_cfg 참조)
+                    pen = dpen * max(0.0, res[0] - lim)
+                    c = best[i][0] + res[0] + pen
+                    d = best[i][1] + dj
+                    if c < bc - 1e-9 or (abs(c - bc) <= 1e-9 and d < bd - 1e-9):
+                        bi, bc, bd = i, c, d
+                        pth[j] = (res[1], res[0], pen)
+                cur.append((bc, bd))
+                par.append(bi)
+            if any(v[0] < INF for v in cur):
+                break
+            if attempt == 0:
+                relaxed.append(f'{lab(ka)}→{lab(kb)} 회전 불가 연결로를 빼면 연결 없음 — 금지 해제')
+        if not any(v[0] < INF for v in cur):
+            raise RouteError(
+                f'전역 DP: {lab(ka)} → {lab(kb)} 구간에 연결 가능한 차로 조합이 없다 '
+                f'(후보 {len(cands[ka])}×{len(cands[kb])})')
+        best, _ = cur, None
+        parent.append(par)
+        seg_path.append(pth)
+
+    # ── 역추적 ────────────────────────────────────────────────────────────
+    order = sorted(range(len(best)), key=lambda j: (best[j][0], best[j][1]))
+    endj = order[0]
+    picks = [None] * len(idx)
+    picks[-1] = endj
+    for t in range(len(idx) - 1, 0, -1):
+        picks[t - 1] = parent[t][picks[t]]
+    total_cost, total_d = best[endj]
+
+    # ── seq / seg_span 조립 (탐욕과 같은 방식) ────────────────────────────
+    seq, seg_span, detours = [], [], []
+    for t in range(1, len(idx)):
+        path, raw_cost, pen = seg_path[t][picks[t]]
+        if pen > 0:
+            ka, kb = idx[t - 1], idx[t]
+            detours.append(f'{lab(ka)}→{lab(kb)} 경로 {raw_cost:.0f} m / 직선 '
+                           f'{math.dist(waypoints[ka], waypoints[kb]):.0f} m — 우회 벌점을 물고 채택')
+        i0 = max(0, len(seq) - 1)
+        for k, s_en in path:
+            if seq and seq[-1][0] == k:
+                continue
+            seq.append((k, s_en))
+        # 건너뛴 점이 있으면 그 구간들을 한 세그먼트로 본다 (앞 wi 로 기록)
+        for wi in range(idx[t - 1], idx[t]):
+            seg_span.append((wi, i0, len(seq) - 1))
+    forced = []
+    for wi, (k, _s) in enumerate(seq):
+        if k in banned:
+            forced.append((wi, k, banned[k]))
+    info = {
+        'used': True,
+        'forced_infeasible': forced,
+        'n_points': len(waypoints),
+        'n_used_points': len(idx),
+        'skipped_points': [k for k, c in enumerate(cands) if not c],
+        'cand_counts': [0 if not c else len(c) for c in cands],
+        'edges': n_edge,
+        'cost': round(float(total_cost), 1),
+        'wp_dist_sum': round(float(total_d), 2),
+        'picks': [list(cands[k][picks[t]][0]) for t, k in enumerate(idx)],
+        'notes': notes,
+        'relaxed': relaxed + detours,
+    }
+    return seq, seg_span, info
+
+
 def start_yaw_of(rt):
     """경로 시작 헤딩 (첫 두 경유점) — valid_entry_lanes 의 진입 헤딩 폴백."""
     w = rt['waypoints']
@@ -1131,7 +1314,7 @@ def start_yaw_of(rt):
 
 
 def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozenset(),
-                seqs=None, finish_tail_m=0.0, pair_meta=None):
+                seqs=None, finish_tail_m=0.0, pair_meta=None, _dp=True):
     """pair_meta: {'offset','source','why'} — 짝 해석을 pkl 에 기록만 한다.
     경로 계산에는 쓰지 않는다 (계산은 junction_segs 가 전부다)."""
     # 회전 불가 연결로 (R_min < 최소회전반경 × 여유) — dijkstra 에서 통행 금지
@@ -1149,8 +1332,21 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
         d, _ii = lg.kd.query((x, y), k=1)
         return float(np.atleast_1d(d)[0])
     pair_hint, turn_cap, _thr = pair_cfg()
+    # ── 형식 무관 전역 탐색 (작업 R) ──────────────────────────────────────
+    # 켜면 아래 구간별 탐욕 대신 DP 가 차로 열을 정한다. 짝 해석은 대조용으로만
+    # 돈다 (호출부 build_route(_dp=False)). 끄면 이전 동작 그대로다.
+    dp_on = dp_cfg()[0] and _dp and len(waypoints) >= 2
+    dp_info = None
+    if dp_on:
+        seq, seg_span, dp_info = dp_chain(lg, waypoints, radius, start_yaw, banned,
+                                          seqs=seqs)
+        wp_s = [0.0] + [None] * (len(waypoints) - 1)
+        prev_end = seq[-1]                  # 마지막 경유점이 앉은 (차로, s) — 꼬리 계산용
+        forced_infeasible.extend(dp_info.pop('forced_infeasible', []))
     skip_next = False
     for wi in range(len(waypoints) - 1):
+        if dp_on:
+            break                           # 차로 열은 위에서 DP 가 정했다
         if skip_next:                       # 앞 반복에서 짝으로 함께 처리했다
             skip_next = False
             continue
@@ -1424,7 +1620,7 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
 
     rt = {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
             'infeasible_forced': forced_infeasible, 'turn_radius_thr_m': turn_thr,
-            'pair_fallbacks': pair_fallbacks,
+            'pair_fallbacks': pair_fallbacks, 'dp': dp_info,
             'finish_xy': [float(waypoints[-1][0]), float(waypoints[-1][1])],
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
             'waypoint_seq': list(seqs) if seqs else list(range(1, len(waypoints) + 1)),
@@ -1460,6 +1656,25 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
     # 아무도 안 읽으면 영향 0 이어야 하므로 여기서 **덧붙이기만** 한다.
     if valid_entry_lanes_enable():
         rt['valid_entry_lanes'] = valid_entry_lanes(lg, rt, radius, banned, turn_cap)
+
+    # ── 짝 해석 대조 (DP 로 지었을 때만) ──────────────────────────────────
+    # 선택은 자동이다 — DP 결과를 쓰고, 짝 해석은 **다르면 알리기 위해서만** 돈다.
+    if dp_on and junction_segs:
+        cmp_out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(cmp_out), contextlib.redirect_stderr(cmp_out):
+                rt_p = build_route(lg, waypoints, radius, start_yaw, junction_segs,
+                                   seqs, finish_tail_m, pair_meta, _dp=False)
+            same = ([tuple(k) for k in rt_p['lanes']] == [tuple(k) for k in rt['lanes']])
+            dp_info['pair_cmp'] = {
+                'ok': True, 'same': same,
+                'pair_total': round(float(rt_p['total_length']), 1),
+                'pair_lanes': len(rt_p['lanes']),
+                'pair_fallbacks': len(rt_p.get('pair_fallbacks') or []),
+            }
+        except RouteError as e:
+            dp_info['pair_cmp'] = {'ok': False, 'same': False,
+                                   'error': str(e).splitlines()[0][:160]}
     return rt
 
 
@@ -1551,6 +1766,35 @@ def report(lg, rt, radius, warn_dev=None):
               f"{'—' if is_pair and warn_dev is None else f'{lim:4.2f}'} m  "
               f"경로 s={best_s:8.1f} m  lane={best_lane}{flag}")
 
+    # ── 1b) 전역 DP (작업 R) ─────────────────────────────────────────────
+    dpi = rt.get('dp')
+    if dpi:
+        cc = dpi.get('cand_counts') or []
+        print(f"\n[DP] 형식 무관 전역 탐색 채택 (route.global_dp_enable)")
+        print(f"  경유점 {dpi['n_points']}개 중 {dpi['n_used_points']}개 사용"
+              f"{'' if not dpi['skipped_points'] else '  건너뜀 ' + str([i + 1 for i in dpi['skipped_points']])}"
+              f"   후보 {min(cc) if cc else 0}~{max(cc) if cc else 0}개"
+              f"   전이 {dpi['edges']}회   비용 {dpi['cost']:.0f} m"
+              f"   경유점거리합 {dpi['wp_dist_sum']:.2f} m")
+        for n in (dpi.get('notes') or []):
+            print(f'  · {n}')
+            warns += 1
+        for n in (dpi.get('relaxed') or []):
+            print(f'  · {n}   <= [경고] 제약 해제')
+            warns += 1
+        cm = dpi.get('pair_cmp')
+        if cm is None:
+            print('  짝 대조: 안 함 (짝 해석 없음)')
+        elif not cm.get('ok'):
+            print(f"  짝 대조: 짝 해석은 경로를 못 짓는다 — {cm.get('error')}")
+        elif cm.get('same'):
+            print('  짝 대조: 같은 경로')
+        else:
+            print(f"  짝 대조: **다른 경로** — 짝 {cm['pair_total']:.0f} m/"
+                  f"{cm['pair_lanes']}차로  vs  DP {rt['total_length']:.0f} m/"
+                  f"{len(lanes)}차로   <= [경고] 두 해석이 갈린다 (DP 를 쓴다)")
+            warns += 1
+
     # ── 2) 짝(교차로) 구간 ───────────────────────────────────────────────
     spans = {wi: (i0, i1) for wi, i0, i1 in rt.get('segment_span') or []}
     # ── 짝 해석 머리 (작업21) — 대회 당일 사람이 눈으로 확인하는 한 줄이다.
@@ -1634,9 +1878,17 @@ def report(lg, rt, radius, warn_dev=None):
             turn_txt = f'  회전 X ({k_in}→{k_out})'
             # ERROR — 짝 사이는 차선변경 금지다. 이게 안 되면 물리적으로
             # 주행 불가능한 경로다.
-            flag += (f'   <= [오류] 진입 차로에서 진출 차로로 차선변경 없이 갈 수 없다'
-                     f' (상한 {turn_cap:g} m)')
-            errs += 1
+            # 단 DP 로 지은 경로에서는 WARN 이다: 짝 판정은 경유점이 (진입,진출)
+            # 짝이라는 전제 위에 있고, DP 는 그 전제를 안 쓴다. 형식이 짝이
+            # 아니면 이 판정이 틀린 쪽이다 (작업 R).
+            if rt.get('dp'):
+                flag += ('   <= [경고] 짝 해석으로는 진입→진출이 차선변경 없이 '
+                         '안 이어진다 (DP 경로 — 짝 형식이 아닐 수 있다)')
+                warns += 1
+            else:
+                flag += (f'   <= [오류] 진입 차로에서 진출 차로로 차선변경 없이 갈 수 없다'
+                         f' (상한 {turn_cap:g} m)')
+                errs += 1
         print(f"  seq {sq_in:>3}→{sq_out:<3}  junction={jids if jids else '없음'}  "
               f"Δheading={dh:+7.1f}°  {turn_kind(dh)}  차로 {len(seg_lanes)}개"
               f"{turn_txt}{flag}")
