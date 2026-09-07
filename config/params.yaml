@@ -254,7 +254,21 @@ speed:
   # (PDM 원문 무수정). 대회 7번: 범퍼가 선 앞 2 m 이내 정지 = 정상, 통과 = 중대.
   # 실측 오버런 산포 −2.3~+2.2 m — 넘김(중대) 방지를 우선해 1.5 (백로드 완화는
   # 별도 작업으로 후속).
-  stop_gap_stopline_m: 1.5
+  #
+  # 2026-09-07 1.5 → 2.0 (승인). 근거: 020738 16런 + 014910 적신호 정지 82건
+  # 실측(scratchpad/stopgap). 최종 정지 앞범퍼 중앙값 −0.83 (PDM IDM 착지
+  # −0.59 / ④′ 프로파일 착지 −1.17 — 착지 모드가 0.6 m 갈린다), 넘음 5건.
+  # 운전자 관찰상 정지선 밀착이 위험해 보여 당긴다. 2.0 이면 예상 중앙값
+  # −1.33 (IDM −1.09 / 프로파일 −1.67), 넘음 5 → 0. 2.3 이상은 프로파일
+  # 착지의 절반이 규정·채점기 원거리 경계(score.stop_ok_m 2.0) 를 넘어 경미가
+  # 되므로 쓰지 않는다. rtor_stop_zone_m(2.0) 은 규정 2 m 와 같은 축이라 유지.
+  # 이 값은 네 정지 후보(PDM IDM · _stopline_profile · _stopline_hold 무장 ·
+  # 황색 STOP 래치)의 s0 를 한꺼번에 움직인다 — 다른 키는 없다.
+  # 주의: 야간 배치 오버슛 4건(07 t=88·532, 11 t=328, 16 t=117, +0.07~+0.34)은
+  # 여유 부족이 아니라 **저속 접근(4~6 m/s) 에서 PDM IDM 이 선 8 m 앞까지
+  # 속도를 유지시키고 프로파일이 4 m 앞에서야 구속해 jerk 램프가 못 따라간**
+  # 별개 원인이다. 이 값으로 선 안(−0.2~−0.45) 에는 들어오지만 원인은 남는다.
+  stop_gap_stopline_m: 2.0
   # 정지선 정지 유지 시간 [s] — 규정 "0.5 s 이상 정지" + 여유 (kr_rules 홀드,
   # 실측 0.4 s 만에 재출발한 사례가 감점 대상이라 도입)
   stopline_hold_s: 1.0
@@ -301,7 +315,7 @@ speed:
   # 정지선 s) 로 붙어 정지선을 지나 다음 신호로 넘어가면 적용되지 않는다.
   # 리셋 = fresh 녹색 / 뒷축이 교차로 차로를 벗어남 / 정지선 + rtor_release_dist_m.
   # false = 이전 동작 (틱 단위 동일). **VTD 폐루프 검증 전에는 켜지 않는다.**
-  rtor_enable: false
+  rtor_enable: true
   # 앞차 없이 유지된 stale red(미보고 후 마지막 신호 Red)도 적색으로 인정
   rtor_allow_stale_red: true
   # 수동 제외 신호(controller) id — 화살표 신호 교차로 등 (데이터로 판정 불가)
@@ -978,7 +992,7 @@ overtake:
   # controller(167/168)에서는 10 s 든 90 s 든 85 % 확률로 적신호 통과(항목 7
   # 중대)다. 실측 020738 16런에서 성립 틱 0 (Red→None 6건은 전부 통과 직후).
   # 10.0 s 는 사용자 지정. false = 이전 동작(영구 정지, 미완주 감수).
-  signal_timeout_go_enable: false
+  signal_timeout_go_enable: true
   signal_unknown_timeout_s: 10.0
   # 해제 보류 — 이 거리 안 회랑에 이동 차량이 있으면 시계를 0 으로 [m]
   signal_timeout_clear_m: 30.0
@@ -1182,7 +1196,7 @@ overtake:
   # 로 원복만 기다리며 섰다(100310 158틱). 시프트 시작점이 자차보다 max_m 이상
   # 앞이면 기각(span_too_far). 정상 시프트 실측 5.0~34.7 m. route.py 근본 수정은
   # 범위 밖. false = 이전 동작(거리 무관). 기본 off.
-  span_gate_enable: false
+  span_gate_enable: true
   span_gate_max_m: 100.0
   # ── 전이 배치 (2026-09-03 실주행 100310/100458) ────────────────────────
   # 전이 시작이 자차 +shift_ahead_m 고정이라 우측 차로 11 m 의 id3 를 스쳤다(OBB
@@ -1229,7 +1243,7 @@ overtake:
   # gap_fit 이 고른 전이를 실제로 만들려면 v ≤ trans / shift_k_s 여야 한다.
   # 그 속도를 min() 후보로 내고, 도달할 때까지 span 생성을 보류한다.
   # 커밋 2(gap_fit_enable)와 **별개 스위치**다. false = 속도 연동 없음.
-  gap_fit_speed_enable: false
+  gap_fit_speed_enable: true
   shift_entry_max_delay_m: 15.0
   shift_entry_step_m: 0.5
   shift_exit_min_after_m: 0.0
@@ -1241,7 +1255,7 @@ overtake:
   # 이격 ≥ percep.obstacle_clearance_m(새 span 전 구간 모든 객체). 실측 01: 연장 후
   # id6 1.45 / id7 0.95, 발밑 변화 0.000000 m. 02(엇갈린 배치)는 이격 미달로 연장 안 함.
   # false = 이전 동작(기본 off, 실차 검증 전).
-  span_extend_enable: false
+  span_extend_enable: true
   span_extend_stuck_s: 4.0
   span_extend_max_n: 3
   # ── span 탐색 국소화 (2026-09-04, route.py plan_shift_span) ─────────────
@@ -1252,7 +1266,7 @@ overtake:
   # 제한해 처음부터 올바른 점만 나오게 한다. kr 가 넘기는 객체는 전부 detect_max_m
   # (80 m) 안이라 정상 시프트(실측 5.0~34.7 m)는 그대로다. span_gate 는 판정 층의
   # 안전망으로 남는다(계층이 다르며 대체 아님). false = PDM 원문 동작.
-  span_search_local_enable: false
+  span_search_local_enable: true
   # ── 시프트 목표 차로의 기준점 (2026-09-04 실주행 104648/104807) ─────────
   # PDM 원문은 목표를 항상 route_waypoints[idx](경로 **생성 시점** 차로)의 이웃으로
   # 잡는다. 이미 한 번 시프트해 옆 차로에 있으면 같은 쪽을 다시 골라도 목표가
