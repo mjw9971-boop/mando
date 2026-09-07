@@ -1723,6 +1723,109 @@ def _same_dir_lane_count(lg, k, sl: float, min_w: float,
     return n
 
 
+# ── 통과 가능성 (gen_placement.require_passable / pass_margin_*) ─────────
+# "자차가 합법적으로 지나갈 경로가 최소 하나 존재" 를 배치 **전에** 확인한다.
+# 기존 게이트(_same_dir_lane_count)는 차로 개수·폭만 보고 **차선 종류를 안 본다**
+# — 실선·중앙선 너머 차로를 회피로로 세고 있었다.
+
+PASS_STATS = {'reject': 0, 'why': collections.Counter()}   # main 이 리셋·요약 출력
+
+
+def pass_cfg() -> tuple:
+    """(require_passable, chain_gap_m, pass_margin_enable, need_inlane_m, need_nb_m)
+
+    이웃 차로 폭 임계는 static_vehicle.min_neighbor_width_m 를 그대로 읽는다 —
+    같은 물리량이라 값을 두 곳에 적지 않는다 (params 주석 참조).
+    """
+    c = plc_cfg()
+    veh = full_cfg()['vehicle']['width']
+    return (bool(c.get('require_passable', True)),
+            float(c.get('chain_gap_m', 18.0)),
+            bool(c.get('pass_margin_enable', False)),
+            float(veh) + float(c.get('pass_margin_m', 0.5)),
+            float(c['static_vehicle']['min_neighbor_width_m']))
+
+
+def _lc_legal_at(lg, rt, s: float, side: str, need_w: float):
+    """그 지점에서 side 로 **합법** 차선변경이 되는가 → (bool, 사유).
+
+    합법의 정의(대회 규칙): 실선·중앙선을 넘지 않고, 같은 방향 주행차로가
+    실재하며, 그 폭이 비켜 설 만큼은 될 것. 점선 판정은 lanegraph.mark_at 의
+    ok 플래그가 단일 출처다 (build_route·제어기 블렌드와 같은 값).
+    """
+    _i, k, sl = lane_at(rt, s)
+    nb = lg.neighbor(k, side)
+    if nb is None:
+        return False, '이웃없음'
+    o = lg.lanes[nb]
+    if o['dir'] != lg.lanes[k]['dir'] or o['type'] != 'driving':
+        return False, '반대방향/비주행'
+    if side == 'left' and lg.lanes[k].get('left_is_center'):
+        return False, '중앙선'
+    if not lg.mark_at(k, sl, side)[2]:
+        return False, '실선'
+    if lg.width_at(nb, min(sl, o['length'])) < need_w:
+        return False, '이웃폭부족'
+    return True, ''
+
+
+def _escape_side_over(ctx, lo: float, hi: float, need_w: float, step: float = 2.0):
+    """[lo,hi] **내내** 합법인 회피 측 → 'left'/'right', 없으면 None.
+
+    체인처럼 좌우 교대로 놓이는 장애물은 구간 전체를 하나의 회피로 빠져나가야
+    한다 — 중간에 그 쪽이 실선이 되거나 이웃이 사라지면 갇힌다. 그래서 점이
+    아니라 **구간**으로 본다. 표본 간격은 _multi_lane_spans 와 같은 2 m 다
+    (이 맵의 차로 섹션이 1.6~1.8 m 로 짧아 그보다 성기면 끊김을 건너뛴다).
+
+    **놓기 전에 구간을 좁히지 않고, 놓은 뒤 검증하는 데 쓴다** — 구간 목록을
+    미리 바꾸면 pick_s 의 길이축이 달라져 이미 합법이던 배치까지 전부 옮겨
+    간다 (실측 2026-09-07: 13/21 시나리오의 장애물 위치가 이동했다). 이 파일의
+    관례는 "이미 성립하던 배치는 바뀌지 않는다" 이다 (_place_in_one_span 주석).
+    """
+    total = float(ctx.route.rt['total_length'])
+    lo = max(0.0, lo)
+    hi = min(hi, total - 1e-3)
+    if hi < lo:
+        lo = hi = max(0.0, min(lo, total - 1e-3))
+    for side in ('left', 'right'):
+        u = lo
+        ok_all = True
+        while True:
+            uu = min(u, hi)
+            if not _lc_legal_at(ctx.lg, ctx.route.rt, uu, side, need_w)[0]:
+                ok_all = False
+                break
+            if uu >= hi:
+                break
+            u += step
+        if ok_all:
+            return side
+    return None
+
+
+def _pass_report(prefix: str = '') -> None:
+    """통과 가능성 검사 폐기 요약 — 대량 생성과 단건 재생성이 같은 문구를 쓴다."""
+    if not PASS_STATS['reject']:
+        return
+    print(f'{prefix}통과 가능성 검사 폐기 {PASS_STATS["reject"]}회 (위치 재시도 포함):')
+    for why, n in PASS_STATS['why'].most_common():
+        print(f'{prefix}  {n:>4}회  {why}')
+
+
+def _pass_reject(what: str, why: str):
+    """검사 탈락 1건 기록 → EventUnfeasible (호출부의 위치 재시도가 받는다)."""
+    PASS_STATS['reject'] += 1
+    PASS_STATS['why'][f'{what}: {why}'] += 1
+    return EventUnfeasible(f'{what}: {why}')
+
+
+def _inlane_free_edge(lg, rt, s: float, inset: float, half_w: float) -> float:
+    """가장자리 장애물의 **반대쪽 잔여폭** [m] — 차로 안으로 지나갈 폭."""
+    _i, k, sl = lane_at(rt, s)
+    w = lg.width_at(k, sl)
+    return w / 2.0 + (w / 2.0 - inset) - half_w
+
+
 def _multi_lane_spans(ctx, min_w: float, min_span: float, step: float = 2.0,
                       check_self: bool = False):
     """동일 방향 주행차로가 2개 이상인 route_s 부분구간들 (_opposite_spans 와 같은 형태).
@@ -1775,6 +1878,17 @@ def ev_static_vehicle(ctx, v):
     else:
         s = pick_s(ctx.spans, v['위치'], need=30.0)
         ctx.claim(s - 40, s + 40, 'static_vehicle')
+    # 놓은 자리에서 **합법 회피**가 되는지 검증한다 (차로 개수만으로는 부족 —
+    # 그 쪽 차선이 실선이면 회피가 불법이다). 회피 창은 시프트 진입 앞 여유부터
+    # 복귀 뒤 여유까지로 잡는다 (overtake.shift_ahead_m / extra_after_m).
+    want_pass, _gap, _pm_on, _need_in, need_nb = pass_cfg()
+    if want_pass and v.get('차선') != '좌측차로':
+        ot = full_cfg().get('overtake') or {}
+        lo = s - float(ot.get('shift_ahead_m', 5.0))
+        hi = s + float(ot.get('extra_after_m', 10.0)) + float(full_cfg()['vehicle']['length'])
+        if _escape_side_over(ctx, lo, hi, need_nb) is None:
+            raise _pass_reject('static_vehicle',
+                               '합법 회피(점선·중앙선 아님·이웃폭)가 되는 측이 없다')
     i, k, sl = lane_at(rt, s)
     t = 0.0
     lane_tag = 'ego_lane'
@@ -2063,8 +2177,8 @@ def ev_obstacle_chain(ctx, v):
         if not spans:
             raise EventUnfeasible('obstacle_chain: 동일 방향 주행차로가 2개 이상인 '
                                   '가용구간이 없다 — 1차로의 체인은 회피가 원천 불가다')
+    want_pass, spacing, pm_on, need_in, need_nb = pass_cfg()
     n0 = n = int(v.get('개수', 4))
-    spacing = 18.0
     s0 = None
     while n >= 2:
         s0 = _place_in_one_span(ctx, v['위치'], reach=(n - 1) * spacing,
@@ -2077,12 +2191,33 @@ def ev_obstacle_chain(ctx, v):
     if s0 is None:
         raise GenError('obstacle_chain: 장애물 2개도 놓을 구간이 부족하다')
     shrunk = n != n0
+    if want_pass:
+        # 체인은 좌우 **교대**라 단일 오프셋으로는 못 빠져나간다 — 구간 **내내**
+        # 같은 쪽이 합법이어야 한다. 실측 2026-09-07: 이 검사만이
+        # 실전주행_교통류_18_연속교차로14 를 잡는다 (좌측이 중간에 실선으로
+        # 끊기고 우측은 이웃이 없다).
+        ot = full_cfg().get('overtake') or {}
+        lo = s0 - float(ot.get('shift_ahead_m', 5.0))
+        hi = (s0 + (n - 1) * spacing + float(ot.get('extra_after_m', 10.0))
+              + float(full_cfg()['vehicle']['length']))
+        if _escape_side_over(ctx, lo, hi, need_nb) is None:
+            raise _pass_reject('obstacle_chain',
+                               '체인 구간 내내 유지되는 합법 회피 측이 없다')
+    if pm_on:
+        # 차선변경 없이 **차로 안으로** 지나갈 폭이 나오는가 (기본 off).
+        # 가장자리 장애물은 반대쪽에 w/2 + (w/2 − inset) − 반폭 이 남는다.
+        tight = [round(s0 + i * spacing, 1) for i in range(n)
+                 if _inlane_free_edge(lg, rt, s0 + i * spacing,
+                                      CHAIN_INSET_M, CHAIN_HALF_W_M) < need_in]
+        if tight:
+            raise _pass_reject('obstacle_chain',
+                               f'차로 내 잔여폭 < {need_in:.2f} m 인 지점 {len(tight)}개')
     placed = []
     for i in range(n):
         s = s0 + i * spacing
         _, k, sl = lane_at(rt, s)
         w = lg.width_at(k, sl)
-        t = (w / 2.0 - 0.7) * (1 if i % 2 == 0 else -1)
+        t = (w / 2.0 - CHAIN_INSET_M) * (1 if i % 2 == 0 else -1)
         x, y, z, _ = route_pt(lg, rt, s, t)
         ctx.moving.append(blk_object(ctx.next_name('Obstacle'), x, y, z))
         ctx.checks.append((x, y, 'ego_lane'))
@@ -2092,6 +2227,11 @@ def ev_obstacle_chain(ctx, v):
         out['note'] = f'구간 부족으로 개수 축소 ({v.get("개수", 4)}→{n})'
     return out
 
+
+# 체인 장애물을 차로 **가장자리**에서 안쪽으로 얼마나 들이는가 [m] 와 그 반폭.
+# 배치(t 계산)와 잔여폭 검사가 같은 값을 봐야 해서 상수로 뺐다.
+CHAIN_INSET_M = 0.7
+CHAIN_HALF_W_M = 0.16          # Fuelcan01 근사 (콘과 같은 축 — params cone_half_width_m 참조)
 
 # 양측 정차 차량의 (종거리 오프셋, 좌우 부호) — 우측 먼저, 14 m 뒤 좌측.
 # 배치와 "한 구간 안에 들어가는가" 판정이 같은 값을 봐야 해서 상수로 뺐다.
@@ -2110,6 +2250,16 @@ def ev_narrow(ctx, v):
         raise GenError(f'narrow: 정차 차량 두 대({reach:.0f} m)가 통째로 들어가는 '
                        f'가용구간이 없다')
     intr = float(v.get('침범폭', 0.7))
+    _wp, _gap, pm_on, need_in, _nb = pass_cfg()
+    if pm_on:
+        # 협착은 좌우가 14 m 엇갈려 있어 한 지점의 잔여폭은 w − 침범폭 이다.
+        # 이 이벤트는 **차로 안 통과가 설계 전제**라 차선변경 회피를 요구하지
+        # 않는다 — 잔여폭만 본다 (require_passable 대상이 아니다).
+        tight = [round(s + ds, 1) for ds, _sgn in NARROW_OFFSETS
+                 if lg.width_at(*lane_at(rt, s + ds)[1:]) - intr < need_in]
+        if tight:
+            raise _pass_reject('narrow',
+                               f'차로 내 잔여폭(폭 − 침범 {intr:g}) < {need_in:.2f} m')
     placed = []
     for ds, sgn in NARROW_OFFSETS:
         _, k, sl = lane_at(rt, s + ds)
@@ -2739,6 +2889,8 @@ def main(argv=None) -> int:
 
     route_defs, themes, gen_cfg = load_themes()
     GATE_STATS['ok'] = GATE_STATS['reject'] = 0
+    PASS_STATS['reject'] = 0
+    PASS_STATS['why'].clear()
 
     if a.list:
         for th, cfg in themes.items():
@@ -2775,6 +2927,7 @@ def main(argv=None) -> int:
         write_scenario(out_dir, theme, name, xml_text, sdef2, route.rows)
         for _, x, y, dm in bad:
             print(f'  ⚠ ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
+        _pass_report('  ')
         n_all, n_th = rebuild_batch_lists(out_dir, a.vtd_dir)
         print(f'생성 완료: {out_dir / theme / (name + ".xml")}  '
               f'(길이 {route.rt["total_length"]:.0f} m, timeout {sdef2["timeout_s"]} s)')
@@ -2801,6 +2954,7 @@ def main(argv=None) -> int:
         write_scenario(out_dir, theme, sdef['name'], xml_text, sdef2, route.rows)
         for _, x, y, dm in bad:
             print(f'  ⚠ ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
+        _pass_report('  ')
         print(f'재생성 완료: {out_dir / theme / (sdef["name"] + ".xml")}')
         return 0
 
@@ -2924,6 +3078,14 @@ def main(argv=None) -> int:
         line += ('  ⚠ 폐기가 통과보다 많다 — walk 시작점 선정이 "뒤쪽 탈출로 있는 '
                  '양방향 도로"에 편중됐다는 신호 (start_pool 조건 검토)')
     print(line)
+    wp, _gap, pm_on, need_in, need_nb = pass_cfg()
+    print(f'\n통과 가능성 검사: require_passable={wp} · pass_margin_enable={pm_on}'
+          + (f' (잔여폭 요구 {need_in:.2f} m)' if pm_on else '')
+          + f' · 이웃폭 요구 {need_nb:.2f} m')
+    if PASS_STATS['reject']:
+        _pass_report('  ')
+    else:
+        print('  배치 폐기 0회')
     if a.coverage_report:
         all_roads = set(lg.roads)
         visited = set(cov_roads)
