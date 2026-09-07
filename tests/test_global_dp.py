@@ -165,9 +165,9 @@ RETRY_ON = DP_ON._replace(retry=True, compare=False)
 RETRY_OFF = DP_ON._replace(retry=False, compare=False)
 
 
-def test_retry_params_default_off():
+def test_retry_params_present():
     r = CFG['route']
-    assert r['dp_radius_retry_enable'] is False
+    assert r['dp_radius_retry_enable'] is True     # 2026-09-07 검증 뒤 기본 채택
     assert float(r['dp_radius_max_m']) == 16.0
     assert float(r['dp_radius_dev_penalty']) == 1.0
 
