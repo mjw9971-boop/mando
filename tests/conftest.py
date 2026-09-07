@@ -58,9 +58,7 @@ def _dp_compare_off():
         yield
         return
     old = BR._DP_CFG
-    cfg = list(BR.dp_cfg())
-    cfg[7] = False
-    BR._DP_CFG = tuple(cfg)
+    BR._DP_CFG = BR.dp_cfg()._replace(compare=False)
     try:
         yield
     finally:

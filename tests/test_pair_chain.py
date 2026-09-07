@@ -43,7 +43,7 @@ def lg():
 # DP 가 정해서 여기서 보려는 동작이 일어나지 않는다. 파일 단위로 DP 를 끈다.
 @pytest.fixture(autouse=True)
 def _dp_off(monkeypatch):
-    monkeypatch.setattr(BR, '_DP_CFG', (False,) + tuple(BR.dp_cfg()[1:]))
+    monkeypatch.setattr(BR, '_DP_CFG', BR.dp_cfg()._replace(enable=False))
 
 
 @contextlib.contextmanager

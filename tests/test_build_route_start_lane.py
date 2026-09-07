@@ -42,7 +42,7 @@ LOCATE_BETTER = (971.2777, 665.8487, -2.673638)
 # DP 쪽 검증은 tests/test_global_dp.py 가 따로 한다.
 @pytest.fixture(autouse=True)
 def _dp_off(monkeypatch):
-    monkeypatch.setattr(BR, '_DP_CFG', (False,) + tuple(BR.dp_cfg()[1:]))
+    monkeypatch.setattr(BR, '_DP_CFG', BR.dp_cfg()._replace(enable=False))
 
 @pytest.fixture(scope='module')
 def lg():

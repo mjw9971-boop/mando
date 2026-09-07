@@ -30,7 +30,7 @@ route.pkl:
                    창 시작점은 laneSection 경계를 넘어 최대한 앞으로 당긴다
 탐색 규칙: 차로 길이 = 비용, 차선변경 = +25m 비용 (점선 구간이 있을 때만 허용), 막다른 차로 자동 회피
 """
-import argparse, contextlib, heapq, io, math, pickle, sys
+import argparse, collections as _collections, contextlib, heapq, io, math, pickle, sys
 import numpy as np
 import pathlib as _pathlib, sys as _sys
 _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
@@ -1187,8 +1187,13 @@ def polyline_step_thr():
         return 0.0
 
 
+DPCfg = _collections.namedtuple(
+    'DPCfg', 'enable radius ratio floor detour_penalty step_penalty sep compare '
+             'retry radius_max dev_penalty')
+
+
 def dp_cfg(reload=False):
-    """(enable, radius_m, detour_ratio, detour_floor_m) — route.global_dp_*.
+    """DPCfg — route.global_dp_* / dp_*.
 
     형식 무관 전역 경로 탐색(작업 R). 경유점 형식이 (진입,진출) 짝인지, 홑점인지,
     공유점인지 **모르는 채로** 최적 차로 열을 찾는다. 기본 false = 이전 동작.
@@ -1203,17 +1208,23 @@ def dp_cfg(reload=False):
     비율은 중앙 1.00 · p99 1.41 이고 2.0 초과 3건이 전부 그 병증이다.
     """
     global _DP_CFG
+    if _DP_CFG is not None and not isinstance(_DP_CFG, DPCfg):
+        _DP_CFG = DPCfg(*_DP_CFG)        # 밖에서 평범한 튜플로 덮어써도 필드로 읽힌다
     if _DP_CFG is None or reload:
         from vtd_adapter.config import load_params_yaml
         r = load_params_yaml().get('route') or {}
-        _DP_CFG = (bool(r.get('global_dp_enable', False)),
-                   float(r.get('dp_match_radius_m', 8.0)),
-                   float(r.get('dp_detour_ratio', 3.0)),
-                   float(r.get('dp_detour_floor_m', 400.0)),
-                   float(r.get('dp_detour_penalty', 10.0)),
-                   float(r.get('dp_step_penalty', 0.0)),
-                   None,                      # 간격은 hop_sep_for 가 차로별로 준다
-                   bool(r.get('dp_compare_enable', True)))
+        _DP_CFG = DPCfg(
+            bool(r.get('global_dp_enable', False)),
+            float(r.get('dp_match_radius_m', 8.0)),
+            float(r.get('dp_detour_ratio', 3.0)),
+            float(r.get('dp_detour_floor_m', 400.0)),
+            float(r.get('dp_detour_penalty', 10.0)),
+            float(r.get('dp_step_penalty', 0.0)),
+            None,                      # 간격은 hop_sep_for 가 차로별로 준다
+            bool(r.get('dp_compare_enable', True)),
+            bool(r.get('dp_radius_retry_enable', False)),
+            float(r.get('dp_radius_max_m', 16.0)),
+            float(r.get('dp_radius_dev_penalty', 1.0)))
     return _DP_CFG
 
 
@@ -1255,6 +1266,55 @@ def lc_stack_excess(lg, path, sep_m=None):
     return ex
 
 
+def dp_point_yaw(waypoints, k, start_yaw=None):
+    """점 k 의 진행방향 — 0번은 출발 헤딩(없으면 다음 점 방향), 그 외는 직전 점에서."""
+    x, y = waypoints[k]
+    if k == 0:
+        if start_yaw is not None:
+            return float(start_yaw)
+        return math.atan2(waypoints[1][1] - y, waypoints[1][0] - x)
+    return math.atan2(y - waypoints[k - 1][1], x - waypoints[k - 1][0])
+
+
+def dp_point_candidates(lg, waypoints, k, radius, start_yaw=None):
+    """점 k 의 후보 → ([(lane, s, dist)], 진단). 0개면 헤딩 완화 → 반경 1.5배."""
+    x, y = waypoints[k]
+    yaw = dp_point_yaw(waypoints, k, start_yaw)
+    notes = []
+    c = candidates(lg, x, y, radius, yaw)
+    if not c:
+        c = candidates(lg, x, y, radius)
+        if c:
+            notes.append(f'점 {k + 1}: 헤딩 필터 완화로 후보 {len(c)}개')
+    if not c:
+        c = candidates(lg, x, y, radius * 1.5)
+        if c:
+            notes.append(f'점 {k + 1}: 반경 {radius * 1.5:g} m 로 넓혀 후보 {len(c)}개')
+    return c, notes
+
+
+def dp_wide_radius(lg, waypoints, k, base_r, max_r):
+    """점 k 가 찍힌 도로의 **같은 방향 전체 차로**를 덮는 반경 [m] (max_r 상한).
+
+    지도에 같은 방향 3차로 이상인 도로가 78개 있고 그중 33개는 첫↔끝 차로
+    중심거리가 8 m 를 넘는다 (최대 15.84 m, 도로 1926). 경유점이 한쪽 차로에
+    찍히면 반대쪽 끝 차로가 기본 반경 밖이라 DP 후보에 아예 안 들어온다 —
+    그 교차로 회전이 반대쪽 차로에서만 되면 못 본다 (2026-09-07 분석).
+    """
+    x, y = waypoints[k]
+    near = candidates(lg, x, y, base_r) or candidates(lg, x, y, max_r)
+    if not near:
+        return base_r
+    k0 = near[0][0]
+    r = base_r
+    for kk in lg.lanes_of_road(k0[0]):
+        rr = lg.lanes[kk]
+        if rr.get('type') != 'driving' or kk[1] != k0[1] or (kk[2] > 0) != (k0[2] > 0):
+            continue
+        r = max(r, lg.project(kk, x, y)[2] + 0.5)
+    return min(float(max_r), r)
+
+
 def dp_candidates(lg, waypoints, radius, start_yaw=None):
     """점마다 후보 차로 → ([ [(lane,s,dist)] ... ], [진단 문자열])
 
@@ -1262,28 +1322,12 @@ def dp_candidates(lg, waypoints, radius, start_yaw=None):
     0이면 그 점은 None 으로 두고(=DP 에서 건너뛴다) 진단에 남긴다.
     """
     out, notes = [], []
-    n = len(waypoints)
-    for k in range(n):
-        x, y = waypoints[k]
-        if k == 0:
-            yaw = start_yaw if start_yaw is not None else math.atan2(
-                waypoints[1][1] - y, waypoints[1][0] - x)
-        else:
-            yaw = math.atan2(y - waypoints[k - 1][1], x - waypoints[k - 1][0])
-        c = candidates(lg, x, y, radius, yaw)
-        if not c:
-            c = candidates(lg, x, y, radius)
-            if c:
-                notes.append(f'점 {k + 1}: 헤딩 필터 완화로 후보 {len(c)}개')
-        if not c:
-            c = candidates(lg, x, y, radius * 1.5)
-            if c:
-                notes.append(f'점 {k + 1}: 반경 {radius * 1.5:g} m 로 넓혀 후보 {len(c)}개')
+    for k in range(len(waypoints)):
+        c, nt = dp_point_candidates(lg, waypoints, k, radius, start_yaw)
+        notes += nt
         if not c:
             notes.append(f'점 {k + 1}: 반경 {radius * 1.5:g} m 안에 차로 없음 — 이 점을 건너뛴다')
-            out.append(None)
-        else:
-            out.append(c)
+        out.append(c or None)
     return out, notes
 
 
@@ -1301,7 +1345,8 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
     반환 seq/seg_span 은 탐욕 경로가 만드는 것과 같은 형식이다 — 뒤쪽
     조립(누적거리·이벤트·valid_entry_lanes·리포트)은 손대지 않는다.
     """
-    _en, _r, ratio, floor, dpen, spen, sep_m, _cmp = cfg or dp_cfg()
+    C = cfg or dp_cfg()
+    ratio, floor, dpen, spen, sep_m = C.ratio, C.floor, C.detour_penalty, C.step_penalty, C.sep
     cands, notes = dp_candidates(lg, waypoints, radius, start_yaw)
     idx = [k for k, c in enumerate(cands) if c]
     if len(idx) < 2:
@@ -1314,33 +1359,35 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
     best = [(0.0, c[2]) for c in cands[idx[0]]]      # (누적비용, 누적 경유점거리)
     parent = [[None] * len(cands[idx[0]])]           # 층별 부모 인덱스
     seg_path = [{}]                                  # 층별 {(i,j): dijkstra path}
-    relaxed, n_edge = [], 0
-    for t in range(1, len(idx)):
-        ka, kb = idx[t - 1], idx[t]
-        straight = math.dist(waypoints[ka], waypoints[kb])
-        lim = max(floor, ratio * straight)
-        cur, par, pth = None, None, None
-        # 금지 연결로는 하드 제약이다. 그것 때문에 층이 통째로 막히면 그때만
-        # 풀고 기록한다 (탐욕의 "대안이 없으면 불가피하게 허용하고 기록" 과 같다).
+    best_hist = [best]                               # 층별 best (반경 재시도 되감기용)
+    lims = [0.0]                                     # 층별 우회 상한
+    relaxed, n_edge, retries = [], 0, []
+
+    def layer(ka, kb, cand_b, lim, dev0=0.0, best_in=None, cand_a=None):
+        """한 층 계산 → (cur, par, pth, edges). dev0>0 이면 그 반경을 넘은 후보에
+        경유점 거리 비례 벌점을 물린다 (반경 재시도로 들어온 먼 차로)."""
+        cur, par, pth, ed = [], [], {}, 0
+        bin_ = best if best_in is None else best_in
+        ca = cands[ka] if cand_a is None else cand_a
         for attempt in (0, 1):
             bans = banned if attempt == 0 else frozenset()
             cur, par, pth = [], [], {}
-            for j, (kj, sj, dj) in enumerate(cands[kb]):
+            for j, (kj, sj, dj) in enumerate(cand_b):
                 bi, bc, bd = None, INF, INF
-                for i, (ki, si, _di) in enumerate(cands[ka]):
-                    if best[i][0] == INF:
+                dev = C.dev_penalty * max(0.0, dj - dev0) if dev0 > 0 else 0.0
+                for i, (ki, si, _di) in enumerate(ca):
+                    if bin_[i][0] == INF:
                         continue
                     res = dijkstra(lg, [(ki, si)], {kj: sj}, allow_lane_change=True,
                                    banned=bans, lc_in_junction=False)
-                    n_edge += 1
+                    ed += 1
                     if res is None:
                         continue
-                    # 우회 벌점 — 막지 않고 값을 매긴다 (dp_cfg 참조)
-                    pen = dpen * max(0.0, res[0] - lim)
+                    pen = dpen * max(0.0, res[0] - lim) + dev
                     if spen > 0.0:
                         pen += spen * lc_stack_excess(lg, res[1], sep_m)
-                    c = best[i][0] + res[0] + pen
-                    d = best[i][1] + dj
+                    c = bin_[i][0] + res[0] + pen
+                    d = bin_[i][1] + dj
                     if c < bc - 1e-9 or (abs(c - bc) <= 1e-9 and d < bd - 1e-9):
                         bi, bc, bd = i, c, d
                         pth[j] = (res[1], res[0], pen)
@@ -1350,6 +1397,74 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
                 break
             if attempt == 0:
                 relaxed.append(f'{lab(ka)}→{lab(kb)} 회전 불가 연결로를 빼면 연결 없음 — 금지 해제')
+        return cur, par, pth, ed
+
+    for t in range(1, len(idx)):
+        ka, kb = idx[t - 1], idx[t]
+        straight = math.dist(waypoints[ka], waypoints[kb])
+        lim = max(floor, ratio * straight)
+        # 금지 연결로는 하드 제약이다. 그것 때문에 층이 통째로 막히면 그때만
+        # 풀고 기록한다 (탐욕의 "대안이 없으면 불가피하게 허용하고 기록" 과 같다).
+        cur, par, pth, ed = layer(ka, kb, cands[kb], lim)
+        n_edge += ed
+        # ── 반경 재시도 (route.dp_radius_retry_enable) ─────────────────────
+        # 최선 전이가 우회 벌점을 물었거나 전부 막혔으면, 그 점만 "도로 같은 방향
+        # 전체 차로를 덮는 반경"으로 후보를 다시 잡고 이 층만 재계산한다.
+        # 마지막 경유점은 재시도 대상이 아니다 — 그 점이 완주 판정의 기준
+        # (finish_xy)이라, 먼 차로로 옮기면 경로가 종점을 8 m 밖으로 비껴간다
+        # (실측: venue 계열 6경로에서 마지막 경유점 투영이 사라졌다).
+        if C.retry and kb != idx[-1]:
+            jbest = min(range(len(cur)), key=lambda j: cur[j][0]) if cur else None
+            bad = (jbest is None or cur[jbest][0] == INF
+                   or (pth.get(jbest) or (None, 0.0, 0.0))[2] > 0.0)
+            base_best = cur[jbest][0] if jbest is not None else INF
+            # (a) 진출점 kb 를 넓혀 본다
+            if bad:
+                r2 = dp_wide_radius(lg, waypoints, kb, radius, C.radius_max)
+                c2 = (dp_point_candidates(lg, waypoints, kb, r2, start_yaw)[0]
+                      if r2 > radius + 1e-9 else None)
+                if c2 and len(c2) > len(cands[kb]):
+                    cur2, par2, pth2, ed2 = layer(ka, kb, c2, lim, dev0=radius)
+                    n_edge += ed2
+                    j2 = min(range(len(cur2)), key=lambda j: cur2[j][0]) if cur2 else None
+                    if j2 is not None and cur2[j2][0] < base_best - 1e-9:
+                        retries.append(
+                            f'{lab(kb)} 반경 재시도 {radius:g} → {r2:.1f} m, '
+                            f'채택 차로 {c2[j2][0]} 이탈 {c2[j2][2]:.2f} m')
+                        cands[kb] = c2
+                        cur, par, pth = cur2, par2, pth2
+                        base_best = cur2[j2][0]
+                        bad = False
+            # (b) 진입점 ka 를 넓힌다 — 앞 층까지 되감아 다시 센다.
+            # 넓혀야 할 쪽은 대개 **진입점**이다: 경유점이 한쪽 차로에 찍혀서
+            # 회전 가능한 반대쪽 차로가 후보에 없는 것이 원래 문제다.
+            if bad:
+                r3 = dp_wide_radius(lg, waypoints, ka, radius, C.radius_max)
+                c3 = (dp_point_candidates(lg, waypoints, ka, r3, start_yaw)[0]
+                      if r3 > radius + 1e-9 else None)
+                if c3 and len(c3) > len(cands[ka]):
+                    if t == 1:                     # 첫 층 — best 를 다시 깐다
+                        b3 = [(C.dev_penalty * max(0.0, c[2] - radius), c[2]) for c in c3]
+                        par3, pth3, ed3 = [None] * len(c3), {}, 0
+                    else:                          # 앞 층을 c3 로 다시 계산
+                        b3, par3, pth3, ed3 = layer(idx[t - 2], ka, c3, lims[t - 1],
+                                                    dev0=radius, best_in=best_hist[t - 2])
+                        n_edge += ed3
+                    if any(v[0] < INF for v in b3):
+                        cur3, par3b, pth3b, ed4 = layer(ka, kb, cands[kb], lim,
+                                                        best_in=b3, cand_a=c3)
+                        n_edge += ed4
+                        j3 = min(range(len(cur3)), key=lambda j: cur3[j][0]) if cur3 else None
+                        if j3 is not None and cur3[j3][0] < base_best - 1e-9:
+                            i3 = par3b[j3]
+                            retries.append(
+                                f'{lab(ka)} 반경 재시도 {radius:g} → {r3:.1f} m, '
+                                f'채택 차로 {c3[i3][0]} 이탈 {c3[i3][2]:.2f} m')
+                            cands[ka] = c3
+                            best = best_hist[t - 1] = b3
+                            parent[t - 1] = par3
+                            seg_path[t - 1] = pth3
+                            cur, par, pth = cur3, par3b, pth3b
         if not any(v[0] < INF for v in cur):
             raise RouteError(
                 f'전역 DP: {lab(ka)} → {lab(kb)} 구간에 연결 가능한 차로 조합이 없다 '
@@ -1357,6 +1472,8 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         best, _ = cur, None
         parent.append(par)
         seg_path.append(pth)
+        best_hist.append(best)
+        lims.append(lim)
 
     # ── 역추적 ────────────────────────────────────────────────────────────
     order = sorted(range(len(best)), key=lambda j: (best[j][0], best[j][1]))
@@ -1410,6 +1527,7 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         'picks': [list(cands[k][picks[t]][0]) for t, k in enumerate(idx)],
         'notes': notes,
         'relaxed': relaxed + detours,
+        'retries': retries,
     }
     return seq, seg_span, info
 
@@ -1910,6 +2028,9 @@ def report(lg, rt, radius, warn_dev=None):
             warns += 1
         for n in (dpi.get('relaxed') or []):
             print(f'  · {n}   <= [경고] 제약 해제')
+            warns += 1
+        for n in (dpi.get('retries') or []):
+            print(f'  · {n}   <= [경고] 반경 재시도')
             warns += 1
         if fb:
             print(f'  · {fb}   <= [경고] 연속성 안전망')
