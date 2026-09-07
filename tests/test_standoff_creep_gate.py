@@ -186,3 +186,88 @@ def test_gate_off_when_geom_gate_disabled():
     assert kr._standoff_profile(0.0) == pytest.approx(0.0)
     assert kr._creep_diag['creep_hold_why'] == 'breakout'
     assert kr._creep_diag['creep_need_m'] is None
+
+
+# ── ③ delay 래치 (2026-09-06, 020738/13 근거) ──────────────────────────────
+# 지연 만료로 연 틱에 _creep_hold_ticks 를 0 으로 되돌려 다음 틱에 ③ 이 다시
+# 미달로 닫혔다 — t=30.8·44.2 에 1틱 개방 후 즉시 복귀, 이동 0 m. need·breakout
+# 은 조건이 지속되므로 리셋이 무해했지만 delay 는 시계가 곧 조건이다.
+def _expire(kr, delay_s=1.0):
+    for _ in range(int(round(delay_s * kr.hz))):
+        assert kr._standoff_profile(0.0) == pytest.approx(0.0)
+
+
+def test_delay_open_stays_open_and_leaves_clock_alone():
+    kr, _p, _ap = rig(d=21.0, delay_s=1.0)
+    _expire(kr)
+    for _ in range(int(round(3.0 * kr.hz))):                    # 3 s 연속 개방
+        assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+        dg = kr._creep_diag
+        assert dg['creep_open_why'] == 'delay' and dg['creep_open_latched'] is True
+        assert dg['creep_latch_why'] == 'delay'
+        assert dg['creep_hold_s'] == pytest.approx(1.0)         # 래치 중 시계 불변
+
+
+def test_need_and_breakout_openings_do_not_latch():
+    kr, _p, _ap = rig(d=18.0)
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    assert 'creep_open_latched' not in kr._creep_diag
+    kr2, _p2, _ap2 = rig(d=21.0)
+    kr2.bo_level = kr2.BO_CREEP
+    assert kr2._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    assert 'creep_open_latched' not in kr2._creep_diag
+
+
+def test_latch_released_on_target_change():
+    kr, _p, _ap = rig(d=21.0, delay_s=1.0)
+    _expire(kr)
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    kr.standoff_id = 99
+    assert kr._standoff_profile(0.0) == pytest.approx(0.0)      # 새 대상 → 보류부터
+    assert kr._creep_diag['creep_hold'] is True
+    assert kr._creep_diag['creep_hold_s'] == pytest.approx(0.0)
+
+
+def test_latch_released_when_shift_is_made():
+    kr, _p, _ap = rig(d=21.0, delay_s=1.0)
+    _expire(kr)
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    kr.ot_span = (10, 20)                                        # 시프트 성립
+    assert kr._standoff_profile(0.0) == pytest.approx(0.0)
+    assert kr._creep_diag['creep_hold'] is True
+
+
+def test_latch_released_by_exclusion_and_clock_restarts():
+    """배제(신호)는 시계를 0 으로 되돌린다 — 래치도 같이 버린다."""
+    kr, _p, ap = rig(d=21.0, delay_s=1.0)
+    _expire(kr)
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    ap.traffic_light_hazard = True
+    assert kr._standoff_profile(0.0) == pytest.approx(0.0)
+    assert kr._creep_diag['creep_block'] == 'cause'
+    assert kr._creep_diag['creep_latch_why'] == 'release:cause'
+    ap.traffic_light_hazard = False
+    assert kr._standoff_profile(0.0) == pytest.approx(0.0)      # 다시 보류, 시계 0
+    assert kr._creep_diag['creep_hold_s'] == pytest.approx(0.0)
+
+
+def test_latch_survives_stop_gap():
+    """stop_gap 은 크립 완료다 — 대상이 다시 멀어지면 래치가 그대로 연다."""
+    kr, _p, _ap = rig(d=21.0, delay_s=1.0)
+    _expire(kr)
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    kr.wait_target_d = 4.0
+    assert kr._standoff_profile(0.0) == pytest.approx(0.0)
+    assert kr._creep_diag['creep_block'] == 'stop_gap'
+    kr.wait_target_d = 21.0
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    assert kr._creep_diag['creep_open_latched'] is True
+
+
+def test_reset_clears_latch():
+    kr, _p, _ap = rig(d=21.0, delay_s=1.0)
+    _expire(kr)
+    assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
+    kr.on_reset()
+    assert kr._standoff_profile(0.0) == pytest.approx(0.0)
+    assert kr._creep_diag['creep_hold_s'] == pytest.approx(0.0)

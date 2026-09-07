@@ -271,6 +271,55 @@ class KrRules:
         self.suppress_mode = str(ot.get('suppress_mode', 'queue_only'))
         self.q_green_release_ticks = int(round(float(ot.get('q_green_release_s', 3.0)) * self.hz))
         self.q_nosig_release_ticks = int(round(float(ot.get('q_nosignal_release_s', 10.0)) * self.hz))
+        # 신호 미보고 큐 판정 (2026-09-06, 020738/13 근거) — kill switch 기본 off.
+        # 9910 은 교차로 연결로 위에서 신호를 보내지 않는다 (실측 16런: in_junction
+        # 틱 보고율 0.0~2.8 %). 못 받은 신호는 플래너 기본값 Green 으로 남아, 교차로
+        # 출구 정지선의 적신호 대기열이 큐(green_expired 로 해제)가 아니라 장애물로
+        # 보였다 → 회피 → junction 기각 → 고착. 다음 정지선 controller 가
+        # signal_stale_s 이상 미보고면 UNKNOWN 으로 보고 큐 판정에서 Red 와 같이
+        # 다룬다. 정지 후보·SHIFT_HOLD 는 건드리지 않는다 — UNKNOWN 은 Green 을
+        # 만들지도 Red 를 풀지도 않는다. 보고 시각은 observe_lights (run_agent) 가
+        # 준다 — 신호 state 갱신은 그대로 플래너(route.update_lights) 몫이다.
+        self.sig_stale_queue = bool(ot.get('signal_stale_queue_enable', False))
+        self.sig_stale_ticks = int(round(float(ot.get('signal_stale_s', 1.0)) * self.hz))
+        self._obs_tick = 0                          # observe_lights 호출 수 (= 9910 프레임)
+        self._light_seen: dict = {}                 # controller id → 마지막 보고 _obs_tick
+        self.last_signal: dict | None = None        # 진단 — 스위치 on 일 때만 채운다
+        # B-3(b) 미보고 적신호 시한 출발 (2026-09-06 승인) — kill switch 기본 off.
+        # 앞차 없음 ∧ controller 미보고 ∧ 정지 중이 signal_unknown_timeout_s 이상이면
+        # 신호 정지 후보(_stop_target·PDM 적신호 IDM)를 놓고 min() 이 다른 후보로
+        # 속도를 정하게 둔다. **적신호 통과를 만들 수 있는 유일한 경로다**: 71 s
+        # 주기·적색 60 s 인 controller(167/168)에서는 시한이 얼마든 85 % 확률로
+        # 적색 통과다. 회랑 안 signal_timeout_clear_m 이동 차량·보행자 래치가 있으면
+        # 보류. 020738 16런에서 성립 틱 0 (Red 로 선 뒤 끊긴 사례 없음).
+        self.sig_timeout_go = bool(ot.get('signal_timeout_go_enable', False))
+        self.sig_timeout_ticks = int(round(float(ot.get('signal_unknown_timeout_s', 10.0)) * self.hz))
+        self.sig_timeout_clear_m = float(ot.get('signal_timeout_clear_m', 30.0))
+        self._sig_wait_ticks = 0                    # 조건 성립 연속 틱
+        self._sig_go = False                        # 시한 만료 → 신호 정지 후보 해제 (래치)
+        self._sig_go_tl = None                      # 래치가 붙은 신호 id
+        # RTOR 적색 신호 우회전 (2026-09-06 승인) — kill switch 기본 off.
+        # 정지선 앞 정지(항목 7)를 마친 뒤 선두 ∧ 다음 기동 우회전 ∧ 보행자·교차
+        # 차량 없음이면 _rtor_go 래치. 소비처는 B-3 와 같은 두 곳(_stop_target ·
+        # signal_release)뿐이고, 래치는 (신호 id, 정지선 s) 에 붙어 다음 신호에는
+        # 적용되지 않는다. off 면 _rtor_go 가 영원히 False 라 이전과 틱 단위 동일.
+        self.rtor_enable = bool(sp.get('rtor_enable', False))
+        self.rtor_allow_stale = bool(sp.get('rtor_allow_stale_red', True))
+        self.rtor_exclude = {int(x) for x in (sp.get('rtor_exclude_tl_ids') or [])}
+        self.rtor_turn_win_m = float(sp.get('rtor_turn_event_window_m', 5.0))
+        self.rtor_stop_v = float(sp.get('rtor_stop_v_max', 0.3))
+        self.rtor_zone_m = float(sp.get('rtor_stop_zone_m', 2.0))
+        self.rtor_hold_ticks = int(round(float(sp.get('rtor_stop_hold_s', 1.0)) * _hz))
+        self.rtor_ped_guard_m = float(sp.get('rtor_ped_guard_m', 8.0))
+        self.rtor_cross_gap_m = float(sp.get('rtor_cross_gap_m', 40.0))
+        self.rtor_cross_ttc_s = float(sp.get('rtor_cross_ttc_s', 6.0))
+        self.rtor_go_v = float(sp.get('rtor_go_speed_kph', 15.0)) / 3.6
+        self.rtor_release_m = float(sp.get('rtor_release_dist_m', 30.0))
+        self._rtor_go = False                       # 래치 (B-3 _sig_go 와 별도)
+        self._rtor_go_tl = None                     # 래치가 붙은 신호 id
+        self._rtor_stop_s = None                    # 래치 시점 정지선 route_s
+        self._rtor_junction_seen = False            # 래치 후 교차로 차로 진입 관측
+        self._rtor_hold_cnt = 0                     # 정지 구역 안 정지 누적 틱
         # WAIT — 앞차 출발 기회
         self.wait_s = float(ot.get('wait_before_shift_s', 6.0))
         self.ot_dash_slack_m = float(ot.get('dash_slack_m', 2.0))
@@ -485,6 +534,14 @@ class KrRules:
         # 155049 02_직진3: 녹색 복귀 시 hold_s 22.6 → 즉시 open_why=delay).
         self._creep_hold_ticks = 0
         self._creep_hold_id = None                 # 대상이 바뀌면 시계를 새로
+        # 'delay' 로 연 크립의 래치 (2026-09-06, 020738/13 t=30.8·44.2 근거). 지연
+        # 만료로 열면 그 틱에 _creep_hold_ticks 를 0 으로 되돌렸고, 다음 틱은 ③ 이
+        # 다시 미달이라 닫혔다 — 1틱 개방, 이동 0 m, 10 s 뒤 반복. need·breakout
+        # 은 조건 자체가 지속되므로 리셋이 무해했지만 delay 는 시계가 곧 조건이다.
+        # 해제 = standoff 대상 변경 / 시프트 성립(ot_span 변화) / 배제(cause·
+        # ped_hold — 기존 시계도 거기서 0 이 된다). stop_gap 은 크립 완료라 유지.
+        self._creep_open_latched = False
+        self._creep_latch_span = None              # 래치 시점의 ot_span
         self.bo_paused = False                     # 적색·황색STOP 중 일시정지
         self.last_turn_signal: int = SIG_OFF       # 이번 틱 지시등 (run_agent 가 읽는다)
         self.last_sig_src: str | None = None       # 'turn' | 'lc'
@@ -1163,6 +1220,34 @@ class KrRules:
                 return True
         return False
 
+    def observe_lights(self, lights) -> None:
+        """9910 lights [(id, state)] 를 틱마다 받는다 (run_agent). state 는 플래너가
+        갱신하고 여기서는 **보고 시각만** 센다 — `_signal_stale` 의 입력."""
+        self._obs_tick += 1
+        for lid, _state in lights or []:
+            self._light_seen[int(lid)] = self._obs_tick
+
+    def _signal_stale(self, planner) -> dict | None:
+        """다음 정지선 신호의 미보고 판정 → 진단 dict, 대상 없음/스위치 off 면 None.
+
+        stale = controller 전부가 signal_stale_s 이상 안 보임 (한 번도 안 보인 것
+        포함 — 그때 나이는 첫 관측부터 센다). 관측이 한 번도 없으면(테스트·
+        observe_lights 미호출) 판정하지 않는다 — off 와 같다.
+        """
+        if not (self.sig_stale_queue or self.sig_timeout_go) or self._obs_tick <= 0:
+            return None
+        tls = getattr(planner, 'next_traffic_lights', None)
+        tl = tls[planner.route_index] if tls is not None else None
+        if tl is None:
+            return None
+        ids = [int(i) for i in (getattr(tl, 'controller_ids', None) or [getattr(tl, 'id', -1)])]
+        seen = max((self._light_seen.get(i, 0) for i in ids), default=0)
+        age = self._obs_tick - seen
+        return {'signal_stale': age >= self.sig_stale_ticks,
+                'signal_stale_s': round(age / self.hz, 1),
+                'signal_last_state': getattr(getattr(tl, 'state', None), 'name', None),
+                'signal_ctrl': ids}
+
     def _is_queue_v2(self, blockers, planner, ap, lg, ego_lane) -> bool:
         """큐 (queue_only, C-3): 정지 객체 ≥ 1 ∧ (A 선두가 정지선 25 m 안
         ∨ B 신호 Red/Yellow ∧ 정지 객체 전부가 자차~정지선 사이).
@@ -1176,6 +1261,10 @@ class KrRules:
         가드 아님. 옛 15 s hold 는 없다 — 적색 38 s 에서 큐를 철회해 버렸다.
         """
         self.q_info = None
+        # 신호 미보고 → UNKNOWN (스위치 off 면 None 이라 아래 unknown 은 항상 거짓)
+        self.last_signal = self._signal_stale(planner) if planner is not None else None
+        unknown = bool(self.sig_stale_queue and self.last_signal
+                       and self.last_signal['signal_stale'])
         if blockers and self.obs_fastpath:
             # E-1: 큐는 차량만이다. 박스가 선두든 사이에 끼었든 큐 형태에서 뺀다.
             veh = [b for b in blockers if not self._is_obstacle(b[3])]
@@ -1209,7 +1298,8 @@ class KrRules:
         # B 는 녹색 첫 틱에 사라지지 않는다 — 직전 틱까지 큐였다면(q_ticks > 0) 녹색
         # q_green_release_s 까지 유지한다. 그래야 "녹색 3 s 경과 ∧ 선두 정지 → 해제"
         # 가 성립한다 (실측 003759/05 t=103.9: 녹색 첫 틱에 PREEMPT → standoff 급정지).
-        sig_hold = (state in ('Red', 'Yellow')
+        # UNKNOWN 은 큐 조건 B 에서 Red 와 같다 — 못 본 신호는 적색으로 가정한다.
+        sig_hold = (unknown or state in ('Red', 'Yellow')
                     or (state == 'Green' and self.q_ticks > 0
                         and self.green_since_ticks < self.q_green_release_ticks))
         # E-7: 정지선이 red_pause_max_m 보다 멀면 그 신호의 대기열일 수 없다.
@@ -1235,6 +1325,14 @@ class KrRules:
                 # E-7 진단 — 정지선까지(자차·선두) 거리. 큐 B 오판 사후 판정 근거.
                 'd_sl': None if d_sl is None else round(d_sl, 1),
                 'head_sl': None if d_sl is None else round(d_sl - head[0], 1)}
+        if unknown:
+            # 해제 시한이 없다 — 녹색(green_expired)도 무신호(hold_expired)도 적용하지
+            # 않는다. 선두가 떠나면 blockers 에서 빠져 그 틱에 저절로 풀린다:
+            # "앞차가 서면 서고, 가면 따라간다".
+            info['queue_by_unknown'] = True
+            self.q_reject = None
+            self.q_info = info
+            return True
         if signaled:
             # 선두 '여전히 정지' 는 blockers 자체가 보장한다 (정지 객체만 들어온다).
             if self.green_since_ticks >= self.q_green_release_ticks:
@@ -1303,7 +1401,12 @@ class KrRules:
         BREAKOUT 은 제약을 풀고 전진을 강제하므로, 원인이 신호·보행자·종점
         이면 **절대 발동하면 안 된다**. PDM 이 매 틱 세우는 hazard 플래그와
         kr_rules 자신의 래치를 모두 본다.
+        RTOR 래치 중에는 무조건 거짓 — 신호 정지 후보를 놓은 상태라 hazard 가
+        서지 않으므로, 교차로 안 정지 차량이 크립·BREAKOUT 을 열지 못하게 막는다
+        (그 차량은 IDM 추종·standoff 만).
         """
+        if self._rtor_go:
+            return False
         if getattr(ap, 'traffic_light_hazard', False):
             return False
         if getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False):
@@ -2767,6 +2870,12 @@ class KrRules:
         self.ped_hold_ids.clear()
         self.ped_miss.clear()
         self.ped_last.clear()
+        self._creep_open_latched = False              # 크립 delay 래치 (문맥 불연속)
+        self._sig_go = False                          # B-3(b) 시한 출발 래치
+        self._sig_go_tl = None
+        self._sig_wait_ticks = 0
+        self._rtor_reset()                            # RTOR 래치·정지 누적 (순간이동 = 새 접근)
+        self._creep_hold_ticks = 0
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -2817,10 +2926,308 @@ class KrRules:
           · 교차로 통과 가드 — 앞범퍼가 이미 정지선을 넘었다. 여기서 제동하면
             걸친 채로 선다.
         보행자·선행차 후보는 min() 의 다른 갈래라 그대로 살아 있다.
+        B-3(b) 미보고 적신호 시한 출발(_sig_go, 기본 off)도 같은 자리에서 푼다.
+        RTOR 래치(_rtor_go, 기본 off)도 같은 자리 — 래치가 붙은 신호일 때만.
         """
-        return bool(self.y_decision == 'go' or self.cross_guard)
+        return bool(self.y_decision == 'go' or self.cross_guard or self._sig_go
+                    or self._rtor_active(getattr(ap, '_waypoint_planner', None)))
+
+    def _signal_timeout_tick(self, ap, planner, ego_speed: float) -> None:
+        """B-3(b) 시계 — apply 가 틱당 1회 부른다 (_tick_cache 뒤: 회랑·stale 필요).
+
+        성립 조건 (전부): 스위치 on ∧ 다음 신호 controller 미보고(stale) ∧ 그 신호가
+        정지 후보를 만드는 상태(Red / 황색 STOP) ∧ 정지 중(v < latch_v) ∧ 앞차 없음
+        (정지 회랑 객체 0 ∧ signal_timeout_clear_m 안 이동 차량 0) ∧ 보행자 래치·
+        PDM 보행자 플래그 없음. 하나라도 깨지면 시계 0. signal_unknown_timeout_s 를
+        채우면 _sig_go 래치 — 같은 신호 id 이고 여전히 stale 인 동안만 산다 (신호가
+        다시 보고되면 그 state 가 즉시 우선한다).
+        """
+        if not self.sig_timeout_go:
+            return
+        sig = self.last_signal
+        nxt = self._next_stopline(planner)
+        tl_id = nxt[2] if nxt else None
+        stale = bool(sig and sig['signal_stale'])
+        if self._sig_go and (not stale or tl_id != self._sig_go_tl):
+            self._sig_go = False                          # 보고 재개 / 다음 신호로 넘어감
+            self._sig_go_tl = None
+        ok = stale and self._stop_target_raw(planner, ap) is not None \
+            and ego_speed < self.latch_v and not self._tick_corridor \
+            and not (self.ped_intent or self.ped_hold_ids) \
+            and not (getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False))
+        if ok:
+            moving = self._corridor_blockers(ap, planner, static_ok=lambda _a: True)
+            ok = not any(b[0] <= self.sig_timeout_clear_m for b in moving)
+        self._sig_wait_ticks = self._sig_wait_ticks + 1 if ok else 0
+        if ok and self._sig_wait_ticks >= self.sig_timeout_ticks and not self._sig_go:
+            self._sig_go = True
+            self._sig_go_tl = tl_id
+        if sig is not None:
+            sig['timeout_s'] = round(self._sig_wait_ticks / self.hz, 1)
+            sig['timeout_go'] = self._sig_go
+
+    # ── RTOR 적색 신호 우회전 (2026-09-06 승인, 기본 off) ─────────────────────
+    def _rtor_reset(self) -> None:
+        self._rtor_go = False
+        self._rtor_go_tl = None
+        self._rtor_stop_s = None
+        self._rtor_junction_seen = False
+        self._rtor_hold_cnt = 0
+
+    def _rtor_active(self, planner) -> bool:
+        """RTOR 래치가 **지금 전방 신호**에 붙어 있는가 — 소비처 2곳의 게이트.
+
+        래치는 (신호 id, 정지선 s) 에 붙는다. 뒷축이 정지선을 지나 플래너가 다음
+        정지선으로 넘어가면 id 가 달라져 여기서 거짓이 된다 — 다음 신호에는 절대
+        적용되지 않는다 (교차로 안은 _cross_guard 가 그대로 맡는다).
+        """
+        if not self._rtor_go or planner is None:
+            return False
+        nxt = self._next_stopline(planner)
+        return nxt is not None and nxt[2] == self._rtor_go_tl
+
+    def _rtor_sig(self, planner) -> tuple:
+        """전방 신호의 보고 상태 → ('fresh' | 'stale' | None, controller ids).
+
+        `_signal_stale` 과 같은 식(observe_lights 의 보고 시각, signal_stale_s)을
+        읽되 그 함수는 건드리지 않는다 — 그쪽은 B 스위치가 게이트라 B 가 꺼져
+        있어도 RTOR 가 stale 을 알아야 하기 때문이다. 관측이 한 번도 없으면(목)
+        fresh 로 본다.
+        """
+        tls = getattr(planner, 'next_traffic_lights', None)
+        tl = tls[planner.route_index] if tls is not None else None
+        if tl is None:
+            return None, []
+        ids = [int(i) for i in (getattr(tl, 'controller_ids', None) or [getattr(tl, 'id', -1)])]
+        if self._obs_tick <= 0:
+            return 'fresh', ids
+        seen = max((self._light_seen.get(i, 0) for i in ids), default=0)
+        return ('stale' if self._obs_tick - seen >= self.sig_stale_ticks else 'fresh'), ids
+
+    def _rtor_lead(self, planner, ap, d_line: float):
+        """정지선 앞 앞차 → 사유 문자열, 없으면 None.
+
+        B 큐(_tick_queue) 또는 standoff 회랑(_tick_corridor, 정지 ≥ standoff_stop_s)
+        의 정지선 앞 객체, 또는 PDM 선행차 판정(compute_leading_vehicles — 이동 중
+        포함)의 정지선 앞 차량. B-3 의 80 m 회랑 전체 판정은 쓰지 않는다 — 정지선
+        너머 차량은 앞차가 아니다.
+        """
+        if self._tick_queue:
+            return 'queue'
+        for b in (self._tick_corridor or []):
+            if b[0] < d_line:
+                return f'corridor:{int(getattr(b[3], "id", -1))}'
+        try:
+            vehicles = list(ap._world.get_actors().filter('*vehicle*'))
+            ids = set(planner.compute_leading_vehicles(vehicles, ap._vehicle.id))
+        except Exception:                                  # noqa: BLE001 — 목 플래너
+            return None
+        for a in vehicles:
+            if a.id not in ids:
+                continue
+            loc = a.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is not None and 0.0 < pr[0] < d_line:
+                return f'lead:{int(a.id)}'
+        return None
+
+    def _rtor_ped_block(self, planner, ap, route_s: float, stop_s: float, end_s: float):
+        """보행자 차단 사유, 없으면 None.
+
+        1) 회랑 홀드·의도 래치·PDM walker 플래그 (B-3 시계 조건과 같은 플래그).
+        2) 회랑(ped_release_lat_m)은 경로 좌우 2.5 m 뿐이라 횡단보도 대기 보행자를
+           덮지 못한다 — 정지선~회전 종료 경로 주변 rtor_ped_guard_m 안 보행자를
+           추가로 본다 (서 있는 보행자 포함: 항목 10 은 횡단이 끝날 때까지다).
+        """
+        if self.ped_hold_ids or self.ped_intent:
+            return 'latch'
+        if getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False):
+            return 'pdm'
+        try:
+            walkers = list(ap._world.get_actors().filter('*walker*'))
+        except Exception:                                  # noqa: BLE001
+            return None
+        g = self.rtor_ped_guard_m
+        s_lo, s_hi = stop_s - route_s - g, end_s - route_s + g
+        for w in walkers:
+            loc = w.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is not None and s_lo <= pr[0] <= s_hi and abs(pr[1]) <= g:
+                return f'near:{int(getattr(w, "id", -1))}'
+        return None
+
+    def _rtor_cross_block(self, ap, lg, ego_lane, jid):
+        """교차 차량 차단 사유(id), 없으면 None. 자차 프레임은 VTD 좌표계(좌 = +lat).
+
+        1차: lg.locate 로 차량 차로를 잡아, 그 차로(또는 successor)가 자차 다음
+             교차로 jid 에 속하고 자차 도로가 아닌 것만 후보. 차로를 알았는데
+             후보가 아니면 제외. locate 실패면 2차만 (보수적).
+        2차: 좌측(lat>0) 또는 전방(lon>0)에서 자차 쪽으로 접근 중이고
+             거리 < rtor_cross_gap_m 또는 거리/속도 < rtor_cross_ttc_s.
+        정지 차량(speed < ped_stop_v)은 제외 — 신호 대기열은 교차 위협이 아니다.
+        """
+        try:
+            vehicles = list(ap._world.get_actors().filter('*vehicle*'))
+        except Exception:                                  # noqa: BLE001
+            return None
+        ego = ap._vehicle
+        eloc = ego.get_location()
+        ex, ey = frame.from_carla_xy(eloc.x, eloc.y)
+        eyaw = frame.from_carla_yaw_deg(ego.get_transform().rotation.yaw)
+        ce, se = _math.cos(eyaw), _math.sin(eyaw)
+        for a in vehicles:
+            if a.id == ego.id:
+                continue
+            v = float(getattr(a, 'speed', 0.0))
+            if v < self.ped_stop_v:
+                continue
+            loc = a.get_location()
+            ax, ay = frame.from_carla_xy(loc.x, loc.y)
+            ayaw = frame.from_carla_yaw_deg(a.get_transform().rotation.yaw)
+            cand = None
+            if lg is not None and jid is not None:
+                try:
+                    m = lg.locate(ax, ay, yaw=ayaw)
+                except Exception:                          # noqa: BLE001
+                    m = None
+                if m is not None and m.lane in lg.lanes:
+                    key = m.lane
+                    in_j = (lg.lanes[key]['junction'] == jid
+                            or any(lg.lanes[s]['junction'] == jid
+                                   for s in lg.successors(key) if s in lg.lanes))
+                    same_road = ego_lane is not None and key[0] == ego_lane[0]
+                    cand = in_j and not same_road
+            if cand is False:
+                continue
+            dx, dy = ax - ex, ay - ey
+            lon, lat = dx * ce + dy * se, -dx * se + dy * ce
+            if not (lat > 0.0 or lon > 0.0):
+                continue
+            # 자차 쪽으로 오는가 — 차량 진행 방향 · (자차 − 차량) > 0
+            if (-dx) * _math.cos(ayaw) + (-dy) * _math.sin(ayaw) <= 0.0:
+                continue
+            dist = _math.hypot(dx, dy)
+            if dist < self.rtor_cross_gap_m or dist / max(v, 0.1) < self.rtor_cross_ttc_s:
+                return f'{int(a.id)}'
+        return None
+
+    def _rtor_tick(self, ap, planner, ego_speed: float) -> None:
+        """RTOR 상태기 — apply 가 B-3 시계 직후 틱당 1회 부른다.
+
+        상태: off(조건 1~4·6 미충족) → hold(정지 구역 안 정지 누적 중) → wait
+        (보행자·교차 차량 차단) → go(래치). 래치 중 리셋 = fresh 녹색 / 뒷축이
+        교차로 차로를 벗어남 / 정지선 + rtor_release_dist_m. fresh red 재관측·
+        신호 id 변경으로는 리셋하지 않는다 (B-3 의 not-stale 리셋과 분리 — 그래서
+        변수도 따로다). 진단은 reasons.signal.rtor (스위치 on 일 때만 키 생성).
+        """
+        if not self.rtor_enable:
+            return
+        route_s = float(planner.route_s[planner.route_index])
+        lg, ego_lane = self._tick_lg, self._tick_ego_lane
+        nxt = self._next_stopline(planner)
+        sig, ids = self._rtor_sig(planner)
+        diag = {'state': 'off', 'sig': sig, 'lead': None, 'turn_right': None,
+                'hold_s': 0.0, 'ped_block': None, 'cross_block': None, 'reason': None}
+        in_j = self._in_junction_lane(ap)
+
+        if self._rtor_go:
+            if in_j:
+                self._rtor_junction_seen = True
+            why = None
+            if (nxt is not None and nxt[2] == self._rtor_go_tl
+                    and nxt[1] == 'Green' and sig == 'fresh'):
+                why = 'green'
+            elif self._rtor_junction_seen and not in_j:
+                why = 'junction_exit'
+            elif route_s >= float(self._rtor_stop_s) + self.rtor_release_m:
+                why = 'release_dist'
+            if why is not None:
+                self._rtor_reset()
+                diag['reason'] = 'reset:' + why
+            else:
+                diag['state'] = 'go'
+                diag['hold_s'] = round(self._rtor_hold_cnt / self.hz, 1)
+            self._rtor_log(diag)
+            return
+
+        # ── 조건 1~4, 6 ──────────────────────────────────────────────────
+        tl_id = nxt[2] if nxt else None
+        state = nxt[1] if nxt else None
+        reason = None
+        if nxt is None:
+            reason = 'no_signal'
+        elif tl_id in self.rtor_exclude or any(i in self.rtor_exclude for i in ids):
+            reason = 'excluded'
+        else:
+            tgt = self._stop_target_raw(planner, ap)
+            red = (tgt is not None and state == 'Red'
+                   and (sig == 'fresh' or (self.rtor_allow_stale and sig == 'stale')))
+            if not red:
+                reason = 'not_red'
+        d_line = float(nxt[0]) if nxt else None
+        stop_s = route_s + d_line if d_line is not None else None
+        turn = None
+        if reason is None:
+            if self.sig_plan is None:
+                self.sig_plan = turn_intervals(planner)
+            turn = next((iv for iv in self.sig_plan if iv['sig'] == SIG_RIGHT
+                         and stop_s - 0.5 <= iv['ev_s'] <= stop_s + self.rtor_turn_win_m), None)
+            diag['turn_right'] = turn is not None
+            if turn is None:
+                reason = 'no_turn_right'
+        if reason is None:
+            lead = self._rtor_lead(planner, ap, d_line)
+            diag['lead'] = lead
+            if lead is not None:
+                reason = 'lead'
+        if reason is not None:
+            self._rtor_hold_cnt = 0
+            diag['reason'] = reason
+            self._rtor_log(diag)
+            return
+
+        # ── 조건 5: 정지 구역 안 정지 누적 (구역 밖·이동이면 0 부터) ────────
+        zone = (d_line - self.front) <= self.rtor_zone_m and ego_speed <= self.rtor_stop_v
+        self._rtor_hold_cnt = self._rtor_hold_cnt + 1 if zone else 0
+        diag['hold_s'] = round(self._rtor_hold_cnt / self.hz, 1)
+        # ── 조건 7·8 (hold 중에도 평가해 진단에 남긴다) ────────────────────
+        route = getattr(planner, 'route', None) or {}
+        jid = next((ev.get('junction') for ev in (route.get('events') or [])
+                    if str(ev.get('kind', '')) == 'turn_right'
+                    and abs(float(ev.get('s', -1e9)) - turn['ev_s']) < 1e-6), None)
+        ped = self._rtor_ped_block(planner, ap, route_s, stop_s, float(turn['end_s']))
+        cross = self._rtor_cross_block(ap, lg, ego_lane, jid)
+        diag['ped_block'] = ped
+        diag['cross_block'] = cross
+        if self._rtor_hold_cnt < self.rtor_hold_ticks:
+            diag['state'] = 'hold'
+            diag['reason'] = 'zone' if zone else 'out_of_zone'
+        elif ped is not None or cross is not None:
+            diag['state'] = 'wait'
+            diag['reason'] = 'ped' if ped is not None else 'cross'
+        else:
+            self._rtor_go = True
+            self._rtor_go_tl = tl_id
+            self._rtor_stop_s = stop_s
+            self._rtor_junction_seen = False
+            diag['state'] = 'go'
+            diag['reason'] = 'latch'
+        self._rtor_log(diag)
+
+    def _rtor_log(self, diag: dict) -> None:
+        """reasons.signal.rtor — last_signal 이 없으면(B·B-3 off) 여기서 만든다."""
+        if self.last_signal is None:
+            self.last_signal = {}
+        self.last_signal['rtor'] = diag
 
     def _stop_target(self, planner, ap) -> tuple | None:
+        """정지 후보 대상 — B-3(b) 시한 출발 래치 또는 RTOR 래치(붙은 신호에 한함)가
+        살아 있으면 None (그 외는 raw)."""
+        if self._sig_go or self._rtor_active(planner):
+            return None
+        return self._stop_target_raw(planner, ap)
+
+    def _stop_target_raw(self, planner, ap) -> tuple | None:
         """정지 후보를 만들 대상이면 (뒷축거리, 실행 감속 a_eff), 아니면 None.
 
         색 해석의 **단일 출처**다 — 프로파일과 홀드가 같은 판정을 본다.
@@ -3388,6 +3795,12 @@ class KrRules:
             # 녹색 직후 지연이 이미 만료된 상태가 된다 (위 _creep_hold_ticks 주석).
             self._creep_hold_ticks = 0
             self._creep_diag = dict(diag, so_creep=False, creep_block=why)
+            # 배제(신호·보행자·큐)는 문맥이 바뀐 것이다 — delay 래치도 시계와 같이
+            # 버린다 (비용은 최대 지연 1회). stop_gap·no_size 는 크립 완료·크기
+            # 미상이라 문맥이 그대로다 — 래치 유지.
+            if self._creep_open_latched and why in ('cause', 'ped_hold'):
+                self._creep_open_latched = False
+                self._creep_diag['creep_latch_why'] = 'release:' + why
             return 0.0
 
         if self.standoff_half_len is None:
@@ -3406,6 +3819,20 @@ class KrRules:
         if self.standoff_id != self._creep_hold_id:     # 대상이 바뀌면 새로 센다
             self._creep_hold_ticks = 0
             self._creep_hold_id = self.standoff_id
+            self._creep_open_latched = False              # 래치도 대상별이다
+        if self._creep_open_latched and self.ot_span != self._creep_latch_span:
+            self._creep_open_latched = False              # 시프트가 성립했다 — 새 문맥
+            self._creep_hold_ticks = 0                    # 시계도 새로 (만료값이 남으면 즉시 재래치)
+        if self._creep_open_latched:
+            # delay 래치 — 게이트를 다시 묻지 않고 시계도 건드리지 않는다.
+            need = self._creep_geom_need(ego_speed)
+            self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+                                    creep_open_why='delay', creep_open_latched=True,
+                                    creep_latch_why='delay',
+                                    creep_need_m=round(need, 1) if need is not None else None,
+                                    creep_hold_s=round(self._creep_hold_ticks / self.hz, 1),
+                                    creep_bo_lvl=self.bo_level)
+            return self.standoff_creep_v
         open_why, hold_why, need = self._creep_gate(d, ego_speed)
         gate = {'creep_need_m': round(need, 1) if need is not None else None,
                 'creep_hold_s': round(self._creep_hold_ticks / self.hz, 1),
@@ -3415,7 +3842,15 @@ class KrRules:
             self._creep_diag = dict(diag, so_creep=False, creep_hold=True,
                                     creep_hold_why=hold_why, **gate)
             return 0.0
-        self._creep_hold_ticks = 0
+        if open_why == 'delay':
+            # 시계가 곧 조건이다 — 0 으로 되돌리면 다음 틱에 닫힌다. 래치로 연다.
+            self._creep_open_latched = True
+            self._creep_latch_span = self.ot_span
+            self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+                                    creep_open_why=open_why, creep_open_latched=True,
+                                    creep_latch_why='delay', **gate)
+            return self.standoff_creep_v
+        self._creep_hold_ticks = 0                       # need·breakout: 조건이 지속된다
         self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
                                 creep_open_why=open_why, **gate)
         return self.standoff_creep_v
@@ -3551,6 +3986,8 @@ class KrRules:
         # 틱당 두 번 세어 해제 시한이 절반이 된다. legacy 는 계산하지 않는다
         # (그쪽은 _try_overtake 안에서 옛 위치·옛 횟수로 부른다).
         self._tick_cache(ap, planner)
+        self._signal_timeout_tick(ap, planner, ego_speed)
+        self._rtor_tick(ap, planner, ego_speed)
         if self.bo_enabled:
             self._breakout_tick(planner, ap, ego_speed)
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
@@ -3628,6 +4065,10 @@ class KrRules:
         hold = self._stopline_hold(planner, ego_speed)
         if hold is not None and (candidate is None or hold < candidate):
             candidate = hold
+
+        # RTOR 진행 상한 — 래치가 살아 있는 동안(리셋까지) min() 후보.
+        if self._rtor_go and self.rtor_go_v > 0.0 and (candidate is None or self.rtor_go_v < candidate):
+            candidate = self.rtor_go_v
 
         # 보행자 의도 후보 (P4) — PDM 예측선 교차를 기다리지 않는다.
         ped = self._ped_intent(planner, ap, ego_speed)
