@@ -31,6 +31,11 @@ ON['overtake']['signal_stale_queue_enable'] = True
 # 꺼서 검사한다 (2026-09-07, 판정 근거는 docs/BACKLOG.md B-25).
 OFF = copy.deepcopy(CFG)
 OFF['overtake']['signal_stale_queue_enable'] = False
+# 이웃 스위치도 함께 끈다 — signal_timeout_go 가 켜져 있으면 그쪽이 last_signal
+# 진단을 채워서 "off 면 진단도 없다" 가 깨진다 (2026-09-07 팀원이 기본값을 켰다).
+# 이 파일이 재는 것은 stale 큐이지 시한 출발이 아니다. **params 값이 정본**이라
+# 기본값을 되돌리지 않고 사본에서 끈다.
+OFF['overtake']['signal_timeout_go_enable'] = False
 STALE_TICKS = int(round(OT['signal_stale_s'] * CFG['comm']['send_hz']))
 
 

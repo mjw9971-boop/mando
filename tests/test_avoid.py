@@ -109,13 +109,21 @@ class Planner:
         return out
 
 
+# PDM 주입값 — run_agent.build_pdm_config 와 **같은 식**으로 params 에서 만든다.
+# 하드코딩(5.299 = 옛 stop_gap_stopline_m 1.5 + 앞범퍼)하고 있었더니, params 가
+# 2.0 으로 바뀐 뒤 대역만 옛 값을 물고 있어 정지 프로파일 검사가 깨졌다
+# (2026-09-07, test_priority_signal 4건). **params 값이 정본이다.**
+IDM_RED_S0 = (CFG['speed']['stop_gap_stopline_m']
+              + CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m'])
+
+
 class Ap:
     def __init__(self, planner, actors=(), junction=False):
         self._waypoint_planner = planner
         self._world = World(list(actors))
         self._vehicle = Ego()
         self.junction = junction
-        self.config = type('C', (), {'idm_red_light_minimum_distance': 5.299})()
+        self.config = type('C', (), {'idm_red_light_minimum_distance': IDM_RED_S0})()
 
 
 def make(cfg=CFG, **kw):

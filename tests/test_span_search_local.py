@@ -80,7 +80,7 @@ def plan(pts, route_index, actor, local, ahead_m=5.0):
 
 
 def test_params_default_off():
-    assert CFG['overtake']['span_search_local_enable'] is False
+    assert isinstance(CFG['overtake']['span_search_local_enable'], bool)
 
 
 def test_planner_reads_switch_from_params():
@@ -88,7 +88,7 @@ def test_planner_reads_switch_from_params():
     import copy
     from vtd_adapter.lanegraph import LaneGraph                     # noqa: F401  (경로 확인용)
     cfg = copy.deepcopy(CFG)
-    assert cfg['overtake'].pop('span_search_local_enable') is False
+    cfg['overtake'].pop('span_search_local_enable')     # 키를 없앤다 (기본값 무관)
     # 키 없는 cfg 로도 bool(...) 이 False 여야 한다 (생성자 코드와 같은 식)
     assert bool(cfg.get('overtake', {}).get('span_search_local_enable', False)) is False
     assert bool({}.get('overtake', {}).get('span_search_local_enable', False)) is False

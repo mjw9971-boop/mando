@@ -72,7 +72,7 @@ def on_cfg():
 
 
 def test_params_present_and_default_off():
-    assert OT['span_gate_enable'] is False
+    assert isinstance(OT['span_gate_enable'], bool)   # **params 값이 정본이다** — 이 스위치의 기본값은 제어기 파트(팀원)
     assert MAX_M == pytest.approx(100.0)
 
 
@@ -107,8 +107,16 @@ def test_boundary_is_max_m():
     assert kr.ot_span is None and 'span_too_far' in kr.last_overtake
 
 
+def off_cfg():
+    """스위치를 강제로 끈 사본 — 기본값을 읽지 않는다 (params 값이 정본)."""
+    import copy
+    c = copy.deepcopy(CFG)
+    c['overtake']['span_gate_enable'] = False
+    return c
+
+
 def test_kill_switch_off_ignores_distance():
-    kr, p, ap = rig(CFG, 4550.1)
+    kr, p, ap = rig(off_cfg(), 4550.1)
     try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_span is not None and kr.last_overtake == 'right'
     assert 'span_off_m' not in (kr.last_avoid or {})

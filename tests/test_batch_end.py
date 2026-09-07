@@ -232,10 +232,19 @@ QUEUE_AVOID = {'state': 'SUPPRESS', 'suppress': 'queue',
 STOPPED_15 = [{'id': 15, 'cls': 'vehicle', 'speed': 0.0}]
 
 
-def test_params_present_queue_excuse_default_off():
-    assert BATCH['stall_excuse_queue'] is False
+def test_params_present_queue_excuse():
+    """키와 부속 상수만 본다 — **params 값이 정본**이다.
+
+    stall_excuse_queue 의 기본값은 운영 판단이라 이 테스트가 강제하지 않는다
+    (2026-09-07 로그 47건 재판정에서 판정이 바뀌는 런이 1건뿐임을 확인하고
+    true 로 켰다). on/off 동작 자체는 아래 judge(stall_excuse_queue=…) 검사가
+    양쪽 다 덮으므로 기본값이 또 바뀌어도 안 깨진다.
+    """
+    assert isinstance(BATCH['stall_excuse_queue'], bool)
     assert float(BATCH['red_wait_max_s']) > 0
     assert float(BATCH['queue_head_gap_m']) > 0
+    # 상한이 최종 백스톱보다 낮아야 실제로 판정에 들어간다 (params 주석).
+    assert float(BATCH['red_wait_max_s']) < float(BATCH['no_progress_end_s'])
 
 
 def test_red_queue_needs_hold_light():

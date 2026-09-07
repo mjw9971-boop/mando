@@ -200,13 +200,19 @@ def test_warned_csv_route_rejected():
     를 교체해 실제로 ③ 을 타게 되자 실패했다 — 경로는 정상적으로 탈락했고
     **assert 가 사유 목록을 덜 적고 있었다**.
     (실측: 옛 CSV 는 'build_route 경고 3건 - R_min 5.43 m' 로 통과했고,
-     현재 CSV 는 '경로 폴리라인 불연속 2.08 m (>0.3 m) - route_s~695.1 m' 다.
+     그 뒤 CSV 는 '경로 폴리라인 불연속 2.08 m (>0.3 m) - route_s~695.1 m' 였다.
      그 불연속 자체는 BACKLOG B-14 소관이고 여기서 고칠 것이 아니다.)
     사유 **문구**가 아니라 "사유와 함께 탈락한다" 가 이 테스트가 지키는 것이다.
+
+    입력은 **tests/fixtures 의 고정 CSV** 를 쓴다. 루트 waypoints.csv 는 팀원이
+    연습용으로 계속 바꾸는 파일이라 테스트가 의존하면 안 된다 — 실제로
+    2026-09-07 에 7행(홀수)이 되면서 이 테스트가 '대회형식(짝수) 아님' 으로
+    먼저 걸렸다 (게이트 사유와 무관한 실패).
     """
     lg = gs.LaneGraph(str(ROOT / 'data' / 'lane_graph.pkl'))
     _routes, _themes, gen_cfg = gs.load_themes()
-    pool = gs.RoutePool(lg, {'기본': {'csv': 'waypoints.csv'}}, seed=1, gen_cfg=gen_cfg)
+    csv_rel = str((ROOT / 'tests' / 'fixtures' / 'waypoints.csv').relative_to(ROOT))
+    pool = gs.RoutePool(lg, {'기본': {'csv': csv_rel}}, seed=1, gen_cfg=gen_cfg)
     try:
         route = pool.get('기본')
     except gs.GenError as e:

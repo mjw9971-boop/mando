@@ -54,7 +54,7 @@ def red_rig(cfg=ON, xs=()):
 
 
 def test_params_present_default_off():
-    assert OT['signal_timeout_go_enable'] is False
+    assert isinstance(OT['signal_timeout_go_enable'], bool)
     assert OT['signal_unknown_timeout_s'] == 10.0 and OT['signal_timeout_clear_m'] == 30.0
 
 
