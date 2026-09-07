@@ -951,3 +951,26 @@ B-21 수정 뒤 남은 콘 회랑 침범 4건은 **전부 같은 원인**이다:
 지금은 제어기가 무신호 정지선을 수집 단계에서 버려(CLAUDE.md 확정 사실)
 주행 영향이 없다. **무신호 정지선을 처리하게 되면 37 m 안 4회 정지가 된다.
 그때 실체 확인 필요.**
+
+## B-28. `rtor_enable` + `signal_timeout_go_enable` 동시 on → `apply` 크래시 — **임시 방어됨**
+
+`kr_rules.apply` 가 `KeyError: 'signal_stale'` 로 죽는다. **실주행 크래시**다.
+
+  · RTOR 경로 `_rtor_log`([kr_rules.py:3220](../team_code/kr_rules.py#L3220))가
+    `last_signal` 이 None 이면 `{}` 로 만들고 `'rtor'` 키만 넣는다. 주석이
+    "last_signal 이 없으면(B·B-3 off) 여기서 만든다" 라고 **두 스위치가 off 임을
+    전제**한다.
+  · 그런데 [:2950](../team_code/kr_rules.py#L2950)(`_sig_timeout_go`)과
+    [:1267](../team_code/kr_rules.py#L1267)(stale 큐)이 `sig['signal_stale']` 을
+    **무조건 인덱싱**한다 → 그 dict 에는 없다.
+
+2026-09-07 팀원 커밋 `e3b75e2 제어기수정` 이 `rtor_enable` · `signal_timeout_go_enable`
+을 둘 다 true 로 켜면서 조건이 성립했다. 재현: `pytest
+tests/test_standoff_chain.py::test_suppression_tick_has_no_standoff`.
+
+**2026-09-07 임시 방어** (사용자 승인, 배치를 돌려야 해서): 두 줄을
+`sig.get('signal_stale')` 로 바꿨다 (`kr_rules.py:1267 · 2950`). 크래시는
+사라지지만 **근본 해결은 아니다** — `_rtor_log` 가 `last_signal` 을 만들 때
+그 dict 의 계약(어떤 키가 항상 있어야 하는가)을 정하지 않은 것이 원인이고,
+지금은 `signal_stale` 이 없으면 조용히 False 로 읽힌다. RTOR 이 활성인 틱에
+stale 판정이 실제로 필요한지는 **제어기 파트(팀원)** 가 정해야 한다.

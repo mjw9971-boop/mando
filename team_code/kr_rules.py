@@ -1264,7 +1264,7 @@ class KrRules:
         # 신호 미보고 → UNKNOWN (스위치 off 면 None 이라 아래 unknown 은 항상 거짓)
         self.last_signal = self._signal_stale(planner) if planner is not None else None
         unknown = bool(self.sig_stale_queue and self.last_signal
-                       and self.last_signal['signal_stale'])
+                       and self.last_signal.get('signal_stale'))
         if blockers and self.obs_fastpath:
             # E-1: 큐는 차량만이다. 박스가 선두든 사이에 끼었든 큐 형태에서 뺀다.
             veh = [b for b in blockers if not self._is_obstacle(b[3])]
@@ -2947,7 +2947,7 @@ class KrRules:
         sig = self.last_signal
         nxt = self._next_stopline(planner)
         tl_id = nxt[2] if nxt else None
-        stale = bool(sig and sig['signal_stale'])
+        stale = bool(sig and sig.get('signal_stale'))
         if self._sig_go and (not stale or tl_id != self._sig_go_tl):
             self._sig_go = False                          # 보고 재개 / 다음 신호로 넘어감
             self._sig_go_tl = None
