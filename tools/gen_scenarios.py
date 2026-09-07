@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import heapq
 import itertools
 import json
@@ -2177,12 +2178,40 @@ def route_summary(lg, route: Route) -> dict:
             'turns': {'left': turns.count('turn_left'), 'right': turns.count('turn_right')}}
 
 
+_TIMEOUT_CFG = None
+
+
+def timeout_cfg(reload=False):
+    """(avg_mps, factor, overhead_s, min_s) — params batch.timeout_*.
+
+    예전에는 평균 27 km/h · 배수 1.8 · 오버헤드 90 s 가 코드에 박혀 있었다.
+    9/6 실주행 실측 평균은 **10.2 km/h** 다(신호 대기 포함). 3 km 경로가
+    810 s 로 잘려 완주 전에 죽는다. 키가 없으면 옛 값으로 떨어진다.
+    """
+    global _TIMEOUT_CFG
+    if _TIMEOUT_CFG is None or reload:
+        try:
+            from vtd_adapter.config import load_params_yaml
+            b = load_params_yaml().get('batch') or {}
+        except Exception:                                # noqa: BLE001
+            b = {}
+        _TIMEOUT_CFG = (float(b.get('timeout_avg_kph', 27.0)) / 3.6,
+                        float(b.get('timeout_factor', 1.8)),
+                        float(b.get('timeout_overhead_s', 90.0)),
+                        float(b.get('timeout_min_s', 180.0)))
+    return _TIMEOUT_CFG
+
+
 def est_seconds(route_len: float) -> float:
-    return route_len / AVG_SPEED_MPS + OVERHEAD_S
+    """배치 예상 소요시간 [s]. 타임아웃과 같은 평균속도를 쓰되 **배수는 안 곱한다**
+    — 예상시간은 실제로 걸릴 시간이고, 타임아웃은 그 위의 여유다."""
+    avg, _f, _oh, _mn = timeout_cfg()
+    return route_len / avg + OVERHEAD_S
 
 
 def timeout_for(route_len: float) -> int:
-    return max(180, int(route_len / AVG_SPEED_MPS * 1.8 + 90))
+    avg, factor, overhead, min_s = timeout_cfg()
+    return max(int(min_s), int(route_len / avg * factor + overhead))
 
 
 # ── VTD 네이티브 교통류 (PulkTraffic) ────────────────────────────────────
@@ -2601,6 +2630,12 @@ def main(argv=None) -> int:
     ap.add_argument('--graph', default=str(ROOT / 'data' / 'lane_graph.pkl'))
     ap.add_argument('--list', action='store_true', help='주제 목록만 출력')
     ap.add_argument('--from-yaml', default=None, help='저장된 정의 YAML 로 단건 재생성')
+    ap.add_argument('--from-csv', default=None,
+                    help='실경로 CSV(seq,x,y) 로 순수 주행 시나리오 생성 — 장애물·교통류'
+                         ' 없이, 생성 게이트(스폰·폴리라인)를 우회한다')
+    ap.add_argument('--name', default=None, help='--from-csv 시나리오 이름 (기본: CSV 파일명)')
+    ap.add_argument('--theme', default='실전주행_교통류',
+                    help='--from-csv 가 쓸 주제 (기본: 실전주행_교통류)')
     ap.add_argument('--rebuild-lists', action='store_true',
                     help='생성 없이 디스크(<주제>/*.yaml) 기준으로 batch 목록만 재생성')
     ap.add_argument('--coverage-report', action='store_true',
@@ -2631,6 +2666,36 @@ def main(argv=None) -> int:
     lg = LaneGraph(a.graph)
     ctrl_map = junction_ctrl_map(lg)
     out_dir = pathlib.Path(a.out_dir)
+
+    # ── 실경로 CSV → 순수 주행 시나리오 (게이트 우회) ────────────────────
+    # 생성기는 연속 차선변경이 빡빡한 경로를 폴리라인 게이트로 폐기한다. 그래서
+    # 도로 418 의 3연속 차선변경 같은 형태가 배치에 한 번도 안 들어간다 — 대회
+    # CSV 에는 나올 수 있는 형태인데 차가 거기서 어떻게 도는지 볼 방법이 없다.
+    # 이 경로는 **게이트를 건너뛰고** 장애물·교통류 없이 순수 주행만 만든다.
+    if a.from_csv:
+        rows = [(int(r[0]), float(r[1]), float(r[2]))
+                for r in csv.reader(open(a.from_csv, encoding='utf-8-sig'))
+                if r and r[0] != 'seq']
+        name = a.name or pathlib.Path(a.from_csv).stem
+        theme = a.theme
+        route = _build_from_rows(lg, name, rows)
+        for why in (spawn_gate(lg, route.rt, gen_cfg),
+                    polyline_gate(lg, route.rt, gen_cfg)):
+            if why:
+                print(f'  ⚠ 게이트 우회: {why}')
+        base = dict(themes.get(theme, {}))
+        base.update({'event': [], 'scale_events': False, 'pulk': False})
+        variant = {'route': (name, 1, theme), 'event': []}
+        _r2, xml_text, sdef2, bad = gen_one(lg, ctrl_map, _FixedPool(route),
+                                            theme, base, variant, name, 0)
+        write_scenario(out_dir, theme, name, xml_text, sdef2, route.rows)
+        for _, x, y, dm in bad:
+            print(f'  ⚠ ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
+        n_all, n_th = rebuild_batch_lists(out_dir, a.vtd_dir)
+        print(f'생성 완료: {out_dir / theme / (name + ".xml")}  '
+              f'(길이 {route.rt["total_length"]:.0f} m, timeout {sdef2["timeout_s"]} s)')
+        print(f'batch_all.json: {n_all}개 (주제 {n_th}개)')
+        return 0
 
     # ── 단건 재생성 ──────────────────────────────────────────────────────
     if a.from_yaml:

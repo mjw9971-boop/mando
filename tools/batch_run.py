@@ -669,6 +669,7 @@ class Runner:
         self.cfg = cfg = load_cfg()
         self.margin = end_margin_m(cfg)
         self.batch_cfg = cfg['batch']       # 종료 판정 임계 전부 (EndJudge 가 읽는다)
+        self.end_policy = 'no_timeout' if getattr(args, 'no_early', False) else 'default'
         self._lg = None                     # 완주 임계 투영용 (지연 로드, 배치당 1회)
 
     def lane_graph(self):
@@ -875,13 +876,22 @@ class Runner:
                 continue
             verdict = judge.feed(time.monotonic(), tick)
             if verdict is not None:
-                status = verdict
-                break
+                if verdict == '완주':
+                    status = verdict
+                    break
+                if status == 'timeout':        # 첫 판정만 남긴다
+                    status = verdict
+                    res['first_verdict_s'] = round(time.monotonic() - t0, 1)
+                if self.end_policy == 'default':
+                    break
+                # --no : 판정은 남기되 끊지 않는다 (timeout_s 까지 관찰)
 
         # 5) 정리 + 로그 회수 (--log 로 이미 out_dir 에 쓰였다)
         self.cleanup()
         launch_out.close()
         res['status'] = status
+        res['end_policy'] = self.end_policy
+        res['ran_s'] = round(time.monotonic() - t0, 1)
         if agent_log.exists():
             res['log'] = str(agent_log)
             if status == 'blocked':
@@ -1036,6 +1046,11 @@ class Runner:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             self.precheck_vtd_paths(scenarios)
         print(f'배치 {len(scenarios)}건, host={self.args.host}')
+        # 종료 정책을 배치마다 한 줄로 남긴다 — 런끼리 비교할 때 규칙이 같았는지가
+        # 표만 봐서는 안 보인다 (report.json 의 end_policy 와 같은 값).
+        print('종료 정책: ' + ('--no  조기 종료 없음 — 시나리오 timeout_s 까지 (판정은 기록)'
+                              if self.end_policy == 'no_timeout'
+                              else '--timeout  blocked/stall/no_progress 에서 조기 종료 (기본)'))
         print(done_rule(self.margin, self.batch_cfg,
                         BASIS_FINISH if self.batch_cfg.get('finish_judge_use_finish_s', True)
                         else None))
@@ -1058,7 +1073,17 @@ class Runner:
             print('\n[중단] 정리 중…')
             self.cleanup()
         table = self.report()
-        rule = done_rule(self.margin, self.batch_cfg,
+        # 종료 정책을 리포트에도 남긴다 — report.txt 만 남고 stdout 이 사라진
+        # 뒤에도 "이 배치가 어떤 규칙이었나" 를 알 수 있어야 런끼리 비교가 된다.
+        pols = sorted({r.get('end_policy') for r in self.results if r.get('end_policy')})
+        pol_line = ('종료 정책: ' + ('--no (조기 종료 없음)' if self.end_policy == 'no_timeout'
+                                  else '--timeout (기본)'))
+        if len(pols) > 1:                    # 섞이면 집계하지 말고 갈라 보여준다
+            pol_line += ('   [경고] 이 배치에 정책이 섞여 있다 — '
+                         + ' / '.join(f'{p} {sum(1 for r in self.results if r.get("end_policy") == p)}건'
+                                      for p in pols)
+                         + ' — 런끼리 비교하지 말 것')
+        rule = pol_line + '\n' + done_rule(self.margin, self.batch_cfg,
                          BASIS_FINISH if self.batch_cfg.get('finish_judge_use_finish_s', True)
                          else None)
         # 판정 기준 설명문은 표 아래로 — 표가 첫 화면에 오도록.
@@ -1091,6 +1116,16 @@ def main(argv=None) -> int:
     ap.add_argument('--pause-s', type=float, default=5.0,
                     help='시나리오 간 대기 (9910 소켓 TIME_WAIT 정리 여유)')
     ap.add_argument('--dry-run', action='store_true', help='실행 없이 계획만 출력')
+    # 조기 종료 정책 — 낮에는 사람이 보면서 끝까지 돌리고, 밤 무인 배치는
+    # 막히면 끊고 다음으로 넘어간다. **시간대 자동 전환은 하지 않는다** —
+    # 자정을 넘기면 한 배치 안에서 규칙이 갈려 런끼리 비교가 안 된다.
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument('--no', '--no-timeout', dest='no_early', action='store_true',
+                   help='blocked/stall/no_progress 조기 종료를 끈다 — 시나리오 '
+                        'timeout_s 까지 돌린다 (판정은 계속 계산해 report 에 남긴다)')
+    g.add_argument('--timeout', dest='no_early', action='store_false',
+                   help='params 기본값으로 조기 종료 (기본)')
+    ap.set_defaults(no_early=False)
     a = ap.parse_args(argv)
     return Runner(a).run()
 
