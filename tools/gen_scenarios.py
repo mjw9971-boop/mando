@@ -2093,8 +2093,14 @@ def _start_lane_id(rt) -> int:
 # 5. 시나리오 조립·검증·저장
 # ════════════════════════════════════════════════════════════════════════
 
-def path_waypoints(lg, rt):
+def path_waypoints(lg, rt, allow_truncate=False):
     """경로 차로 체인 → Path01 Waypoint (track, road_s) 목록.
+
+    allow_truncate: 시작/종점이 교차로 연결로 위여서 첫·끝 도로가 안 맞으면
+    **비교차로 구간까지만 잘라** 쓴다 (--from-csv 전용). Path01 은 VTD 쪽 경로
+    형상·스폰 기준일 뿐이고, 우리 에이전트는 route_csv 로 지은 route.pkl 을
+    따른다 — 완주 판정도 batch_run.finish_threshold 가 route.pkl 의 finish_xy 를
+    투영한 finish_s 로 하므로 Path01 절단과 무관하다.
 
     첫 점은 시작 차로의 s=0 (ego StartS 의 기준점), 마지막은 종점 차로 끝.
     같은 도로가 연달아 나오면 대표점 하나만 남긴다.
@@ -2137,8 +2143,12 @@ def path_waypoints(lg, rt):
     if len(out) < 2:
         raise GenError(f'Path01 waypoint 가 {len(out)}개뿐이다 — 경로가 교차로 연결로 위주다')
     if out[0][0] != groups[0][0] or out[-1][0] != groups[-1][0]:
-        raise GenError('Path01 첫/끝 waypoint 도로가 경로 시작/끝 도로와 다르다 '
-                       '(시작 또는 종점이 교차로 연결로 위인 경로)')
+        if not allow_truncate:
+            raise GenError('Path01 첫/끝 waypoint 도로가 경로 시작/끝 도로와 다르다 '
+                           '(시작 또는 종점이 교차로 연결로 위인 경로)')
+        print(f'  ⚠ Path01 절단: 경로 도로 {groups[0][0]}…{groups[-1][0]} 중 '
+              f'비교차로 {out[0][0]}…{out[-1][0]} 까지만 쓴다 '
+              f'(주행은 route_csv 의 route.pkl 을 따르므로 영향 없음)')
     for road, s in out:
         L_road = lg.roads[road]['length']
         if lg.roads[road]['junction'] != -1 or not (0.5 - 1e-6 <= s <= L_road - 0.5 + 1e-6):
@@ -2277,7 +2287,7 @@ def pulk_attrs(d: dict) -> str:
 
 def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                    name: str, seed_key: str, min_keep: int | None = None,
-                   pulk: dict | None = None):
+                   pulk: dict | None = None, path_truncate: bool = False):
     """이벤트 목록 → (xml_text, def_dict, warnings).
 
     min_keep 이 주어지면(실전주행 scale_events) 개별 이벤트의 배치 실패
@@ -2335,7 +2345,7 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                        f'(최소 {min_keep}) — 공간 부족, 시나리오 폐기')
     doc = XmlDoc(TEMPLATE)
     rt = route.rt
-    doc.set_path(path_waypoints(lg, rt))
+    doc.set_path(path_waypoints(lg, rt, allow_truncate=path_truncate))
     doc.set_ego(rt['start_s_in_lane'], rt['start_s_in_lane'] + rt['total_length'],
                 _start_lane_id(rt))
     if pulk:
@@ -2546,7 +2556,7 @@ def write_scenario(out_dir, theme, name, xml_text, sdef, rows):
         + yaml.safe_dump(sdef, allow_unicode=True, sort_keys=False), encoding='utf-8')
 
 
-def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
+def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed, path_truncate=False):
     ml = cfg.get('min_length_m')
     route = pool.get(*variant['route'],
                      min_length_m=None if ml is None else float(ml))
@@ -2613,7 +2623,7 @@ def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed):
     pulk = pulk_def(axes) if cfg.get('pulk') else None
     xml_text, sdef, bad = build_scenario(lg, ctrl_map, route, ev_list, axes,
                                          name, seed_key, min_keep=min_keep,
-                                         pulk=pulk)
+                                         pulk=pulk, path_truncate=path_truncate)
     return route, xml_text, sdef, bad
 
 
@@ -2687,7 +2697,8 @@ def main(argv=None) -> int:
         base.update({'event': [], 'scale_events': False, 'pulk': False})
         variant = {'route': (name, 1, theme), 'event': []}
         _r2, xml_text, sdef2, bad = gen_one(lg, ctrl_map, _FixedPool(route),
-                                            theme, base, variant, name, 0)
+                                            theme, base, variant, name, 0,
+                                            path_truncate=True)
         write_scenario(out_dir, theme, name, xml_text, sdef2, route.rows)
         for _, x, y, dm in bad:
             print(f'  ⚠ ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
