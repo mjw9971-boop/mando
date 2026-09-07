@@ -26,6 +26,16 @@ OT = CFG['overtake']
 HZ = CFG['comm']['send_hz']
 ON = copy.deepcopy(CFG)
 ON['overtake']['signal_timeout_go_enable'] = True
+# 이 파일의 대상 스위치(signal_timeout_go_enable)는 params 와 테스트가 일치한다
+# (둘 다 off). 다만 **다른** 스위치인 signal_stale_queue_enable 이 켜져 있으면
+# 그쪽이 last_signal 진단을 채워서, "off 면 진단도 없다" 를 보는 검사가 깨진다.
+# 그래서 off 검사에서는 그 이웃 스위치도 함께 끈다 — 이 파일이 재는 것은
+# 타임아웃 해제이지 stale 큐가 아니다.
+# **params 값이 정본이다** — 두 키의 기본값은 제어기 파트(팀원) 소관이라 이
+# 테스트가 정하지 않는다 (2026-09-07, docs/BACKLOG.md B-25).
+OFF = copy.deepcopy(CFG)
+OFF['overtake']['signal_timeout_go_enable'] = False
+OFF['overtake']['signal_stale_queue_enable'] = False
 STALE = int(round(OT['signal_stale_s'] * HZ))
 TIMEOUT = int(round(OT['signal_unknown_timeout_s'] * HZ))
 
@@ -49,7 +59,7 @@ def test_params_present_default_off():
 
 
 def test_off_never_releases():
-    kr, p, ap = red_rig(cfg=CFG)
+    kr, p, ap = red_rig(cfg=OFF)
     step(kr, p, ap, n=STALE + TIMEOUT + 10)
     assert kr._stop_target(p, ap) is not None and kr.signal_release(ap) is False
     assert kr.last_signal is None

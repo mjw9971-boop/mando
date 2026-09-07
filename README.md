@@ -209,12 +209,11 @@ python3 tools/plot_lane_graph.py data/lane_graph.pkl -o docs/images/map_full.png
 | 1 | 점멸 신호(state 6) 황색/적색 구분 | 조직위 문의 대상. 현재 코드는 **Green 하드코딩** (route.py:84) |
 | 2 | 방향지시등 선행 점등 "n초"의 규정값 | `signal.turn_lead_s` 4.0 / `signal.lc_lead_s` 3.0 가정값 — 규정 확정 시 yaml 만 수정 |
 | 3 | RTOR 허용 여부 | 미구현 |
-| 4 | 스쿨존 내 비신호 횡단보도 일시정지 채점 여부 | 폴백 오정지 위험 46곳과 상충 — 규정 확인 후 결정 |
-| 5 | `RM_518` = 스쿨존 30 해석 | 텍스처 미검증 (build_lane_graph 가 30 으로 가정) |
-| 6 | 5분 제한 초과 시 처리 | 평균 속도 전략에 직결 (`score.time_limit_s`) |
-| 7 | 횡단보도 보행자 → 정지선 정지 | 미구현 (PDM 은 forecast 충돌 회피로 처리) |
-| 8 | 라우터 연속 차선변경 이격 / waypoint 짝 활용 | 미착수 |
-| 9 | `scoring.finish_xy` 미확보 | null 이면 route_s 임계 방식으로 폴백 + 경고 |
+| 4 | `RM_518` = 스쿨존 30 해석 | 텍스처 미검증 (build_lane_graph 가 30 으로 가정) |
+| 5 | 5분 제한 초과 시 처리 | 평균 속도 전략에 직결 (`score.time_limit_s`) |
+| 6 | 횡단보도 보행자 → 정지선 정지 | 미구현 (PDM 은 forecast 충돌 회피로 처리) |
+| 7 | 라우터 연속 차선변경 이격 / waypoint 짝 활용 | 미착수 |
+| 8 | `scoring.finish_xy` 미확보 | null 이면 route_s 임계 방식으로 폴백 + 경고 |
 
 ## 구현 상태
 

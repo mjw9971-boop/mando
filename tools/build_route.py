@@ -1189,7 +1189,10 @@ def polyline_step_thr():
 
 DPCfg = _collections.namedtuple(
     'DPCfg', 'enable radius ratio floor detour_penalty step_penalty sep compare '
-             'retry radius_max dev_penalty')
+             'retry radius_max dev_penalty finish_lock',
+    # finish_lock 만 기본값을 준다 — 밖에서 11개짜리 위치인자로 DPCfg 를 짓는
+    # 자리(tests/test_global_dp.py)가 있어서, 기본값 없이 늘리면 그쪽이 깨진다.
+    defaults=(True,))
 
 
 def dp_cfg(reload=False):
@@ -1224,7 +1227,8 @@ def dp_cfg(reload=False):
             bool(r.get('dp_compare_enable', True)),
             bool(r.get('dp_radius_retry_enable', False)),
             float(r.get('dp_radius_max_m', 16.0)),
-            float(r.get('dp_radius_dev_penalty', 1.0)))
+            float(r.get('dp_radius_dev_penalty', 1.0)),
+            bool(r.get('dp_finish_lane_lock', True)))
     return _DP_CFG
 
 
@@ -1475,9 +1479,45 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         best_hist.append(best)
         lims.append(lim)
 
-    # ── 역추적 ────────────────────────────────────────────────────────────
+    # ── 종점 차로 고정 (route.dp_finish_lane_lock) ────────────────────────
+    # 완주 규칙이 "뒷축이 **두 콘 사이** 종료선 통과" 라, 경로가 종료 좌표가
+    # 놓인 차로의 옆 차로로 끝나면 종료선을 넘고도 콘 밖이 된다. 실측
+    # 2026-09-07: 생성 경로 21개 중 9개가 그랬고(경로 중심선에서 ±3~6 m),
+    # 그중 5개는 종료선 콘이 주행 회랑 안으로 들어왔다.
+    #
+    # 그래서 마지막 층에서는 **비용보다 차로 정합을 우선**한다: 종료 좌표가
+    # 실제로 올라앉은 차로가 후보에 있고 도달 가능하면 비용과 무관하게 채택하고,
+    # 도달 불가일 때만 최소비용 후보로 떨어진다.
+    #
+    # "올라앉았다" 의 기준은 그 차로 **반폭 안** 이다 — 좌표가 차로 경계 밖이면
+    # 어느 차로의 것인지가 애매하므로 고정하지 않는다. cands 는 거리순 정렬이라
+    # (candidates() 의 sorted(key=dist)) 첫 후보가 가장 가까운 차로다.
+    #
+    # 반경 재시도와는 충돌하지 않는다: 재시도는 `C.retry and kb != idx[-1]` 로
+    # **마지막 경유점을 이미 제외**하므로 cands[idx[-1]] 을 건드리지 않는다.
+    # 이 고정은 그 후보 목록을 읽기만 한다.
     order = sorted(range(len(best)), key=lambda j: (best[j][0], best[j][1]))
     endj = order[0]
+    lock = None
+    if C.finish_lock and cands[idx[-1]]:
+        k0, s0, d0 = cands[idx[-1]][0]
+        on_lane = d0 <= lg.width_at(k0, s0) / 2.0
+        j0 = next((j for j, c in enumerate(cands[idx[-1]]) if c[0] == k0), None)
+        lock = {'lane': list(k0), 'dev_m': round(float(d0), 3),
+                'on_lane': bool(on_lane), 'was': list(cands[idx[-1]][endj][0]),
+                'last_point_used': idx[-1] == len(waypoints) - 1}
+        if not on_lane:
+            lock['why'] = (f'종료 좌표가 {k0} 경계 밖({d0:.2f} m > 반폭 '
+                           f'{lg.width_at(k0, s0) / 2.0:.2f} m) — 고정하지 않는다')
+        elif j0 is None or best[j0][0] == INF:
+            lock['why'] = f'{k0} 로 이어지는 차로 조합이 없다 — 최소비용 후보로 떨어진다'
+        elif j0 == endj:
+            lock['why'] = '최소비용 후보가 이미 종료 좌표 차로다'
+        else:
+            lock['why'] = (f'비용 {best[endj][0]:.0f} → {best[j0][0]:.0f} 를 물고 '
+                           f'종료 좌표 차로 {k0} 로 고정')
+            endj = j0
+        lock['applied'] = (endj == j0 and j0 is not None and on_lane)
     picks = [None] * len(idx)
     picks[-1] = endj
     for t in range(len(idx) - 1, 0, -1):
@@ -1525,6 +1565,7 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         'cost': round(float(total_cost), 1),
         'wp_dist_sum': round(float(total_d), 2),
         'picks': [list(cands[k][picks[t]][0]) for t, k in enumerate(idx)],
+        'finish_lock': lock,
         'notes': notes,
         'relaxed': relaxed + detours,
         'retries': retries,

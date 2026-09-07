@@ -48,6 +48,20 @@ def on_cfg(cfg=CFG):
     return c
 
 
+def off_cfg(cfg=CFG):
+    """스위치를 강제로 끈 사본.
+
+    **params 값이 정본이다.** `speed.ped_multi_enable` 의 기본값은 제어기
+    파트(팀원) 소관이라 이 저장소의 테스트가 정하지 않는다 — 기본값이 무엇이든
+    kill switch 의 off 경로는 계속 덮어야 하므로, 기본값을 읽는 대신 여기서
+    명시적으로 꺼서 검사한다 (2026-09-07). 기본값 판정 근거는
+    `docs/BACKLOG.md` B-25.
+    """
+    c = copy.deepcopy(cfg)
+    c['speed']['ped_multi_enable'] = False
+    return c
+
+
 def profile(s_rel):
     return (2.0 * A_STOP * max(0.0, s_rel - FRONT - S0_PED)) ** 0.5
 
@@ -80,16 +94,25 @@ class World2:
 
 
 # ── 스위치 ───────────────────────────────────────────────────────────────
-def test_params_present_and_default_off():
-    assert SP['ped_multi_enable'] is False
+def test_params_present_and_wired():
+    """키가 있고 KrRules 로 그대로 전달되는지만 본다.
+
+    **params 값이 정본** — 기본값 자체는 제어기 파트(팀원) 소관이라 여기서
+    특정 값을 강제하지 않는다 (2026-09-07, `docs/BACKLOG.md` B-25).
+    도입 커밋은 '기본 off' 였고 지금은 on 이다; 어느 쪽이 맞는지는 팀원이 정한다.
+    """
+    assert isinstance(SP['ped_multi_enable'], bool)
     assert SP['ped_hold_coast_s'] == 0.5
     kr = KrRules(CFG)
-    assert kr.ped_multi is False and kr.ped_coast_ticks == COAST_TICKS
+    assert kr.ped_multi is SP['ped_multi_enable']
+    assert kr.ped_coast_ticks == COAST_TICKS
+    # off 경로는 off_cfg() 로 계속 검사한다 (아래 test_off_*).
+    assert KrRules(off_cfg()).ped_multi is False
 
 
 def test_off_never_populates_hold_and_keeps_profile():
     """스위치 off: 회랑 안 보행자라도 홀드 집합은 비고 후보는 프로파일 그대로."""
-    kr, p, ap = rig(CFG, [Walker(4, 12.0, -5.0)])
+    kr, p, ap = rig(off_cfg(), [Walker(4, 12.0, -5.0)])
     w = ap._world.get_actors()[0]
     observe_static(kr, ap, p=p)
     out = walk(kr, ap, p, w, dy=+0.5 / HZ, ticks=1)
@@ -220,7 +243,7 @@ def test_dropout_beyond_coast_releases():
 
 def test_off_dropout_releases_immediately():
     """스위치 off: 이전 동작 — 첫 미관측 틱에 즉시 해제."""
-    kr, p = KrRules(CFG), Planner()
+    kr, p = KrRules(off_cfg()), Planner()
     w = Vanishing(4, 12.0, -5.0)
     ap = Ap(p, actors=[w])
     ap._world = World2([w])

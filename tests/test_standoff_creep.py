@@ -55,8 +55,21 @@ def rig(creep=True, half_len=0.075, d=20.0, cause=True, delay_s=None):
     return kr, p, ap
 
 
-def test_params_present_and_default_off():
-    assert OT['standoff_creep_enable'] is False                    # kill switch 기본 off
+def test_params_present():
+    """키가 있는지와 크립 상수만 본다 — 기본값은 강제하지 않는다.
+
+    **params 값이 정본이다.** `overtake.standoff_creep_enable` 의 기본값은
+    제어기 파트(팀원) 소관이라 이 테스트가 정하지 않는다 (2026-09-07).
+
+    ⚠ 이 키는 **확인이 필요한 축**이다: `b37e051 chore: standoff_creep_enable
+    기본 off 로 복원 (실차 검증 전)` 이 명시적으로 껐던 것을 그 뒤 무제목 커밋
+    `8103c8b "제어기수정"` 이 다시 켰다. 실차 검증이 끝났는지는 팀원만 안다 —
+    판정 근거는 `docs/BACKLOG.md` B-25. 여기서 값을 되돌리지 말 것.
+
+    off/on 동작 자체는 이 파일의 나머지 검사가 `rig(creep=False/True)` 로
+    (기본값과 무관하게) 양쪽 다 덮는다.
+    """
+    assert isinstance(OT['standoff_creep_enable'], bool)
     assert OT['standoff_creep_v'] == 0.8
     assert OT['standoff_creep_gap_m'] == 1.0
 

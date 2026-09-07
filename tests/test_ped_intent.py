@@ -51,8 +51,24 @@ class Walker(Box):
         self.type_id = 'walker.vtd.pedestrian'
 
 
-def make(cfg=CFG):
-    return KrRules(cfg), Planner()
+def a1_cfg(cfg=CFG):
+    """A-1(의도 래치)만 분리해 보기 위한 사본 — P4-M 을 끈다.
+
+    이 파일은 A-1 이 대상이다. P4-M(다중 보행자 회랑 홀드, `ped_multi_enable`)
+    은 별개 기능이고 켜면 회랑 안 보행자를 계속 붙들어 `_ped_intent` 가 None
+    을 안 돌려준다 — A-1 의 해제·리셋 불변을 그 위에서 재면 무엇을 재는지
+    알 수 없다. P4-M 의 동작은 test_ped_multi 가 담당한다.
+
+    **params 값이 정본이다** — `speed.ped_multi_enable` 의 기본값은 제어기
+    파트(팀원) 소관이라 이 테스트가 정하지 않는다 (`docs/BACKLOG.md` B-25).
+    """
+    c = copy.deepcopy(cfg)
+    c['speed']['ped_multi_enable'] = False
+    return c
+
+
+def make(cfg=None):
+    return KrRules(a1_cfg() if cfg is None else cfg), Planner()
 
 
 def observe_static(kr, ap, n=STATIC_TICKS + 2, p=None, v=0.0):
@@ -140,7 +156,7 @@ def test_never_observed_static_does_not_latch_via_static_path():
     """정지 관찰이 없으면(이미 걷고 있던 보행자) **정지 관찰 경로**로는 안 잡는다.
     A-4 이후 그런 보행자는 걷는 채 접근 경로(ped_walkin, 0.5 s)가 잡는다 — 여기서는
     그 스위치를 끄고 옛 전제를 고정한다 (과검출 방지). 켜진 동작은 test_ped_walkin."""
-    cfg = copy.deepcopy(CFG)
+    cfg = a1_cfg()
     cfg['speed']['ped_walkin_enable'] = False
     kr, p = make(cfg)
     w = Walker(7, 25.0, -5.0, speed=2.5)

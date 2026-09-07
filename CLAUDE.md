@@ -8,7 +8,7 @@
 | | 대상 |
 |---|---|
 | **수정 가능** | `team_code/`, `vtd_adapter/`, `run_agent.py`, `config/params.yaml` 의 `speed.*` · `control.*` · `vehicle.*` 키 |
-| **수정 금지** | `tools/batch_run.py` · `tools/build_route.py` · `tools/gen_scenarios.py` · `tools/score.py` · `tools/scp_client.py` · `tools/summarize_run.py`, `configs/themes.yaml`, `config/params.yaml` 의 `scoring.*` · `batch.*` 키 |
+| **수정 금지** | `tools/batch_run.py` · `tools/build_route.py` · `tools/gen_scenarios.py` · `tools/score.py` · `tools/scp_client.py` · `tools/summarize_run.py` · `tools/finish_cone.py`, `configs/themes.yaml`, `config/params.yaml` 의 `scoring.*` · `batch.*` · `gen_*` (`gen_placement.*` 포함) · `route.*` 중 **경로 조립 키** (`dp_*` · `candidates_*` · `finish_tail_*` · `waypoint_*`) |
 
 ## 채점·시나리오 파트 (사용자가 세션에서 선언할 때만)
 
@@ -16,8 +16,12 @@
 
 | | 대상 |
 |---|---|
-| **수정 가능** | `tools/batch_run.py` · `build_route.py` · `gen_scenarios.py` · `score.py` · `scp_client.py` · `summarize_run.py`, `configs/themes.yaml`, `params.yaml` 의 `scoring.*` · `batch.*` |
+| **수정 가능** | `tools/batch_run.py` · `build_route.py` · `gen_scenarios.py` · `score.py` · `scp_client.py` · `summarize_run.py` · `finish_cone.py`, `configs/themes.yaml`, `params.yaml` 의 `scoring.*` · `batch.*` · `gen_*` (`gen_placement.*` 포함) · `route.*` 중 **경로 조립 키** (`dp_*` · `candidates_*` · `finish_tail_*` · `waypoint_*`) |
 | **수정 금지** | `team_code/`, `vtd_adapter/`, `run_agent.py` |
+
+`route.*` 는 **두 파트가 나눠 쓴다**: `taper_blend_m` · `lc_move_*` 는
+`vtd_adapter/route.py`(제어기 플래너)가 읽으므로 **제어기 파트** 키다.
+경로를 *짓는* 키(`dp_*` 등)만 채점·시나리오 파트 소관이다.
 
 ## 경계 밖이 필요할 때 — **고치지 말고 보고한다**
 
@@ -82,24 +86,94 @@
 ## 검증
 
 - `pytest` 는 이제 이 환경에 **설치되어 있다** (7.4.4). 예전의 "고정 실패
-  37건" 은 shim 러너가 builtin fixture 를 지원하지 못해 생긴 것이었고,
-  실제 pytest 로 돌리면 **전부 통과한다** (2026-09-02 확인, `docs/BACKLOG.md` B-4).
-  통과 수는 테스트가 늘면 같이 오르므로, 회귀 판단은 개수가 아니라
-  **실패 목록이 늘었는지**로 한다.
+  37건" 은 shim 러너가 builtin fixture 를 지원하지 못해 생긴 것이었다
+  (2026-09-02 확인, `docs/BACKLOG.md` B-4). 통과 수는 테스트가 늘면 같이
+  오르므로, 회귀 판단은 개수가 아니라 **실패 목록이 늘었는지**로 한다.
 
-  **현재 기준선 (2026-09-05 실측, `python3 -m pytest -q`, ~165 s)**:
-  `1069 passed / 2 skipped / 1 failed`.
+  **현재 기준선 (2026-09-07 실측, `python3 -m pytest -q`, ~7.0 분)**:
+  `1303 passed / 2 skipped / **0 failed**`. 전부 통과한다.
 
-  | 알려진 실패 | 원인 | 성격 |
-  |---|---|---|
-  | `test_batch_finish_judge.py::test_planned_stop_is_inside_threshold[scenarios/정적회피집중/정적회피집중_08_직진11.csv]` | 그 경로의 종료선 뒤 꼬리가 10.0 m 로 요구 12 m 에 못 미쳐 계획 정지점이 클립된다 (`[경고] 종료선 뒤 꼬리 …` 가 빌드 때 함께 뜬다) | **생성물 의존** — `scenarios/` 는 `.gitignore` 대상이고 `gen_scenarios` 를 다시 돌리면 사라지거나 다른 경로로 옮겨간다. 코드 결함이 아니다 |
+  실패가 하나라도 나오면 그건 회귀다.
 
-  이 목록에 없는 실패가 나오면 그건 회귀다. `scenarios/` 를 재생성했다면
-  목록을 실제 상태에 맞게 갱신한다.
+  2026-09-07 이전의 "실패 17~24건(실행 순서에 따라 변동)" 은 정리됐다.
+  원인은 전부 **params 기본값과 테스트의 드리프트** 하나였다 — 기능을
+  `params.yaml` 에서 켜 놓고 "기본값이 꺼져 있는지" 보는 테스트를 같이 안
+  고친 것이다. 플래그를 하나씩 꺼 보며 확인한 결과 실패 17건이 params 플래그
+  5개에 **1:1 로 대응**했고, 독립적으로 깨진 테스트는 없었다. 실행 순서 의존
+  (17~24 변동)도 같은 플래그가 만든 것이라 함께 사라졌다.
+
+  처리 원칙 (다시 생기면 그대로 따를 것):
+
+  · **키마다 "params 가 맞나 테스트가 맞나" 를 따로 판정한다.** 판정 기준은
+    그 키를 넣은/바꾼 커밋의 의도다. 일괄 처리 금지.
+  · params 가 틀린 사례가 실제로 있었다 — `red_zone.roadmark_30_as_limit` 은
+    무제목 커밋 `c491357 "루트 생성"` 이 작업 2a 의 `false` 를 뒤집은 것이라
+    되돌렸다 (그대로 두면 다음 `build_lane_graph` 실행에서 붉지 않은 30 표시
+    도로 10,237 m 가 30 캡으로 돌아간다).
+  · 나머지 5개(`speed.ped_multi_enable` · `overtake.shift_entry_enable` ·
+    `side_pick_enable` · `signal_stale_queue_enable` · `standoff_creep_enable`)
+    는 **제어기 파트 소관**이라 params 를 건드리지 않고 **테스트를 현재
+    기본값에 맞췄다**. 각 테스트에 "params 값이 정본, 팀원 소관" 주석과
+    `docs/BACKLOG.md` B-25 참조가 달려 있다.
+  · 켜고 끄는 동작 자체의 커버리지는 잃지 않았다 — off 경로를 보는 검사는
+    기본값을 읽는 대신 **사본에서 명시적으로 끄고**(`off_cfg()` / `a1_cfg()` /
+    `OFF`) 검사하도록 바꿨다. 기본값이 또 바뀌어도 안 깨진다.
+
+  회귀 판단은 전체 실행으로 충분하지만, 어느 파일인지 좁힐 때는 파일별
+  격리 실행이 편하다:
+
+  ```
+  for f in tests/test_*.py; do echo "$f: $(python3 -m pytest $f -q 2>&1 | tail -1)"; done
+  ```
+
+  옛 기준선 `1069 passed / 1 failed` (2026-09-05) 의 알려진 실패였던
+  `test_batch_finish_judge.py::…[정적회피집중_08_직진11.csv]` 는 지금 없다 —
+  그 시나리오가 `scenarios/` 에 더는 없어서다 (`scenarios/` 는 `.gitignore`
+  대상이라 재생성하면 목록이 바뀐다). `test_batch_finish_judge` 는 현재 전건
+  통과한다.
+
 - 실주행 배치는 VTD PC 에서 사용자가 돌린다. 이 환경에서는 **리플레이와
   폐루프 시뮬**까지만 가능하다. 시뮬 수치를 실주행 예측으로 제시하지 않는다.
 - 배치 결과는 `logs/batch/<ts>/report.txt` 에 남고, 로그를 지워도 **정지 지표
   표는 남는다**.
+
+## 확정 사실 (재조사 금지)
+
+조사가 끝나 결론이 난 것들. **다시 파지 말 것** — 근거와 함께 여기 남긴다.
+
+### 채점 범위
+**채점은 주최측 안내문의 15개 항목이 전부다. 그 밖의 동작으로는 감점되지
+않는다.** 안내문이 "각 평가항목의 위반 기준 및 경미/중대 구분은 아래와
+같습니다" 로 15개를 열거한다 (부호화된 목록은 `tools/score.py` `ITEMS`).
+무신호 교차로·정지선 일시정지는 **항목에 없다**. 그래서 AGENT_SPEC §7 의
+"스쿨존 비신호 횡단보도 일시정지 채점 여부" 는 2026-09-07 종결·삭제했다.
+
+### junction_ctrl_map 의 8개 교차로 "누락" 은 오류가 아니다
+`xodr <junction><controller>` 보유 53개 vs 맵 키 45개의 차집합
+`[11, 27, 47, 48, 50, 52, 71, 85]` 은 **정상**이다.
+
+- 이웃 교차로와 7~20 m 토막 도로로 붙은 **쌍둥이 교차로의 반쪽**이고
+  **자기 신호가 없다** (8개 전 접근로 신호 0개).
+- controller 14개는 xodr 이 양쪽 교차로에 **중복 선언**했을 뿐, 실제 등은
+  이웃 교차로 정지선(s≈L, ori=+) 또는 far-side(s≈0, ori=+)에 있다.
+- 그래서 현재 맵 귀속(j11→j20, j27→j6, j47→j46, j48·j50→j49, j52→j53,
+  j71→j72, j85→j86)이 **물리적으로 맞다**. xodr 귀속으로 바꾸면 정상 교차로
+  7개의 신호를 잘못 옮긴다.
+- **맵 귀속을 바꾸지 말 것. 재조사 금지** (2026-09-07 결론).
+
+### 무신호 정지선은 제어기가 수집 단계에서 버린다
+지도 전체 정지선 576개 중 **245개가 신호 미매핑**이다.
+
+- [route.py:355](vtd_adapter/route.py#L355) `collect_stops` 가
+  `controller_ids or signal_ids` 인 것만 모은다 → `VtdTrafficLight` 가 아예
+  안 만들어진다. PDM 정지표지 경로도 stub (`next_stop_signs` 전부 None).
+- 따라서 `kr_rules._stop_target_raw` 의 색 해석이 "신호 없음 → None" 으로
+  끝난다. **UNKNOWN 으로 세우지 않는다 — 세울 객체가 없으므로 잠기지도,
+  풀 조건이 필요하지도 않다.**
+- **무한 정지의 원인이 될 수 없다.** 로그 실측(2026-09-07, 36개 로그):
+  무신호 정지선 앞 통과 3,966틱에서 `reasons.stop_line` 이 **전부 null**,
+  속도 중앙 22.6 km/h, 그 지점 **최장 연속 정지 2.0 s**.
+- 무신호 정지선이 쓰이는 곳은 회피 억제(`_signal_zone`)와 큐 판정뿐이다.
 
 ## 진행 중 과제
 

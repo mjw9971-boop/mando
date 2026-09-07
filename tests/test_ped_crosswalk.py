@@ -39,6 +39,15 @@ LAT_MIN, LAT_MAX = SP['ped_release_lat_m'], SP['ped_crosswalk_lat_m']
 def cw_cfg(**kw):
     c = copy.deepcopy(CFG)
     c['speed']['ped_crosswalk_creep_enable'] = True
+    # 이 파일은 A-3(횡단보도 크립)만 본다. P4-M(다중 보행자 회랑 홀드)은 별개
+    # 기능이고 켜면 회랑 안 보행자에 v_allow=0 을 걸어 크립 후보가 winner 를
+    # 뺏긴다 (실측 2026-09-07: ped_multi_enable=true 에서 last_ped['wins']
+    # False). 그래서 **여기서는 명시적으로 꺼서** A-3 만 분리해 검사한다.
+    #
+    # **params 값이 정본이다** — `speed.ped_multi_enable` 의 기본값은 제어기
+    # 파트(팀원) 소관이라 이 테스트가 정하지 않는다. 위 상호작용이 의도인지도
+    # 팀원 판단이다 (`docs/BACKLOG.md` B-25).
+    c['speed']['ped_multi_enable'] = False
     c['speed'].update(kw)
     return c
 

@@ -107,8 +107,23 @@ def on_cfg():
     return c
 
 
-def test_params_present_default_off():
-    assert OT['shift_entry_enable'] is False
+def off_cfg():
+    """스위치를 강제로 끈 사본.
+
+    **params 값이 정본이다** — `overtake.shift_entry_enable` 의 기본값은 제어기
+    파트(팀원) 소관이라 이 테스트가 정하지 않는다. 기본값이 무엇이든 kill
+    switch 의 off 경로(배치 키 미출력·호출 인자 불변)는 계속 덮어야 하므로,
+    기본값을 읽는 대신 여기서 명시적으로 꺼서 검사한다 (2026-09-07,
+    `docs/BACKLOG.md` B-25).
+    """
+    c = copy.deepcopy(CFG)
+    c['overtake']['shift_entry_enable'] = False
+    return c
+
+
+def test_params_present_and_wired():
+    """키가 있는지와 부속 상수만 본다 — 기본값은 팀원 소관이라 강제하지 않는다."""
+    assert isinstance(OT['shift_entry_enable'], bool)
     assert OT['shift_entry_max_delay_m'] == 15.0 and OT['shift_entry_step_m'] == 0.5
     assert OT['shift_exit_min_after_m'] == 0.0
 
@@ -123,7 +138,7 @@ def test_lat_band_default_is_previous_behaviour():
 
 
 def test_off_no_placement_keys_and_same_call():
-    kr, p, ap = rig(CFG, [Car(2, FAR, 0.0), Car(3, 11.0, -D)])
+    kr, p, ap = rig(off_cfg(), [Car(2, FAR, 0.0), Car(3, 11.0, -D)])
     try_overtake(kr, ap, p, ego_speed=0.0)
     assert kr.ot_span is not None and kr.last_overtake == 'right'
     assert 'entry_delay_m' not in kr.last_avoid

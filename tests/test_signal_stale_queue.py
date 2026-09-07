@@ -25,6 +25,12 @@ CFG = load_params_yaml(PARAMS_YAML)
 OT = CFG['overtake']
 ON = copy.deepcopy(CFG)
 ON['overtake']['signal_stale_queue_enable'] = True
+# 스위치를 강제로 끈 사본. **params 값이 정본이다** — 이 키의 기본값은 제어기
+# 파트(팀원) 소관이라 이 테스트가 정하지 않는다. 기본값이 무엇이든 off 경로
+# (녹색 만료로 큐 해제 · 진단 키 없음)는 계속 덮어야 하므로 여기서 명시적으로
+# 꺼서 검사한다 (2026-09-07, 판정 근거는 docs/BACKLOG.md B-25).
+OFF = copy.deepcopy(CFG)
+OFF['overtake']['signal_stale_queue_enable'] = False
 STALE_TICKS = int(round(OT['signal_stale_s'] * CFG['comm']['send_hz']))
 
 
@@ -35,14 +41,15 @@ def feed(kr, p, ap, lights, n):
         kr._tick_cache(ap, p)
 
 
-def test_params_present_default_off():
-    assert OT['signal_stale_queue_enable'] is False
+def test_params_present():
+    """키가 있는지와 부속 상수만 본다 — 기본값은 팀원 소관이라 강제하지 않는다."""
+    assert isinstance(OT['signal_stale_queue_enable'], bool)
     assert OT['signal_stale_s'] == 1.0
 
 
 def test_off_keeps_green_expired_and_no_diag():
     """off: 미보고여도 이전 동작 — 녹색 만료로 큐 해제, 진단 키 없음."""
-    kr, p, ap = rig(xs=(40.0,), state=TrafficLightState.Green, d_tl=60.0)
+    kr, p, ap = rig(xs=(40.0,), state=TrafficLightState.Green, d_tl=60.0, cfg=OFF)
     kr.green_since_ticks = GREEN_TICKS
     feed(kr, p, ap, [], STALE_TICKS + 5)
     assert kr._tick_queue is False and kr.q_reject == 'green_expired'

@@ -49,8 +49,16 @@ def kr(**over):
 
 
 # ── 스위치 ──────────────────────────────────────────────────────────────
-def test_params_present_and_default_off():
-    assert OT['side_pick_enable'] is False
+def test_params_present():
+    """키가 있는지만 본다 — 기본값은 강제하지 않는다.
+
+    **params 값이 정본이다.** `overtake.side_pick_enable` 의 기본값은 제어기
+    파트(팀원) 소관이라 이 테스트가 정하지 않는다 (2026-09-07). 도입 커밋은
+    '기본 off' 였고 지금은 on 이다; 어느 쪽이 맞는지의 판정 근거는
+    `docs/BACKLOG.md` B-25. off/on 동작 자체는 아래
+    test_flag_read_from_params 가 두 값 모두로 덮는다.
+    """
+    assert isinstance(OT['side_pick_enable'], bool)
 
 
 def test_flag_read_from_params():

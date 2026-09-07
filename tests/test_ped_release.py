@@ -43,9 +43,25 @@ BACK_TICKS = int(round(SP['ped_backstop_s'] * HZ))
 DY = 1.0 / HZ                                   # 보행 1.0 m/s 의 틱당 이동
 
 
-def latched(cfg=CFG, y0=-5.0):
+def a1_cfg(cfg=CFG):
+    """A-1 해제 규칙만 분리해 보기 위한 사본 — P4-M 을 끈다.
+
+    이 파일은 A-1 의 **해제**(회랑 밖 ∧ 멀어짐 ∧ 정지/차도 밖, backstop 포함)가
+    대상이다. P4-M(`ped_multi_enable`)은 회랑 안 보행자를 별도 집합으로 계속
+    붙들어 해제 시점을 덮으므로, 켠 채로는 A-1 해제를 잴 수 없다. P4-M 의
+    홀드·드롭아웃 동작은 test_ped_multi 가 담당한다.
+
+    **params 값이 정본이다** — `speed.ped_multi_enable` 의 기본값은 제어기
+    파트(팀원) 소관이라 이 테스트가 정하지 않는다 (`docs/BACKLOG.md` B-25).
+    """
+    c = copy.deepcopy(cfg)
+    c['speed']['ped_multi_enable'] = False
+    return c
+
+
+def latched(cfg=None, y0=-5.0):
     """정지 관찰 → 걸어나옴 → 래치까지 만든 (kr, p, ap, w)."""
-    kr, p = KrRules(cfg), Planner()
+    kr, p = KrRules(a1_cfg() if cfg is None else cfg), Planner()
     w = Walker(4, 20.0, y0)
     ap = Ap(p, actors=[w])
     observe_static(kr, ap, p=p)
@@ -246,7 +262,7 @@ def test_reasons_ped_carries_diag_and_release():
     해제 틱에는 후보 없이 release 사유가 남는다."""
     p = Planner()
     w = Walker(4, 20.0, -5.0)
-    ap = make_ap(p, [w])
+    ap = make_ap(p, [w], cfg=a1_cfg())      # A-1 진단만 본다 (a1_cfg 주석 참조)
     kr = ap.kr_rules
     observe_static(kr, ap, p=p)
     walk(kr, ap, p, w, dy=+0.5 / HZ, ticks=1)

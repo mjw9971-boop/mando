@@ -55,6 +55,7 @@ sys.path.insert(0, str(ROOT))
 
 from build_route import (RouteError, build_route, junction_segments,   # noqa: E402
                          read_waypoints_csv, report as route_report)
+from finish_cone import finish_gate                                    # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph, wrap                       # noqa: E402
 
 TEMPLATE = ROOT / 'templates' / '9_clean_drive.xml'
@@ -587,6 +588,17 @@ def plc_cfg() -> dict:
         from vtd_adapter.config import load_params_yaml
         _PLC_CFG = load_params_yaml()['gen_placement']
     return _PLC_CFG
+
+
+_FULL_CFG = None     # params.yaml 전체 캐시 (콘 기하는 vehicle·percep 도 본다)
+
+
+def full_cfg() -> dict:
+    global _FULL_CFG
+    if _FULL_CFG is None:
+        from vtd_adapter.config import load_params_yaml
+        _FULL_CFG = load_params_yaml()
+    return _FULL_CFG
 
 
 _COV_CFG = None      # params.yaml gen_coverage 캐시 (후보 선별·추첨 상수의 단일 출처)
@@ -1334,11 +1346,51 @@ def blk_character_actions(name, trig_x, trig_y, radius, walk_speed, shape_id):
             f'        </CharacterActions>\n')
 
 
-def blk_object(name, x, y, z):
-    return (f'        <Object Type="other" Name="{name}" Definition="Fuelcan01">\n'
+def blk_object(name, x, y, z, definition='Fuelcan01'):
+    """정적 오브젝트 1개. definition 기본값은 장애물 체인이 쓰는 Fuelcan01 —
+    종료선 콘만 gen_placement.cone_model(라바콘)을 넘긴다."""
+    return (f'        <Object Type="other" Name="{name}" Definition="{definition}">\n'
             f'            <StartPosAbs X="{fnum(x)}" Y="{fnum(y)}" Z="{fnum(z)}" '
             f'Direction="0.0" Pitch="0.0" Roll="0.0"/>\n'
             f'        </Object>\n')
+
+
+def finish_cone_blocks(lg, rt) -> tuple[list, dict | None, list]:
+    """종료선 콘 2개의 <Object> 블록 → (blocks, gate, warnings).
+
+    이벤트가 아니라 **시나리오 전역 요소**다 (pulk 와 같은 축) — 종료 좌표는
+    경로가 정하지 이벤트가 정하지 않는다. 그래서 Ctx 이벤트 경로가 아니라
+    build_scenario 가 직접 부른다.
+
+    콘은 판정에 관여하지 않는다 (주최측 공지: 판정은 운영측 종료 지점 좌표
+    기준, 콘은 대략적 위치 표시). 그래서 회랑 여유가 모자라도 **경고만** 내고
+    배치는 한다 — 여기서 조용히 빼면 눈으로 확인할 수단이 사라진다.
+    """
+    cfg = full_cfg()
+    if not bool(plc_cfg().get('finish_cone_enable', True)):
+        return [], None, []
+    gate = finish_gate(lg, rt, cfg)
+    if gate is None:
+        return [], None, ['종료 좌표(finish_xy)를 경로에 투영하지 못해 콘 생략']
+    warn = []
+    if gate['lane_mismatch']:
+        # 마지막 경유점이 경로 차로의 **옆 차로**에 찍혔다 — 콘은 경유점 차로에
+        # 서고 ego 는 옆 차로로 지나므로 콘이 회랑에 걸리기 쉽다. 콘 문제가
+        # 아니라 그 경로의 문제라, 원인을 여기서 드러낸다.
+        warn.append(f"종료 좌표가 경로 차로 {gate['route_lane']} 가 아니라 "
+                    f"{gate['place_lane']} 에 있다 (경로 중심선에서 "
+                    f"{gate['t_finish']:+.2f} m) — 콘은 경유점 차로 기준으로 선다")
+    if gate['clear_min'] < 0.0:
+        warn.append(f"종료선 콘이 회피 회랑 안이다 (여유 {gate['clear_min']:+.2f} m "
+                    f"< 0) — 회피 로직이 장애물로 잡을 수 있다. "
+                    f"gen_placement.cone_margin_m 를 올릴 것")
+    elif gate['clear_min'] < 0.2:
+        warn.append(f"종료선 콘의 회랑 여유가 {gate['clear_min']:.2f} m 로 얇다 "
+                    f"(차로폭 {gate['lane_width']:.2f} m, 종료좌표 횡오프셋 "
+                    f"{gate['t_finish']:+.2f} m)")
+    blocks = [blk_object('FinishCone_L', *gate['left'], definition=gate['model']),
+              blk_object('FinishCone_R', *gate['right'], definition=gate['model'])]
+    return blocks, gate, warn
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2352,7 +2404,10 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
         doc.set_pulk(pulk_attrs(pulk))
     doc.add_players(ctx.players)
     doc.add_player_actions(ctx.actions)
-    doc.add_moving(ctx.moving)
+    cone_blocks, cone_gate, cone_warn = finish_cone_blocks(lg, rt)
+    for w in cone_warn:
+        print(f'  ⚠ {name}: {w}', file=sys.stderr)
+    doc.add_moving(ctx.moving + cone_blocks)
     for cid, (go, att, stop) in sorted(ctx.signals.items()):
         doc.set_signal(cid, go, att, stop)
     xml_text = doc.final(name)
@@ -2370,6 +2425,24 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
             if min_keep is not None else {}),
          'est_s': round(est_seconds(rt['total_length']), 1),
          'timeout_s': timeout_for(rt['total_length'])}
+    if cone_gate is not None:
+        # 재생성 없이 좌표를 대조할 수 있게 정의에 남긴다 (검증·현장 확인용).
+        d['finish_cone'] = {
+            'model': cone_gate['model'],
+            'place_lane': list(cone_gate['place_lane']),
+            'route_lane': list(cone_gate['route_lane']),
+            'lane_mismatch': bool(cone_gate['lane_mismatch']),
+            'finish_xy': [round(v, 3) for v in cone_gate['finish_xy']],
+            'finish_s': round(cone_gate['finish_s'], 2),
+            't_finish': round(cone_gate['t_finish'], 3),
+            'lane_width_m': round(cone_gate['lane_width'], 3),
+            'half_gate_m': round(cone_gate['half_gate'], 3),
+            'left': [round(v, 3) for v in cone_gate['left']],
+            'right': [round(v, 3) for v in cone_gate['right']],
+            'lat': [round(cone_gate['lat_left'], 3), round(cone_gate['lat_right'], 3)],
+            'reach_m': round(cone_gate['reach'], 3),
+            'clear_m': [round(cone_gate['clear_left'], 3),
+                        round(cone_gate['clear_right'], 3)]}
     return xml_text, d, bad
 
 

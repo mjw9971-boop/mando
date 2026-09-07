@@ -357,13 +357,12 @@ PDM 판단 상수는 `team_code/config.py` 가 단일 출처다 (§4).
 | 1 | 점멸(state 6) 황/적 구분 | `signal.flash_mode` — **키 없음**. 현재 [route.py:84](vtd_adapter/route.py#L84) 에서 Green 하드코딩. 조직위 문의 |
 | 2 | 지시등 선행 "n초" 규정값 | `signal.lc_lead_s` 3.0 / `signal.turn_lead_s` 4.0 (가정값). 규정 확정되면 yaml 만 고치면 된다 |
 | 3 | RTOR 허용 여부 | `signal.rtor_enabled` — **키 없음**. 미구현 |
-| 4 | 스쿨존 비신호 횡단보도 일시정지 채점 여부 | 폴백 오정지 위험 46곳과 상충 — 규정 후 결정. 폴백②도 현재 미구현 |
-| 5 | RM_518 = 스쿨존 30 | 텍스처 미검증. `build_lane_graph` [SPEED_MARKS](tools/build_lane_graph.py#L680) 가 30 으로 가정 |
-| 6 | 5분 초과 처리 | `speed.margin_kph` 전략 직결 (현 평균 26–31 km/h). 검출은 `score.time_limit_s` |
-| 7 | 횡단보도 보행자 → 정지선 정지 + shield 우선순위 | **미구현**. 현재는 PDM forecast 충돌 회피로만 처리 |
-| 8 | 라우터: 연속 LC 이격 / waypoint 짝으로 진출차로 특정 | 미착수 |
-| 9 | junction 6 신호가 대회날 켜지는지 | 연습 환경 state=0 고정 — 당일 첫 수 초 확인. state 0 처리는 §8 질문 1 |
-| 10 | `scoring.finish_xy` 미확보 | null 이면 route_s 임계 폴백 + 경고 [kr_rules.py:104-125](team_code/kr_rules.py#L104-L125) |
+| 4 | RM_518 = 스쿨존 30 | 텍스처 미검증. `build_lane_graph` [SPEED_MARKS](tools/build_lane_graph.py#L680) 가 30 으로 가정 |
+| 5 | 5분 초과 처리 | `speed.margin_kph` 전략 직결 (현 평균 26–31 km/h). 검출은 `score.time_limit_s` |
+| 6 | 횡단보도 보행자 → 정지선 정지 + shield 우선순위 | **미구현**. 현재는 PDM forecast 충돌 회피로만 처리 |
+| 7 | 라우터: 연속 LC 이격 / waypoint 짝으로 진출차로 특정 | 미착수 |
+| 8 | junction 6 신호가 대회날 켜지는지 | 연습 환경 state=0 고정 — 당일 첫 수 초 확인. state 0 처리는 §8 질문 1 |
+| 9 | `scoring.finish_xy` 미확보 | null 이면 route_s 임계 폴백 + 경고 [kr_rules.py:104-125](team_code/kr_rules.py#L104-L125) |
 
 ## 8. 규격 vs 코드 — 판단 보류 (팀 확인 필요)
 

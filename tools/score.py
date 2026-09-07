@@ -64,6 +64,10 @@ sys.path.insert(0, str(_ROOT / 'team_code'))
 from kr_rules import plan_stop_s                               # noqa: E402 — 제어와 공용 (단일 출처)
 from vtd_adapter.config import end_margin_m, load_params_yaml  # noqa: E402
 
+sys.path.insert(0, str(_ROOT / 'tools'))
+from finish_cone import (between_cones, finish_gate,          # noqa: E402 — 생성기와 공용
+                         gate_span, lat_of, project_route)
+
 # 정보성 집계 — 위반 총계(n_violations)에 넣지 않는다.
 # overtime: 안내문 채점 규칙에 없음 (20분은 세팅 포함 운영 시간, 완주 시간은
 # 동점 타이브레이커) — 검출은 유지하되 정보로 강등 (2026-08-27).
@@ -517,17 +521,12 @@ def detect_center_line(ticks: list[dict], t0: float, lg, veh_width: float,
 
 def _route_project(lg, route, x: float, y: float):
     """점 (x,y) → 경로 차로들 중 최근접 투영.
-    반환 (dist, lane_key, s_in_lane, t_signed(좌 +), route_s) 또는 None."""
-    best = None
-    for i, k in enumerate(route['lanes']):
-        try:
-            s_p, t_p, d_p, _ = lg.project(tuple(k), x, y)
-        except KeyError:
-            continue
-        if best is None or d_p < best[0]:
-            best = (float(d_p), tuple(k), float(s_p), float(t_p),
-                    float(route['cum_s'][i]) + float(s_p))
-    return best
+    반환 (dist, lane_key, s_in_lane, t_signed(좌 +), route_s) 또는 None.
+
+    정의는 tools/finish_cone.project_route 한 곳이다 — 종료선 콘 게이트와
+    완주 판정(finish_s)이 같은 투영을 봐야 표시와 판정이 어긋나지 않는다.
+    """
+    return project_route(lg, route, x, y)
 
 
 def detect_pedestrian_response(ticks: list[dict], t0: float, lg, route, sc: dict,
@@ -1304,7 +1303,10 @@ def detect_finish(ticks: list[dict], t0: float, route, cfg: dict,
             if res['wall_s'] > limit_s:
                 overtime.append(_ev(ticks, t0, len(ticks) - 1, len(ticks) - 1,
                                     finish_time_s=None, limit_s=limit_s))
-    return {'summary': res, 'not_finished': not_finished, 'overtime': overtime}
+    # hit/peak_i 는 판정에 이미 쓴 값이다 — 콘 게이트 **표시**가 같은 틱을 보게
+    # 그대로 내보낸다 (표시 쪽에서 다시 계산하면 규칙이 두 벌이 된다).
+    return {'summary': res, 'not_finished': not_finished, 'overtime': overtime,
+            'hit_i': hit if route is not None else None, 'peak_i': peak_i}
 
 
 def detect_stall(ticks: list[dict], t0: float, cfg: dict) -> list:
@@ -1342,6 +1344,83 @@ def resolve_finish_xy(cfg: dict, route) -> list | None:
     if (cfg.get('route_end') or {}).get('finish_xy_from_route_enable', True):
         return (route or {}).get('finish_xy')
     return None
+
+
+def finish_gate_report(ticks: list[dict], t0: float, lg, route, cfg: dict,
+                       finish_s: float | None, fin: dict) -> dict | None:
+    """종료선 통과의 **표시**용 상세 — 완주 판정은 건드리지 않는다.
+
+    주최측 공지: 종료 지점은 정지선 위 라바콘 2개로 표시되지만 "콘은 대략적
+    위치 표시이고 실제 판정은 운영측 제공 종료 지점 좌표 기준" 이다. 그래서
+    완주 여부(detect_finish)는 종전대로 finish_s 도달로만 내고, 여기서는
+
+      · 뒷축이 종료선을 넘은 시각 · route_s · 여유 거리
+      · 그 시점의 횡오프셋이 두 콘 사이였는가 (아니면 "콘 밖" 표시)
+      · 못 넘었으면 남은 거리
+
+    를 낼 뿐이다. between=False 여도 done 은 바뀌지 않는다.
+
+    반환 키: done / t_s / route_s / margin_m / remain_m / lat / between /
+             gate_lo / gate_hi / gate (finish_cone.finish_gate 결과 요약)
+    """
+    if lg is None or route is None or finish_s is None:
+        return None
+    gate = finish_gate(lg, route, cfg)
+    if gate is None:
+        return None
+    lo, hi = gate_span(gate)
+    out = {'done': bool(fin['summary']['done']),
+           'model': gate['model'], 'enable': gate['enable'],
+           'gate_lo': round(lo, 2), 'gate_hi': round(hi, 2),
+           'gate_w': round(hi - lo, 2),
+           'left': [round(v, 2) for v in gate['left']],
+           'right': [round(v, 2) for v in gate['right']],
+           'lane_mismatch': bool(gate['lane_mismatch']),
+           'clear_min': round(gate['clear_min'], 2),
+           't_s': None, 'route_s': None, 'margin_m': None,
+           'remain_m': None, 'lat': None, 'between': None}
+
+    # 경로에서 이만큼 넘게 떨어진 틱의 lat 은 표시하지 않는다. 접선 연장
+    # 투영(tangent_ends)은 폴리라인 **끝점 밖** 점의 t 를 무한 접선까지의
+    # 수직거리로 재기 때문에, 로그와 경로가 어긋난 런에서는 수백 m 로 튄다
+    # (실측 2026-09-07: 경로 불일치 로그에서 +881.33 m). 게이트 밖 몇 m 를
+    # 넘어가면 "콘 사이를 지났는가" 자체가 성립하지 않으므로 —(표시 없음)로 둔다.
+    lat_max = gate['half_gate'] + 5.0
+
+    def _lat(i):
+        e = ticks[i]['ego']
+        if e.get('x') is None or e.get('y') is None:
+            return None
+        # 콘 lat 과 **같은 자**(통과 차로 접선 투영)로 잰다 — finish_cone.lat_of.
+        # 경로 전체 최근접으로 재면 종료선 직전 차선변경 구간에서 옆 차로에
+        # 붙는다 (finish_gate 의 lat 주석 참조).
+        v = lat_of(lg, gate, float(e['x']), float(e['y']))
+        return None if abs(v) > lat_max else v
+
+    hit = fin.get('hit_i')
+    if hit is None:
+        # 미완주 — 요구는 "남은 거리" 뿐이다. 최원점의 횡오프셋은 종료선에서
+        # 멀 수 있어(여기선 258 m) 콘과 무관한 값이라 내지 않는다.
+        out['remain_m'] = round(float(finish_s) - float(fin['summary']['peak_route_s']), 2)
+        return out
+    s_hit = float(ticks[hit]['ego']['route_s'])
+    out['t_s'] = round(ticks[hit]['t'] - t0, 1)
+    out['route_s'] = round(s_hit, 1)
+    out['margin_m'] = round(s_hit - float(finish_s), 2)
+    # 통과 틱은 종료선을 **이미 지난** 첫 틱이라 그 자리의 lat 을 그대로 쓰면
+    # 최대 1틱분(50 km/h 에서 ~0.7 m) 뒤로 밀린 지점을 보게 된다. 직전 틱과
+    # route_s 로 선형보간해 종료선 **위**의 lat 을 낸다 (표시 정밀도 문제일 뿐,
+    # 판정과는 무관하다).
+    lat = _lat(hit)
+    if hit > 0 and lat is not None:
+        lat0, s0 = _lat(hit - 1), float(ticks[hit - 1]['ego']['route_s'])
+        if lat0 is not None and s_hit > s0:
+            u = min(1.0, max(0.0, (float(finish_s) - s0) / (s_hit - s0)))
+            lat = lat0 + u * (lat - lat0)
+    if lat is not None:
+        out['lat'] = round(lat, 2)
+        out['between'] = bool(between_cones(gate, lat))
+    return out
 
 
 def _severity(cat: str, ev: dict, sc: dict) -> str:
@@ -1603,6 +1682,15 @@ def analyze(log_path: str, cfg: dict, lg=None, route=None,
             rep['warnings'].append(
                 f'계획 정지점(뒷축 {planned_stop:.1f} m)이 종료선(finish_s '
                 f'{float(finish_s):.1f} m)을 못 넘는다 — 정상 정지해도 미완주 채점')
+        # 종료선 콘 게이트 — **표시 전용**. done/감점은 위에서 이미 확정됐고
+        # 이 결과는 어디에도 되먹임되지 않는다 (주최측: 판정은 종료 좌표 기준).
+        gate_rep = finish_gate_report(span, t0, lg, route, cfg, finish_s, fin)
+        if gate_rep is not None:
+            rep['finish']['gate'] = gate_rep
+            if gate_rep['lane_mismatch']:
+                rep['warnings'].append(
+                    '종료 좌표가 경로 차로가 아닌 옆 차로에 있다 — 콘이 주행 '
+                    f"회랑에 걸릴 수 있다 (회랑 여유 {gate_rep['clear_min']:+.2f} m)")
     V['not_finished'] = {'count': 0, 'events': fin['not_finished']}
     V['overtime'] = {'count': 0, 'events': fin['overtime']}
 
@@ -1691,6 +1779,20 @@ def render(rep: dict) -> str:
         if f.get('finish_s') is not None:
             L.append(f"종료선: finish_s {f['finish_s']} m  계획 정지 뒷축 "
                      f"{f['planned_stop_s']} m  여유 {f['margin_m']:+.2f} m")
+        g = f.get('gate')
+        if g:
+            # 표시 전용 — 위 '완주:' 줄의 판정과 무관하다 (콘 밖이어도 완주는 완주).
+            lat = '—' if g['lat'] is None else f"{g['lat']:+.2f}"
+            if g['route_s'] is not None:
+                where = ('두 콘 사이 통과' if g['between']
+                         else '**종료선은 넘었으나 콘 밖**' if g['between'] is False
+                         else '콘 통과 여부 판단불가(ego 좌표 없음)')
+                L.append(f"콘 게이트: {where}  t {g['t_s']} s  route_s {g['route_s']} m"
+                         f" (종료선 {g['margin_m']:+.2f} m)  횡오프셋 {lat} m"
+                         f" ∈ [{g['gate_lo']:+.2f}, {g['gate_hi']:+.2f}]")
+            else:
+                L.append(f"콘 게이트: **종료선 미통과** — 남은 거리 "
+                         f"{g['remain_m']:.2f} m  (게이트 폭 {g['gate_w']:.2f} m)")
     if 'speed_groups' in rep:
         L.append('구간별 속도: ' + '  '.join(
             f"[{k}] {g['ticks']}틱 v_max {g['v_max']:.1f}"
