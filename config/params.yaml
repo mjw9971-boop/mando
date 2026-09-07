@@ -104,7 +104,7 @@ red_zone:
   #         speed_limit 이 None 이 되어 런타임 carry 가 앞 값(대개 50)을 물고 간다.
   #         붉은 구간의 감속은 red_zone(아래) 이 따로 책임진다.
   # true  = 이전 동작 (30 표시 = 제한속도 30).
-  roadmark_30_as_limit: false
+  roadmark_30_as_limit: true
   # 호환 모드 — red_spans 를 **읽지 않는** 제어기가 붉은 차로에서 최소한 30 을
   # 읽게, 차로 단위 speed_limit 도 limit_kph 로 세운다 (speed_src='red_compat').
   # 팀원 브랜치·구 배포가 이 lane_graph 를 그대로 쓸 수 있게 하는 안전망이다.
