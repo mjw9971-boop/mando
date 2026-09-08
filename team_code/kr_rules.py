@@ -279,6 +279,8 @@ class KrRules:
         # 종료 구간 정적 장애물 무시 (실주행 1차 [1](b)). 꺼지면 이전 동작.
         self.fg_ignore = bool(sp.get('finish_gate_ignore_enable', False))
         self.fg_m = float(sp.get('finish_gate_m', 10.0))
+        # A3: 미보고 신호 시한이 **정지 앞차가 있어도** 돌게 한다. off = 이전 동작.
+        self.sig_lead_ok = bool(ot.get('signal_timeout_with_lead_enable', False))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -3262,13 +3264,25 @@ class KrRules:
         if self._sig_go and (not stale or tl_id != self._sig_go_tl):
             self._sig_go = False                          # 보고 재개 / 다음 신호로 넘어감
             self._sig_go_tl = None
+        # A3: 앞차 판정. 기본은 이전 동작 — 회랑에 정지 객체가 하나라도 있으면
+        # 시계가 안 돈다. 스위치를 켜면 **정지** 객체는 막지 않는다: 시한이
+        # 만료돼도 푸는 것은 신호 유래 정지 후보뿐이고(_stop_target → None)
+        # PDM 의 선행차 IDM 은 그대로 살아 앞차 뒤에 선다. "신호를 못 봐서 서
+        # 있는 것" 만 풀고 "앞차 때문에 서 있는 것" 은 안 푼다.
+        lead_block = bool(self._tick_corridor) and not self.sig_lead_ok
         ok = stale and self._stop_target_raw(planner, ap) is not None \
-            and ego_speed < self.latch_v and not self._tick_corridor \
+            and ego_speed < self.latch_v and not lead_block \
             and not (self.ped_intent or self.ped_hold_ids) \
             and not (getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False))
         if ok:
-            moving = self._corridor_blockers(ap, planner, static_ok=lambda _a: True)
-            ok = not any(b[0] <= self.sig_timeout_clear_m for b in moving)
+            # 스위치가 꺼져 있으면 static_ok=True 그대로 (정지 객체까지 센다).
+            # 켜면 **실제로 움직이는** 차량만 본다 — 임계는 blocker_speed_max
+            # ("회피가 정지로 보는 속도")를 그대로 읽는다.
+            near = self._corridor_blockers(
+                ap, planner,
+                static_ok=(lambda a: float(getattr(a, 'speed', 0.0)) >= self.ot_v_max)
+                if self.sig_lead_ok else (lambda _a: True))
+            ok = not any(b[0] <= self.sig_timeout_clear_m for b in near)
         self._sig_wait_ticks = self._sig_wait_ticks + 1 if ok else 0
         if ok and self._sig_wait_ticks >= self.sig_timeout_ticks and not self._sig_go:
             self._sig_go = True

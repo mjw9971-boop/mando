@@ -36,6 +36,11 @@ ON['overtake']['signal_timeout_go_enable'] = True
 OFF = copy.deepcopy(CFG)
 OFF['overtake']['signal_timeout_go_enable'] = False
 OFF['overtake']['signal_stale_queue_enable'] = False
+# A3 스위치 — off/on 사본. **기본값을 읽지 않는다** (2026-09-07 드리프트 원칙).
+LEAD_OFF = copy.deepcopy(ON)
+LEAD_OFF['overtake']['signal_timeout_with_lead_enable'] = False
+LEAD_ON = copy.deepcopy(ON)
+LEAD_ON['overtake']['signal_timeout_with_lead_enable'] = True
 STALE = int(round(OT['signal_stale_s'] * HZ))
 TIMEOUT = int(round(OT['signal_unknown_timeout_s'] * HZ))
 
@@ -89,9 +94,43 @@ def test_reported_again_restores_stop():
 
 
 def test_stopped_vehicle_ahead_holds():
-    kr, p, ap = red_rig(xs=(10.0,))                        # 정지 회랑 객체
+    """이전 동작 — 정지 앞차가 하나라도 있으면 시계가 아예 안 돈다."""
+    kr, p, ap = red_rig(cfg=LEAD_OFF, xs=(10.0,))          # 정지 회랑 객체
     step(kr, p, ap, n=STALE + TIMEOUT + 5)
     assert kr._stop_target(p, ap) is not None and kr.last_signal['timeout_s'] == 0.0
+
+
+# ── A3: 정지 앞차가 있어도 시한이 돈다 (signal_timeout_with_lead_enable) ──
+# 왜: 같은 상황을 막아 주던 다른 안전망도 같이 죽는다 — _is_queue_v2 는 UNKNOWN
+# 큐에 "해제 시한이 없다" 고 명시한다. 미보고 신호 + 안 움직이는 앞차 =
+# **두 안전망이 동시에 죽어 무한 정지**다.
+# 안전한 이유: 시한이 만료돼도 푸는 것은 신호 유래 정지 후보뿐이고
+# (_stop_target → None), PDM 의 선행차 IDM 은 그대로 살아 앞차 뒤에 선다.
+
+def test_stopped_lead_no_longer_blocks_the_clock():
+    kr, p, ap = red_rig(cfg=LEAD_ON, xs=(10.0,))
+    step(kr, p, ap, n=STALE + TIMEOUT + 5)
+    assert kr._stop_target(p, ap) is None                  # 신호 후보만 풀렸다
+    assert kr.last_signal['timeout_go'] is True
+
+
+def test_stopped_lead_release_does_not_touch_the_lead_candidate():
+    """푸는 것은 신호뿐이다 — 앞차는 여전히 회랑에 있고 PDM 이 그 뒤에 선다."""
+    kr, p, ap = red_rig(cfg=LEAD_ON, xs=(10.0,))
+    step(kr, p, ap, n=STALE + TIMEOUT + 5)
+    assert kr._stop_target(p, ap) is None
+    assert len(kr._tick_corridor) == 1                     # 앞차 판정은 그대로다
+
+
+def test_moving_lead_still_blocks_with_the_switch_on():
+    """움직이는 차량은 켜도 막는다 — 실제로 흘러가는 중이면 기다리는 게 맞다."""
+    kr, p, ap = red_rig(cfg=LEAD_ON)
+    mv = Box(9, OT['signal_timeout_clear_m'] - 1.0, 0.0)
+    mv.speed = 5.0
+    ap._world = World([mv])
+    step(kr, p, ap, n=STALE + TIMEOUT + 5)
+    assert kr._stop_target(p, ap) is not None
+    assert kr.last_signal['timeout_s'] == 0.0
 
 
 def test_moving_vehicle_within_clear_m_holds():
@@ -109,6 +148,24 @@ def test_moving_vehicle_beyond_clear_m_does_not_hold():
     mv.speed = 5.0
     ap._world = World([mv])
     step(kr, p, ap, n=STALE + TIMEOUT)
+    assert kr._stop_target(p, ap) is None
+
+
+def test_missing_light_object_needs_no_release():
+    """통신 끊김의 다른 형태 — 플래너에 신호 객체 자체가 없는 경우.
+
+    이때는 _signal_stale 이 None 이라 시계가 안 돌지만, **풀 것도 없다**:
+    _stop_target_raw 가 "신호 없음 → None" 이라 애초에 정지 후보를 안 만든다.
+    무한 정지의 원인이 될 수 없다 (CLAUDE.md '무신호 정지선' 확정 사실과 같은 축).
+
+    실제 통신 끊김(신호 객체는 남고 보고만 끊김)은 위 test_on_releases… 가 재는
+    경로다 — 플래너 state 가 마지막 값(Red)으로 남고 _light_seen 나이가 쌓여
+    stale 이 된다.
+    """
+    kr, p, ap = red_rig(cfg=LEAD_ON)
+    p.next_traffic_lights = [None] * len(p.route_s)
+    step(kr, p, ap, n=STALE + TIMEOUT + 5)
+    assert kr._stop_target_raw(p, ap) is None              # 정지 후보 자체가 없다
     assert kr._stop_target(p, ap) is None
 
 
