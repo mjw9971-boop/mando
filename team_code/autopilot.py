@@ -208,6 +208,19 @@ class AutoPilot:                                             # VTD: leaderboard 
         actors = self._world.get_actors()
         vehicles = list(actors.filter("*vehicle*"))
 
+        # VTD: 종료 구간(종료선 앞 speed.finish_gate_m)의 **정지 객체**를 뺀다.
+        # 주최측이 종료 지점에 놓는 라바콘이 좁은 연결로에서 주행 회랑에 들어와
+        # PDM 의 vehicle 후보를 0 으로 만든다 — 실측 20260908_222954/실경로_02:
+        # 종료선 3.7 m 앞에서 483틱 정지(미완주). kr 쪽 회랑에서 빼는 것만으로는
+        # PDM 의 forecast·OBB 가 그대로 보므로 여기서도 뺀다.
+        # 판정은 kr_rules.finish_gate_drop 한 곳뿐이고
+        # speed.finish_gate_ignore_enable=false 면 아무것도 안 뺀다(이전 동작).
+        _fg = getattr(self, "kr_rules", None)
+        if _fg is not None:
+            _pl = self._waypoint_planner
+            actors = type(actors)(a for a in actors if not _fg.finish_gate_drop(_pl, a))
+            vehicles = [a for a in vehicles if not _fg.finish_gate_drop(_pl, a)]
+
         # Manage route obstacle scenarios and adjust target speed
         target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = (
             self._manage_route_obstacle_scenarios(
