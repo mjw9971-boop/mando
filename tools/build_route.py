@@ -578,19 +578,53 @@ def lane_r_min(lg, key):
     return (1.0 / m) if m > 1e-6 else float('inf')
 
 
+def banned_r_min_m():
+    """연결로 통행 금지 임계 R_min [m] — route.banned_r_min_m (기본 3.0).
+
+    옛 임계는 최소회전반경 × vehicle.min_turn_margin (= 5.65 m) 이었다.
+    2026-09-08 완화: 지도가 실도로 기반이라 연결로는 실차가 도는 길이고,
+    이탈 실측 4/4 는 커브 감속 없이 25 km/h 로 진입한 결과였다. 이제
+    speed.curvature_cap 이 R 에 맞춰 눌러 준다. 규정상 우회가 급회전보다
+    나쁘므로(경로 이탈 감점), 금지는 **지도 결함 안전망**으로만 남긴다.
+    """
+    return float((route_cfg() or {}).get('banned_r_min_m', 3.0))
+
+
+def curvature_a_lat_max_m_s2():
+    """제어기 커브 감속의 허용 횡가속 [m/s²] — speed.curvature_a_lat_max.
+
+    리포트에서 "급회전 연결로에 몇 m/s 로 들어가는가" 를 보여 주기 위해서만
+    읽는다 (제어기 파트 키다 — 여기서는 읽기 전용). 커브 감속이 꺼져 있으면
+    상한이 없다는 뜻이라 None 대신 0 을 쓰지 않고, 값 자체는 그대로 보여 준다.
+    """
+    try:
+        from vtd_adapter.config import load_params_yaml
+        return float((load_params_yaml().get('speed') or {})
+                     .get('curvature_a_lat_max', 2.5))
+    except Exception:                                    # noqa: BLE001 — 독립 실행 폴백
+        return 2.5
+
+
+def tight_turn_r_m():
+    """'급회전' 경고 상한 [m] = 기하 최소회전반경 × vehicle.min_turn_margin.
+
+    banned 임계와 이 값 사이 구간은 **통행하되 감속 진입**으로 다룬다.
+    """
+    r_need, margin = min_turn_radius_m()
+    return r_need * margin
+
+
 def infeasible_connectors(lg):
     """
     물리적으로 돌 수 없는 교차로 연결로 집합.
 
-    junction 연결로의 R_min 이 (최소회전반경 × vehicle.min_turn_margin) 미만이면
-    풀락으로도 호를 못 따라간다 — 9_school_route 실측(2026-08-24): junction 25 의
-    (1576,0,-1) R_min 2.55 m 를 최단이라고 골랐다가 조향 포화 1.8 s 끝에 호를
-    이탈해 off_route 정지. 같은 교차로에 R 56.6 m 대안(1573)이 있었다.
+    R_min < route.banned_r_min_m (기본 3.0 m) 인 junction 연결로만 금지한다.
+    9_school_route 실측(2026-08-24)의 (1576,0,-1) R_min 2.55 m — 조향 포화
+    1.8 s 끝에 호를 이탈해 off_route 정지 — 는 이 임계에도 계속 걸린다.
     곡률 스파이크는 빌드 단계에서 이미 걸렀으므로(중앙값 필터) 남은 값은 진짜
     기하다 — 그대로 평가한다.
     """
-    r_min, margin = min_turn_radius_m()
-    thr = r_min * margin
+    thr = banned_r_min_m()
     out = {}
     for key, rec in lg.lanes.items():
         if rec['junction'] == -1:
@@ -1991,8 +2025,23 @@ def build_route(lg, waypoints, radius=8.0, start_yaw=None, junction_segs=frozens
             print(f'  경로 꼬리 연장: 잔여 {tail0:.1f} m < 요구 {finish_tail_m:g} m → '
                   f'{" → ".join(str(k) for k in added)}  (꼬리 {tail:.1f} m)')
 
+    # 급회전 연결로 (banned 임계 ≤ R_min < 기하 최소회전반경) — 통행은 하되
+    # 리포트 WARN + 여기에 기록한다. 커브 감속(speed.curvature_cap)이 이 R 에
+    # 맞춰 속도를 눌러 주므로 금지 대신 '감속 진입'으로 다룬다 (2026-09-08).
+    tight_thr = tight_turn_r_m()
+    tight_turns = []
+    for i, k in enumerate(lanes):
+        if lg.lanes[k]['junction'] == -1:
+            continue
+        r = lane_r_min(lg, k)
+        if turn_thr <= r < tight_thr:
+            tight_turns.append({'lane': list(k), 'r_min_m': round(r, 2),
+                                's_m': round(float(cum[i]), 1),
+                                'junction': int(lg.lanes[k]['junction'])})
+
     rt = {'lanes': lanes, 'cum_s': cum, 'lengths': lengths, 'total_length': total, 'start_s_in_lane': s_first,
             'infeasible_forced': forced_infeasible, 'turn_radius_thr_m': turn_thr,
+            'tight_turns': tight_turns, 'tight_turn_thr_m': tight_thr,
             'pair_fallbacks': pair_fallbacks, 'dp': dp_info,
             'finish_xy': [float(waypoints[-1][0]), float(waypoints[-1][1])],
             'waypoints': [tuple(w) for w in waypoints], 'waypoint_s': wp_dist, 'events': events,
@@ -2430,12 +2479,20 @@ def report(lg, rt, radius, warn_dev=None):
                   f"{mark} 누적 {need:5.1f} / 차로 {room:6.1f} m{note}")
 
     # ── [5] 회전 가능성 — 회전 이벤트가 지나는 연결로들의 최소 곡률반경 ──────
-    # R_min < 최소회전반경 × vehicle.min_turn_margin 이면 풀락으로도 못 돈다
-    # (9_school_route 실측: R 2.55 m 연결로 선택 → 호 이탈 → off_route 정지).
+    # 금지는 route.banned_r_min_m (기본 3.0) 미만 = 지도 결함 안전망뿐이다.
+    # 그 위 ~ 기하 최소회전반경 사이는 **급회전**: 통행하되 WARN 이고,
+    # speed.curvature_cap 이 √(a_lat_max·R) 로 진입속도를 눌러 준다.
+    # (9_school_route 실측 R 2.55 m 연결로 → 호 이탈 → off_route 정지는
+    #  3.0 임계에도 계속 걸린다.)
     r_need, margin = min_turn_radius_m()
-    thr = rt.get('turn_radius_thr_m', r_need * margin)
-    print(f"\n[5] 회전 가능성  (금지 임계 R < {thr:.2f} m = 최소회전반경 {r_need:.2f} × {margin:g};"
-          f"  {thr:.2f}~{r_need:.2f} m 는 '빠듯' — 포화·차로폭 여유로 통과)")
+    thr = rt.get('turn_radius_thr_m', banned_r_min_m())
+    tight_thr = rt.get('tight_turn_thr_m', r_need * margin)
+    a_lat = curvature_a_lat_max_m_s2()
+    # 임계는 **그 경로를 지을 때 쓴 값**(pkl 기록)이다 — 지금 params 와 다를 수
+    # 있으므로(옛 pkl 재검증) 같을 때만 키 이름을 붙인다.
+    src = ' = route.banned_r_min_m' if abs(thr - banned_r_min_m()) < 1e-9 else ' (이 pkl 을 지을 때 값)'
+    print(f"\n[5] 회전 가능성  (금지 임계 R < {thr:.2f} m{src} — 지도 결함 안전망;"
+          f"\n     {thr:.2f}~{tight_thr:.2f} m 는 '급회전' — 통행 허용, 커브 감속 진입)")
     lanes_list = rt['lanes']
     cum = rt['cum_s']
     for e in ev:
@@ -2448,12 +2505,26 @@ def report(lg, rt, radius, warn_dev=None):
         for i, k in conns:
             r = lane_r_min(lg, k)
             bad = r < thr
-            tight = (not bad) and r < r_need
-            note = '   <= ⚠ 회전 불가 기하' if bad else ('   (빠듯 — 조향 포화 예상)' if tight else '')
+            tight = (not bad) and r < tight_thr
+            if bad:
+                note = '   <= ⚠ 회전 불가 기하'
+            elif tight:
+                note = (f"   <= [경고] 급회전 연결로 R {r:.2f} — 감속 진입"
+                        f" (v ≤ {math.sqrt(a_lat * r):.2f} m/s)")
+            else:
+                note = ''
             print(f"  {e['s']:8.1f} m  {e['kind']:<11} 연결로 {str(k):<16} "
                   f"R_min {r:8.2f} m{note}")
             if bad:
                 errs += 1              # ERROR — 풀락으로도 못 도는 기하
+    # 급회전 집계는 rt['tight_turns'] 를 정본으로 센다 — 위 이벤트 루프는 한
+    # 연결로를 여러 이벤트에서 다시 찍을 수 있고, 회전 이벤트가 안 붙은
+    # 직진 통과 연결로는 아예 안 찍힌다.
+    for tt in rt.get('tight_turns') or []:
+        r = float(tt['r_min_m'])
+        print(f"  [경고] {tt['s_m']:8.1f} m  급회전 연결로 {tuple(tt['lane'])} "
+              f"R {r:.2f} m — 감속 진입 (v ≤ {math.sqrt(a_lat * r):.2f} m/s)")
+        warns += 1                     # WARN — 통행 가능, 커브 감속이 받쳐 준다
     forced = rt.get('infeasible_forced', [])
     for wi, k, r in forced:
         print(f"  ⚠ 구간 {wi}: 대안 경로가 없어 회전 불가 연결로 {k} (R_min {r:.2f} m) 를 "

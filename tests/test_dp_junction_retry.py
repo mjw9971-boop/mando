@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import build_route as BR                                        # noqa: E402
 from vtd_adapter.config import load_params_yaml                 # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
+from conftest import banned_r_min, legacy_banned_r_min          # noqa: E402
 
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
 CFG = load_params_yaml()
@@ -163,8 +164,15 @@ def test_ratio_trigger_fires_where_penalty_does_not(lg):
 
 # ── 경로 결과 ─────────────────────────────────────────────────────────────
 def test_off_takes_the_771m_detour(lg):
+    """재시도 off ⇒ 29 m 직선 자리에 771 m 우회 (머리 주석의 실측 그대로).
+
+    금지 임계도 그 실측 당시 값(5.65 m)으로 고정한다 — 우회로가 어느 차로를
+    지나는지는 어느 연결로가 막혀 있느냐에 딸린 값이라, 2026-09-08 완화
+    (기본 3.0, docs/BACKLOG.md B-29) 로 차로 수가 48 → 49 로 바뀐다. 여기서
+    보려는 계약(재시도가 없으면 우회한다)은 임계와 무관하다.
+    """
     pts = wps()
-    with dp(OFF):
+    with banned_r_min(legacy_banned_r_min()), dp(OFF):
         rt = build(lg, pts)
     assert not (rt['dp'].get('retries') or [])
     assert len(rt['lanes']) == 48

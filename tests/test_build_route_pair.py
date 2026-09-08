@@ -26,14 +26,16 @@ from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
 
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
 RADIUS = 8.0
-# waypoints.csv · tests/fixtures/waypoints.csv 임시 제외 (2026-09-04, 작업13-2).
-# vehicle.min_turn_margin 0.7 → 1.0 (임계 3.96 → 5.65 m) 으로 두 경로가 각각
-# (2429,0,-1) R 5.43 m / (550,0,-1) R 4.52 m 를 지나 #7 '회전 불가 기하' ERROR
-# 가 되어 rc=1 이다. 임계가 맞고 **경로 쪽이 틀렸다** — 작업15 에서 경유점을
-# 조정해 좁은 연결로를 우회시킨 뒤 이 목록에 되돌린다.
-# 테스트가 검증하는 계약("짝 진입 차로에서 회전을 수행할 수 있다")은 그대로다.
+# tests/fixtures/waypoints.csv 복귀 (2026-09-08, 회전 금지 완화).
+# 작업13-2 에서 뺐던 이유 — vehicle.min_turn_margin 1.0(임계 5.65 m)으로
+# (550,0,-1) R 4.52 m 가 #7 '회전 불가 기하' ERROR 가 됐다 — 가 사라졌다.
+# 금지 임계가 route.banned_r_min_m(3.0)로 내려가 그 연결로는 '급회전' WARN 이고
+# rc=0 이다 (커브 감속 speed.curvature_cap 이 v ≤ 3.36 m/s 로 눌러 준다).
+# 근거·측정은 tests/test_tight_turn.py.
+# 루트 waypoints.csv 는 여전히 뺀다 — 대회날 갈아끼우는 작업 파일이라
+# 내용이 고정이 아니다 (픽스처만 목록에 둔다는 작업17 규칙과 같은 이유).
 CSVS = ['tests/fixtures/venue_20260903_waypoints.csv', 'data/official_route.csv',
-        'data/test_route_waypoints.csv'] + sorted(
+        'data/test_route_waypoints.csv', 'tests/fixtures/waypoints.csv'] + sorted(
     str(p.relative_to(ROOT)) for p in (ROOT / 'scenarios').glob('*/*.csv'))
 
 

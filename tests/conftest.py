@@ -1,4 +1,5 @@
 """테스트에서 vtd_adapter / tools 를 import 할 수 있게 경로를 잡는다."""
+import contextlib
 import pathlib
 import sys
 
@@ -63,3 +64,32 @@ def _dp_compare_off():
         yield
     finally:
         BR._DP_CFG = old
+
+
+# ── 옛 금지 임계(5.65 m)를 명시적으로 고정하는 헬퍼 ─────────────────────────
+# 2026-09-08 회전 금지 완화로 route.banned_r_min_m 기본이 3.0 이 됐고, 금지
+# 연결로가 38개 → 4개로 줄었다 (docs/BACKLOG.md B-29). "금지 연결로가 있으면
+# 어떻게 되나" 를 보는 테스트들은 그 **금지 자체가 전제**라, 기본값을 읽으면
+# 전제가 사라져 깨진다.
+#
+# 기본값을 되돌리는 게 아니라 **사본에서 임계를 명시적으로 올려** 본다 —
+# params 기본값이 또 움직여도 이 검사들은 안 깨진다 (CLAUDE.md 의 off_cfg() /
+# a1_cfg() 와 같은 처리 원칙).
+@contextlib.contextmanager
+def banned_r_min(thr):
+    """route.banned_r_min_m 을 이 블록 안에서만 thr 로 둔다."""
+    import build_route as BR
+    BR.route_cfg(reload=True)
+    old = dict(BR._ROUTE_CFG)
+    BR._ROUTE_CFG['banned_r_min_m'] = float(thr)
+    try:
+        yield
+    finally:
+        BR._ROUTE_CFG = old
+
+
+# 옛 임계 = 기하 최소회전반경 × vehicle.min_turn_margin (2.944/tan(0.48) ≈ 5.65).
+# 숫자를 박지 않고 계산해 둔다 — vehicle 제원이 바뀌면 같이 따라간다.
+def legacy_banned_r_min():
+    import build_route as BR
+    return BR.tight_turn_r_m()

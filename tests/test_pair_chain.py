@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import build_route as BR                                        # noqa: E402
 from vtd_adapter.config import load_params_yaml                 # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
+from conftest import banned_r_min, legacy_banned_r_min          # noqa: E402
 
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
 CFG = load_params_yaml()
@@ -77,7 +78,14 @@ def test_params_present_default_off():
 
 
 def test_off_falls_back_on_2152(lg):
-    with chain(False):
+    """짝 연쇄 off ⇒ 폴백이 220 m 자리에 먼 길을 고른다.
+
+    금지 임계를 옛 값(5.65 m)으로 고정해 둔다 — 이 '먼 길' 의 길이는 어느
+    연결로가 막혀 있느냐에 딸린 값이고, 여기서 보려는 계약은 "off 면 폴백이
+    돌고 그 결과가 220 m 가 아니다" 다 (2026-09-08, docs/BACKLOG.md B-29).
+    완화된 기본값(3.0)에서는 같은 폴백이 1934 m 를 고른다 — 여전히 먼 길이다.
+    """
+    with banned_r_min(legacy_banned_r_min()), chain(False):
         rt, err = build(lg, wps(), FORCED_SEGS)
     assert len(rt['pair_fallbacks']) == 1
     assert rt['pair_fallbacks'][0]['roads_in'] == [2152, 2190]

@@ -31,7 +31,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 sys.path.insert(0, str(ROOT))
 
-import build_route as BR                                        # noqa: E402
+import build_route as BR
+from conftest import banned_r_min, legacy_banned_r_min                                        # noqa: E402
 from vtd_adapter.lanegraph import LaneGraph                     # noqa: E402
 
 GRAPH = ROOT / 'data' / 'lane_graph.pkl'
@@ -189,11 +190,18 @@ def test_empty_pair_set_means_banned_connector(lg, field_on):
     실패하고 있었다 — 테스트도 코드도 아닌 **픽스처가 움직인 것**이다.
     그래서 옛 내용을 `tests/fixtures/waypoints_pair_banned.csv` 로 보존하고
     그쪽을 본다. 루트 CSV 는 연습 경로라 앞으로도 바뀐다.
+
+    **금지 임계를 명시적으로 옛 값(5.65 m)으로 고정한다** (2026-09-08). 회전
+    금지 완화로 route.banned_r_min_m 기본이 3.0 이 되어 이 CSV 의 R 5.43 /
+    4.52 연결로가 더는 금지가 아니다 — 기본값을 읽으면 빈 집합이 안 생겨 이
+    검사의 전제가 사라진다 (docs/BACKLOG.md B-29). 여기서 보려는 계약은
+    "**금지 연결로뿐이면** 유효 진입 차로가 0 이다" 라 임계와 무관하다.
     """
     csv = 'tests/fixtures/waypoints_pair_banned.csv'
     if not (ROOT / csv).exists():
         pytest.skip('없음')
-    rt = _build(lg, csv)
+    with banned_r_min(legacy_banned_r_min()):
+        rt = _build(lg, csv)
     empty = [e for e in rt['valid_entry_lanes'] if e['target'] == 'pair' and not e['lanes']]
     forced = {tuple(k) for _wi, k, _r in rt.get('infeasible_forced') or []}
     assert empty, '이 CSV 에 빈 집합이 있어야 이 테스트가 유효하다'
