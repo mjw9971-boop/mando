@@ -264,6 +264,18 @@ class KrRules:
         # 바꾼다 (standoff_creep_v 는 제동거리 계산에서 온 값이라 m/s 그대로다).
         self.j_creep_floor = float(ot.get('junction_creep_floor_kph', 3.0)) / 3.6
         self.j_creep_cap = float(ot.get('junction_creep_kph', 5.0)) / 3.6
+        # 절대 안 멈춤 (A2). 꺼지면 이전 동작 — 시계도 안 돈다.
+        self.ns_enable = bool(ot.get('never_stall_enable', False))
+        self.ns_max_ticks = int(round(float(ot.get('deadlock_max_s', 20.0)) * self.hz))
+        self.ns_step_ticks = int(round(float(ot.get('never_stall_step_s', 5.0)) * self.hz))
+        self.ns_creep_v = float(ot.get('never_stall_creep_kph', 3.0)) / 3.6
+        self.ns_force_v = float(ot.get('never_stall_force_v', 1.0))
+        self.ns_turn_hold_ticks = int(round(
+            float(ot.get('never_stall_turn_hold_s', 6.0)) * self.hz))
+        self.ns_turn_margin_m = float(ot.get('never_stall_turn_margin_m', 10.0))
+        # never_stall 의 종점 배제 폭 — route_end 래치와 같은 축(unlatch_m).
+        # active_m(150)은 후보 생성 창이라 여기 쓰면 마지막 150 m 가 통째로 죽는다.
+        self.ns_end_m = float(cfg['route_end']['unlatch_m'])
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -519,6 +531,13 @@ class KrRules:
         # 그건 사유를 안 가려서 right:no_neighbor 등에도 오르므로, 교차로가
         # 아닌 곳의 기각이 교차로 해제를 무장시킨다.
         self.j_reject_ticks = 0
+        # never_stall (A2) — 원인 무관 **하나의** 무진전 시계. 신호·보행자·종점은
+        # _ns_cause 게이트에서 빠지므로 여기 쌓이지 않는다.
+        self.ns_ticks = 0
+        self.ns_ref_s: float | None = None         # 마지막 진전 route_s
+        self.ns_level = 0                          # 0 정상 / 1 크립 / 2 사다리 재진입 / 3 최후
+        self.ns_turn_ticks = 0                     # (c) 회전 차로 복귀 보류 누적
+        self.ns_info: dict | None = None           # 진단 (로그용)
         self.bo_lvl_ticks = 0
         self.bo_stall_ticks = 0
         self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
@@ -1409,7 +1428,9 @@ class KrRules:
         return True
 
     # ── 규칙 2: 데드락 해제 (BREAKOUT) ──────────────────────────────────
-    def _obstacle_cause(self, planner, ap) -> bool:
+    def _obstacle_cause(self, planner, ap, ignore_queue: bool = False,
+                        end_m: float | None = None,
+                        pdm_hazard_ok: bool = False) -> bool:
         """지금 정지 원인이 **장애물 계열**인가. 하나라도 아니면 거짓.
 
         BREAKOUT 은 제약을 풀고 전진을 강제하므로, 원인이 신호·보행자·종점
@@ -1431,16 +1452,28 @@ class KrRules:
             return False
         if self.y_decision is not None or self.cross_guard:  # 황색 래치 / 통과 가드
             return False
-        if self.last_d_end is not None and self.last_d_end <= self.active_m:
+        end_m = self.active_m if end_m is None else end_m
+        if self.last_d_end is not None and self.last_d_end <= end_m:
             return False                                   # route_end 유령차 사정권
         if self.suppress_mode == 'legacy':
             if self._red_ahead(planner) is not None:           # 절대 규칙 (신호 > 회피)
                 return False
             if self._signal_zone(planner, ap) is not None:     # 규칙 1
                 return False
-        elif self._tick_queue:                             # 큐 뒤에 선 것은 데드락이 아니다 (C-5)
+        elif self._tick_queue and not ignore_queue:        # 큐 뒤에 선 것은 데드락이 아니다 (C-5)
+            # ignore_queue 는 never_stall(A2) 전용이다 — UNKNOWN 큐만 그 경로로
+            # 들어온다 (_ns_cause). BREAKOUT 은 기본값 False 로 옛 동작 그대로.
             return False
         if self._blocker(ap, planner) is not None:         # 실제로 앞이 막혀 있을 것
+            return True
+        # PDM 이 차량·OBB 로 세우고 있으면 그것도 장애물 정지다 (never_stall 전용).
+        # kr 의 회랑만 보면 놓친다: 시프트 span 이 활성이면 회랑은 **밀린 경로**
+        # 기준이라 비어 있고(_blocker None), _try_overtake_inner 도 조기 반환해
+        # 기각 시계가 안 돈다. 실측 replay(정적회피집중_01_좌회전2): 목표 0 인
+        # 489틱 **전부** vehicle_hazard=True · blocker=False · reject_pending=False
+        # 라 이 함수가 거짓이었고, 24 s 정지에 아무 안전망도 안 걸렸다.
+        # 위의 배제(신호·보행자·정지표지·종점·큐)를 이미 통과한 뒤라 안전하다.
+        if pdm_hazard_ok and getattr(ap, 'vehicle_hazard', False):
             return True
         # E-3: 회랑 후보가 있는데 양쪽 다 기각된 채면 30 m 밖이라도 장애물 원인이다
         return self._reject_pending()
@@ -1470,6 +1503,12 @@ class KrRules:
         여기까지 열면 연결로 한복판에서 선행차·OBB 를 지운 채 전진한다. 해제가
         푸는 것은 크립 **상한**뿐이고 PDM 의 IDM·OBB 는 최후 안전망으로 남긴다.
         """
+        # A2 3단계 — **최후 수단**. 회랑(선행차·OBB)을 무시하고 전진한다. 교차로
+        # 차단(A1)보다도 우선한다: 여기까지 왔다는 것은 다른 모든 완화가 실패해
+        # 정지가 deadlock_max_s + 2·step 을 넘겼다는 뜻이고, 그 상태로 계속 서
+        # 있는 것(=미완주 확정)보다 1 m/s 접촉 위험이 낫다는 판단이다.
+        if self.ns_level >= 3:
+            return True
         if (self.j_release and self.bo_level >= self.BO_CREEP
                 and self._ap is not None and self._in_junction_lane(self._ap)):
             return False
@@ -1493,6 +1532,17 @@ class KrRules:
             if not self._obstacle_cause(planner, ap):
                 self._breakout_reset('cause_gone')
                 self.bo_state = None
+                return
+            # A2 2단계 — CREEP_FAIL 은 원래 탈출구가 'cause_gone' 하나뿐이라
+            # 장애물이 안 치워지면 영구다 (코드 주석: "정지 유지 … 미구현").
+            # 여기서 L4 로 되돌려 사다리를 다시 돌린다. 무진전 시계만 새로 하고
+            # 단계는 L4 그대로다 — 아래에서부터 다시 오를 이유가 없다.
+            if self.ns_level >= 2:
+                self.bo_state = 'BREAKOUT'
+                self.bo_stall_ticks = 0
+                self.bo_ref_s = route_s
+                print('[kr_rules] never_stall — CREEP_FAIL 해제, BREAKOUT L%d 재개'
+                      % self.bo_level, flush=True)
             return
 
         # 적색·황색 STOP 중에는 **일시정지**한다 — 카운터·단계를 그대로 두고
@@ -1635,6 +1685,165 @@ class KrRules:
             return False
         ap = self._ap
         return ap is not None and self._in_junction_lane(ap)
+
+    # ── 절대 안 멈춤 (A2) ────────────────────────────────────────────────
+    def _ns_cause(self, planner, ap) -> bool:
+        """never_stall 시계가 도는 조건 — "풀어도 되는 정지" 인가.
+
+        기본은 `_obstacle_cause` 와 **같다**. 신호·보행자·정지표지·종점·황색
+        래치·RTOR 는 절대 제외다 — 새 배제 목록을 만들지 않고 그 함수를 그대로
+        쓴다 (배제가 두 곳에 적히면 어긋난다).
+
+        딱 하나 넓힌다: **UNKNOWN 큐**. `_is_queue_v2` 는 미보고 신호 큐에
+        해제 시한을 두지 않고("해제 시한이 없다"), 같은 상황의 다른 안전망
+        `_signal_timeout_tick` 은 `not _tick_corridor` 를 요구해 큐(=회랑 객체가
+        있다)에서는 시계가 안 돈다 — 둘이 동시에 죽어 무한 정지가 된다.
+        여기서만 시한을 준다.
+
+        **실제로 보고된** 적색·황색 큐는 그대로 제외다 (신호 준수 > 정체 해소).
+
+        종점 배제 폭도 좁힌다. `_obstacle_cause` 는 `route_end.active_m`(150 m)
+        안이면 거짓인데, 그 값은 유령차 **후보를 만드는 창**이지 "종점 때문에
+        서 있다" 는 뜻이 아니다 — 150 m 앞에서 선 것은 종점이 세운 게 아니다.
+        그대로 쓰면 **경로 마지막 150 m 에서 never_stall 이 영영 무장하지 못한다**
+        (실측: 정적회피집중 계열은 경로가 짧아 정지 구간 대부분이 이 창 안이다).
+        실제로 자차를 세우는 것은 래치(`route_end.latch_m` 12 m)이므로, 그 축의
+        해제 거리 `unlatch_m`(30 m)까지만 제외한다. 종점 정지는 그대로 지킨다.
+        """
+        end_m = self.ns_end_m
+        if self._obstacle_cause(planner, ap, end_m=end_m, pdm_hazard_ok=True):
+            return True
+        if not self._tick_queue or not (self.q_info or {}).get('queue_by_unknown'):
+            return False
+        return self._obstacle_cause(planner, ap, ignore_queue=True, end_m=end_m,
+                                    pdm_hazard_ok=True)
+
+    def _ns_turn_lane_pending(self, planner, ap, ego_speed: float):
+        """(c) 지금은 **전진보다 회전 차로 복귀가 급한가** → 진단 dict 또는 None.
+
+        재료는 route.pkl 의 `valid_entry_lanes` (build_route 산출, params
+        route.valid_entry_lanes_enable). 그 필드의 목적이 문서상 바로 이것이다 —
+        "회피 시프트로 옆 차로에 나간 뒤 원래 차로로 복귀해야 하는가".
+
+        조건 (전부):
+          · 지금 세그먼트의 항목이 target='pair' 이고 유효 차로 집합이 **비어
+            있지 않다** (빈 집합은 "유효 차로 없음" 이라 복귀할 곳이 없다.
+            target='finish' 는 "제약 없음" 이라 대상이 아니다 — 둘을 target 으로
+            구분하는 것이 그 필드의 규약이다)
+          · 자차 차로가 그 집합에 **없다**
+          · 다음 교차로까지 남은 거리 ≤ 복귀 전이거리 + never_stall_turn_margin_m
+            (전이거리는 시프트와 같은 식 max(transition_m, shift_k_s·v) — 상수를
+            복제하지 않는다)
+
+        왜 전진보다 우선인가: 크립으로 앞으로 나가면 남은 거리가 그만큼 줄어
+        복귀 전이가 못 들어간다. 회전 차로에 못 붙은 채 교차로에 들어가는 것은
+        정지보다 나쁘다 (경로 이탈 + 회전 불가).
+        """
+        route = getattr(planner, 'route', None) or {}
+        vel = route.get('valid_entry_lanes')
+        wps = route.get('waypoint_s')
+        if not vel or not wps:
+            return None
+        route_s = float(planner.route_s[planner.route_index])
+        lane = self._tick_ego_lane
+        if lane is None:
+            return None
+        for e in vel:
+            if e.get('target') != 'pair' or not e.get('lanes'):
+                continue
+            seg = int(e['seg'])
+            if seg + 1 >= len(wps):
+                continue
+            s0, s1 = float(wps[seg]), float(wps[seg + 1])
+            if not (s0 <= route_s < s1):
+                continue
+            if tuple(lane) in {tuple(k) for k in e['lanes']}:
+                return None                        # 이미 유효 차로에 있다
+            need = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1)) \
+                + self.ns_turn_margin_m
+            left = s1 - route_s
+            if left > need:
+                return None                        # 아직 복귀할 거리가 넉넉하다
+            return {'seg': seg, 'turn': e.get('turn'), 'left_m': round(left, 1),
+                    'need_m': round(need, 1), 'lane': list(lane),
+                    'want': [list(k) for k in e['lanes']]}
+        return None
+
+    def _never_stall_tick(self, planner, ap, ego_speed: float) -> None:
+        """A2 시계 — apply 가 _tick_cache 뒤에 틱당 1회 부른다.
+
+        단계 (`ns_level`):
+          0  정상
+          1  deadlock_max_s 경과 — 크립 바닥을 깐다. `stop_gap`·`no_size` 블록과
+             크립 지연 게이트를 풀고, 기준선 **밖**(모드 A)도 크립을 거치게 한다.
+          2  +step — CREEP_FAIL 을 풀어 사다리를 다시 돌린다.
+          3  +step — 최후. breakout_creep() 훅을 강제로 열어 선행차·OBB 후보를
+             무효화하고 never_stall_force_v 로 전진한다. **접촉을 감수하는
+             단계다** — 그래서 마지막이고 속도가 1 m/s 다.
+
+        시계는 `_ns_cause` 가 참이고 진전이 progress_m 미만인 틱만 센다. 진전이
+        있으면 기준을 옮기고 0 으로 되돌린다 — 조금씩이라도 가고 있으면 stall 이
+        아니다.
+        """
+        if not self.ns_enable:
+            self.ns_level = 0
+            self.ns_info = None
+            return
+        route_s = float(planner.route_s[planner.route_index])
+        if not self._ns_cause(planner, ap):
+            self.ns_ticks = 0
+            self.ns_ref_s = route_s
+            self.ns_level = 0
+            self.ns_turn_ticks = 0
+            self.ns_info = None
+            return
+        if self.ns_ref_s is None:
+            self.ns_ref_s = route_s                 # 첫 틱 — 기준만 잡고 세기 시작
+        elif route_s - self.ns_ref_s >= self.bo_progress_m:
+            self.ns_ref_s = route_s                 # 진전 — 시계를 새로
+            self.ns_ticks = 0
+            self.ns_level = 0
+            self.ns_turn_ticks = 0
+            self.ns_info = None
+            return
+        self.ns_ticks += 1
+        if self.ns_ticks < self.ns_max_ticks:
+            self.ns_level = 0
+            # 무장 전에도 시계를 남긴다 — "왜 안 걸렸나" 를 로그로 답할 수 있어야
+            # 한다 (실측 13로그에서 단계 0 만 보고 원인을 못 좁혔다).
+            self.ns_info = {'state': 'ARMING',
+                            'ns_s': round(self.ns_ticks / self.hz, 1)}
+            return
+
+        # (c) 회전 차로 복귀 우선 — 단계 상승을 보류하고 시프트를 원복한다.
+        # 보류에도 시한이 있다: never_stall 이 새 무한 대기를 만들면 안 된다.
+        turn = self._ns_turn_lane_pending(planner, ap, ego_speed)
+        if turn is not None and self.ns_turn_ticks < self.ns_turn_hold_ticks:
+            self.ns_turn_ticks += 1
+            if self.ot_span is not None:
+                self._restore_span(planner)         # 계획 경로가 회전 차로로 데려간다
+            self.ns_level = 0
+            self.ns_info = dict(turn, state='TURN_LANE_RETURN',
+                                hold_s=round(self.ns_turn_ticks / self.hz, 1),
+                                ns_s=round(self.ns_ticks / self.hz, 1))
+            return
+
+        over = self.ns_ticks - self.ns_max_ticks
+        lvl = 1 + (over // self.ns_step_ticks if self.ns_step_ticks > 0 else 2)
+        new_level = int(min(3, lvl))
+        if new_level != self.ns_level:
+            print('[kr_rules] ⚠ never_stall 단계 %d — 무진전 %.1f s'
+                  % (new_level, self.ns_ticks / self.hz), flush=True)
+        self.ns_level = new_level
+        self.ns_info = {'state': 'NEVER_STALL', 'level': self.ns_level,
+                        'ns_s': round(self.ns_ticks / self.hz, 1),
+                        'turn_hold_s': round(self.ns_turn_ticks / self.hz, 1),
+                        'v': round(self.ns_force_v if self.ns_level >= 3
+                                   else self.ns_creep_v, 2)}
+
+    def _ns_creep_v(self) -> float:
+        """단계별 크립 속도 [m/s]. 3단계만 회랑 무시 속도를 쓴다."""
+        return self.ns_force_v if self.ns_level >= 3 else self.ns_creep_v
 
     @staticmethod
     def _shift_profile(s, s0, end, L):
@@ -2938,6 +3147,10 @@ class KrRules:
         self._rtor_reset()                            # RTOR 래치·정지 누적 (순간이동 = 새 접근)
         self._creep_hold_ticks = 0
         self.j_reject_ticks = 0                       # 교차로 해제 시계 (A1) — 새 문맥
+        self.ns_ticks = 0                             # never_stall 시계 (A2) — 새 문맥
+        self.ns_ref_s = None
+        self.ns_level = 0
+        self.ns_turn_ticks = 0
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -3687,7 +3900,8 @@ class KrRules:
         d = self.wait_target_d - standoff
         if d >= 0.0:
             v = _math.sqrt(2.0 * self.stop_profile_a * d)      # 기준선 밖 — 무수정
-            if not self._junction_release():
+            j_rel = self._junction_release()
+            if not j_rel and self.ns_level < 1:
                 return v
             # ① 모드 A (A1) — d 가 기준선에 정확히 얹히면 √(2a·0) = 0 인데,
             # 이 갈래는 _standoff_creep 을 부르지 않으므로 크립 게이트에
@@ -3696,8 +3910,8 @@ class KrRules:
             # 회전 중이므로 상한으로 자른다. 배제(stop_gap·ped_hold·cause)는
             # _standoff_creep 이 그대로 판정해 0 을 돌려주고, 그때는 프로파일
             # 값 v 가 그대로 남는다 (바닥만 없어질 뿐 더 세우지 않는다).
-            return min(max(v, self._standoff_creep(standoff, ego_speed)),
-                       self.j_creep_cap)
+            out = max(v, self._standoff_creep(standoff, ego_speed))
+            return min(out, self.j_creep_cap) if j_rel else out
         return self._standoff_creep(standoff, ego_speed)       # 기준선 안 — 바닥
 
     def _red_intervals(self, planner) -> list:
@@ -3819,6 +4033,10 @@ class KrRules:
         보류 중에는 v_allow = 0 이라 자차가 서 있고, 그래서 ot_blocked_ticks 와
         bo_stuck_ticks 가 **정상적으로 쌓인다** — 지연이 사다리를 굶기지 않는다.
         """
+        if self.ns_level >= 1:
+            # ⓪′ never_stall (A2) — 여기서 기다리는 '시프트 가능성' 이 무엇이든,
+            # deadlock_max_s 를 넘겼으면 그 기다림 자체가 stall 이다.
+            return 'never_stall', None, self._creep_geom_need(ego_speed)
         if self._junction_release():
             # ⓪ 교차로 해제 (A1) — 다른 조건보다 먼저다. 여기서 기다리는 대상인
             # '시프트 가능성' 이 교차로 lane 에서는 **원리적으로 0** 이라
@@ -3861,17 +4079,23 @@ class KrRules:
         홀드 래치)는 PDM 플래그와 축이 달라 2차 방어로 따로 본다.
         """
         j_rel = self._junction_release()
-        if not self.standoff_creep and not j_rel:
+        ns = self.ns_level >= 1
+        if not self.standoff_creep and not j_rel and not ns:
             return 0.0          # 이전 동작. 진단도 남기지 않는다 — off 는 로그까지 동일
         # 교차로 해제가 무장되면 크립 속도의 바닥을 올리고 상한으로 자른다 (A1).
         # 바닥이 필요한 이유는 모드 A: 기준선 **밖**에서 부르는 경로라 여기서
         # standoff_creep_v(0.8)만 돌려주면 프로파일 값보다 낮아 아무 효과가 없다.
-        v_creep = (min(max(self.standoff_creep_v, self.j_creep_floor), self.j_creep_cap)
-                   if j_rel else self.standoff_creep_v)
+        v_creep = self.standoff_creep_v
+        if ns:
+            v_creep = max(v_creep, self._ns_creep_v())      # A2 단계 바닥
+        if j_rel:
+            v_creep = min(max(v_creep, self.j_creep_floor), self.j_creep_cap)
         d = float(self.wait_target_d)
         diag = {'creep_d': round(d, 1), 'creep_standoff': round(standoff, 1)}
         if j_rel:
             diag['creep_junction'] = True
+        if ns:
+            diag['creep_ns_lvl'] = self.ns_level
 
         # 진단 키가 'so_creep' 인 이유: BREAKOUT 진단이 같은 last_avoid 에 'creep'
         # 을 나중에 써서(아래 bo_state 블록) 이름이 겹치면 덮인다 — 실측 02_직진3
@@ -3889,17 +4113,31 @@ class KrRules:
                 self._creep_diag['creep_latch_why'] = 'release:' + why
             return 0.0
 
+        # A2 1단계는 ③ no_size · ① stop_gap 을 건너뛴다 — 둘 다 상한 없는 0 이다.
+        # 건너뛰어도 **강제 전진이 아니다**: 이 값은 min() 상한이라 PDM 의 IDM·OBB
+        # 가 그대로 자기 간격에서 세운다. 그걸 무효화하는 것은 3단계뿐이다.
         if self.standoff_half_len is None:
-            return block('no_size')                     # 크기 미상 → 정지 거리 불명
-        d_stop = self.front + self.standoff_half_len + self.standoff_creep_gap_m
-        diag['creep_stop_m'] = round(d_stop, 2)
-        if d <= d_stop:
-            return block('stop_gap')                    # 진짜 정지
+            if not ns:
+                return block('no_size')                 # 크기 미상 → 정지 거리 불명
+            diag['creep_ns_relax'] = 'no_size'
+            d_stop = None
+        else:
+            d_stop = self.front + self.standoff_half_len + self.standoff_creep_gap_m
+            diag['creep_stop_m'] = round(d_stop, 2)
+        if d_stop is not None and d <= d_stop:
+            if not ns:
+                return block('stop_gap')                # 진짜 정지
+            diag['creep_ns_relax'] = 'stop_gap'
         if self.ped_hold_ids:
-            return block('ped_hold')
+            return block('ped_hold')                    # 보행자는 어떤 단계에서도 유지
         ap = self._ap
         planner = getattr(ap, '_waypoint_planner', None) if ap is not None else None
-        if planner is None or not self._obstacle_cause(planner, ap):
+        if planner is None:
+            return block('cause')
+        # A2 는 UNKNOWN 큐까지 원인으로 본다 (_ns_cause). 적신호·보행자·종점은
+        # 그 함수도 그대로 제외한다 — 배제 목록은 여전히 한 곳이다.
+        if not (self._ns_cause(planner, ap) if ns
+                else self._obstacle_cause(planner, ap)):
             return block('cause')
         # 지연 게이트 — 시프트가 확실히 불가능해지기 전에는 열지 않는다 (_creep_gate).
         if self.standoff_id != self._creep_hold_id:     # 대상이 바뀌면 새로 센다
@@ -4072,6 +4310,9 @@ class KrRules:
         # 틱당 두 번 세어 해제 시한이 절반이 된다. legacy 는 계산하지 않는다
         # (그쪽은 _try_overtake 안에서 옛 위치·옛 횟수로 부른다).
         self._tick_cache(ap, planner)
+        # A2 시계 — _tick_cache 뒤(큐 판정 필요), _breakout_tick 앞(단계가 그 안에서
+        # CREEP_FAIL 재진입을 여는 입력이다).
+        self._never_stall_tick(planner, ap, ego_speed)
         self._signal_timeout_tick(ap, planner, ego_speed)
         self._rtor_tick(ap, planner, ego_speed)
         if self.bo_enabled:
@@ -4228,6 +4469,10 @@ class KrRules:
 
         if self.q_reject:
             self.last_avoid = dict(self.last_avoid or {}, queue_reject=self.q_reject)
+        if self.ns_info:
+            # A2 진단. 스위치가 꺼져 있으면 ns_info 가 항상 None 이라 키가 안 생긴다
+            # — off 는 로그까지 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
+            self.last_avoid = dict(self.last_avoid or {}, never_stall=self.ns_info)
         if self.bo_state is not None:
             self.last_avoid = dict(self.last_avoid or {}, **{
                 'state': self.bo_state, 'level': self.bo_level,

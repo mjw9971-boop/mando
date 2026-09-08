@@ -56,6 +56,16 @@ def on_cfg(**over):
     return c
 
 
+def off_cfg(**over):
+    """이전 동작 사본. **기본값을 읽지 않는다** — params 가 true 로 바뀌어도
+    off 경로 커버리지를 잃지 않기 위해서다 (CLAUDE.md 2026-09-07 드리프트 원칙)."""
+    c = copy.deepcopy(CFG)
+    c['overtake']['junction_creep_release_enable'] = False
+    c['overtake']['never_stall_enable'] = False
+    c['overtake'].update(over)
+    return c
+
+
 class LgJunction(LgOne):
     """자차 lane 이 교차로 연결로 — _try_overtake_inner 가 reject='junction'."""
 
@@ -140,7 +150,7 @@ def test_on_reset_clears_counter():
 # ── 모드 A: 기준선 **밖**(d ≥ standoff)에서 0 으로 얼어붙는 것 ─────────────
 def test_mode_a_locks_at_baseline_when_off():
     """이전 동작 — d 가 22.0 에 얹히면 v_allow 0 이고 크립 진단조차 없다."""
-    kr, p, ap = rig(STANDOFF, CFG)                   # d = standoff 정확히
+    kr, p, ap = rig(STANDOFF, off_cfg())                   # d = standoff 정확히
     so = step(kr, p, ap, REL_TICKS + 40)
     assert so == pytest.approx(0.0)
     assert kr._creep_diag is None                    # _standoff_creep 미호출
@@ -164,7 +174,7 @@ def test_mode_a_creep_is_capped():
 
 # ── 모드 B: 기준선 **안쪽** — 크립 게이트가 'need' 로 보류하던 것 ──────────
 def test_mode_b_gate_holds_on_need_when_off():
-    kr, p, ap = rig(STANDOFF - 1.0, CFG)             # d = 21.0 < standoff
+    kr, p, ap = rig(STANDOFF - 1.0, off_cfg())             # d = 21.0 < standoff
     step(kr, p, ap, REL_TICKS + 1)
     d = kr._creep_diag or {}
     assert d.get('creep_hold_why') == 'need' and d.get('so_creep') is False
@@ -190,7 +200,7 @@ def test_mode_b_stop_gap_still_stops():
 
 # ── 사다리: 무장 후에는 돌지만 크립 훅은 닫힌 채다 ─────────────────────────
 def test_ladder_stays_paused_when_off():
-    kr, p, ap = rig(STANDOFF - 1.0, CFG)
+    kr, p, ap = rig(STANDOFF - 1.0, off_cfg())
     step(kr, p, ap, REL_TICKS + 60)
     assert kr.bo_paused is True and kr.bo_state is None and kr.bo_level == 0
 
@@ -222,7 +232,7 @@ def test_shift_stays_forbidden_inside_junction_after_release():
 # ── off 지문 ──────────────────────────────────────────────────────────────
 def test_off_leaves_no_new_log_keys():
     """54 지문 회귀의 근거 — off 는 로그 키까지 이전과 동일해야 한다."""
-    kr, p, ap = rig(STANDOFF - 1.0, CFG)
+    kr, p, ap = rig(STANDOFF - 1.0, off_cfg())
     step(kr, p, ap, REL_TICKS + 5)
     a = kr.last_avoid or {}
     assert 'j_reject_s' not in a and 'j_release' not in a
