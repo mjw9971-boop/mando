@@ -156,6 +156,10 @@ class VtdRoutePlanner:
         self.lc_move_s = float(rt_cfg['lc_move_s'])
         self.lc_move_min_m = float(rt_cfg['lc_move_min_m'])
         self.lc_move_max_m = float(rt_cfg['lc_move_max_m'])
+        # [3](b) 램프를 다음 hop 안으로 맞춘다. off = 이전 동작.
+        self.lc_ramp_fit_hop = bool(rt_cfg.get('lc_ramp_fit_hop_enable', False))
+        self.lc_ramp_hop_gap_m = float(rt_cfg.get('lc_ramp_hop_gap_m', 2.0))
+        self.lc_ramps: list = []
         self.veh_width = float(cfg['vehicle']['width'])
         # 정적 장애물 인식 (compute_leading_vehicles) — params 가 단일 출처
         self.obstacle_speed_max = float(cfg['percep']['obstacle_speed_max'])
@@ -233,20 +237,33 @@ class VtdRoutePlanner:
         길이 = 계획 속도 x lc_move_s (지시등 선행 signal.lc_lead_s 와 같은 축).
         옮겨탄 뒤 남은 거리는 그 차로에서 그대로 주행한다.
         """
-        ramps: dict = {}
+        # [3](b) 1차 — hop 별 시작점 w0 을 **먼저** 다 구한다. 램프 길이를 다음
+        # hop 안으로 맞추려면 다음 hop 이 어디서 시작하는지 알아야 하는데, 한
+        # 바퀴로 돌면 그때는 아직 모른다.
+        plan = []
         for ev in lc_events:
             frm, to = tuple(ev['from_lane']), tuple(ev['to_lane'])
             i_hop = next((k for k in range(len(lanes) - 1)
                           if tuple(lanes[k]) == frm and tuple(lanes[k + 1]) == to), None)
             if i_hop is None:
                 continue
+            w0 = max(float(ev.get('window_s0', cum_s[i_hop])),
+                     self._road_entry_s(lanes, cum_s, i_hop))
+            plan.append((w0, ev, frm, to, i_hop))
+        plan.sort(key=lambda z: z[0])
+        nxt_w0 = [plan[k + 1][0] if k + 1 < len(plan) else None for k in range(len(plan))]
+
+        ramps: dict = {}
+        for k, (w0, ev, frm, to, i_hop) in enumerate(plan):
             left = to == self.lg.neighbor(frm, 'left')
             side = 'left' if left else 'right'
             w1_cap = float(ev.get('window_s1', cum_s[i_hop]))
-            # 도로 진입로부터 — 단 점선이 허용하는 가장 이른 지점 이후여야 한다
-            w0 = max(float(ev.get('window_s0', cum_s[i_hop])),
-                     self._road_entry_s(lanes, cum_s, i_hop))
             w1 = min(w0 + self._lc_move_len(frm), w1_cap)
+            # [3](b) 2차 — 다음 램프 시작 전에 끝낸다. 겹치면 경로가 두 차로를
+            # 한 번에 건너는 S자가 되어 조향이 포화한다 (실측 rs 413~455).
+            # lc_move_min_m 하한보다 짧아져도 자른다 — 겹치는 것보다 짧은 게 낫다.
+            if self.lc_ramp_fit_hop and nxt_w0[k] is not None:
+                w1 = min(w1, nxt_w0[k] - self.lc_ramp_hop_gap_m)
             if w1 - w0 > 1e-6 and self._ramp_is_dashed(lanes, cum_s, lens, w0, w1, side):
                 ramps[i_hop] = {'w0': w0, 'w1': w1, 'side': side,
                                 'sign': 1.0 if left else -1.0, 'i_hop': i_hop}
@@ -254,9 +271,15 @@ class VtdRoutePlanner:
                 # 확인 실패 → 기존 동작(hop 차로 안에서 블렌드 + 점선 클립)으로 폴백
                 w0f = max(float(ev.get('window_s0', cum_s[i_hop])), cum_s[i_hop])
                 w0f, w1f = self._clip_to_dashed(frm, cum_s[i_hop], w0f, w1_cap, side)
-                ramps[i_hop] = {'w0': w0f, 'w1': min(w0f + self._lc_move_len(frm), w1f),
+                w1b = min(w0f + self._lc_move_len(frm), w1f)
+                if self.lc_ramp_fit_hop and nxt_w0[k] is not None:
+                    w1b = min(w1b, nxt_w0[k] - self.lc_ramp_hop_gap_m)
+                ramps[i_hop] = {'w0': w0f, 'w1': w1b,
                                 'side': side, 'sign': 1.0 if left else -1.0,
                                 'i_hop': i_hop, 'fallback': True}
+        # 제어기가 읽는다 ([3](a) 차선변경 구간 속도 상한) — route_s 창 목록.
+        self.lc_ramps = sorted((float(r['w0']), float(r['w1']))
+                               for r in ramps.values())
         return ramps
 
     def _clip_to_dashed(self, key, base: float, w0: float, w1: float,

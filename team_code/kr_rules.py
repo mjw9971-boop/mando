@@ -290,6 +290,11 @@ class KrRules:
         # 나왔다 — √(1.5·6.5)). params 키도 같은 이유로 curvature_ 접두어다.
         self.curv_a_lat = float(sp.get('curvature_a_lat_max', 2.5))
         self.curv_min_k = float(sp.get('curvature_min_kappa', 0.005))
+        # 차선변경 구간 속도 상한 ([3](a)). 꺼지면 후보를 만들지 않는다.
+        self.lc_cap = bool(sp.get('lc_speed_cap_enable', False))
+        self.lc_cap_v = float(sp.get('lc_speed_cap_kph', 20.0)) / 3.6
+        self.lc_chain_sep_m = float(sp.get('lc_hop_chain_sep_m', 25.0))
+        self.lc_look_m = float(sp.get('lc_speed_cap_look_m', 60.0))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -556,6 +561,8 @@ class KrRules:
         self.fg_dropped = 0                        # 종료 구간에서 회랑에서 뺀 정지 객체 수
         self.last_curv: float | None = None        # 이번 틱 곡률 상한 (로그·중재용)
         self.last_curv_info: dict | None = None    # 곡률 진단
+        self.last_lc_cap: float | None = None       # 차선변경 구간 상한 (진단)
+        self._lc_windows: list | None = None        # 병합된 LC 창 (경로당 1회)
         self.bo_lvl_ticks = 0
         self.bo_stall_ticks = 0
         self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
@@ -4290,6 +4297,55 @@ class KrRules:
                                else round((k_at - i0) / ppm, 1)}
         return v
 
+    def _lc_speed_cap(self, planner) -> float | None:
+        """계획 차선변경 창 안·직전의 속도 상한 ([3](a)). min() 후보.
+
+        실측 실경로_01_PathShape03 rs 413~455: 도로 418 에서 차선변경 4회가
+        연속인데 자차가 그 구간에서 8 → 13.3 m/s 로 **가속**했다. 램프 길이는
+        v × lc_move_s 라 속도에 비례하므로 39 m 로 구워졌고 hop 간격 20 m 를
+        넘어 겹쳤다 — 경로가 2차로를 한 번에 건너는 S자가 되어 heading_err
+        +31°, 조향 포화 4회, |t_off| 1.85 m (항목 3 중대 + 항목 6).
+
+        창은 플래너가 만든 램프(`planner.lc_ramps`, route_s 구간)를 그대로
+        읽는다 — 제어기가 창을 다시 계산하면 플래너가 실제로 민 구간과 어긋난다.
+
+        **연속 hop 은 하나로 본다**: 다음 창이 이번 창 끝 + lc_hop_chain_sep_m
+        안에서 시작하면 사이에서도 상한을 유지한다. 사이에서 가속하면 다음
+        램프가 다시 길어져 겹친다.
+
+        창 **진입 전**에는 정지선 프로파일과 같은 식으로 미리 줄인다:
+            v = √(cap² + 2·a_stop·d)
+        멀면 제한속도보다 커서 min() 에 지므로 스스로 비활성이다.
+        """
+        if not self.lc_cap or self.lc_cap_v <= 0.0 or self.stop_profile_a <= 0.0:
+            return None
+        wins = getattr(planner, 'lc_ramps', None)
+        if not wins:
+            return None
+        if self._lc_windows is None:
+            merged: list = []
+            for w0, w1 in sorted(wins):
+                if merged and w0 - merged[-1][1] <= self.lc_chain_sep_m:
+                    merged[-1][1] = max(merged[-1][1], w1)
+                else:
+                    merged.append([float(w0), float(w1)])
+            self._lc_windows = merged
+        route_s = float(planner.route_s[planner.route_index])
+        for a, b in self._lc_windows:
+            if b < route_s:
+                continue                                   # 이미 지난 창
+            if a <= route_s:
+                self.last_lc_cap = self.lc_cap_v
+                return self.lc_cap_v                       # 창 안 (연속 hop 포함)
+            d = a - route_s
+            if d > self.lc_look_m:
+                return None                                # 아직 멀다 (진단도 안 남긴다)
+            v = _math.sqrt(self.lc_cap_v * self.lc_cap_v
+                           + 2.0 * self.stop_profile_a * d)
+            self.last_lc_cap = v
+            return v                                       # 진입 전 감속
+        return None
+
     def _stopline_profile(self, planner, ap) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
 
@@ -4398,6 +4454,7 @@ class KrRules:
         self.fg_dropped = 0
         self.last_curv = None
         self.last_curv_info = None
+        self.last_lc_cap = None
         self._creep_diag = None
         self.gap_v_req = None
         self.last_d_end = d_end
@@ -4479,6 +4536,11 @@ class KrRules:
         self.last_curv = cv
         if cv is not None and (candidate is None or cv < candidate):
             candidate = cv
+
+        # 차선변경 구간 속도 상한 ([3](a)) — 같은 자리의 min() 후보.
+        lcv = self._lc_speed_cap(planner)
+        if lcv is not None and (candidate is None or lcv < candidate):
+            candidate = lcv
 
         # 붉은 구간 진입 전 감속 (2b-B) — 구간 **밖**에서만 산다. min() 후보.
         rz = self._red_approach_profile(planner)
@@ -4590,6 +4652,9 @@ class KrRules:
 
         if self.q_reject:
             self.last_avoid = dict(self.last_avoid or {}, queue_reject=self.q_reject)
+        if self.last_lc_cap is not None:
+            self.last_avoid = dict(self.last_avoid or {},
+                                   lc_cap=round(self.last_lc_cap, 2))
         if self.last_curv_info is not None:
             # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
