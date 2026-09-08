@@ -22,6 +22,7 @@
   <이름>.yaml  확정 정의 — 이 파일 하나로 단건 재생성 가능 (--from-yaml)
   scenarios/batch_<주제>.json     주제별 batch_run.py 용 목록
   scenarios/batch_all.json        이번 실행 전체 통합 목록 (이름 중복은 통합 기준 검사)
+  scenarios/batch_quick.json      quick_list.txt 에 적은 이름만 고른 낮용 짧은 목록
 
 좌표 조회는 전부 data/lane_graph.pkl (LaneGraph) 로 한다 — xodr 재파싱 금지.
 신호 조작용 교차로별 접근 컨트롤러 매핑은 최초 1회 lane_graph(=xodr 파싱 결과)
@@ -2764,7 +2765,53 @@ def rebuild_batch_lists(out_dir: pathlib.Path, vtd_dir: str) -> tuple[int, int]:
             json.dumps(items, ensure_ascii=False, indent=1), encoding='utf-8')
     (out_dir / 'batch_all.json').write_text(
         json.dumps(all_items, ensure_ascii=False, indent=1), encoding='utf-8')
+    write_quick_list(out_dir, all_items)
     return len(all_items), len(per_theme)
+
+
+def read_quick_names(out_dir: pathlib.Path) -> list[str] | None:
+    """scenarios/quick_list.txt 의 이름 목록. 파일이 없으면 None.
+
+    '#' 뒤는 주석 (시나리오 이름에 '#' 은 안 들어간다). 빈 줄 무시. 적힌 순서를
+    유지한다 — 낮 배치의 실행 순서를 사람이 정하는 파일이기 때문이다.
+    """
+    f = out_dir / 'quick_list.txt'
+    if not f.is_file():
+        return None
+    names = []
+    for line in f.read_text(encoding='utf-8').splitlines():
+        n = line.split('#', 1)[0].strip()
+        if n and n not in names:
+            names.append(n)
+    return names
+
+
+def write_quick_list(out_dir: pathlib.Path, all_items: list[dict]) -> int:
+    """quick_list.txt 의 이름으로 batch_all 항목을 골라 batch_quick.json 재생성.
+
+    목록을 손으로 유지하면 시나리오 재생성 때마다 낡는다 (scenarios/ 는 gitignore
+    대상이라 재생성하면 이름·timeout 이 바뀐다). 이름만 추적하고 나머지는 매번
+    batch_all 에서 다시 가져오면 항상 최신을 본다.
+
+    quick_list.txt 가 없으면 아무것도 쓰지 않는다. 이름이 안 맞으면 경고만 하고
+    나머지로 진행한다 — 실패시키면 목록 하나 때문에 시나리오 생성 전체가 막힌다.
+    → 고른 항목 수 (파일 없으면 -1)
+    """
+    names = read_quick_names(out_dir)
+    if names is None:
+        return -1
+    by_name = {it['name']: it for it in all_items}
+    items = [by_name[n] for n in names if n in by_name]
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        print(f'  [경고] quick_list.txt 의 이름 {len(missing)}개가 batch_all 에 없다: '
+              + ', '.join(missing))
+    (out_dir / 'batch_quick.json').write_text(
+        json.dumps(items, ensure_ascii=False, indent=1), encoding='utf-8')
+    tot = sum(int(it['timeout_s']) for it in items)
+    print(f'batch_quick.json: {len(items)}개  timeout 합계 {tot} s ({tot / 3600:.2f} h)'
+          f'  ({out_dir}/)')
+    return len(items)
 
 
 def write_scenario(out_dir, theme, name, xml_text, sdef, rows):

@@ -88,3 +88,71 @@ def test_rebuild_lists_cli(tmp_path):
     make_theme(tmp_path, '주제A', ['주제A_01_기본'], 0)
     assert gs.main(['--rebuild-lists', '--out-dir', str(tmp_path)]) == 0
     assert len(json.loads((tmp_path / 'batch_all.json').read_text())) == 1
+
+
+# ── quick_list.txt → batch_quick.json ────────────────────────────────────────
+# 낮에 21건(8.2 h)을 못 돌리므로 목적별 7개만 고른 짧은 목록을 쓴다. 손으로 유지한
+# 목록은 시나리오 재생성 때마다 낡으므로(scenarios/ 는 gitignore) 이름만 추적하고
+# 나머지는 매번 batch_all 에서 다시 가져온다.
+
+def write_quick(out_dir: pathlib.Path, text: str):
+    (out_dir / 'quick_list.txt').write_text(text, encoding='utf-8')
+
+
+def test_quick_list_selects_named_items_in_listed_order(tmp_path):
+    """quick_list 순서를 그대로 쓴다 — 낮 배치 실행 순서를 사람이 정하는 파일이다."""
+    make_theme(tmp_path, '주제A', ['주제A_01_기본', '주제A_02_직진',
+                                   '주제A_03_좌회전'], 0)
+    write_quick(tmp_path, '# 주석\n\n주제A_03_좌회전  # 뒤 주석\n주제A_01_기본\n')
+
+    gs.rebuild_batch_lists(tmp_path, VTD_DIR)
+
+    items = json.loads((tmp_path / 'batch_quick.json').read_text())
+    assert [it['name'] for it in items] == ['주제A_03_좌회전', '주제A_01_기본']
+    assert items[0]['timeout_s'] == 182                  # batch_all 항목을 그대로 재사용
+    assert items[0]['vtd_xml_path'] == f'{VTD_DIR}/주제A/주제A_03_좌회전.xml'
+
+
+def test_quick_list_absent_writes_nothing(tmp_path):
+    """목록 파일이 없으면 batch_quick.json 을 만들지 않는다 (빈 목록도 아니다)."""
+    make_theme(tmp_path, '주제A', ['주제A_01_기본'], 0)
+    gs.rebuild_batch_lists(tmp_path, VTD_DIR)
+    assert not (tmp_path / 'batch_quick.json').exists()
+
+
+def test_quick_list_missing_name_warns_and_keeps_rest(tmp_path, capsys):
+    """이름이 안 맞아도 실패시키지 않는다 — 목록 하나가 시나리오 생성 전체를 막으면 안 된다."""
+    make_theme(tmp_path, '주제A', ['주제A_01_기본'], 0)
+    write_quick(tmp_path, '주제A_01_기본\n사라진_시나리오\n')
+
+    n_all, _ = gs.rebuild_batch_lists(tmp_path, VTD_DIR)
+
+    assert n_all == 1                                    # 전체 목록은 정상 생성
+    items = json.loads((tmp_path / 'batch_quick.json').read_text())
+    assert [it['name'] for it in items] == ['주제A_01_기본']
+    assert '사라진_시나리오' in capsys.readouterr().out   # 조용히 빠지지 않는다
+
+
+def test_quick_list_is_regenerated_after_scenarios_change(tmp_path):
+    """재생성 때마다 최신 batch_all 을 다시 읽는다 — timeout 이 바뀌면 따라간다."""
+    make_theme(tmp_path, '주제A', ['주제A_01_기본'], 0)
+    write_quick(tmp_path, '주제A_01_기본\n')
+    gs.rebuild_batch_lists(tmp_path, VTD_DIR)
+    assert json.loads((tmp_path / 'batch_quick.json').read_text())[0]['timeout_s'] == 180
+
+    (tmp_path / '주제A' / '주제A_01_기본.yaml').write_text(
+        yaml.safe_dump({'name': '주제A_01_기본', 'theme': '주제A', 'timeout_s': 999},
+                       allow_unicode=True), encoding='utf-8')
+    gs.rebuild_batch_lists(tmp_path, VTD_DIR)
+    assert json.loads((tmp_path / 'batch_quick.json').read_text())[0]['timeout_s'] == 999
+
+
+def test_repo_quick_list_names_all_exist():
+    """저장소의 quick_list.txt 7건이 실제 batch_all 에 있는지 — 이름 오타 방지."""
+    scen = pathlib.Path(gs.ROOT) / 'scenarios'
+    names = gs.read_quick_names(scen)
+    if names is None or not (scen / 'batch_all.json').exists():
+        pytest.skip('scenarios/ 미생성 환경')
+    have = {it['name'] for it in json.loads((scen / 'batch_all.json').read_text())}
+    assert len(names) == 7
+    assert [n for n in names if n not in have] == []

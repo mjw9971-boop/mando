@@ -1,0 +1,20 @@
+# 낮에 돌리는 짧은 배치 목록 (batch_quick.json 의 단일 출처).
+#
+# 21개 전건(batch_all.json)은 timeout 합계가 8.2 h 라 낮에 못 돌린다.
+# 여기에 이름만 적어 두면 gen_scenarios 가 재생성될 때마다 batch_all.json 에서
+# 그 이름을 골라 scenarios/batch_quick.json 을 다시 만든다 — 목록이 낡지 않는다.
+# (batch_quick.json 은 scenarios/ 라 gitignore 대상이고, 이 파일만 추적한다.)
+#
+# 실행: python3 tools/batch_run.py scenarios/batch_quick.json [--no]
+# 갱신: python3 tools/gen_scenarios.py --rebuild-lists
+#
+# '#' 주석·빈 줄 무시. 여기 적은 순서대로 돈다.
+# 목적을 하나씩 맡긴 7개다 — 하나 빼면 그 목적의 관측이 없어진다.
+
+실경로_01_PathShape03          # 대회 형식·3연속 차선변경·866 m
+실경로_02_venue0903            # 대회 형식·749 m
+실전주행_교통류_07_연속교차로8   # 체인 회피
+실전주행_교통류_18_연속교차로14  # 체인 회피, 이번에 배치 바뀐 것
+실전주행_교통류_10_좌회전14      # 짧은 구간 2152 포함, 교차로 29개
+실전주행_교통류_09_우회전13      # 무신호 정지선 교차로 4건
+실전주행_교통류_11_직진10        # 차선변경 0 — 순수 속도·신호 확인

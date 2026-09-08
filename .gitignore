@@ -18,7 +18,10 @@ bags/
 # ===== 생성물 (gen_scenarios / build_route) =====
 # 배치가 만드는 route pkl 은 logs/batch/<ts>/routes/ 에 남는다 (logs/ 로 무시).
 # data/ 에는 손으로 만든 pkl 만 둔다 — 그중 추적할 것만 화이트리스트.
-scenarios/
+# scenarios/ 는 통째로 생성물이지만 quick_list.txt 만은 손으로 쓰는 입력이다
+# (batch_quick.json 의 단일 출처). 디렉터리째 무시하면 되살릴 수 없어 '*' 로 쓴다.
+scenarios/*
+!scenarios/quick_list.txt
 data/route_*.pkl
 !data/route_example.pkl
 !data/route_official_route.pkl
