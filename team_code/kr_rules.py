@@ -276,6 +276,9 @@ class KrRules:
         # never_stall 의 종점 배제 폭 — route_end 래치와 같은 축(unlatch_m).
         # active_m(150)은 후보 생성 창이라 여기 쓰면 마지막 150 m 가 통째로 죽는다.
         self.ns_end_m = float(cfg['route_end']['unlatch_m'])
+        # 종료 구간 정적 장애물 무시 (실주행 1차 [1](b)). 꺼지면 이전 동작.
+        self.fg_ignore = bool(sp.get('finish_gate_ignore_enable', False))
+        self.fg_m = float(sp.get('finish_gate_m', 10.0))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -475,6 +478,7 @@ class KrRules:
 
         self.latched = False
         self.stop_s: float | None = None           # 시작 시 1회 계산 캐시 (매 틱 투영 금지)
+        self.finish_s: float | None = None         # 종료선 route_s (종료 구간 게이트용)
         self.sl_hold_left = 0                      # 정지선 홀드 잔여 틱
         self.sl_stopped = False                    # 정지 연속성 (B-1 재무장 판정)
         self.sl_stop_ticks = 0                     # 현재 정지의 지속 틱
@@ -538,6 +542,7 @@ class KrRules:
         self.ns_level = 0                          # 0 정상 / 1 크립 / 2 사다리 재진입 / 3 최후
         self.ns_turn_ticks = 0                     # (c) 회전 차로 복귀 보류 누적
         self.ns_info: dict | None = None           # 진단 (로그용)
+        self.fg_dropped = 0                        # 종료 구간에서 회랑에서 뺀 정지 객체 수
         self.bo_lvl_ticks = 0
         self.bo_stall_ticks = 0
         self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
@@ -605,6 +610,7 @@ class KrRules:
             print('[kr_rules] finish_xy 를 경로에 투영하지 못함 — route_total 기준으로 정지',
                   flush=True)
             return total
+        self.finish_s = finish_s                   # [1](b) 종료 구간 게이트가 읽는다
         stop_s, clipped = plan_stop_s(self.cfg, total, finish_s)
         if clipped:
             print(f'[kr_rules] ⚠ 계획 정지점이 종료선을 못 넘는다 — finish_s {finish_s:.1f} '
@@ -945,9 +951,18 @@ class KrRules:
         ego_id = ap._vehicle.id
         half_ego = float(self.cfg['vehicle']['width']) / 2.0
         clr = float(self.cfg['percep'].get('obstacle_clearance_m', 0.3))
+        # [1](b) 종료 구간에서는 **정지 객체**를 회랑에서 뺀다 (종료선 콘).
+        # 이 함수가 회피·standoff·큐 판정의 단일 관문이라 여기 한 곳만 막으면
+        # 셋이 같이 빠진다. 움직이는 객체는 그대로 본다 — 속도 임계는
+        # blocker_speed_max("회피가 정지로 보는 속도")를 그대로 읽는다.
+        # PDM 의 IDM 추종·보행자 정지는 여기와 무관하게 계속 산다.
+        drop_static = self._in_finish_gate(planner)
         out = []
         for a in actors:
             if a.id == ego_id or not static_ok(a):
+                continue
+            if drop_static and float(getattr(a, 'speed', 0.0)) < self.ot_v_max:
+                self.fg_dropped += 1
                 continue
             loc = a.get_location()
             pr = self._project(planner, loc.x, loc.y)
@@ -967,6 +982,27 @@ class KrRules:
                 out.append((s_rel, lat, hw, a))
         out.sort(key=lambda z: z[0])
         return out
+
+    def _in_finish_gate(self, planner) -> bool:
+        """지금 **종료 구간**인가 — 종료선 앞 finish_gate_m 부터 꼬리 끝까지.
+
+        종료 지점은 주최측이 라바콘 2개로 표시하고, 좁은 연결로에서는 그 콘이
+        주행 회랑 안에 들어온다. 실측 실경로_01_PathShape03: 콘(cls obstacle,
+        0.3 m)을 blocker 로 잡아 종료선 17 m 앞에서 영구 정지했다(미완주).
+        생성기 쪽은 콘을 도로 끝으로 옮겼지만 **주최측 콘 위치는 우리가 못
+        정한다** — 대회에서 같은 일이 그대로 난다.
+
+        하필 이 구간은 다른 안전망이 전부 죽어 있다: route_end.active_m(150 m)
+        안이라 `_obstacle_cause` 가 거짓이고, BREAKOUT·크립·never_stall 이
+        하나도 안 선다. 그래서 여기서만 따로 막는다.
+        """
+        if not self.fg_ignore or self.finish_s is None:
+            return False
+        try:
+            route_s = float(planner.route_s[planner.route_index])
+        except Exception:                                   # noqa: BLE001
+            return False
+        return route_s >= self.finish_s - self.fg_m
 
     def _crossable_runs(self, lg, key, side) -> list:
         """side 로 **넘을 수 있는** 구간 [(s0, s1) …] — 점선 조각 + (E-8 ①) 마킹
@@ -4284,6 +4320,7 @@ class KrRules:
         self.wait_target_d = None
         self.standoff_id = None
         self.standoff_half_len = None
+        self.fg_dropped = 0
         self._creep_diag = None
         self.gap_v_req = None
         self.last_d_end = d_end
@@ -4469,6 +4506,12 @@ class KrRules:
 
         if self.q_reject:
             self.last_avoid = dict(self.last_avoid or {}, queue_reject=self.q_reject)
+        if self.fg_dropped:
+            # 스위치가 꺼져 있으면 항상 0 이라 키가 안 생긴다 — off 는 로그까지
+            # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
+            self.last_avoid = dict(self.last_avoid or {},
+                                   finish_gate={'dropped': int(self.fg_dropped),
+                                                'finish_s': round(self.finish_s, 1)})
         if self.ns_info:
             # A2 진단. 스위치가 꺼져 있으면 ns_info 가 항상 None 이라 키가 안 생긴다
             # — off 는 로그까지 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
