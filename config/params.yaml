@@ -263,7 +263,11 @@ speed:
   # 읽는다 — "회피가 정지로 보는 속도" 의 단일 출처다). PDM 의 IDM 추종과
   # 보행자 정지도 그대로다 — 여기서 빼는 것은 kr 의 회랑 계열 판정뿐이다.
   # false = 이전 동작.
-  finish_gate_ignore_enable: false
+  # true (2026-09-08): replay 검증 통과 — 같은 로그 rs ≥ 835 구간에서 v_target
+  # < 0.2 인 틱이 489(24.4 s) → **0**, standoff 후보 495틱 → **0**.
+  # 51 로그: decision 이 달라진 3건 전부 **진단 키만** 늘었고 v_target·state 는
+  # 전 틱 동일 — 켜도 속도가 바뀌는 로그가 하나도 없다.
+  finish_gate_ignore_enable: true
   # 종료선 앞 몇 m 부터 적용할지 [m].
   # 30.0 근거 — **감지창 전체를 덮어야 한다**. 종료선 위 콘은 회랑에 들어오는
   # 순간(overtake.blocker_dist_max 30 m) wait_target_d 를 세우고, standoff
