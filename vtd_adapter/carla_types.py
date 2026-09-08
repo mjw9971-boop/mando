@@ -112,6 +112,12 @@ class TrafficLightState(IntEnum):
     Green = 2
     Off = 3
     Unknown = 4
+    # VTD 확장 — 적색 점멸 (9910 state 6). CARLA 에는 없는 값이라 번호를 뒤에
+    # 붙인다. **PDM 에는 "녹색이 아닌 것" 으로만 보인다** = 정지선까지 적신호
+    # IDM 이 걸린다(정지 프로파일 축). 풀어 주는 것은 kr_rules.signal_release
+    # 뿐이라 PDM 원문 비교문(== Red / == Yellow / == Green / == Off)은 전부
+    # 거짓이 되고 손댈 필요가 없다.
+    FlashRed = 5
 
 
 class RoadOption(IntEnum):

@@ -507,6 +507,22 @@ class KrRules:
         # 순수 제한속도(아무도 안 줄인 틱)도 상한으로 실행할지 (실주행 2차 [1]).
         # false = 이전 동작 (곡률·LC·붉은구간 접근만 상한 축).
         self.cap_limit = bool(cfg['control'].get('cap_limit_target_enable', False))
+        # ── 적색 점멸 일시정지 (B3, 항목 9) ──────────────────────────────
+        self.flash_stop = bool(sp.get('signal_flash_stop_enable', False))
+        # 유지시간은 규정(0.5 s)보다 길게 잡는다 — 채점기가 0.5 s 를 **넘겨야**
+        # 인정하므로 딱 맞추면 틱 경계에서 놓친다. speed.flash_hold_s 가 정본.
+        self.flash_hold_ticks = int(round(float(sp.get('flash_hold_s', 0.8)) * self.hz))
+        # 판정 임계는 **채점기와 같은 출처**를 읽는다 (scoring.*). 여기서 새
+        # 상수를 만들면 같은 주행이 제어기 기준과 채점 기준으로 갈린다.
+        # (임계는 scoring.*, 정지 속도는 score.stop_speed_mps — 채점기가 읽는
+        #  자리가 둘로 갈려 있어 여기서도 그대로 따라간다)
+        _sc = cfg.get('scoring') or {}
+        self.flash_ok_m = float(_sc.get('stop_ok_m', 2.0))
+        self.flash_stop_v = float((cfg.get('score') or {}).get('stop_speed_mps', 0.5))
+        self.flash_latch_tl: int | None = None      # 통과 허가가 난 신호 id
+        self.flash_hold_n = 0                       # 그 신호 앞 정지 유지 틱
+        self.flash_tl = None                        # 지금 세고 있는 신호 id
+        self.last_flash: dict | None = None         # 진단 (로그용)
         # 황색 원샷 판정 래치 (접근당 1회, 번복 금지)
         self.y_decision: str | None = None            # None | 'stop' | 'go'
         self.y_ctrl: int | None = None                # 래치가 걸린 신호 id
@@ -3270,6 +3286,76 @@ class KrRules:
             return False
         return True
 
+    def _flash_tick(self, planner, ego_speed: float) -> None:
+        """적색 점멸 일시정지 시계 (B3, 항목 9). apply 가 틱당 1회 부른다.
+
+        규정: **범퍼 기준 정지선 2 m 이내에서 0.5 s 이상 정지 1회**, 그 뒤 통과.
+        무정차 통과는 중대(−6)다. 채점기 `detect_blink_stop` 과 **같은 축**을
+        쓴다 — 임계는 `scoring.stop_ok_m` · `scoring.stop_hold_s` 가 정본이고
+        여기서 새 상수를 만들지 않는다 (같은 주행이 항목별로 다르게 판정되면
+        안 된다).
+
+        멈추는 일 자체는 이 함수가 하지 않는다. 9910 state 6 이
+        `TrafficLightState.FlashRed` 로 매핑되면 **PDM 의 적신호 IDM 이 정지선까지
+        정지 프로파일을 그린다** — 상한형이 아니라 정지 축이다(CLAUDE.md 확정
+        사실). 여기서는 "충분히 섰다" 를 판정해 `signal_release` 로 풀어 줄
+        뿐이다. 6 은 지속 플래그라 램프 위상을 볼 필요가 없다.
+
+        래치는 **신호 id 단위**다. 한 번 허가가 나면 그 정지선을 지날 때까지
+        유지되므로 같은 선에 다시 서지 않는다. 다음 신호로 넘어가면 해제된다.
+        """
+        if not self.flash_stop:
+            return
+        nxt = self._next_stopline(planner)
+        if nxt is None:
+            self.flash_tl = None
+            self.flash_hold_n = 0
+            return
+        d_line, state, tl_id = nxt
+        if state != 'FlashRed':
+            # 이 신호가 점멸이 아니면 시계도 래치도 이 신호에 대해선 무의미하다.
+            if self.flash_tl == tl_id:
+                self.flash_tl = None
+                self.flash_hold_n = 0
+            return
+        if self.flash_tl != tl_id:                     # 새 점멸 신호
+            self.flash_tl = tl_id
+            self.flash_hold_n = 0
+            if self.flash_latch_tl != tl_id:
+                self.flash_latch_tl = None
+        # 부호 규약은 로그 `world.stop_line_front_m` · 채점기와 **같다**:
+        # 앞범퍼 기준, **음수 = 아직 선 앞**. (d_line 은 뒷축 기준 남은 거리다.)
+        front_m = self.front - d_line
+        near = front_m >= -self.flash_ok_m             # 선까지 ok_m 안
+        # 정지 유지는 **선을 넘기 전에만** 센다 — 넘어가 선 것은 일시정지가
+        # 아니다 (채점기가 front_m ≤ 0 만 인정하는 것과 같은 규약).
+        if near and front_m <= 0.0 and ego_speed < self.flash_stop_v:
+            self.flash_hold_n += 1
+        elif ego_speed >= self.flash_stop_v:
+            self.flash_hold_n = 0
+        if self.flash_hold_n >= self.flash_hold_ticks:
+            self.flash_latch_tl = tl_id                # 통과 허가
+        self.last_flash = {'tl': int(tl_id) if tl_id is not None else None,
+                           'front_m': round(front_m, 2),
+                           'hold_s': round(self.flash_hold_n / self.hz, 2),
+                           'need_s': round(self.flash_hold_ticks / self.hz, 2),
+                           'released': bool(self.flash_latch_tl == tl_id)}
+
+    def _flash_release(self, planner) -> bool:
+        """점멸 통과 허가가 이번 틱 유효한가 — signal_release 의 한 갈래.
+
+        허가는 **그 신호 id 에만** 붙는다. 교차 차량·보행자는 여기서 새로 보지
+        않는다: PDM 의 IDM·OBB 와 `_ped_intent`·보행자 홀드가 min() 의 다른
+        갈래로 그대로 살아 있어, 허가가 나도 교차 차량이 있으면 그쪽이 세운다.
+        (`signal_release` 는 **신호 유래 감속만** 건너뛴다.)
+        """
+        if not self.flash_stop or self.flash_latch_tl is None:
+            return False
+        nxt = self._next_stopline(planner)
+        if nxt is None:
+            return False
+        return nxt[2] == self.flash_latch_tl and nxt[1] == 'FlashRed'
+
     def signal_release(self, ap, _distance_to_traffic_light=None) -> bool:
         """PDM 의 적신호 IDM 을 이번 틱 건너뛸 것인가 — autopilot 조기 반환 조건.
 
@@ -3289,8 +3375,11 @@ class KrRules:
         B-3(b) 미보고 적신호 시한 출발(_sig_go, 기본 off)도 같은 자리에서 푼다.
         RTOR 래치(_rtor_go, 기본 off)도 같은 자리 — 래치가 붙은 신호일 때만.
         """
+        planner = getattr(ap, '_waypoint_planner', None)
         return bool(self.y_decision == 'go' or self.cross_guard or self._sig_go
-                    or self._rtor_active(getattr(ap, '_waypoint_planner', None)))
+                    or self._rtor_active(planner)
+                    # B3: 적색 점멸 — 규정 유지시간을 채운 신호에 한해 통과.
+                    or self._flash_release(planner))
 
     def _signal_timeout_tick(self, ap, planner, ego_speed: float) -> None:
         """B-3(b) 시계 — apply 가 틱당 1회 부른다 (_tick_cache 뒤: 회랑·stale 필요).
@@ -3606,6 +3695,8 @@ class KrRules:
           · 적색            → (d, stop_profile_a)
           · 황색 + STOP 래치 → (d, stop_profile_a)  적색과 **완전히 동일** 취급
           · 황색 + GO 래치   → None
+          · 적색점멸 (B3)    → 유지시간 채우기 전까지 (d, stop_profile_a),
+                              채운 뒤(래치)는 None — "정지 후 진행" 이 규정이다
           · 녹색 / 신호 없음 → None
 
         판정(a_yellow=4.0)과 실행(stop_profile_a=3.0)의 상수가 **다른 것이
@@ -3627,6 +3718,13 @@ class KrRules:
         if state == 'Red' and self.y_decision != 'go':
             return (d_line, self.stop_profile_a)
         if state == 'Yellow' and self.y_decision == 'stop':
+            return (d_line, self.stop_profile_a)
+        # B3 적색 점멸 — 적색과 **같은 실행 축**(④′ 정지 프로파일)으로 세운다.
+        # PDM 의 적신호 IDM 은 차간모형이라 정지 컨트롤러가 아니어서, 이걸 안
+        # 달면 점멸에서 5.4 m/s 로 정지선을 지난다 (replay 실측 2026-09-09).
+        # 유지시간을 채우면 래치가 붙어 여기서 None 이 되고, 같은 틱에
+        # signal_release 가 PDM 의 적신호 IDM 도 건너뛴다 = 재출발.
+        if state == 'FlashRed' and not self._flash_release(planner):
             return (d_line, self.stop_profile_a)
         return None
 
@@ -4485,6 +4583,7 @@ class KrRules:
         self.last_curv_info = None
         self.last_lc_cap = None
         self.last_cap_binds = False
+        self.last_flash = None
         self._creep_diag = None
         self.gap_v_req = None
         self.last_d_end = d_end
@@ -4494,6 +4593,9 @@ class KrRules:
         self.ped_emergency = False
         # 황색 원샷 판정 — 프로파일·홀드보다 먼저 정해야 같은 틱에 반영된다
         self._yellow_latch(planner, ego_speed, ap)
+        # 적색 점멸 일시정지 시계 (B3) — 같은 신호 축이라 여기서 같이 돈다.
+        # 세우는 것은 PDM 의 적신호 IDM 이고, 이 시계는 "충분히 섰나" 만 본다.
+        self._flash_tick(planner, ego_speed)
         # 녹색 연속 틱 (C-3 큐 해제 기준). 신호 id 가 바뀌면 0.
         nxt = self._next_stopline(planner)
         tl_id, state = (nxt[2], nxt[1]) if nxt else (None, None)
@@ -4726,6 +4828,10 @@ class KrRules:
         if self.last_lc_cap is not None:
             self.last_avoid = dict(self.last_avoid or {},
                                    lc_cap=round(self.last_lc_cap, 2))
+        if self.last_flash is not None:
+            # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
+            # 이전과 동일해야 회귀 비교(지문)가 성립한다.
+            self.last_avoid = dict(self.last_avoid or {}, flash=self.last_flash)
         if self.last_curv_info is not None:
             # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.

@@ -81,8 +81,15 @@ LIGHT_STATE_MAP = {
     3: TrafficLightState.Green,
     4: TrafficLightState.Red,       # 좌회전 화살표 — 직진/우회전엔 적색과 동등
     5: TrafficLightState.Green,     # 녹색+좌
-    6: TrafficLightState.Green,     # 점멸 — 기존 flash_mode 'yield' 관례
+    6: TrafficLightState.Green,     # 점멸 — 이전 동작 (flash_mode 'yield' 관례)
 }
+# 적색 점멸을 별도 상태로 볼 때의 맵 (speed.signal_flash_stop_enable).
+# 6 은 **지속 플래그**다 — 램프 on/off 위상은 9910 에 안 실린다 (실측 2026-09-01:
+# 629틱 35.7 s 동안 6 고정, 전이 0회). 이 맵의 점멸 컨트롤러는 117 하나뿐이고
+# 적색으로 확정됐다 (배포본 7개 전부 blink=117, Signal 373 type 1000020=적).
+# 황색 점멸은 이 맵에 없다.
+LIGHT_STATE_MAP_FLASH = dict(LIGHT_STATE_MAP)
+LIGHT_STATE_MAP_FLASH[6] = TrafficLightState.FlashRed
 
 
 def lg_neighbor_missing(lg, key, side) -> bool:
@@ -161,6 +168,8 @@ class VtdRoutePlanner:
         self.lc_ramp_hop_gap_m = float(rt_cfg.get('lc_ramp_hop_gap_m', 2.0))
         self.lc_ramps: list = []
         self.veh_width = float(cfg['vehicle']['width'])
+        # 적색 점멸(9910 state 6)을 별도 상태로 볼지 (B3). false = 이전 동작(녹색).
+        self.flash_stop = bool((cfg.get('speed') or {}).get('signal_flash_stop_enable', False))
         # 정적 장애물 인식 (compute_leading_vehicles) — params 가 단일 출처
         self.obstacle_speed_max = float(cfg['percep']['obstacle_speed_max'])
         self.obstacle_clearance_m = float(cfg['percep']['obstacle_clearance_m'])
@@ -575,7 +584,8 @@ class VtdRoutePlanner:
         정지선)만 보므로 무해하다.
         """
         for lid, state in lights:
-            mapped = LIGHT_STATE_MAP.get(int(state), TrafficLightState.Unknown)
+            tbl = (LIGHT_STATE_MAP_FLASH if self.flash_stop else LIGHT_STATE_MAP)
+            mapped = tbl.get(int(state), TrafficLightState.Unknown)
             for tl in self.traffic_lights:
                 if int(lid) in tl.controller_ids:
                     tl.state = mapped
