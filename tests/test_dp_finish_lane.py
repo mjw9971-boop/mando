@@ -71,7 +71,11 @@ def test_default_is_on():
 def test_dpcfg_still_builds_from_eleven_positional_args():
     """밖에서 11개 위치인자로 DPCfg 를 짓는 자리가 있다 (test_global_dp)."""
     c = BR.DPCfg(True, 8.0, 3.0, 400.0, 10.0, 1.0, 45.0, True, False, 16.0, 1.0)
-    assert c.finish_lock is True and len(c) == 12
+    # 뒤쪽 필드는 전부 기본값이 있어야 한다 (finish_lock / retry_ratio /
+    # retry_junction). 기본값은 params 기본과 같은 값이다 — 위치인자로 지은
+    # 설정이 조용히 새 기능을 켜면 안 된다.
+    assert c.finish_lock is True and c.retry_ratio == 0.0 and c.retry_junction is False
+    assert len(c) == 14
 
 
 # ── 실제 경로 ────────────────────────────────────────────────────────────

@@ -807,7 +807,8 @@ def pair_junction_ratio(lg, rt):
             sum(other) / len(other) if other else 0.0, len(other))
 
 
-def pair_offset_auto(lg, waypoints, radius, start_yaw, seqs, finish_tail_m, build_fn=None):
+def pair_offset_auto(lg, waypoints, radius, start_yaw, seqs, finish_tail_m,
+                     build_fn=None, dp_radius=None):
     """짝 해석을 고른다 → (offset|None, 근거 문자열, {offset: 신호}).
 
     짝수면 시험 빌드 없이 offset 1 이다 (주최 공식 형식). 홀수일 때만 0/1 을
@@ -827,9 +828,12 @@ def pair_offset_auto(lg, waypoints, radius, start_yaw, seqs, finish_tail_m, buil
     ev = {}
     for off in (0, 1):
         try:
+            # dp_radius 를 같이 넘겨야 한다 — 이 시험 빌드가 짝 해석을 정하는데,
+            # 여기만 params 기본 반경으로 지으면 **본 빌드와 다른 경로**를 보고
+            # 고르게 된다 (2026-09-08).
             rt = fn(lg, waypoints, radius, start_yaw,
                     junction_segs=junction_segments(n, off),
-                    seqs=seqs, finish_tail_m=finish_tail_m)
+                    seqs=seqs, finish_tail_m=finish_tail_m, dp_radius=dp_radius)
         except RouteError as e:                 # SystemExit 파생 — 이것만 잡는다.
             ev[off] = dict(ok=False, why=str(e).splitlines()[0], ratio=-1.0,
                            n=0, other=0.0, n_other=0)
@@ -1189,10 +1193,10 @@ def polyline_step_thr():
 
 DPCfg = _collections.namedtuple(
     'DPCfg', 'enable radius ratio floor detour_penalty step_penalty sep compare '
-             'retry radius_max dev_penalty finish_lock',
-    # finish_lock 만 기본값을 준다 — 밖에서 11개짜리 위치인자로 DPCfg 를 짓는
+             'retry radius_max dev_penalty finish_lock retry_ratio retry_junction',
+    # 뒤 두 개만 기본값을 준다 — 밖에서 11개짜리 위치인자로 DPCfg 를 짓는
     # 자리(tests/test_global_dp.py)가 있어서, 기본값 없이 늘리면 그쪽이 깨진다.
-    defaults=(True,))
+    defaults=(True, 0.0, False))
 
 
 def dp_cfg(reload=False):
@@ -1228,7 +1232,9 @@ def dp_cfg(reload=False):
             bool(r.get('dp_radius_retry_enable', False)),
             float(r.get('dp_radius_max_m', 16.0)),
             float(r.get('dp_radius_dev_penalty', 1.0)),
-            bool(r.get('dp_finish_lane_lock', True)))
+            bool(r.get('dp_finish_lane_lock', True)),
+            float(r.get('dp_retry_ratio', 2.0)),
+            bool(r.get('dp_retry_junction_enable', False)))
     return _DP_CFG
 
 
@@ -1297,26 +1303,102 @@ def dp_point_candidates(lg, waypoints, k, radius, start_yaw=None):
     return c, notes
 
 
-def dp_wide_radius(lg, waypoints, k, base_r, max_r):
-    """점 k 가 찍힌 도로의 **같은 방향 전체 차로**를 덮는 반경 [m] (max_r 상한).
+WideR = _collections.namedtuple('WideR', 'radius allow near')
+
+
+def dp_wide_radius(lg, waypoints, k, base_r, max_r, junc=None):
+    """점 k 를 덮어야 할 반경 [m] 과 그때 후보로 허용할 차로 → WideR.
 
     지도에 같은 방향 3차로 이상인 도로가 78개 있고 그중 33개는 첫↔끝 차로
     중심거리가 8 m 를 넘는다 (최대 15.84 m, 도로 1926). 경유점이 한쪽 차로에
     찍히면 반대쪽 끝 차로가 기본 반경 밖이라 DP 후보에 아예 안 들어온다 —
     그 교차로 회전이 반대쪽 차로에서만 되면 못 본다 (2026-09-07 분석).
+
+    **최근접 후보가 교차로 연결로면 그 연결로의 폭을 봐서는 안 된다.**
+    연결로는 언제나 1차로라 "도로 전폭" 이 1차로 폭으로 계산되고, 그러면
+    반경이 base_r 그대로여서 재시도가 아예 무장하지 않는다. 대회 공식 형식은
+    경유점이 전부 교차로 진입·진출부라 이 경우가 기본값이다 (2026-09-08
+    PathShape04 seq 3: 최근접 (1940,0,-1) = junction 39 연결로 → wide 8.0,
+    필요한 차로 (1926,0,6) 은 12.0 m 밖, seq 3→4 가 29 m 직선에 771 m 우회).
+
+    그래서 교차로 안 점은 **접근 도로** 를 본다: 연결로의 진입 도로
+    (predecessor) 를 우선으로 그 도로 같은 방향 전폭까지 넓히고, 후보도 그
+    도로의 같은 방향 차로로 제한한다. 진입 도로가 max_r 밖이면 — 긴 연결로의
+    **진출단** 에 찍힌 점이다 (실측 seq 4: 진입 도로 1869 이 53.9 m, 진출 도로
+    1927 이 9.7 m) — 진출 도로(successor)로 대신한다. 둘 다 밖이면 안 넓힌다.
+
+    allow 는 **넓힌 만큼에만** 적용되는 화이트리스트다 — base_r 안에서 이미
+    잡히던 후보는 그대로 남는다. 재시도는 후보를 더하기만 해야 한다.
     """
     x, y = waypoints[k]
-    near = candidates(lg, x, y, base_r) or candidates(lg, x, y, max_r)
+    base_c = candidates(lg, x, y, base_r)
+    near = base_c or candidates(lg, x, y, max_r)
     if not near:
-        return base_r
+        return WideR(base_r, None, None)
     k0 = near[0][0]
-    r = base_r
-    for kk in lg.lanes_of_road(k0[0]):
-        rr = lg.lanes[kk]
-        if rr.get('type') != 'driving' or kk[1] != k0[1] or (kk[2] > 0) != (k0[2] > 0):
-            continue
-        r = max(r, lg.project(kk, x, y)[2] + 0.5)
-    return min(float(max_r), r)
+
+    def _span(ref):
+        """ref 도로 섹션의 같은 방향 주행차로 → (가장 가까운 차로까지, 가장 먼
+        차로까지, 차로 집합). 거리는 lg.project — 점이 그 섹션 **옆**에 있을 때만
+        가로 폭을 뜻한다. 섹션 끝을 지난 점에서는 세로 거리가 지배하므로
+        (실측: seq1 이 접근 도로 1846 에서 42.58 m 인데 2차로 편차가 0.24 m
+        뿐이다 — 폭이 아니라 길이를 잰 것이다), 가까운 쪽(lo)으로 그 섹션을
+        쓸지 말지를 거른다."""
+        allow, lo, hi = set(), float('inf'), base_r
+        for kk in lg.lanes_of_road(ref[0]):
+            rr = lg.lanes[kk]
+            if rr.get('type') != 'driving' or kk[1] != ref[1] or (kk[2] > 0) != (ref[2] > 0):
+                continue
+            d = lg.project(kk, x, y)[2]
+            allow.add(kk)
+            lo, hi = min(lo, d), max(hi, d + 0.5)
+        return lo, min(float(max_r), hi), allow
+
+    if junc is None:
+        junc = dp_cfg().retry_junction
+    if not junc:                     # route.dp_retry_junction_enable=false = 이전 동작
+        _lo, hi, _aw = _span(k0)
+        return WideR(hi, None, k0)
+    refs = [k0]
+    if lg.lanes[k0].get('junction', -1) != -1:
+        # 연결로는 언제나 1차로라 자기 폭으로는 못 넓힌다. 접근 도로를 본다:
+        # 진입(predecessor) 우선, 그쪽이 max_r 밖이면(긴 연결로의 진출단에 찍힌
+        # 점) 진출(successor). 둘 다 밖이면 이전처럼 안 넓힌다.
+        pre = [kk for kk in lg.predecessors(k0) if lg.lane(kk).get('junction', -1) == -1]
+        suc = [kk for kk in lg.successors(k0) if lg.lane(kk).get('junction', -1) == -1]
+        pre = [kk for kk in pre if _span(kk)[0] <= max_r]
+        suc = [kk for kk in suc if _span(kk)[0] <= max_r]
+        refs = pre or suc or [k0]
+
+    r, allow = base_r, set()
+    for ref in refs:
+        _lo, hi, aw = _span(ref)
+        r = max(r, hi)
+        allow |= aw
+    # base_r 안 후보는 무조건 살린다 — 재시도는 후보를 **더하기만** 해야 한다.
+    allow |= {kk for kk, _s, _d in (base_c or [])}
+    return WideR(min(float(max_r), r), frozenset(allow), k0)
+
+
+def _wide_cands(lg, waypoints, k, wide, start_yaw):
+    """넓힌 반경의 후보 — WideR.allow 화이트리스트로 거른다.
+
+    다른 도로·반대 방향은 반경 안이어도 뺀다. 넓히는 목적은 "같은 도로의 반대쪽
+    끝 차로"를 보는 것이지 옆 도로를 끌어오는 것이 아니다. allow 는 base_r 안
+    후보를 이미 품고 있어서 (dp_wide_radius) 이 필터가 기존 후보를 줄이지는
+    않는다 — 재시도는 후보를 더하기만 한다.
+    """
+    c, _nt = dp_point_candidates(lg, waypoints, k, wide.radius, start_yaw)
+    if not wide.allow:
+        return c
+    return [x for x in c if x[0] in wide.allow]
+
+
+def _wide_warn(wide, pick):
+    """재시도가 경유점이 찍힌 도로가 **아닌** 도로의 차로를 골랐으면 경고 꼬리."""
+    if wide.near is None or pick[0] == wide.near[0]:
+        return ''
+    return f'  <= [경고] 경유점이 찍힌 도로는 {wide.near[0]} 다'
 
 
 def dp_candidates(lg, waypoints, radius, start_yaw=None):
@@ -1412,20 +1494,32 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         cur, par, pth, ed = layer(ka, kb, cands[kb], lim)
         n_edge += ed
         # ── 반경 재시도 (route.dp_radius_retry_enable) ─────────────────────
-        # 최선 전이가 우회 벌점을 물었거나 전부 막혔으면, 그 점만 "도로 같은 방향
-        # 전체 차로를 덮는 반경"으로 후보를 다시 잡고 이 층만 재계산한다.
+        # 최선 전이가 우회 벌점을 물었거나, 경로/직선 비율이 dp_retry_ratio 를
+        # 넘었거나, 전부 막혔으면 — 그 점만 "도로 같은 방향 전체 차로를 덮는
+        # 반경"(교차로 연결로면 접근 도로, dp_retry_junction_enable)으로 후보를
+        # 다시 잡고 이 층만 재계산한다.
         # 마지막 경유점은 재시도 대상이 아니다 — 그 점이 완주 판정의 기준
         # (finish_xy)이라, 먼 차로로 옮기면 경로가 종점을 8 m 밖으로 비껴간다
         # (실측: venue 계열 6경로에서 마지막 경유점 투영이 사라졌다).
         if C.retry and kb != idx[-1]:
             jbest = min(range(len(cur)), key=lambda j: cur[j][0]) if cur else None
+            raw = (pth.get(jbest) or (None, 0.0, 0.0))[1] if jbest is not None else 0.0
+            # 우회 벌점만으로는 부족하다: 벌점은 raw > max(floor 400, ratio×직선)
+            # 일 때만 붙으므로 **400 m 아래 우회는 전부 안 보인다**. 실측
+            # 2026-09-08 PathShape04 seq 3→4 는 직선 29 m 에 경로 771 m 라
+            # 벌점이 붙었지만, 같은 병증이 350 m 로 났으면 아무 표시가 없다.
+            # 그래서 경로/직선 비율도 함께 본다 (dp_retry_ratio, 0 = 끔).
+            over = (C.retry_ratio > 0.0 and straight > 1.0
+                    and raw > C.retry_ratio * straight)
             bad = (jbest is None or cur[jbest][0] == INF
-                   or (pth.get(jbest) or (None, 0.0, 0.0))[2] > 0.0)
+                   or (pth.get(jbest) or (None, 0.0, 0.0))[2] > 0.0 or over)
             base_best = cur[jbest][0] if jbest is not None else INF
             # (a) 진출점 kb 를 넓혀 본다
             if bad:
-                r2 = dp_wide_radius(lg, waypoints, kb, radius, C.radius_max)
-                c2 = (dp_point_candidates(lg, waypoints, kb, r2, start_yaw)[0]
+                w2 = dp_wide_radius(lg, waypoints, kb, radius, C.radius_max,
+                                    junc=C.retry_junction)
+                r2 = w2.radius
+                c2 = (_wide_cands(lg, waypoints, kb, w2, start_yaw)
                       if r2 > radius + 1e-9 else None)
                 if c2 and len(c2) > len(cands[kb]):
                     cur2, par2, pth2, ed2 = layer(ka, kb, c2, lim, dev0=radius)
@@ -1434,7 +1528,8 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
                     if j2 is not None and cur2[j2][0] < base_best - 1e-9:
                         retries.append(
                             f'{lab(kb)} 반경 재시도 {radius:g} → {r2:.1f} m, '
-                            f'채택 차로 {c2[j2][0]} 이탈 {c2[j2][2]:.2f} m')
+                            f'채택 차로 {c2[j2][0]} 이탈 {c2[j2][2]:.2f} m'
+                            + _wide_warn(w2, c2[j2][0]))
                         cands[kb] = c2
                         cur, par, pth = cur2, par2, pth2
                         base_best = cur2[j2][0]
@@ -1443,8 +1538,10 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
             # 넓혀야 할 쪽은 대개 **진입점**이다: 경유점이 한쪽 차로에 찍혀서
             # 회전 가능한 반대쪽 차로가 후보에 없는 것이 원래 문제다.
             if bad:
-                r3 = dp_wide_radius(lg, waypoints, ka, radius, C.radius_max)
-                c3 = (dp_point_candidates(lg, waypoints, ka, r3, start_yaw)[0]
+                w3 = dp_wide_radius(lg, waypoints, ka, radius, C.radius_max,
+                                    junc=C.retry_junction)
+                r3 = w3.radius
+                c3 = (_wide_cands(lg, waypoints, ka, w3, start_yaw)
                       if r3 > radius + 1e-9 else None)
                 if c3 and len(c3) > len(cands[ka]):
                     if t == 1:                     # 첫 층 — best 를 다시 깐다
@@ -1463,7 +1560,8 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
                             i3 = par3b[j3]
                             retries.append(
                                 f'{lab(ka)} 반경 재시도 {radius:g} → {r3:.1f} m, '
-                                f'채택 차로 {c3[i3][0]} 이탈 {c3[i3][2]:.2f} m')
+                                f'채택 차로 {c3[i3][0]} 이탈 {c3[i3][2]:.2f} m'
+                                + _wide_warn(w3, c3[i3][0]))
                             cands[ka] = c3
                             best = best_hist[t - 1] = b3
                             parent[t - 1] = par3
@@ -1530,8 +1628,13 @@ def dp_chain(lg, waypoints, radius, start_yaw, banned, seqs=None, cfg=None):
         path, raw_cost, pen = seg_path[t][picks[t]]
         if pen > 0:
             ka, kb = idx[t - 1], idx[t]
+            # pen 은 우회 벌점과 **반경 재시도 거리 벌점**의 합이다. 둘을 다
+            # "우회" 로 찍으면 우회가 없는 구간에도 경고가 뜬다 (2026-09-08:
+            # 재시도로 고친 PathShape04 가 277/216 m 구간에 우회 경고를 냈다).
+            why = ('우회 벌점' if raw_cost > lims[t] + 1e-9 else '반경 재시도 거리 벌점')
             detours.append(f'{lab(ka)}→{lab(kb)} 경로 {raw_cost:.0f} m / 직선 '
-                           f'{math.dist(waypoints[ka], waypoints[kb]):.0f} m — 우회 벌점을 물고 채택')
+                           f'{math.dist(waypoints[ka], waypoints[kb]):.0f} m — '
+                           f'{why}을 물고 채택')
         i0 = max(0, len(seq) - 1)
         for k, s_en in path:
             if seq and seq[-1][0] == k:
@@ -2443,7 +2546,8 @@ def main():
     if mode == 'none':
         offset, why, src = None, '--pair-offset none (짝 해석 안 함)', 'forced'
     elif mode == 'auto':
-        offset, why, _ev = pair_offset_auto(lg, wps, radius, start_yaw, seqs, tail_m)
+        offset, why, _ev = pair_offset_auto(lg, wps, radius, start_yaw, seqs, tail_m,
+                                           dp_radius=a.radius)
         src = 'auto'
     else:
         offset, why, src = int(mode), f'--pair-offset {mode} (사람이 지정)', 'forced'
