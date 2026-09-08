@@ -502,6 +502,11 @@ class KrRules:
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
         self.last_stop_profile: float | None = None   # 이번 틱 정지 프로파일 상한 (로그용)
+        # 이번 틱 최종 목표를 정상상태 상한(곡률·LC)이 정했나 (실주행 2차 [1], 로그용)
+        self.last_cap_binds: bool = False
+        # 순수 제한속도(아무도 안 줄인 틱)도 상한으로 실행할지 (실주행 2차 [1]).
+        # false = 이전 동작 (곡률·LC·붉은구간 접근만 상한 축).
+        self.cap_limit = bool(cfg['control'].get('cap_limit_target_enable', False))
         # 황색 원샷 판정 래치 (접근당 1회, 번복 금지)
         self.y_decision: str | None = None            # None | 'stop' | 'go'
         self.y_ctrl: int | None = None                # 래치가 걸린 신호 id
@@ -1002,6 +1007,30 @@ class KrRules:
                 out.append((s_rel, lat, hw, a))
         out.sort(key=lambda z: z[0])
         return out
+
+    def finish_gate_drop(self, planner, actor) -> bool:
+        """이 객체를 **종료 구간의 정지 장애물**로 보고 빼야 하나 (실주행 2차 [3]).
+
+        `_actors_in_corridor` 안의 같은 판정을 **밖에서도 쓸 수 있게** 꺼낸 것이다
+        (조건을 두 벌 적지 않는다). autopilot 의 `# VTD:` 접합부가 PDM 의 actor
+        목록을 거를 때 이 함수 하나만 부른다.
+
+        왜 PDM 입력까지 손대나 — kr 후보만 빼는 것으로는 안 멈춘다:
+        실측 20260908_222954/실경로_02 rs 745.5(종료선 749.2, **3.7 m 앞**)에서
+        `finish_gate.dropped=4` 로 kr 은 콘을 이미 뺐는데 PDM 의
+        `compute_target_speeds_wrt_all_actors` 가 콘을 보고 vehicle 후보 0.0 을
+        내 483틱(로그 끝까지) 정지했다 — **미완주**다. 종료선 콘은 주최측이
+        놓는 것이라 위치를 우리가 못 정한다.
+
+        범위는 좁다: `finish_gate_ignore_enable` on ∧ 종료선 앞 finish_gate_m
+        (기본 10 m)부터 ∧ **정지 객체만**(속도 < blocker_speed_max). 움직이는
+        것은 그대로 보이고, 보행자 정지·IDM 추종도 이 구간 밖에서는 전부 그대로다.
+        """
+        if not self._in_finish_gate(planner):
+            return False
+        if not self._static_ok(actor):
+            return False
+        return float(getattr(actor, 'speed', 0.0)) < self.ot_v_max
 
     def _in_finish_gate(self, planner) -> bool:
         """지금 **종료 구간**인가 — 종료선 앞 finish_gate_m 부터 꼬리 끝까지.
@@ -4455,6 +4484,7 @@ class KrRules:
         self.last_curv = None
         self.last_curv_info = None
         self.last_lc_cap = None
+        self.last_cap_binds = False
         self._creep_diag = None
         self.gap_v_req = None
         self.last_d_end = d_end
@@ -4532,20 +4562,38 @@ class KrRules:
 
         # 연결로 곡률 상한 (B1) — min() 후보. 오버라이드가 아니라 상한이라
         # 신호·보행자·standoff 가 더 낮으면 그쪽이 이긴다.
+        #
+        # 곡률·차선변경은 **정상상태 속도 상한**이다 (목표점 0 정지 프로파일이
+        # 아니다). 종방향이 이 둘을 IDM 의 "1틱 전방 목표" 로 오해하면 err/dt 가
+        # 20배 증폭돼 0.2 m/s 초과에도 −4.0 이 나간다 — 실주행 2차 [1]. 그래서
+        # 상한형 후보의 최저값을 따로 들고 있다가, 최종 목표를 이쪽이 정했을 때만
+        # 종방향에 cap_target 으로 알린다.
+        cap_cand: float | None = None
         cv = self._curvature_cap(planner)
         self.last_curv = cv
         if cv is not None and (candidate is None or cv < candidate):
             candidate = cv
+        if cv is not None and (cap_cand is None or cv < cap_cand):
+            cap_cand = cv
 
         # 차선변경 구간 속도 상한 ([3](a)) — 같은 자리의 min() 후보.
         lcv = self._lc_speed_cap(planner)
         if lcv is not None and (candidate is None or lcv < candidate):
             candidate = lcv
+        if lcv is not None and (cap_cand is None or lcv < cap_cand):
+            cap_cand = lcv
 
         # 붉은 구간 진입 전 감속 (2b-B) — 구간 **밖**에서만 산다. min() 후보.
+        # 이것도 **정상상태 상한**이다: 목표가 0 이 아니라 구간 제한속도 v_allow
+        # 라, 곡률·LC 와 같은 실행축에 태운다 (실주행 2차 [1]). 실측 rs 55.0:
+        # v_allow 6.79 인데 v 7.71 (err −0.92) 만으로 −4.0 이 나갔고, 구간에
+        # 들어가 후보가 사라진 뒤에도 jerk 램프 때문에 10 m 를 더 감속해
+        # 7.26 → 4.25 m/s 가 됐다.
         rz = self._red_approach_profile(planner)
         if rz is not None and (candidate is None or rz < candidate):
             candidate = rz
+        if rz is not None and (cap_cand is None or rz < cap_cand):
+            cap_cand = rz
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)
@@ -4634,21 +4682,44 @@ class KrRules:
 
         if candidate is not None:
             self.last_candidate = candidate
-        if (candidate is not None and candidate < target_speed) or emg:
-            if candidate is not None and candidate < target_speed:
+        kr_wins = candidate is not None and candidate < target_speed
+        # ── 순수 제한속도도 '상한' 이다 ────────────────────────────────────
+        # PDM 의 중재 전 목표(제한속도 ∧ 교차로 상한)를 **아무도 줄이지 않은**
+        # 틱이면 최종 목표는 IDM 의 1틱 전방 값이 아니라 그냥 속도 상한이다.
+        # 그때도 err/dt 축을 쓰면 0.3 m/s 초과에 −4.0 이 나간다 (실측 rs 55.6~
+        # 65.0: 제한 6.94 에 v 7.26 인데 급제동 → 4.25 m/s 까지 밀렸다).
+        # 적신호·선행차·정지 프로파일이 이기면 target < initial 이라 여기 안 온다.
+        init_t = getattr(ap, 'initial_target', None)
+        pure_limit = bool(self.cap_limit and init_t is not None and not emg
+                          and not kr_wins and target_speed > 1e-5
+                          and abs(float(target_speed) - float(init_t)) < 1e-6)
+        if kr_wins or emg or pure_limit:
+            if kr_wins:
                 target_speed = candidate
-            # 종방향 재계산 — 본류가 이번 틱 이미 호출했으므로 되감고 다시
-            # (되감지 않으면 두 호출이 jerk 창을 나눠 갖는 핑퐁 — rewind_last 참고)
-            hazard = target_speed < 1e-5
-            ap._longitudinal_controller.rewind_last()
-            if emg:
-                accel, brake = ap._longitudinal_controller.emergency()
-            else:
-                accel, brake = ap._longitudinal_controller.get_throttle_and_brake(
-                    hazard, target_speed, ego_speed)
-            control.accel = accel
-            control.throttle = accel
-            control.brake = float(brake)
+            # 최종 목표를 **상한형 후보가 정했나**. 동률이면 상한이 아니라고 본다
+            # — 정지 프로파일·보행자·홀드가 같은 값이면 그쪽 실행축(err/dt)이
+            # 맞기 때문이다. 안전한 쪽으로 틀린다 (이전 동작).
+            cap_binds = bool(not emg and (
+                pure_limit
+                or (cap_cand is not None and abs(target_speed - cap_cand) < 1e-9)))
+            self.last_cap_binds = cap_binds
+            # 순수 제한속도인데 이미 목표 이하면 본류 명령과 같다 — 되감아
+            # 다시 부르지 않는다 (가속측은 cap 여부와 무관하게 같은 축이라
+            # 결과가 같고, 불필요한 rewind 로 jerk 이력을 건드리지 않는다).
+            skip = pure_limit and not kr_wins and ego_speed <= target_speed
+            if not skip:
+                # 종방향 재계산 — 본류가 이번 틱 이미 호출했으므로 되감고 다시
+                # (되감지 않으면 두 호출이 jerk 창을 나눠 갖는 핑퐁 — rewind_last)
+                hazard = target_speed < 1e-5
+                ap._longitudinal_controller.rewind_last()
+                if emg:
+                    accel, brake = ap._longitudinal_controller.emergency()
+                else:
+                    accel, brake = ap._longitudinal_controller.get_throttle_and_brake(
+                        hazard, target_speed, ego_speed, cap_target=cap_binds)
+                control.accel = accel
+                control.throttle = accel
+                control.brake = float(brake)
 
         if self.q_reject:
             self.last_avoid = dict(self.last_avoid or {}, queue_reject=self.q_reject)

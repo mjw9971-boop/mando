@@ -136,6 +136,18 @@ class LoggingAutoPilot(AutoPilot):
     final: (brake, target_speed, speed_reduced_by_obj), initial: 중재 전 목표.
     """
 
+    def _manage_route_obstacle_scenarios(self, target_speed, *a, **kw):
+        """중재 **전** 목표(제한속도 ∧ 교차로 상한)를 매 틱 기록만 한다.
+
+        아래 get_brake_and_target_speed 에도 같은 값이 들어오지만 그쪽은
+        keep_driving 분기에서 **호출되지 않아** 직전 틱 값이 얼어붙는다.
+        이 훅은 두 분기보다 앞이라 항상 이번 틱 값이다 — kr_rules 가
+        "아무도 안 줄였다 = 목표가 순수 제한속도" 를 판정하는 데 쓴다
+        (실주행 2차 [1]). 판단에는 관여하지 않는다.
+        """
+        self.initial_target = float(target_speed)
+        return super()._manage_route_obstacle_scenarios(target_speed, *a, **kw)
+
     def get_brake_and_target_speed(self, plant, route_points, dist_tl, next_tl,
                                    dist_ss, next_ss, vehicle_list, actor_list,
                                    initial_target_speed, speed_reduced_by_obj):

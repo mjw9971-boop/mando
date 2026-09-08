@@ -48,20 +48,46 @@ class VtdLongitudinalController:
         # B-2 좁은 패치 (params 참조). release_eps 0 이면 비활성.
         self.release_eps = float(c.get('release_eps', 0.0))
         self.release_v = float(c.get('release_v', 0.5))
+        # 정상상태 속도 **상한**(곡률·차선변경)을 따를 때의 감속 축 (실주행 2차 [1]).
+        # err/dt 는 "1틱 전방 목표"에만 맞는 식이라 상한에 쓰면 안 된다 — 아래
+        # _raw_accel 주석 참조. false = 이전 동작(전부 err/dt).
+        self.cap_soft_dec = bool(c.get('cap_soft_dec_enable', False))
+        self.a_cap_dec_max = float(c.get('a_cap_dec_max', -1.5))
+        self.kp_cap_dec = float(c.get('kp_cap_dec', 0.8))
         self.dt = 1.0 / float(cfg['comm']['send_hz'])
         self._prev_accel = 0.0
         self._undo_accel = 0.0
         self._saved_accel = 0.0
 
-    def _raw_accel(self, target: float, v: float) -> float:
+    def _raw_accel(self, target: float, v: float, cap_target: bool = False) -> float:
+        """target [m/s] → accel [m/s²].
+
+        cap_target=True 면 target 이 **정상상태 속도 상한**(곡률·차선변경 등)
+        이라는 뜻이다. 그때는 err/dt 를 쓰면 안 된다:
+
+        err/dt 는 PDM IDM 의 target 이 "1틱(dt=0.05 s) 전방 속도"라는 성질에
+        기댄 식이라, (target−v)/dt 가 곧 IDM 이 의도한 가감속이다. 상한은 그런
+        뜻이 아니라 그냥 "이 속도를 넘지 마라" 이므로, 같은 식에 넣으면 **1/dt
+        = 20배로 증폭**된다 — 실측 2026-09-08 배치(실경로_01): 목표가 실속도보다
+        0.20 m/s 낮기만 해도 −4.0(a_dec_max 포화)이 나갔고, jerk 램프(+0.1/틱)로
+        푸는 데 1.75 s 가 걸려 그 사이 상한 아래로 한참 내려갔다. 그 언더슛이
+        다음 틱의 오차를 키워 되먹임되면서 rs 364 에서는 목표 5.56 m/s 인데
+        **완전히 정지**했다. 같은 꼴이 한 주행에 11곳.
+
+        상한일 때는 P 로 부드럽게 붙이고 a_cap_dec_max 로만 클램프한다.
+        """
         err = target - v
         if err < 0.0:
+            if cap_target and self.cap_soft_dec:
+                # 상한 추종 — 부드러운 P, a_cap_dec_max 클램프
+                return max(self.kp_cap_dec * err, self.a_cap_dec_max)
             # IDM 의도 감속 (err/dt), 상한 a_dec_max — a_min 은 hazard 전용
             return max(err / self.dt, self.a_dec_max)
         return min(self.kp * err, self.a_max)
 
     def get_throttle_and_brake(self, hazard_brake: bool, target_speed: float,
-                               current_speed: float) -> tuple[float, bool]:
+                               current_speed: float,
+                               cap_target: bool = False) -> tuple[float, bool]:
         """(accel [m/s²], brake_bool). brake_bool 은 로그·rolling-back 방지 판정용.
 
         · hazard_brake 또는 목표 0 인데 이미 저속 → a_hold (정지 유지 — 굴러가지 않게)
@@ -91,7 +117,9 @@ class VtdLongitudinalController:
             self._prev_accel = 0.0
 
         target = 0.0 if hazard_brake else float(target_speed)
-        accel = self._raw_accel(target, float(current_speed))
+        # hazard 는 목표 0 = 정지 요구지 상한이 아니다 — cap 축을 태우지 않는다.
+        accel = self._raw_accel(target, float(current_speed),
+                                cap_target=bool(cap_target) and not hazard_brake)
 
         accel = _clamp(accel,
                        self._prev_accel - self.jerk_dec_mult * self.jerk_max * self.dt,
