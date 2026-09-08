@@ -138,9 +138,15 @@ def test_wider_margin_hurts_when_finish_is_one_lane_over():
     −0.32 → −1.02 로 **악화**했다. margin 튜닝이 해법이 아니라는 근거다.
     """
     r = route(finish_y=2.9)                       # 종료 좌표가 경로에서 좌로 2.9 m
-    a = fc.finish_gate(FakeLG(3.0), r, cfg_with(cone_margin_m=0.3))
-    b = fc.finish_gate(FakeLG(3.0), r, cfg_with(cone_margin_m=1.0))
+    a = fc.finish_gate(FakeLG(3.0), r, cfg_with(cone_margin_m=0.3,
+                                                cone_at_road_edge=False))
+    b = fc.finish_gate(FakeLG(3.0), r, cfg_with(cone_margin_m=1.0,
+                                                cone_at_road_edge=False))
     assert a['clear_min'] < 0.0 and b['clear_min'] < a['clear_min']
+    # 그래서 margin 이 아니라 **기준점**을 바꿨다 (cone_at_road_edge, 2026-09-08):
+    # 차로 중심선 기준이면 종료 좌표가 얼마나 치우쳐 있든 콘은 경계에 선다.
+    c = fc.finish_gate(FakeLG(3.0), r, cfg_with(cone_margin_m=0.3))
+    assert c['clear_min'] > 0.0
 
 
 # ── 테이퍼 차로 게이트 바닥 ──────────────────────────────────────────────
@@ -155,6 +161,9 @@ def test_gate_never_narrower_than_the_car():
     lo, hi = fc.gate_span(g)
     assert g['gate_floored'] is True
     assert hi - lo >= cfg['vehicle']['width']
+    g_legacy = fc.finish_gate(FakeLG(0.75), route(),
+                              cfg_with(cone_margin_m=0.3, cone_at_road_edge=False))
+    assert g_legacy['gate_floored'] is True             # 이전 경로에서도 받친다
 
 
 def test_gate_floor_is_off_by_switch():
@@ -182,11 +191,50 @@ def test_between_cones_uses_inner_faces():
     assert not fc.between_cones(g, -1.7)
 
 
-def test_between_cones_follows_the_finish_coordinate_not_the_lane():
-    """콘은 종료 좌표를 중심으로 서므로 게이트도 그쪽으로 따라간다."""
-    g = fc.finish_gate(FakeLG(3.0), route(finish_y=2.9), cfg_with(cone_margin_m=0.3))
+def test_between_cones_follows_the_finish_coordinate_when_legacy():
+    """이전 동작(cone_at_road_edge=false): 콘이 종료 좌표를 중심으로 선다.
+
+    **기본값을 읽지 않고 사본에서 명시적으로 끈다** — 기본이 바뀌어도 이 경로의
+    커버리지를 잃지 않기 위해서다 (CLAUDE.md 2026-09-07 드리프트 원칙).
+    """
+    g = fc.finish_gate(FakeLG(3.0), route(finish_y=2.9),
+                       cfg_with(cone_margin_m=0.3, cone_at_road_edge=False))
     assert fc.between_cones(g, 2.9)
     assert not fc.between_cones(g, 0.0)
+
+
+def test_road_edge_places_cones_at_the_lane_edge_not_around_the_finish_point():
+    """기본(도로 끝): 종료 좌표가 치우쳐 있어도 콘은 차로 경계 + margin 에 선다.
+
+    실측 실경로_01_PathShape03: 폭 2.4 m 연결로에서 종료 좌표가 중심선에서
+    0.406 m 치우쳐 있었고, 종료 좌표 기준 대칭 배치는 오른쪽 콘을 회랑 안
+    (여유 −0.309 m)에 놓아 자차가 종료선 17 m 앞에서 영구 정지했다(미완주).
+    """
+    off = fc.finish_gate(FakeLG(2.4), route(finish_y=0.406),
+                         cfg_with(cone_margin_m=0.3, cone_at_road_edge=False))
+    on = fc.finish_gate(FakeLG(2.4), route(finish_y=0.406),
+                        cfg_with(cone_margin_m=0.3))
+    # 이전: 종료 좌표 기준 대칭 → 한쪽이 회랑 안
+    assert off['lat_left'] == pytest.approx(0.406 + 1.5)
+    assert off['lat_right'] == pytest.approx(0.406 - 1.5)
+    assert off['clear_min'] < 0
+    # 지금: 차로 중심선 기준 ±(반폭 + margin)
+    assert on['lat_left'] == pytest.approx(1.5)
+    assert on['lat_right'] == pytest.approx(-1.5)
+    assert on['clear_min'] > 0
+
+
+def test_road_edge_spans_all_same_direction_lanes():
+    """편도 다차로면 **바깥 차로 경계**까지 나간다 — 도로 한가운데 세우지 않는다."""
+    class MultiLG(FakeLG):
+        """배치 차로 왼쪽에 3.0 m 차로가 하나 더 있는 편도 2차로."""
+
+        def neighbor(self, key, side):
+            return (1, 0, -2) if (side == 'left' and key == LANE) else None
+
+    g = fc.finish_gate(MultiLG(3.0), route(), cfg_with(cone_margin_m=0.3))
+    assert g['lat_left'] == pytest.approx(1.5 + 3.0 + 0.3)  # 반폭 + 이웃 폭 + margin
+    assert g['lat_right'] == pytest.approx(-1.8)         # 오른쪽은 이웃이 없다
 
 
 # ── 판정 불변 (이 작업의 핵심 경계) ──────────────────────────────────────
@@ -273,10 +321,15 @@ def test_generated_xml_has_two_cones_of_the_configured_model():
     assert {o.get('Definition') for o in objs} == {model}
     # 정의(yaml)에 좌표가 남아 재생성 없이 대조할 수 있어야 한다
     assert sdef['finish_cone']['model'] == model
-    fx, fy = sdef['finish_cone']['finish_xy']
     L, R = sdef['finish_cone']['left'], sdef['finish_cone']['right']
-    assert (L[0] + R[0]) / 2 == pytest.approx(fx, abs=1e-3)
-    assert (L[1] + R[1]) / 2 == pytest.approx(fy, abs=1e-3)
+    lat = sdef['finish_cone']['lat']
+    # 도로 끝 규약: 두 콘은 배치 차로 **중심선**을 사이에 두고 서고, 좌우 거리는
+    # 각 방향 바깥 경계까지라 대칭이 아닐 수 있다. 종료 좌표 중점이 아니다.
+    assert lat[0] > 0 > lat[1]
+    assert L[2] == pytest.approx(R[2], abs=1e-6)        # 같은 높이
+    assert sdef['finish_cone']['clear_m'] == pytest.approx(
+        [abs(lat[0]) - sdef['finish_cone']['reach_m'],
+         abs(lat[1]) - sdef['finish_cone']['reach_m']], abs=1e-6)
 
 
 @pytest.mark.skipif(not GRAPH.exists(), reason='data/lane_graph.pkl 없음 (gitignore 대상)')

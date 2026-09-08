@@ -74,7 +74,41 @@ def cone_cfg(cfg: dict) -> dict:
             'half_width_m': float(plc.get('cone_half_width_m', 0.16)),
             'z_offset_m': float(plc.get('cone_z_offset_m', 0.0)),
             'min_gate_from_vehicle': bool(
-                plc.get('cone_min_gate_from_vehicle', True))}
+                plc.get('cone_min_gate_from_vehicle', True)),
+            'at_road_edge': bool(plc.get('cone_at_road_edge', True))}
+
+
+def road_edge_dist(lg, key, x: float, y: float, side: str, cap: int = 6) -> float:
+    """차로 중심선 → **같은 방향 차로들의 바깥 경계**까지 횡거리 [m].
+
+    주최측 공지는 "도로 양 끝에 세운 콘" 이다. 차로 반폭으로 세우면 편도
+    2차로 이상에서 콘이 도로 한가운데에 서고, 1차로여도 종료 좌표가 차로
+    중앙에서 벗어나 있으면 한쪽 콘이 회랑 안으로 들어온다 (실측 아래).
+
+    neighbor() 가 주는 같은 방향 주행 차로를 바깥쪽으로 따라가며 폭을 더한다.
+    이웃 차로에서의 s 는 **같은 세계 좌표를 다시 투영해서** 얻는다 — 차로마다
+    s 축 원점이 다르므로 s 를 그대로 물려주면 엉뚱한 지점의 폭을 읽는다.
+    """
+    s0 = lg.project(key, x, y, tangent_ends=True)[0]
+    d = float(lg.width_at(key, s0)) / 2.0
+    # neighbor 가 없는 대역 LaneGraph 도 있다 (score 검출기 테스트) — 그 경우는
+    # 차로 하나짜리 도로로 본다. 있는 API 만 쓰고 조용히 틀리지 않게 한다.
+    if not hasattr(lg, 'neighbor'):
+        return d
+    k = key
+    seen = {tuple(key)}
+    for _ in range(cap):
+        nb = lg.neighbor(k, side)
+        if nb is None or tuple(nb) in seen:
+            break
+        seen.add(tuple(nb))
+        try:
+            s_nb = lg.project(tuple(nb), x, y, tangent_ends=True)[0]
+            d += float(lg.width_at(tuple(nb), s_nb))
+        except (KeyError, IndexError):
+            break
+        k = tuple(nb)
+    return d
 
 
 def corridor_reach(cfg: dict, obj_half_w: float) -> float:
@@ -152,8 +186,33 @@ def finish_gate(lg, route: dict, cfg: dict, finish_xy=None) -> dict | None:
     # 좌(+t) 단위벡터 = (−sin h, cos h) — gen_scenarios.route_pt 와 같은 규약.
     dx, dy = -math.sin(h), math.cos(h)
     zc = z + cc['z_offset_m']
-    left = (fx + half_gate * dx, fy + half_gate * dy, zc)
-    right = (fx - half_gate * dx, fy - half_gate * dy, zc)
+    # ── 콘 위치 (2026-09-08) ──────────────────────────────────────────────
+    # 기본(at_road_edge): 주최측 공지대로 **도로 양 끝**에 세운다. 기준점이
+    # 종료 좌표가 아니라 **배치 차로 중심선**이고, 좌우 각각 그 방향 마지막
+    # 차로의 바깥 경계 + margin 이다. 좌우 거리가 다를 수 있어 비대칭이다.
+    #
+    # 왜 바꿨나 — 실측 실경로_01_PathShape03 (logs/batch/20260908_130919):
+    # 마지막 좌회전 연결로 (1502,0,-1) 은 폭 2.4 m 이고 종료 좌표가 중심선에서
+    # t=+0.406 m 치우쳐 있었다. 종료 좌표 기준 대칭 배치(half_gate 1.5)는
+    # 오른쪽 콘을 lat −1.094 에 놓았는데 회랑 임계 reach 는 1.403 이라 여유가
+    # **−0.309 m**, 즉 콘이 회랑 안이다. 자차는 그 콘을 정적 장애물로 잡아
+    # 종료선 17 m 앞에서 영구 정지했다(미완주). 도로 끝 기준이면 양쪽 콘이
+    # lat ±1.5 로 서서 여유 +0.097 로 바뀐다.
+    # false = 이전 동작(종료 좌표 기준 대칭).
+    if cc['at_road_edge']:
+        d_l = road_edge_dist(lg, k_pl, fx, fy, 'left') + cc['margin_m']
+        d_r = road_edge_dist(lg, k_pl, fx, fy, 'right') + cc['margin_m']
+        if cc['min_gate_from_vehicle']:
+            floor = float(cfg['vehicle']['width']) / 2.0 + cc['half_width_m'] \
+                + cc['margin_m']
+            if floor > d_l or floor > d_r:
+                d_l, d_r, gate_floored = max(d_l, floor), max(d_r, floor), True
+        half_gate = (d_l + d_r) / 2.0                # 보고용 대표값
+        left = (_x + d_l * dx, _y + d_l * dy, zc)
+        right = (_x - d_r * dx, _y - d_r * dy, zc)
+    else:
+        left = (fx + half_gate * dx, fy + half_gate * dy, zc)
+        right = (fx - half_gate * dx, fy - half_gate * dy, zc)
     # lat 은 배치 프레임 값을 유용하지 않고 **다시 투영**해서 낸다 (배치 차로와
     # 경로 차로가 다를 수 있다 — 모듈 도입부 참조). 기준 차로는 종료 좌표가
     # 붙은 **경로 차로 하나**(k_route)로 고정한다.
