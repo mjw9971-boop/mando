@@ -1346,6 +1346,34 @@ def resolve_finish_xy(cfg: dict, route) -> list | None:
     return None
 
 
+def _cones_seen(ticks: list[dict], gate: dict, radius: float = 2.0) -> list:
+    """콘 월드좌표 근처에서 관측된 객체 요약 [{id, cls, size, speed, d_m}].
+
+    "콘이 어떻게 들어오는가" 를 사후에 답하기 위한 **기록**이다 (판정 아님).
+    size 가 null 이면 크기 미보고라 제어기의 정지 거리 계산이 성립하지 않는다
+    (kr_rules 의 creep_block='no_size'). 실측 2026-09-08 실경로_01 의 콘은
+    0.3×0.3×0.32 m 로 정상 보고됐고, 그 런의 정지는 no_size 가 아니라 콘이
+    회랑 안이었기 때문이다 — 그 구분을 리포트에서 바로 볼 수 있어야 한다.
+    """
+    import math as _m
+    out: dict = {}
+    for cone in ('left', 'right'):
+        cx, cy = float(gate[cone][0]), float(gate[cone][1])
+        for tk in ticks:
+            for o in (tk.get('objects') or []):
+                if o.get('x') is None or o.get('y') is None:
+                    continue
+                d = _m.hypot(float(o['x']) - cx, float(o['y']) - cy)
+                if d > radius:
+                    continue
+                oid = o.get('id')
+                if oid in out and out[oid]['d_m'] <= round(d, 2):
+                    continue
+                out[oid] = {'id': oid, 'cls': o.get('cls'), 'size': o.get('size'),
+                            'speed': o.get('speed'), 'cone': cone, 'd_m': round(d, 2)}
+    return [out[k] for k in sorted(out)]
+
+
 def finish_gate_report(ticks: list[dict], t0: float, lg, route, cfg: dict,
                        finish_s: float | None, fin: dict) -> dict | None:
     """종료선 통과의 **표시**용 상세 — 완주 판정은 건드리지 않는다.
@@ -1378,7 +1406,13 @@ def finish_gate_report(ticks: list[dict], t0: float, lg, route, cfg: dict,
            'lane_mismatch': bool(gate['lane_mismatch']),
            'clear_min': round(gate['clear_min'], 2),
            't_s': None, 'route_s': None, 'margin_m': None,
-           'remain_m': None, 'lat': None, 'between': None}
+           'remain_m': None, 'lat': None, 'between': None,
+           # 로그에 **실제로 온** 콘 객체 (2026-09-08 실주행 1차).
+           # 콘이 회피 회랑 안이면 자차가 그걸 장애물로 잡아 종료선 앞에서 선다
+           # (실경로_01: 여유 −0.31 m → 17 m 앞 영구 정지, 미완주). 계산상의
+           # clear_min 만으로는 "그래서 실제로 뭐가 보였나" 를 못 되짚으므로,
+           # 콘 위치 근처에서 관측된 객체의 id·cls·크기·속도를 같이 남긴다.
+           'seen': _cones_seen(ticks, gate)}
 
     # 경로에서 이만큼 넘게 떨어진 틱의 lat 은 표시하지 않는다. 접선 연장
     # 투영(tangent_ends)은 폴리라인 **끝점 밖** 점의 t 를 무한 접선까지의
@@ -1793,6 +1827,17 @@ def render(rep: dict) -> str:
             else:
                 L.append(f"콘 게이트: **종료선 미통과** — 남은 거리 "
                          f"{g['remain_m']:.2f} m  (게이트 폭 {g['gate_w']:.2f} m)")
+            # 회랑 여유와 **실제로 온 콘 객체** — 콘이 회피 회랑 안이면 자차가
+            # 장애물로 잡아 종료선 앞에서 선다 (실측 실경로_01: 여유 −0.31 →
+            # 17 m 앞 영구 정지). size 가 null 이면 크기 미보고다.
+            if g.get('clear_min') is not None:
+                warn = '  ⚠ 콘이 회피 회랑 안' if g['clear_min'] < 0 else ''
+                L.append(f"콘 회랑 여유: {g['clear_min']:+.2f} m{warn}")
+            for o in (g.get('seen') or []):
+                sz = '미보고' if not o.get('size') else \
+                    '×'.join(f"{v:.2f}" for v in o['size'])
+                L.append(f"  콘 관측 id {o['id']}  cls {o['cls']}  크기 {sz}"
+                         f"  속도 {o['speed']}  ({o['cone']} 콘에서 {o['d_m']:.2f} m)")
     if 'speed_groups' in rep:
         L.append('구간별 속도: ' + '  '.join(
             f"[{k}] {g['ticks']}틱 v_max {g['v_max']:.1f}"

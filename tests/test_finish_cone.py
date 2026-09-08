@@ -350,6 +350,43 @@ def test_switch_off_reproduces_cone_free_xml(monkeypatch):
     assert 'finish_cone' not in sdef
 
 
+# ── 콘 관측 기록 (실주행 1차 [1](c)) ─────────────────────────────────────
+def test_cones_seen_records_class_and_size():
+    """콘 위치 근처에서 관측된 객체를 리포트에 남긴다 — 판정이 아니라 **기록**이다.
+
+    실주행 1차에서 종료선 콘이 회피 장애물로 잡혀 미완주가 났는데, 로그에 cls 만
+    있고 크기가 없어 "크기 미보고(no_size) 때문인가" 를 원본에서 되짚어야 했다.
+    (확인 결과 콘은 0.3×0.3×0.32 m 로 정상 보고 — no_size 무관.)
+    """
+    import score
+    gate = {'left': (100.0, 1.5, 0.0), 'right': (100.0, -1.5, 0.0)}
+    ticks = [{'objects': [
+        {'id': 2, 'cls': 'obstacle', 'size': [0.3, 0.3, 0.32],
+         'x': 100.1, 'y': 1.4, 'speed': 0.0},
+        {'id': 9, 'cls': 'vehicle', 'size': [4.5, 1.9, 1.5],
+         'x': 60.0, 'y': 0.0, 'speed': 8.0},          # 콘과 무관 — 반경 밖
+    ]}]
+    seen = score._cones_seen(ticks, gate)
+    assert [o['id'] for o in seen] == [2]
+    assert seen[0]['cls'] == 'obstacle' and seen[0]['size'] == [0.3, 0.3, 0.32]
+    assert seen[0]['cone'] == 'left' and seen[0]['d_m'] == pytest.approx(0.14, abs=0.02)
+
+
+def test_cones_seen_marks_missing_size():
+    """size 가 없는 옛 로그도 조용히 넘기지 않고 '미보고' 로 남는다."""
+    import score
+    gate = {'left': (100.0, 1.5, 0.0), 'right': (100.0, -1.5, 0.0)}
+    ticks = [{'objects': [{'id': 2, 'cls': 'obstacle', 'x': 100.0, 'y': 1.5,
+                           'speed': 0.0}]}]
+    assert score._cones_seen(ticks, gate)[0]['size'] is None
+
+
+def test_cones_seen_is_empty_without_objects():
+    import score
+    gate = {'left': (100.0, 1.5, 0.0), 'right': (100.0, -1.5, 0.0)}
+    assert score._cones_seen([{'objects': []}, {}], gate) == []
+
+
 def test_obstacle_chain_keeps_its_own_model():
     """체인은 회피 **대상**이고 콘은 아니다 — 모델을 같이 바꾸지 않는다."""
     import gen_scenarios as gs

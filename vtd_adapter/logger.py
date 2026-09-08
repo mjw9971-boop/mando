@@ -239,6 +239,12 @@ class Logger:
             # 알 수 없었다 (리플레이로 복원해야 했다).
             'objects': [
                 {'id': int(o.id), 'cls': o.cls,
+                 # 크기 (길이·폭·높이) — 콘·박스가 어떤 치수로 오는지 사후에
+                 # 확인할 수 있어야 한다. 실주행 1차(2026-09-08)에서 종료선 콘이
+                 # 회피 장애물로 잡혀 미완주가 났는데, 로그에 cls 만 있고 크기가
+                 # 없어 "크기 미보고(no_size) 때문인지" 를 원본에서 되짚어야 했다.
+                 # (확인 결과 콘은 0.3×0.3×0.32 m 로 정상 보고 — no_size 무관.)
+                 'size': [_num(o.length), _num(o.width), _num(o.height)],
                  'x': _num(o.x), 'y': _num(o.y), 'speed': _num(o.speed),
                  'lane': list(o.lane) if o.lane else None,
                  'on_route': bool(o.on_route),
