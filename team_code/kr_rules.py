@@ -507,6 +507,15 @@ class KrRules:
         # 순수 제한속도(아무도 안 줄인 틱)도 상한으로 실행할지 (실주행 2차 [1]).
         # false = 이전 동작 (곡률·LC·붉은구간 접근만 상한 축).
         self.cap_limit = bool(cfg['control'].get('cap_limit_target_enable', False))
+        # ── 차로 지도 (커밋 A, 읽기 전용) ────────────────────────────────
+        _lm = cfg.get('avoid_map') or {}
+        self.lane_map_on = bool(_lm.get('lane_map_avoid_enable', False))
+        self.lane_map_hops = int(_lm.get('lane_map_max_hops', 2))
+        self.lane_map_ahead_m = float(_lm.get('lane_map_ahead_m', 80.0))
+        self.lane_map_min_w = float(_lm.get('lane_map_min_width_m', 2.0))
+        # "정지 객체" 임계는 회피 계층과 같은 출처를 읽는다 (상수 복제 금지).
+        self.lane_map_static_v = self.ot_v_max
+        self.last_lane_map: dict | None = None
         # ── 적색 점멸 일시정지 (B3, 항목 9) ──────────────────────────────
         self.flash_stop = bool(sp.get('signal_flash_stop_enable', False))
         # 유지시간은 규정(0.5 s)보다 길게 잡는다 — 채점기가 0.5 s 를 **넘겨야**
@@ -1325,6 +1334,113 @@ class KrRules:
                                               self._tick_lg, self._tick_ego_lane)
         else:
             self._tick_corridor, self._tick_queue = [], False
+
+    # ── 차로 지도 (커밋 A — 읽기 전용, 동작 변화 0) ──────────────────────
+    def _lane_hops(self, lg, ego_lane, max_hops: int) -> dict:
+        """자차 차로 기준 ±max_hops 이웃 → {차로: hop 수}. 자기 자신은 0.
+
+        `lg.neighbor` 만 쓴다 — 이웃 정의를 새로 만들지 않는다. 한쪽으로 가다
+        끊기면 그쪽은 거기서 멈춘다.
+        """
+        out = {ego_lane: 0}
+        for side, sign in (('left', -1), ('right', +1)):
+            k = ego_lane
+            for h in range(1, int(max_hops) + 1):
+                k = lg.neighbor(k, side)
+                if k is None or k in out:
+                    break
+                out[k] = sign * h
+        return out
+
+    def _lane_width_at(self, lg, key, s: float) -> float:
+        """그 지점의 차로 폭 [m]. 폭 배열은 s 격자라 **평균이 아니라 보간**이다 —
+        소멸 차로는 끝에서 0 이 되므로 평균으로 보면 통과 가능해 보인다."""
+        r = lg.lanes[key]
+        try:
+            return float(np.interp(float(s), r['s'], r['width']))
+        except Exception:                                  # noqa: BLE001
+            return 0.0
+
+    def _actor_lanes(self, lg, actor, hops: dict) -> set:
+        """객체가 **걸친** 차로 집합 (hops 안의 것만).
+
+        객체 lane 은 9910 에 없다(로그 `lane: null` 은 설계다). 중심 + 좌우 폭
+        끝점 **세 점**을 각각 투영해 합집합을 취한다 — 중심만 보면 두 차로에
+        걸쳐 선 차가 한 차로만 막은 것으로 보인다 (지시안 증상 3).
+        """
+        loc = actor.get_location()
+        yaw = _math.radians(float(getattr(actor, 'yaw_deg', 0.0)))
+        half_w = float(getattr(actor, 'width', 1.8)) / 2.0
+        # 차체 횡방향 단위벡터 (진행방향 +90°)
+        nx, ny = -_math.sin(yaw), _math.cos(yaw)
+        pts = [(loc.x, loc.y),
+               (loc.x + nx * half_w, loc.y + ny * half_w),
+               (loc.x - nx * half_w, loc.y - ny * half_w)]
+        out = set()
+        for x, y in pts:
+            m = lg.locate(x, y, prefer=list(hops.keys()))
+            if m is not None and m.key in hops:
+                out.add(m.key)
+        return out
+
+    def lane_map(self, ap, planner) -> dict | None:
+        """자차 앞 `lane_map_ahead_m` 의 **차로별 여유거리·통행가능** 지도.
+
+        **커밋 A 는 읽기 전용이다** — 아무도 이 값을 읽지 않으므로 동작이 변하지
+        않는다 (`reasons.lane_map` 진단으로만 나간다). 후보 선택에 쓰는 것은
+        커밋 B 다.
+
+            free_run[k]  그 차로의 첫 **정지 객체**까지 거리 [m]. 없으면 ahead_m.
+            passable[k]  존재 ∧ 같은 방향 ∧ 폭 ≥ min_width ∧ 교차로 아님
+
+        큐 제외: `_tick_queue` 가 참인 틱에는 `_tick_corridor` 에 든 id 를 뺀다 —
+        신호 대기 줄을 추월 후보로 삼지 않기 위해서다. 객체 단위 큐 판정을 새로
+        만들지 않고 **기존 규약을 그대로** 쓴다 (억제 기준이 두 벌이 되면 안 된다).
+        """
+        if not self.lane_map_on:
+            return None
+        lg = getattr(planner, 'lg', None)
+        ego_lane = self._tick_ego_lane or self._ego_lane(lg, ap)
+        if lg is None or ego_lane is None or ego_lane not in lg.lanes:
+            return None
+        hops = self._lane_hops(lg, ego_lane, self.lane_map_hops)
+        ahead = self.lane_map_ahead_m
+        ego_s = self._ego_local_s(lg, ap)
+        free = {k: ahead for k in hops}
+        passable = {}
+        for k in hops:
+            r = lg.lanes[k]
+            w = self._lane_width_at(lg, k, ego_s if k == ego_lane else ego_s)
+            passable[k] = bool(r['junction'] == -1
+                               and r['dir'] == lg.lanes[ego_lane]['dir']
+                               and w >= self.lane_map_min_w)
+        # 큐로 판정된 객체는 지도에서 뺀다
+        drop = set()
+        if self._tick_queue:
+            drop = {b[3].id for b in self._tick_corridor}
+        blocked: dict = {}
+        try:
+            actors = list(ap._world.get_actors())
+        except Exception:                                  # noqa: BLE001
+            actors = []
+        ego_id = ap._vehicle.id
+        for a in actors:
+            if a.id == ego_id or a.id in drop:
+                continue
+            if float(getattr(a, 'speed', 0.0)) >= self.lane_map_static_v:
+                continue                                   # 움직이는 것은 여유를 안 깎는다
+            pr = self._project(planner, a.get_location().x, a.get_location().y)
+            if pr is None or not (0.0 < pr[0] <= ahead):
+                continue
+            for k in self._actor_lanes(lg, a, hops):
+                if pr[0] < free.get(k, ahead):
+                    free[k] = pr[0]
+                    blocked[k] = int(a.id)
+        return {'ego_lane': list(ego_lane), 'hops': {str(list(k)): h for k, h in hops.items()},
+                'free_run': {str(list(k)): round(v, 1) for k, v in free.items()},
+                'passable': {str(list(k)): bool(v) for k, v in passable.items()},
+                'blocked_by': {str(list(k)): v for k, v in blocked.items()},
+                'queue_dropped': len(drop)}
 
     def _stopline_d(self, planner) -> float | None:
         """다음 정지선까지 뒷축 거리 — 신호 정지선 우선, 없으면 무신호 정지선 최근접."""
@@ -4584,6 +4700,7 @@ class KrRules:
         self.last_lc_cap = None
         self.last_cap_binds = False
         self.last_flash = None
+        self.last_lane_map = None
         self._creep_diag = None
         self.gap_v_req = None
         self.last_d_end = d_end
@@ -4593,6 +4710,9 @@ class KrRules:
         self.ped_emergency = False
         # 황색 원샷 판정 — 프로파일·홀드보다 먼저 정해야 같은 틱에 반영된다
         self._yellow_latch(planner, ego_speed, ap)
+        # 차로 지도 (커밋 A) — 읽기 전용. 스위치가 꺼져 있으면 None 이라
+        # 진단 키도 안 생긴다 (off 는 로그까지 이전과 동일해야 지문이 성립한다).
+        self.last_lane_map = self.lane_map(ap, planner)
         # 적색 점멸 일시정지 시계 (B3) — 같은 신호 축이라 여기서 같이 돈다.
         # 세우는 것은 PDM 의 적신호 IDM 이고, 이 시계는 "충분히 섰나" 만 본다.
         self._flash_tick(planner, ego_speed)
@@ -4828,6 +4948,8 @@ class KrRules:
         if self.last_lc_cap is not None:
             self.last_avoid = dict(self.last_avoid or {},
                                    lc_cap=round(self.last_lc_cap, 2))
+        if self.last_lane_map is not None:
+            self.last_avoid = dict(self.last_avoid or {}, lane_map=self.last_lane_map)
         if self.last_flash is not None:
             # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(지문)가 성립한다.
