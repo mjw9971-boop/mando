@@ -166,7 +166,8 @@ class LoggingAutoPilot(AutoPilot):
 
 # decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등은 kr_rules 가 따로 낸다.
 _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
-                'vehicle': 'vehicle', 'bicycle': 'bicycle', 'route_end': 'route_end'}
+                'vehicle': 'vehicle', 'bicycle': 'bicycle', 'route_end': 'route_end',
+                'curvature': 'curvature'}
 
 
 class Runner:
@@ -297,6 +298,10 @@ class Runner:
         # kr_rules 의 route_end 후보를 같은 중재 축에 합친다 (작업2)
         if self.kr.last_candidate is not None:
             cand['route_end'] = float(self.kr.last_candidate)
+        # 곡률 상한(B1)은 **제 슬롯**에 넣는다 — reasons.curvature 가 그 자리다.
+        # kr 공용 슬롯('route_end')에만 넣으면 곡선에서 이겼는지 사후에 못 가른다.
+        if self.kr.last_curv is not None:
+            cand['curvature'] = float(self.kr.last_curv)
         if self.kr.last_target is not None:
             target = float(self.kr.last_target)
 

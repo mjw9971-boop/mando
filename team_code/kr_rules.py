@@ -281,6 +281,15 @@ class KrRules:
         self.fg_m = float(sp.get('finish_gate_m', 10.0))
         # A3: 미보고 신호 시한이 **정지 앞차가 있어도** 돌게 한다. off = 이전 동작.
         self.sig_lead_ok = bool(ot.get('signal_timeout_with_lead_enable', False))
+        # 연결로 곡률 감속 (B1). 꺼지면 후보를 만들지 않는다 = 이전 동작.
+        self.curv_cap = bool(sp.get('curvature_cap_enable', False))
+        self.curv_look_m = float(sp.get('curvature_lookahead_m', 15.0))
+        # 속성명이 self.a_lat_max 이면 **안 된다** — 그 이름은 _shift_speed_cap 이
+        # overtake.a_lat_max(1.5)로 쓰고 있고, 그 대입이 여기보다 뒤라 조용히
+        # 덮어쓴다 (2026-09-08 실제로 그렇게 짜서 v_cap 이 4.03 대신 3.12 로
+        # 나왔다 — √(1.5·6.5)). params 키도 같은 이유로 curvature_ 접두어다.
+        self.curv_a_lat = float(sp.get('curvature_a_lat_max', 2.5))
+        self.curv_min_k = float(sp.get('curvature_min_kappa', 0.005))
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -545,6 +554,8 @@ class KrRules:
         self.ns_turn_ticks = 0                     # (c) 회전 차로 복귀 보류 누적
         self.ns_info: dict | None = None           # 진단 (로그용)
         self.fg_dropped = 0                        # 종료 구간에서 회랑에서 뺀 정지 객체 수
+        self.last_curv: float | None = None        # 이번 틱 곡률 상한 (로그·중재용)
+        self.last_curv_info: dict | None = None    # 곡률 진단
         self.bo_lvl_ticks = 0
         self.bo_stall_ticks = 0
         self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
@@ -4229,6 +4240,56 @@ class KrRules:
                                 creep_open_why=open_why, **gate)
         return v_creep
 
+    def _curvature_cap(self, planner) -> float | None:
+        """앞 경로 곡률 상한 — `v ≤ √(a_lat_max / κ_max)` (B1). min() 후보.
+
+        실측 실경로_01_PathShape03 rs 89~107: 연결로 797(R 6.47 m)에 6.8 m/s 로
+        들어가 조향이 −0.480 에 **9 m 포화**하고 t_off 1.36 m 까지 벌어진 뒤
+        +0.480 으로 되튀었다. 그 구간 reasons.curvature 는 전 틱 None 이었다 —
+        곡률을 보는 후보가 아예 없었다.
+
+        κ 는 **실제로 따라갈 경로점**(planner.route_points)에서 잰다. lane_graph
+        의 차로 R 을 쓰지 않는 이유: 회피 시프트·차선변경 블렌드가 경로를 옆으로
+        밀면 실제 곡률이 차로 곡률과 달라진다. 따라가는 선에서 재야 맞다.
+
+        3점 외접원으로 κ = 4·A / (a·b·c). 표본 간격은 2 m 로 둔다 — 0.1 m 격자
+        그대로 쓰면 좌표 잡음이 κ 를 부풀려 직선에서도 상한이 생긴다.
+        curvature_min_kappa 미만(≈ R 200 m 초과)은 직선으로 보고 버린다.
+        """
+        if not self.curv_cap or self.curv_a_lat <= 0.0:
+            return None
+        pts = getattr(planner, 'route_points', None)
+        if pts is None or len(pts) < 3:
+            return None
+        ppm = float(getattr(planner, 'points_per_meter', 10) or 10)
+        step = max(1, int(round(2.0 * ppm)))               # 2 m 간격 표본
+        i0 = int(planner.route_index)
+        n_ahead = int(round(self.curv_look_m * ppm))
+        idx = list(range(i0, min(i0 + n_ahead + 1, len(pts)), step))
+        if len(idx) < 3:
+            return None
+        k_max, k_at = 0.0, None
+        for j in range(len(idx) - 2):
+            (ax, ay), (bx, by), (cx, cy) = (pts[idx[j]][:2], pts[idx[j + 1]][:2],
+                                            pts[idx[j + 2]][:2])
+            a = _math.hypot(bx - ax, by - ay)
+            b = _math.hypot(cx - bx, cy - by)
+            c = _math.hypot(cx - ax, cy - ay)
+            if a < 1e-6 or b < 1e-6 or c < 1e-6:
+                continue
+            area2 = abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))   # 2·A
+            k = 2.0 * area2 / (a * b * c)                  # 4A/(abc), area2 = 2A
+            if k > k_max:
+                k_max, k_at = k, idx[j + 1]
+        if k_max < self.curv_min_k:
+            return None                                    # 직선 — 후보 없음
+        v = _math.sqrt(self.curv_a_lat / k_max)
+        self.last_curv_info = {'kappa': round(k_max, 4), 'R_m': round(1.0 / k_max, 1),
+                               'v_cap': round(v, 2),
+                               'ahead_m': None if k_at is None
+                               else round((k_at - i0) / ppm, 1)}
+        return v
+
     def _stopline_profile(self, planner, ap) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
 
@@ -4335,6 +4396,8 @@ class KrRules:
         self.standoff_id = None
         self.standoff_half_len = None
         self.fg_dropped = 0
+        self.last_curv = None
+        self.last_curv_info = None
         self._creep_diag = None
         self.gap_v_req = None
         self.last_d_end = d_end
@@ -4409,6 +4472,13 @@ class KrRules:
                                    standoff_d=round(float(self.wait_target_d), 1),
                                    standoff_id=self.standoff_id, standoff_v=round(so, 2),
                                    **(self._creep_diag or {}))
+
+        # 연결로 곡률 상한 (B1) — min() 후보. 오버라이드가 아니라 상한이라
+        # 신호·보행자·standoff 가 더 낮으면 그쪽이 이긴다.
+        cv = self._curvature_cap(planner)
+        self.last_curv = cv
+        if cv is not None and (candidate is None or cv < candidate):
+            candidate = cv
 
         # 붉은 구간 진입 전 감속 (2b-B) — 구간 **밖**에서만 산다. min() 후보.
         rz = self._red_approach_profile(planner)
@@ -4520,6 +4590,10 @@ class KrRules:
 
         if self.q_reject:
             self.last_avoid = dict(self.last_avoid or {}, queue_reject=self.q_reject)
+        if self.last_curv_info is not None:
+            # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
+            # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
+            self.last_avoid = dict(self.last_avoid or {}, curv=self.last_curv_info)
         if self.fg_dropped:
             # 스위치가 꺼져 있으면 항상 0 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
