@@ -221,8 +221,11 @@ def stop_excused(tick: dict, intent_mps: float, queue_excuse: bool = False,
 #   standoff     standoff 대상 뒤 정지 (큐 머리 거리 조건 불충족 — 대개 주차 장애물)
 #   stopped_lead PDM 선행차(speed_reduced_by vehicle)가 정지 차량 — 회피 억제 중
 #   red_light    정지선 앞 적신호 대기 (red_light 후보가 낮음 — 원래 면제 대상)
+#   avoid        ctrl24 회피 상태(PREEMPT/SHIFT_NESTED/NOOP/SHIFT_ACTIVE/HANDLED)에서 정지 —
+#                시프트가 NOOP/기각이거나 활성 중 앞이 막힌 것 (won_24)
 STOP_CAUSES = ('red_queue', 'pedestrian', 'breakout', 'standoff', 'stopped_lead',
-               'red_light', 'unknown')
+               'avoid', 'red_light', 'unknown')
+AVOID24_STATES = ('PREEMPT', 'SHIFT_NESTED', 'NOOP', 'SHIFT_ACTIVE', 'HANDLED')
 
 
 def stop_cause(tick: dict, intent_mps: float, head_gap_m: float = 10.0) -> str:
@@ -238,6 +241,8 @@ def stop_cause(tick: dict, intent_mps: float, head_gap_m: float = 10.0) -> str:
     if a.get('standoff_id') is not None:
         return 'standoff'
     rb = reasons.get('speed_reduced_by') or {}
+    if a.get('state') in AVOID24_STATES and 'vehicle' in str(rb.get('type') or ''):
+        return 'avoid'
     if 'vehicle' in str(rb.get('type') or ''):
         if any(o.get('id') == rb.get('id') and float(o.get('speed') or 0.0) < 0.5
                for o in tick.get('objects') or []):
@@ -363,8 +368,11 @@ class EndJudge:
 
         if self.progress_t is None:
             self.progress_t = now
-        # 완주
-        if route_s >= self.thr:
+        # 완주 — 한 번 임계에 닿았으면(reached_at) 그 뒤 route_s 가 떨어져도 판정은 유지한다.
+        # ctrl24(won_24)는 종점에 서지 않고 계속 달려 62 m 뒤 경로 차로를 벗어나면 ego.route_s
+        # 가 차로 로컬 s 로 떨어진다 — 옛 조건(route_s ≥ thr 인 틱 안에서만)은 그때
+        # stop_grace_s 유예 안에 완주를 못 돌려주고 no_progress 로 끝났다 (2026-09-08 결정 Q6).
+        if route_s >= self.thr or self.reached_at is not None:
             if self.reached_at is None:        # `or now` 는 now=0.0 을 falsy 로 오판
                 self.reached_at = now
             if v < 0.5 or now - self.reached_at > self.grace:
