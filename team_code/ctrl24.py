@@ -1274,11 +1274,14 @@ class Ctrl24:
         self.last_kr = {}
         self.last_kr_winner = None
         self.ped_emergency = False
-        self.last_avoid = None
-        self.last_overtake = None
+        if not self._prepass_done:
+            # pre_pass 가 이미 이 틱의 회피 진단을 만들었으면 지우지 않는다 (2026-09-08
+            # 리플레이 41건에서 avoid 가 전부 null 로 남았던 버그).
+            self.last_avoid = None
+            self.last_overtake = None
         self._yellow_latch(planner, ego_speed, ap)
         # 회랑 안 정지 객체 (관찰 시계 없음) — timeout GO·RTOR 의 앞차 판정 입력.
-        # 회피 틱(커밋 3)이 경로를 밀거나 원복하면 그쪽에서 다시 잰다.
+        # pre_pass 가 경로를 밀었으면 밀린 경로 기준으로 다시 잰 값이다.
         self._corridor = self._corridor_blockers(ap, planner)
 
     def _tick_signals(self, ap, planner, ego_speed: float, route_s: float) -> None:

@@ -287,6 +287,9 @@ def test_prepass_obb_triggers_shift_for_object_outside_corridor():
     calls = len(p.calls)
     apply(kr, ap, v=8.0)                                        # 같은 틱 apply — 재시도 없음
     assert len(p.calls) == calls and kr._prepass_done is False
+    assert kr.last_avoid['trigger'] == 'obb' and kr.last_avoid['shift'] == 'left'   # 진단 유지
+    apply(kr, ap, v=8.0)                                        # 훅 없는 다음 틱 — 새 진단
+    assert kr.last_avoid['state'] in ('SHIFT_ACTIVE', 'HANDLED')
 
 
 def test_prepass_trigger_both_when_in_corridor_and_obb():

@@ -19,7 +19,9 @@ team_code/          판단 계층 (PDM-Lite 이식, 수정한 줄에는 전부 `
   config.py           GlobalConfig — PDM 하이퍼파라미터의 단일 출처
   lateral_controller.py     횡방향 PID
   kinematic_bicycle_model.py 자차·타차 미래 궤적 외삽
-  kr_rules.py         한국 대회 규칙 계층 (종점 정지 + 적신호 최소 정지 유지 + 방향지시등)
+  kr_rules.py         한국 대회 규칙 계층 (won 제어기 — ctrl24.enable=false 일 때)
+  ctrl24.py           won_24 제어기 (기본, ctrl24.enable=true): 정적 장애물 첫 틱 PREEMPT·
+                      중첩 시프트·종점 정지 없이 계속 주행. 상수는 params ctrl24: 섹션
 
 vtd_adapter/        VTD ↔ CARLA 어댑터. **판단 없음**
   comm.py             9910 TCP (1109 B 수신 / 9 B 송신), watchdog·재접속

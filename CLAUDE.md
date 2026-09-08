@@ -64,6 +64,12 @@
 - `team_code/kr_rules.py` — 한국 대회 규칙 계층. `_get_control` 맨 끝의
   `kr_rules.apply(...)` 한 줄이 유일한 접점이고, **PDM 의 `min()` 중재에
   후보를 덧대는 형태로만** 개입한다. 외부 오버라이드 금지.
+- `team_code/ctrl24.py` — **won_24 제어기 (2026-09-08, 기본 on).** kr_rules 와 같은
+  접점(apply / signal_release) + `pre_pass` 훅(autopilot 이 PDM 후보 계산 앞에서
+  부른다). `config/params.yaml` `ctrl24.enable` 로 고른다 — `false` 면 kr_rules 경로이고
+  won 과 틱 단위 동일(리플레이 diff 0 확인). 상수는 `ctrl24:` 섹션이 단일 출처.
+  정적 장애물은 첫 틱 PREEMPT(게이트 span_too_far 하나)·중첩 시프트, 종점에 서지
+  않고 계속 주행(route.py 종점 패드 300 m, batch_run 완주 래치).
 - `vtd_adapter/` — CARLA 표면을 흉내내는 어댑터 (플래너·월드·제어·로거).
 - `config/params.yaml` — VTD·차량·판정 상수의 단일 출처.
   판단(IDM·forecast·lateral) 상수는 `team_code/config.py` 가 단일 출처다.
