@@ -169,6 +169,15 @@ class VtdRoutePlanner:
         # false = PDM 원문 그대로(앞쪽 전 구간 탐색).
         self.span_search_local = bool(
             cfg.get('overtake', {}).get('span_search_local_enable', False))
+        # ctrl24 (won_24): 시프트 목표는 항상 '현재 경로 차로' 기준이고 열 상한은 물리 한계만,
+        # span 탐색은 항상 국소 — 유일한 side 게이트(span_too_far)의 전제다. kr_rules 경로
+        # (enable false)는 위 두 스위치를 그대로 따른다.
+        _c24 = cfg.get('ctrl24') or {}
+        self.ctrl24 = bool(_c24.get('enable', False))
+        if self.ctrl24:
+            self.shift_target_current = True
+            self.shift_target_max_steps = int(_c24.get('shift_target_max_steps', 99))
+            self.span_search_local = True
 
         self.route_index = 0
         self.last_route_index = 0
@@ -598,8 +607,13 @@ class VtdRoutePlanner:
     # 같은 목표를 쓰도록** 한 곳에 둔 것이다. 둘이 어긋나면 shift_entry·span_extend
     # 의 사전 이격 계측이 실제로 갈 차로가 아닌 곳을 재게 된다.
 
-    def _shift_target_steps(self, shift_to_left_lane) -> int:
+    def _shift_target_steps(self, shift_to_left_lane, ref_index=None) -> int:
         """목표까지 따라갈 이웃 차로 **단계 수**. 원문은 항상 1 이다.
+
+        ref_index (ctrl24 중첩 시프트): 밀림 k 를 잴 경로 인덱스. 기본(None)은 route_index
+        = 자차 발밑인데, 활성 span 의 전이 시작이 자차 앞 5 m 라 발밑은 아직 원 경로 위
+        (k=0)다 — 그러면 두 번째 시프트도 같은 이웃을 겨눠 플래토에서 변위 0 이 된다.
+        ctrl24 는 새 span 의 한가운데(플래토)를 넘긴다.
 
         현재 경로가 원 경로에서 그 방향으로 몇 칸 밀려 있는지(k)를 재어 k+1 을
         돌려준다 — "지금 있는 차로에서 한 칸" 이다. 한 칸 제한은 그대로다.
@@ -614,7 +628,7 @@ class VtdRoutePlanner:
         """
         if not self.shift_target_current:
             return 1                                   # 원문 동작
-        i0 = int(self.route_index)
+        i0 = int(self.route_index) if ref_index is None else int(ref_index)
         n = len(self.original_route_points)
         if i0 >= n - 1:
             return 1
@@ -656,11 +670,19 @@ class VtdRoutePlanner:
         return VtdWaypoint(self.lg, key, min(wp.s, self.lg.length(key)))
 
     def shift_route_smoothly(self, start_index, end_index, shift_to_left_lane,
-                             transition_length=120.0, lane_transition_factor=1.0):
-        """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트."""
+                             transition_length=120.0, lane_transition_factor=1.0,
+                             transition_length_back=None, ref_index=None):
+        """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트.
+
+        VTD 추가 인자 (ctrl24, 기본값이면 원문과 글자 그대로 같다):
+          transition_length_back — 복귀(끝) 전이 길이 [경로점]. None = transition_length.
+            중첩 시프트가 두 칸 이상에서 한 번에 원 경로로 돌아오면 √(D/D1) 배가 필요하다.
+          ref_index — _shift_target_steps 의 밀림 계측 인덱스.
+        """
         # VTD: 원문은 목표가 route_waypoints[idx].get_*_lane() 고정이다.
         # 기준점만 현재 경로 차로로 옮긴다 (_shift_target_steps). off 면 1 단계 = 원문.
-        n_steps = self._shift_target_steps(shift_to_left_lane)
+        n_steps = self._shift_target_steps(shift_to_left_lane, ref_index=ref_index)
+        back = transition_length if transition_length_back is None else float(transition_length_back)
         for idx in range(start_index, end_index):
             wp_t = self._shift_target_wp(idx, shift_to_left_lane, n_steps)
             if wp_t is None and n_steps != 1:
@@ -679,9 +701,9 @@ class VtdRoutePlanner:
                     float(idx - start_index) / transition_length)
                 self.commands[idx] = (RoadOption.CHANGELANELEFT if shift_to_left_lane
                                       else RoadOption.CHANGELANERIGHT)
-            elif idx >= end_index - transition_length:
+            elif idx >= end_index - back:
                 transition_factor = self._smooth_transition(
-                    float(end_index - idx) / transition_length)
+                    float(end_index - idx) / back)
                 self.commands[idx] = (RoadOption.CHANGELANERIGHT if shift_to_left_lane
                                       else RoadOption.CHANGELANELEFT)
 
@@ -742,7 +764,7 @@ class VtdRoutePlanner:
         return shift_start_index, shift_end_index, obstacle_direction == 'right'
 
     def planned_lateral_offsets(self, start_index, end_index, shift_to_left_lane,
-                                step_pts=10):
+                                step_pts=10, ref_index=None):
         """적용 전, 이웃 차로 중심까지의 **부호 있는 횡오프셋**을 성긴 간격으로.
 
         shift_route_smoothly 가 각 점에서 목표로 삼는 `get_left_lane()/
@@ -763,7 +785,7 @@ class VtdRoutePlanner:
         # 헬퍼로 바꾼다. 둘이 어긋나면 여기(계측)가 재는 차로와 저기(적용)가 미는
         # 차로가 달라져, shift_entry·span_extend 의 사전 이격 계측이 무효가 된다.
         # off 면 n_steps == 1 이라 원문과 완전히 같다.
-        n_steps = self._shift_target_steps(shift_to_left_lane)
+        n_steps = self._shift_target_steps(shift_to_left_lane, ref_index=ref_index)
         for i in range(int(start_index), min(int(end_index), n), max(1, int(step_pts))):
             wp_t = self._shift_target_wp(i, shift_to_left_lane, n_steps)
             if wp_t is None and n_steps == 1:

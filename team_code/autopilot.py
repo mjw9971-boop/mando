@@ -208,6 +208,14 @@ class AutoPilot:                                             # VTD: leaderboard 
         actors = self._world.get_actors()
         vehicles = list(actors.filter("*vehicle*"))
 
+        # VTD: ctrl24 pre-pass (won_24) — 정적 장애물 회피 시프트를 PDM 후보 계산 **앞**에서
+        # 만든다. route_np 는 planner.route_points 의 뷰라 시프트가 그대로 반영되어 아래
+        # P1/P2 가 밀린 경로 기준으로 계산된다 (P2 본문 무수정). kr_rules 에는 없는 훅 —
+        # 속성이 없으면 건너뛰어 kr_rules 경로는 글자 그대로 이전과 같다.
+        pre_pass = getattr(self.kr_rules, 'pre_pass', None)
+        if pre_pass is not None:
+            pre_pass(self, route_np, vehicles, target_speed, ego_speed)
+
         # Manage route obstacle scenarios and adjust target speed
         target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = (
             self._manage_route_obstacle_scenarios(

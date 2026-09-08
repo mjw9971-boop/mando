@@ -119,6 +119,17 @@ class Ctrl24:
         self.detect_max_m = float(c['detect_max_m'])
         self.v_static = float(c['blocker_speed_max'])
         self.clr = float(cfg['percep']['obstacle_clearance_m'])   # 회랑 여유 = P1 과 같은 값
+        # ── 정적 장애물 회피 (A·B·C) ───────────────────────────────────────
+        self.ot_enabled = bool(c['avoid_enable'])
+        self.trans_min_m = float(c['trans_min_m'])
+        self.trans_k = float(c['trans_k'])
+        self.shift_ahead_m = float(c['shift_ahead_m'])
+        self.ot_before_m = float(c['extra_before_m'])
+        self.ot_after_m = float(c['extra_after_m'])
+        self.chain_gap_m = float(c['chain_gap_m'])
+        self.span_gate_max_m = float(c['span_gate_max_m'])
+        self.noop_disp_m = float(c['noop_disp_m'])
+        self.prepass_obb = bool(c['prepass_obb_enable'])
         # ── 지시등 ─────────────────────────────────────────────────────────
         self.turn_lead_s = float(c['turn_lead_s'])
         self.lc_lead_s = float(c['lc_lead_s'])
@@ -189,7 +200,14 @@ class Ctrl24:
         # kr_rules 와 파일을 공유하므로 남겨 두고 여기서는 항상 거짓이다 (오버라이드 아님).
         self._sig_go = False                          # 커밋 2 (timeout GO)
         self._rtor_go = False                         # 커밋 2 (RTOR)
-        self.ot_span = None                           # 커밋 3 (회피)
+        self.ot_span = None                           # 활성 시프트 인덱스 구간 (합집합)
+        self.ot_side: str | None = None
+        self.nested = 0                               # 활성 span 에 겹쳐 만든 시프트 수
+        self._shifted_for: set = set()                # 이미 시프트를 만든 객체 id (요동 방지)
+        self.last_span_plan: tuple | None = None
+        self.last_overtake: str | None = None
+        self._prepass_done = False
+        self.last_prepass_ms: float | None = None     # pre_pass 실행 시간 (틱 비용 보고용)
         self._corridor: list = []                     # 이번 틱 회랑 안 정지 객체 (커밋 3 이 채운다)
         self._tick_lg = None
         self._tick_ego_lane = None
@@ -989,6 +1007,239 @@ class Ctrl24:
                 if remain is not None and ego_speed > 0.1 else None)
         return sig, src, lead
 
+    # ── 정적 장애물 회피 — A(첫 틱 PREEMPT) · B(게이트 1개) · C(중첩) ─────────
+    def _trans_m(self, ego_speed: float) -> float:
+        """전이 길이 = max(trans_min_m, trans_k·v)."""
+        return max(self.trans_min_m, self.trans_k * max(float(ego_speed), 0.0))
+
+    def _chain(self, corridor, actor) -> dict:
+        """actor 에서 시작하는 연쇄 (chain_gap_m 안에 이어지는 정지 객체) — kr_rules B-9."""
+        out = {'first': actor, 'last': actor, 'ids': [actor.id], 'extent_m': 0.0}
+        if self.chain_gap_m <= 0.0 or not corridor:
+            return out
+        idx = next((i for i, c in enumerate(corridor) if c[3].id == actor.id), None)
+        if idx is None:
+            return out
+        s_first = s_prev = corridor[idx][0]
+        for s_rel, _lat, _hw, a in corridor[idx + 1:]:
+            if s_rel - s_prev > self.chain_gap_m:
+                break
+            out['ids'].append(a.id)
+            out['last'] = a
+            s_prev = s_rel
+        out['extent_m'] = s_prev - s_first
+        return out
+
+    def _restore_span(self, planner) -> None:
+        """지나간 시프트 span 원복 — 원 경로로. 요동 방지 집합도 비운다."""
+        a, b = self.ot_span
+        planner.route_points[a:b] = planner.original_route_points[a:b]
+        if getattr(planner, 'commands_orig', None) is not None:
+            planner.commands[a:b] = planner.commands_orig[a:b]
+        if getattr(planner, '_lat_build', None) is not None:
+            planner.lat_shift[a:b] = planner._lat_build[a:b]
+        self._rebuild_kd(planner)
+        self.ot_span = None
+        self.ot_side = None
+        self.nested = 0
+        self._shifted_for.clear()
+        self.last_overtake = 'restored'
+
+    @staticmethod
+    def _rebuild_kd(planner) -> None:
+        if getattr(planner, '_kd', None) is not None:
+            from scipy.spatial import cKDTree
+            planner._kd = cKDTree(planner.route_points[:, :2])
+
+    def pre_pass(self, ap, route_np, vehicles, target_speed: float, ego_speed: float) -> None:
+        """PDM 후보 계산 **앞**의 훅 (autopilot._get_control). 트리거 = 회랑 정지 객체 ∪
+        원 경로 기준 OBB 2 s 예측이 교차하는 정지 객체. 시프트가 성립하면 route_points 가
+        밀려 P1/P2 가 밀린 경로 기준으로 계산된다 — P2 본문은 무수정, 불성립이면 P2 가
+        기존대로 0 을 낸다 (정지 객체인데 못 비켰으면 선다)."""
+        import time
+        t0 = time.perf_counter()
+        planner = ap._waypoint_planner
+        obb_ids = None
+        if self.ot_enabled and self.prepass_obb:
+            obb_ids = self._obb_static_ids(ap, route_np, vehicles, target_speed, ego_speed)
+        self._corridor = self._corridor_blockers(ap, planner)
+        self._avoid_tick(ap, planner, ego_speed, obb_ids)
+        self._prepass_done = True
+        self.last_prepass_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+    def _obb_static_ids(self, ap, route_np, vehicles, target_speed, ego_speed) -> set:
+        """원 경로 기준 자차 OBB 예측(2 s, 차선변경 근처 1.1 s)과 교차하는 **정지** 차량 id.
+        PDM 의 forecast_ego_agent / predict_other_actors_bounding_boxes / check_obb_intersection
+        을 그대로 부른다 — 정지 객체만 넘기므로 forecast 는 등속(0) 상자다."""
+        try:
+            cfg = ap.config
+            ego = ap._vehicle
+            loc = ego.get_location()
+            stopped = [v for v in vehicles
+                       if v.id != ego.id and float(getattr(v, 'speed', 0.0)) < self.v_static
+                       and v.get_location().distance(loc) < cfg.detection_radius]
+            if not stopped:
+                return set()
+            near_lc = ap.is_near_lane_change(ego_speed, route_np)
+            n = int(cfg.bicycle_frame_rate * (cfg.forecast_length_lane_change if near_lc
+                                              else cfg.default_forecast_length))
+            ego_bbs = ap.forecast_ego_agent(ego.get_transform(), ego_speed, n,
+                                            target_speed, route_np)
+            pred = ap.predict_other_actors_bounding_boxes(False, stopped, loc, n, near_lc)
+        except Exception:                                  # noqa: BLE001 — 목 조립
+            return set()
+        out = set()
+        for vid, bbs in pred.items():
+            for i, ebb in enumerate(ego_bbs):
+                if i < len(bbs) and ap.check_obb_intersection(ebb, bbs[i]):
+                    out.add(vid)
+                    break
+        return out
+
+    def _avoid_tick(self, ap, planner, ego_speed: float, obb_ids) -> None:
+        """틱당 1회. 원복 → 트리거 수집 → 아직 시프트를 안 만든 첫 객체에 PREEMPT."""
+        i0 = int(planner.route_index)
+        if self.ot_span is not None and i0 > self.ot_span[1]:
+            self._restore_span(planner)
+            self._corridor = self._corridor_blockers(ap, planner)   # 원 경로 기준으로 다시
+            self.last_avoid = {'state': 'RESTORED'}
+        if not self.ot_enabled:
+            return
+        corridor = list(self._corridor)
+        trig = {c[3].id: 'corridor' for c in corridor}
+        for oid in (obb_ids or ()):
+            if oid in trig:
+                trig[oid] = 'both'
+                continue
+            act = next((a for a in ap._world.get_actors() if a.id == oid), None)
+            if act is None or self._is_walker(act):
+                continue
+            loc = act.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None or not (0.5 < pr[0] <= self.detect_max_m):
+                continue
+            bb = getattr(act, 'bounding_box', None)
+            hw = float(bb.extent.y) if bb is not None else 0.9
+            corridor.append((pr[0], pr[1], hw, act))
+            trig[oid] = 'obb'
+        corridor.sort(key=lambda z: z[0])
+        if not corridor:
+            if self.ot_span is not None and self.last_avoid is None:
+                self.last_avoid = {'state': 'SHIFT_ACTIVE', 'span': list(self.ot_span),
+                                   'nested': self.nested}
+            return
+        target = next((c for c in corridor if c[3].id not in self._shifted_for), None)
+        if target is None:                               # 전부 이미 시프트한 객체 — 요동 방지
+            self.last_avoid = {'state': 'HANDLED', 'blocker': corridor[0][3].id,
+                               's_rel': round(corridor[0][0], 1),
+                               'span': list(self.ot_span) if self.ot_span else None,
+                               'nested': self.nested}
+            return
+        s_rel, lat, _hw, actor = target
+        self.last_avoid = {'state': 'PREEMPT' if self.ot_span is None else 'SHIFT_NESTED',
+                           'blocker': actor.id, 's_rel': round(s_rel, 1), 'lat': round(lat, 2),
+                           'trigger': trig.get(actor.id, 'corridor'), 'nested': self.nested}
+        chain = self._chain(corridor, actor)
+        self._try_shift(planner, ego_speed, chain)
+
+    def _try_shift(self, planner, ego_speed: float, chain: dict) -> bool:
+        """좌측 우선, 좌측이 변위 0(이웃 없음 — route.py 폴백)이면 우측. 게이트는 span_too_far
+        하나. 변위 < noop_disp_m 인 시프트는 성공이 아니다(NOOP): 되돌리고 span 을 세우지 않는다."""
+        actor, last = chain['first'], chain['last']
+        chain_last = None if last is actor else last
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        i0 = int(planner.route_index)
+        trans = self._trans_m(ego_speed)
+        rejects = []
+        for side in ('left', 'right'):
+            left = side == 'left'
+            try:
+                a, b, _l = planner.plan_shift_span(
+                    actor, chain_last, obstacle_direction='right' if left else 'left',
+                    transition_length=trans * ppm,
+                    extra_length_before=self.ot_before_m * ppm,
+                    extra_length_after=self.ot_after_m * ppm,
+                    min_start_ahead=self.shift_ahead_m * ppm)
+            except Exception:                              # noqa: BLE001 — 목 플래너
+                rejects.append(f'{side}:no_plan')
+                continue
+            a, b = int(a), int(b)
+            self.last_span_plan = (a, b, left)
+            span_off = (a - i0) / ppm
+            if span_off >= self.span_gate_max_m:          # 유일한 게이트
+                rejects.append(f'{side}:span_too_far')
+                self.last_avoid['span_off_m'] = round(span_off, 1)
+                break                                      # 기하가 side 와 무관 — 반대쪽도 같다
+            if b <= a + 1 or b > len(planner.route_points):
+                rejects.append(f'{side}:no_plan')
+                continue
+            ref = (a + b) // 2                            # 중첩 시프트의 밀림은 플래토에서 잰다
+            steps = self._target_steps(planner, left, ref)
+            try:
+                d = np.asarray(planner.planned_lateral_offsets(a, b, left, step_pts=int(ppm),
+                                                               ref_index=ref), dtype=float)
+            except TypeError:
+                d = np.asarray(planner.planned_lateral_offsets(a, b, left, step_pts=int(ppm)),
+                               dtype=float)
+            except Exception:                              # noqa: BLE001
+                d = None
+            if d is not None and (d.size == 0 or float(np.abs(d).max()) < self.noop_disp_m):
+                rejects.append(f'{side}:noop')             # 이웃 없음 → 원 경로 유지
+                continue
+            back = trans * _math.sqrt(max(1, steps)) if (
+                self.ot_span is not None and b > self.ot_span[1]) else trans
+            snap = (planner.route_points[a:b].copy(),
+                    planner.commands[a:b].copy() if getattr(planner, 'commands', None) is not None else None,
+                    planner.lat_shift[a:b].copy() if getattr(planner, 'lat_shift', None) is not None else None)
+            try:
+                planner.shift_route_smoothly(a, b, left, transition_length=trans * ppm,
+                                             transition_length_back=back * ppm, ref_index=ref)
+            except TypeError:
+                planner.shift_route_smoothly(a, b, left, transition_length=trans * ppm)
+            disp = float(np.abs(planner.route_points[a:b, :2] - snap[0][:, :2]).max())
+            if disp < self.noop_disp_m:                    # 폴백이 원 경로를 그대로 뒀다
+                planner.route_points[a:b] = snap[0]
+                if snap[1] is not None:
+                    planner.commands[a:b] = snap[1]
+                if snap[2] is not None:
+                    planner.lat_shift[a:b] = snap[2]
+                rejects.append(f'{side}:noop')
+                continue
+            self._rebuild_kd(planner)
+            if self.ot_span is None:
+                self.ot_span = (a, b)
+            else:
+                self.nested += 1
+                self.ot_span = (min(self.ot_span[0], a), max(self.ot_span[1], b))
+            self.ot_side = side
+            self._shifted_for.add(actor.id)
+            self.last_overtake = side
+            self.last_avoid.update({
+                'shift': side, 'span': list(self.ot_span), 'span_new': [a, b],
+                'trans_m': round(trans, 1), 'back_m': round(back, 1), 'steps': int(steps),
+                'ahead_m': round(self.shift_ahead_m, 1), 'chain': list(chain['ids']),
+                'disp_m': round(disp, 2), 'nested': self.nested,
+                'rejects': rejects or None})
+            print(f'[ctrl24] 정적 장애물 회피 — {side} 로 경로 시프트 '
+                  f'(id={chain["ids"]}, 구간 {a}~{b}, 전이 {trans:.1f}/{back:.1f} m, '
+                  f'{steps}칸, 중첩 {self.nested})', flush=True)
+            return True
+        noop = bool(rejects) and all(r.endswith(':noop') for r in rejects)
+        self.last_avoid.update({'state': 'NOOP' if noop else self.last_avoid['state'],
+                                'reject': rejects[-1] if rejects else None, 'rejects': rejects})
+        self.last_overtake = rejects[-1] if rejects else 'no_plan'
+        return False
+
+    @staticmethod
+    def _target_steps(planner, left: bool, ref: int) -> int:
+        f = getattr(planner, '_shift_target_steps', None)
+        if f is None:
+            return 1
+        try:
+            return int(f(left, ref_index=ref))
+        except TypeError:
+            return int(f(left))
+
     # ── 리셋 ──────────────────────────────────────────────────────────────
     def on_reset(self) -> None:
         """courseRespawn — 순간이동 전 래치는 전부 무효 (run_agent 가 부른다)."""
@@ -1023,6 +1274,8 @@ class Ctrl24:
         self.last_kr = {}
         self.last_kr_winner = None
         self.ped_emergency = False
+        self.last_avoid = None
+        self.last_overtake = None
         self._yellow_latch(planner, ego_speed, ap)
         # 회랑 안 정지 객체 (관찰 시계 없음) — timeout GO·RTOR 의 앞차 판정 입력.
         # 회피 틱(커밋 3)이 경로를 밀거나 원복하면 그쪽에서 다시 잰다.
@@ -1110,6 +1363,9 @@ class Ctrl24:
         route_s = float(planner.route_s[planner.route_index])
         ego_speed = ap._vehicle.get_velocity().length()
         self._tick_head(ap, planner, ego_speed)
+        if not self._prepass_done:                    # 훅이 없는 조립(테스트·구형 autopilot)
+            self._avoid_tick(ap, planner, ego_speed, None)
+        self._prepass_done = False
         self._tick_signals(ap, planner, ego_speed, route_s)
 
         candidate, ped_bind, ped = self._candidates(ap, planner, ego_speed, target_speed)
