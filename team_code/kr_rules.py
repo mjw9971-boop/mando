@@ -254,6 +254,16 @@ class KrRules:
         # 시간 축은 ot_blocked_ticks 를 그대로 쓴다 — 신규 시계를 만들지 않는다.
         self.creep_delay_ticks = int(round(
             float(ot.get('standoff_creep_delay_s', 0.0)) * self.hz))
+        # 교차로 안 자기잠금 해제 (A1). 꺼지면 이전 동작 — 교차로 lane 에서
+        # 크립도 사다리도 없다. 무장 조건은 _junction_release 참조.
+        self.j_release = bool(ot.get('junction_creep_release_enable', False))
+        self.j_release_ticks = int(round(
+            float(ot.get('junction_release_s', 8.0)) * self.hz))
+        # km/h 로 받는 이유: 이 둘은 "교차로를 기어서 지난다" 는 주행 감각의
+        # 값이라 사람이 읽는 단위가 낫다. 내부는 전부 m/s 이므로 여기서 한 번만
+        # 바꾼다 (standoff_creep_v 는 제동거리 계산에서 온 값이라 m/s 그대로다).
+        self.j_creep_floor = float(ot.get('junction_creep_floor_kph', 3.0)) / 3.6
+        self.j_creep_cap = float(ot.get('junction_creep_kph', 5.0)) / 3.6
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -505,6 +515,10 @@ class KrRules:
         self.bo_stuck_ticks = 0
         self.bo_stop_ticks = 0                     # 순수 정지(v<eps) 지속 틱 (E-3 안전 가드)
         self.ot_reject_ticks = 0                   # 회피 시도가 양쪽 다 기각된 연속 틱 (E-3)
+        # reject='junction' **만** 센 연속 틱 (A1). ot_reject_ticks 로는 못 쓴다 —
+        # 그건 사유를 안 가려서 right:no_neighbor 등에도 오르므로, 교차로가
+        # 아닌 곳의 기각이 교차로 해제를 무장시킨다.
+        self.j_reject_ticks = 0
         self.bo_lvl_ticks = 0
         self.bo_stall_ticks = 0
         self.bo_entry_s: float | None = None       # 진입 시 route_s (복귀 판정)
@@ -1450,7 +1464,15 @@ class KrRules:
 
         참이 되는 경우는 **BREAKOUT 최종 단계(L4) 단독**이다. 그 외 어떤
         상태에서도 거짓이어야 한다 — 열리면 앞차·장애물을 그대로 들이받는다.
+
+        A1 이후 **교차로 안에서는 L4 여도 거짓**이다. 교차로 해제
+        (junction_creep_release_enable)가 사다리를 돌리므로 L4 도달이 가능해졌는데,
+        여기까지 열면 연결로 한복판에서 선행차·OBB 를 지운 채 전진한다. 해제가
+        푸는 것은 크립 **상한**뿐이고 PDM 의 IDM·OBB 는 최후 안전망으로 남긴다.
         """
+        if (self.j_release and self.bo_level >= self.BO_CREEP
+                and self._ap is not None and self._in_junction_lane(self._ap)):
+            return False
         return bool(self.bo_state == 'BREAKOUT' and self.bo_level >= self.BO_CREEP
                     and not self.bo_paused)          # 적색 중에는 행동 금지
 
@@ -1484,7 +1506,17 @@ class KrRules:
         # 시프트를 금지하므로 여기서 크립까지 가면 접촉뿐이다. 리셋이 아니라
         # pause 라 카운터·단계는 보존된다. legacy 는 _signal_zone 이 원인 판정에서
         # 걸러 리셋한다 (옛 동작 그대로).
-        if self.suppress_mode != 'legacy' and self._in_junction_lane(ap):
+        # A1: 다만 **상한이 없으면 안 된다**. 연결로 안에 정지 차량이 있으면
+        # 시프트는 reject='junction' 으로 영구 기각이고 사다리는 여기서 영구
+        # 정지라, 탈출 경로가 하나도 남지 않는다 (실측 02_직진11 31.2 s).
+        # junction_release_s 를 넘기면 사다리를 다시 돌린다. 실제 전진은 크립
+        # 게이트 ⓪ 가 만들고, 여기서 얻는 것은 **상태 유지**다: 얼어 있으면
+        # 카운터가 진입 시점 값에 묶여 연결로를 벗어난 뒤에도 그 값부터 다시
+        # 시작하고, 진전 감지(bo_entry_s)가 안 돌아 NORMAL 복귀도 못 한다.
+        # 단계가 올라도 위험은 없다 — 시프트는 위 reject='junction' 으로 여전히
+        # 금지고, L4 의 크립 훅은 breakout_creep() 이 교차로에서 따로 닫는다.
+        if (self.suppress_mode != 'legacy' and self._in_junction_lane(ap)
+                and not self._junction_release()):
             self.bo_paused = True
             return
         self.bo_paused = False
@@ -1585,6 +1617,24 @@ class KrRules:
         if lg is not None and lane is not None and lane in lg.lanes:
             return lg.lanes[lane]['junction'] != -1
         return bool(getattr(ap, 'junction', False))
+
+    def _junction_release(self) -> bool:
+        """교차로 안 자기잠금 해제(A1)가 이번 틱 무장됐나.
+
+        조건: 스위치 on ∧ reject='junction' 연속 junction_release_s ∧ 지금도
+        교차로 lane. 마지막 조건을 빼면 연결로를 막 벗어난 틱에도 무장이 남는다
+        — 시계는 _try_overtake 가 다음 기각 판정에서야 0 이 되기 때문이다.
+
+        푸는 것은 **종방향 두 개뿐**이다: 크립 게이트(_creep_gate ⓪)와
+        _breakout_tick 의 교차로 일시정지. 차로 시프트 금지
+        (_try_overtake_inner 의 reject='junction')는 어떤 단계에서도 그대로고,
+        breakout_creep() 훅(선행차·OBB 무효화)도 교차로 안에서는 열지 않는다 —
+        PDM 의 IDM·OBB 가 최후 안전망으로 남아야 한다.
+        """
+        if not self.j_release or self.j_reject_ticks < self.j_release_ticks:
+            return False
+        ap = self._ap
+        return ap is not None and self._in_junction_lane(ap)
 
     @staticmethod
     def _shift_profile(s, s0, end, L):
@@ -1899,8 +1949,19 @@ class KrRules:
         """
         rejected = self._try_overtake_inner(ap, planner, ego_speed)
         self.ot_reject_ticks = self.ot_reject_ticks + 1 if rejected else 0
+        # A1: 교차로 **전용** 시계. 사유가 'junction' 인 기각만 센다 — 시프트가
+        # 살아 있는 다른 기각(occupied·geom·no_neighbor)은 정상적으로 풀릴 수
+        # 있으므로 교차로 해제를 무장시키면 안 된다. 조기 반환(SHIFT_ACTIVE·
+        # 큐 억제 등)은 rejected=False 라 여기서 0 이 되고, 그게 맞다.
+        self.j_reject_ticks = (self.j_reject_ticks + 1
+                               if rejected and self.last_overtake == 'junction' else 0)
         if rejected and self.last_avoid is not None:
             self.last_avoid['reject_s'] = round(self.ot_reject_ticks / self.hz, 1)
+            if self.j_release and self.j_reject_ticks:
+                # 스위치가 꺼져 있으면 키 자체를 남기지 않는다 — off 는 로그까지
+                # 이전과 동일해야 회귀 비교(54 지문)가 성립한다.
+                self.last_avoid['j_reject_s'] = round(self.j_reject_ticks / self.hz, 1)
+                self.last_avoid['j_release'] = self._junction_release()
 
     def _try_overtake_inner(self, ap, planner, ego_speed: float) -> bool:
         """_try_overtake 본문. 반환 = 이번 틱 회피 시도가 전부 기각됐나 (E-3)."""
@@ -2876,6 +2937,7 @@ class KrRules:
         self._sig_wait_ticks = 0
         self._rtor_reset()                            # RTOR 래치·정지 누적 (순간이동 = 새 접근)
         self._creep_hold_ticks = 0
+        self.j_reject_ticks = 0                       # 교차로 해제 시계 (A1) — 새 문맥
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
@@ -3624,7 +3686,18 @@ class KrRules:
         standoff = max(self.standoff_floor_m, self.shift_k_s * max(ego_speed, 0.1))
         d = self.wait_target_d - standoff
         if d >= 0.0:
-            return _math.sqrt(2.0 * self.stop_profile_a * d)   # 기준선 밖 — 무수정
+            v = _math.sqrt(2.0 * self.stop_profile_a * d)      # 기준선 밖 — 무수정
+            if not self._junction_release():
+                return v
+            # ① 모드 A (A1) — d 가 기준선에 정확히 얹히면 √(2a·0) = 0 인데,
+            # 이 갈래는 _standoff_creep 을 부르지 않으므로 크립 게이트에
+            # **도달조차 못 한다** (시뮬: 장애물 24 m → d 22.0 에서 60 s 무진전,
+            # creep_* 키 없음). 무장된 동안은 여기도 크립을 거쳐 바닥을 깔고,
+            # 회전 중이므로 상한으로 자른다. 배제(stop_gap·ped_hold·cause)는
+            # _standoff_creep 이 그대로 판정해 0 을 돌려주고, 그때는 프로파일
+            # 값 v 가 그대로 남는다 (바닥만 없어질 뿐 더 세우지 않는다).
+            return min(max(v, self._standoff_creep(standoff, ego_speed)),
+                       self.j_creep_cap)
         return self._standoff_creep(standoff, ego_speed)       # 기준선 안 — 바닥
 
     def _red_intervals(self, planner) -> list:
@@ -3746,6 +3819,11 @@ class KrRules:
         보류 중에는 v_allow = 0 이라 자차가 서 있고, 그래서 ot_blocked_ticks 와
         bo_stuck_ticks 가 **정상적으로 쌓인다** — 지연이 사다리를 굶기지 않는다.
         """
+        if self._junction_release():
+            # ⓪ 교차로 해제 (A1) — 다른 조건보다 먼저다. 여기서 기다리는 대상인
+            # '시프트 가능성' 이 교차로 lane 에서는 **원리적으로 0** 이라
+            # (reject='junction'), need 를 보고 보류하는 것 자체가 무의미하다.
+            return 'junction', None, self._creep_geom_need(ego_speed)
         if self.creep_delay_ticks <= 0:
             return 'no_gate', None, None                   # 지연 없음 (이전 동작)
         need = self._creep_geom_need(ego_speed)
@@ -3782,10 +3860,18 @@ class KrRules:
         d_end ≤ active_m)·정지표지를 이미 전부 본다. `ped_hold_ids`(횡단보도
         홀드 래치)는 PDM 플래그와 축이 달라 2차 방어로 따로 본다.
         """
-        if not self.standoff_creep:
+        j_rel = self._junction_release()
+        if not self.standoff_creep and not j_rel:
             return 0.0          # 이전 동작. 진단도 남기지 않는다 — off 는 로그까지 동일
+        # 교차로 해제가 무장되면 크립 속도의 바닥을 올리고 상한으로 자른다 (A1).
+        # 바닥이 필요한 이유는 모드 A: 기준선 **밖**에서 부르는 경로라 여기서
+        # standoff_creep_v(0.8)만 돌려주면 프로파일 값보다 낮아 아무 효과가 없다.
+        v_creep = (min(max(self.standoff_creep_v, self.j_creep_floor), self.j_creep_cap)
+                   if j_rel else self.standoff_creep_v)
         d = float(self.wait_target_d)
         diag = {'creep_d': round(d, 1), 'creep_standoff': round(standoff, 1)}
+        if j_rel:
+            diag['creep_junction'] = True
 
         # 진단 키가 'so_creep' 인 이유: BREAKOUT 진단이 같은 last_avoid 에 'creep'
         # 을 나중에 써서(아래 bo_state 블록) 이름이 겹치면 덮인다 — 실측 02_직진3
@@ -3826,13 +3912,13 @@ class KrRules:
         if self._creep_open_latched:
             # delay 래치 — 게이트를 다시 묻지 않고 시계도 건드리지 않는다.
             need = self._creep_geom_need(ego_speed)
-            self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+            self._creep_diag = dict(diag, so_creep=True, creep_v=v_creep,
                                     creep_open_why='delay', creep_open_latched=True,
                                     creep_latch_why='delay',
                                     creep_need_m=round(need, 1) if need is not None else None,
                                     creep_hold_s=round(self._creep_hold_ticks / self.hz, 1),
                                     creep_bo_lvl=self.bo_level)
-            return self.standoff_creep_v
+            return v_creep
         open_why, hold_why, need = self._creep_gate(d, ego_speed)
         gate = {'creep_need_m': round(need, 1) if need is not None else None,
                 'creep_hold_s': round(self._creep_hold_ticks / self.hz, 1),
@@ -3846,14 +3932,14 @@ class KrRules:
             # 시계가 곧 조건이다 — 0 으로 되돌리면 다음 틱에 닫힌다. 래치로 연다.
             self._creep_open_latched = True
             self._creep_latch_span = self.ot_span
-            self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+            self._creep_diag = dict(diag, so_creep=True, creep_v=v_creep,
                                     creep_open_why=open_why, creep_open_latched=True,
                                     creep_latch_why='delay', **gate)
-            return self.standoff_creep_v
+            return v_creep
         self._creep_hold_ticks = 0                       # need·breakout: 조건이 지속된다
-        self._creep_diag = dict(diag, so_creep=True, creep_v=self.standoff_creep_v,
+        self._creep_diag = dict(diag, so_creep=True, creep_v=v_creep,
                                 creep_open_why=open_why, **gate)
-        return self.standoff_creep_v
+        return v_creep
 
     def _stopline_profile(self, planner, ap) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
