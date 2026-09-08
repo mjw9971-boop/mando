@@ -1814,3 +1814,98 @@ pdm:
   # 정지 보행자의 새 겹침 임계. 걸어나오는 보행자는 speed.ped_intent_v 래치가 잡는다.
   # 1.5 = 원문 = 이전 동작 (team_code/config.py 기본값과 같은 축).
   pedestrian_minimum_extent: 0.5
+
+# ══════════════════════════════════════════════════════════════════════════
+# ctrl24 — won_24 제어기 (team_code/ctrl24.py). 2026-09-08 설계 승인.
+# enable: true 면 run_agent 가 kr_rules 대신 Ctrl24 를 조립한다. false = won 과
+# 틱 단위 동일 (kr_rules 경로, 이 섹션의 나머지 키는 읽지 않는다).
+# 이 섹션이 ctrl24 상수의 단일 출처다. 위 speed.* / overtake.* 는 kr_rules 비교
+# 실행용으로 값·이름을 그대로 둔다. 값이 같은 키가 겹쳐 보이는 것은 "두 제어기가
+# 각자 한 곳에서 읽는다" 이지 이원화가 아니다 — ctrl24 는 위 섹션을 읽지 않는다.
+# 예외(여기 없고 다른 섹션을 읽는 값): vehicle.* · control.a_dec_max · speed.a_emergency ·
+# speed.stop_gap_stopline_m(PDM 주입 s0) · percep.obstacle_clearance_m(회랑 여유 —
+# P1 정지 객체 폭 판정과 같은 값이어야 한다) · comm.send_hz.
+# ══════════════════════════════════════════════════════════════════════════
+ctrl24:
+  enable: true
+  # ── K1·K2 정지선 (kr_rules ④′ / B-1 과 같은 의미·값) ────────────────────
+  stop_profile_a: 3.0          # K1 v = √(2·a·(d − s0)) 의 a [m/s²]. 0 = 후보 없음
+  stopline_hold_s: 1.0         # K2 정지선 6 m 안 정지 시 유지 [s] (규정 0.5 + 여유)
+  stopline_hold_min_s: 0.5     # 녹색 전환·래치 해제 시 남기는 최소 정지 [s]
+  stopline_hold_near_m: 6.0    # 홀드를 무장하는 정지선 근접 창 [m, 앞범퍼]
+  a_yellow: 4.0                # 황색 원샷 판정 감속 [m/s²]. 0 = 판정 없음(PDM 원문)
+  yellow_guard_max_m: 60.0     # 교차로 통과 가드 상한 [m]
+  # ── K3·K4·K5 보행자 ────────────────────────────────────────────────────
+  ped_intent_v: 0.3            # 경로 쪽 횡속도·보행자 속도 하한 [m/s]. 0 = K3 없음
+  ped_emergency_ratio: 0.75    # K4: a_req > 이 배수 × |a_dec_max| 면 a_emergency 즉시
+  ped_release_lat_m: 2.5       # 회랑 반폭 [m] — 홀드(v=0)·해제 축
+  ped_release_s: 1.5
+  ped_stop_v: 0.2
+  ped_offroad_lat_m: 12.5
+  ped_backstop_s: 30.0
+  ped_walkin_v: 0.5            # 래치 횡속도 하한 [m/s]
+  # 래치까지 연속 틱 [s]. 0.0 = 첫 틱 래치 (2026-09-08 결정 Q2). 되돌림 값 0.5 —
+  # kr_rules 는 정지 관찰을 마친 보행자만 첫 틱에 래치하고 나머지는 0.5 s 였는데,
+  # ctrl24 에는 정지 관찰 시계가 없어 그 경로가 사라진 만큼 0 으로 당긴다.
+  ped_walkin_s: 0.0
+  ped_walkin_lat_m: 8.0
+  ped_multi_enable: true       # 회랑 안 보행자 누구든 홀드 (v_allow 0)
+  ped_hold_coast_s: 0.5
+  ped_crosswalk_creep_enable: false   # K5 — 이식하되 기본 off
+  ped_crosswalk_zone_m: 10.0
+  ped_crosswalk_lat_m: 4.0
+  ped_crosswalk_wait_s: 3.0
+  ped_crosswalk_creep_v: 2.0
+  # ── 지시등 (signal.* 과 같은 값) ───────────────────────────────────────
+  turn_lead_s: 4.0
+  lc_lead_s: 3.0
+  sig_lead_min_m: 20.0
+  lat_shift_on_m: 0.5
+  sig_min_on_s: 1.0
+  sig_off_delay_s: 0.5
+  # ── 미보고 신호 · timeout GO (overtake.signal_* 과 같은 값) ─────────────
+  signal_stale_s: 1.0
+  signal_timeout_go_enable: true
+  signal_unknown_timeout_s: 10.0
+  signal_timeout_clear_m: 30.0
+  # ── RTOR (speed.rtor_* 과 같은 값 — 정지 유지만 0.5 s) ───────────────────
+  rtor_enable: true
+  rtor_allow_stale_red: true
+  rtor_exclude_tl_ids: []
+  rtor_turn_event_window_m: 5.0
+  rtor_stop_v_max: 0.3
+  rtor_stop_zone_m: 2.0
+  # 정지 구역 안 정지 누적 [s]. 2026-09-08 결정 Q5: 삭제하지 않고 0.5 (규정 최소).
+  # 0 이면 정지 없이 래치 — 조건 1~4·6 은 정지를 요구하지 않고, 래치가 서면
+  # K1·K2·P3 가 전부 꺼져 정지 후보가 없어진다.
+  rtor_stop_hold_s: 0.5
+  rtor_ped_guard_m: 8.0
+  rtor_cross_gap_m: 40.0
+  rtor_cross_ttc_s: 6.0
+  rtor_go_speed_kph: 15
+  rtor_release_dist_m: 30.0
+  # ── 정적 장애물 회피 (A·B·C) ───────────────────────────────────────────
+  avoid_enable: true
+  blocker_speed_max: 0.5       # 이 속도 미만 = 정지 객체 (GT 속도, 관찰 시계 없음)
+  detect_max_m: 80.0           # 회랑 탐지 상한 [m] (= GT 범위)
+  # 전이 길이 trans = max(trans_min_m, trans_k · v).
+  # 8.0 = 3.0 m 차로 기구학 최소 7.6(최소회전반경 5.65 m 의 S 자) + 여유.
+  # 3.24 = 코사인 전이 a_lat 1.5 m/s² (10 m/s → 32 m).
+  trans_min_m: 8.0
+  trans_k: 3.24
+  shift_ahead_m: 5.0           # 전이 시작을 자차 앞 이만큼 [m] (정지 상태 조향 풀락 방지)
+  extra_before_m: 5.0          # 장애물 앞뒤 여유 [m]
+  extra_after_m: 10.0
+  chain_gap_m: 18.0            # 연쇄 병합 [m] = extra_after + trans_min
+  # 유일한 side 게이트 — 시프트 시작점이 자차보다 이만큼 앞이면 기각 (순환 코스 안전망)
+  span_gate_max_m: 100.0
+  # 이 미만의 횡변위는 시프트가 아니다 (이웃 없음 → route.py 폴백이 원 경로 유지).
+  # avoid.state = NOOP, ot_span 없음.
+  noop_disp_m: 0.5
+  prepass_obb_enable: true     # P2 pre-pass: 원 경로 OBB 2 s 교차 정지 객체도 트리거
+  # ── 종점 (D) — route.py 가 읽는다 ─────────────────────────────────────
+  # successor 가 끝난 뒤 마지막 헤딩으로 붙이는 직선 패드 [m]. 0 = 패드 없음.
+  # 없으면 PDM 룩어헤드가 마지막 점으로 고정돼 통과 후 뒤를 향해 조향한다.
+  end_pad_m: 300.0
+  # 중첩 시프트가 원 경로 차로에서 몇 열까지 나갈 수 있나. 99 = 물리 한계만.
+  shift_target_max_steps: 99
