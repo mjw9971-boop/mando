@@ -36,6 +36,46 @@ from vtd_adapter import frame
 SIG_OFF, SIG_LEFT, SIG_RIGHT = 0, 1, 2        # 9910 turnSignal (SPEC §1.2)
 
 
+def _turn_end_s(lg, lanes, cum, lens, ev) -> float:
+    """회전 이벤트의 소등 지점 [route_s] — 같은 junction 차로가 이어지는 끝까지 (kr_rules 원문)."""
+    s0 = float(ev['s'])
+    if lg is None or not lanes or not cum:
+        return s0
+    i = min(range(len(cum)), key=lambda j: abs(float(cum[j]) - s0))
+    rec = lg.lanes.get(tuple(lanes[i]))
+    if rec is None:
+        return s0
+    end_of = lambda j: float(cum[j]) + (float(lens[j]) if j < len(lens) else 0.0)
+    jid = rec.get('junction', -1)
+    if jid == -1:
+        return end_of(i)
+    j = i
+    while j + 1 < len(lanes):
+        nxt = lg.lanes.get(tuple(lanes[j + 1]))
+        if nxt is None or nxt.get('junction') != jid:
+            break
+        j += 1
+    return end_of(j)
+
+
+def turn_intervals(planner) -> list[dict]:
+    """route['events'] 의 회전만 → 점등 구간 [{sig, src, ev_s, end_s}]. 시작 시 1회."""
+    route = getattr(planner, 'route', None) or {}
+    lg = getattr(planner, 'lg', None)
+    lanes = route.get('lanes') or []
+    cum = route.get('cum_s') or []
+    lens = route.get('lengths') or []
+    out: list[dict] = []
+    for ev in route.get('events') or []:
+        kind = str(ev.get('kind', ''))
+        if kind.startswith('turn_'):
+            out.append({'sig': SIG_LEFT if kind.endswith('left') else SIG_RIGHT,
+                        'src': 'turn', 'ev_s': float(ev['s']),
+                        'end_s': _turn_end_s(lg, lanes, cum, lens, ev)})
+    out.sort(key=lambda d: d['ev_s'])
+    return out
+
+
 class Ctrl24:
     def __init__(self, cfg: dict) -> None:
         c = cfg['ctrl24']
@@ -77,6 +117,33 @@ class Ctrl24:
         self.a_emergency = float(cfg['speed']['a_emergency'])
         self.a_dec_max = abs(float(cfg['control']['a_dec_max']))
         self.detect_max_m = float(c['detect_max_m'])
+        self.v_static = float(c['blocker_speed_max'])
+        self.clr = float(cfg['percep']['obstacle_clearance_m'])   # 회랑 여유 = P1 과 같은 값
+        # ── 지시등 ─────────────────────────────────────────────────────────
+        self.turn_lead_s = float(c['turn_lead_s'])
+        self.lc_lead_s = float(c['lc_lead_s'])
+        self.sig_lead_min_m = float(c['sig_lead_min_m'])
+        self.lat_on_m = float(c['lat_shift_on_m'])
+        self.sig_min_on_ticks = int(round(float(c['sig_min_on_s']) * self.hz))
+        self.sig_off_delay_ticks = int(round(float(c['sig_off_delay_s']) * self.hz))
+        # ── 미보고 신호 · timeout GO ────────────────────────────────────────
+        self.sig_stale_ticks = int(round(float(c['signal_stale_s']) * self.hz))
+        self.sig_timeout_go = bool(c['signal_timeout_go_enable'])
+        self.sig_timeout_ticks = int(round(float(c['signal_unknown_timeout_s']) * self.hz))
+        self.sig_timeout_clear_m = float(c['signal_timeout_clear_m'])
+        # ── RTOR ───────────────────────────────────────────────────────────
+        self.rtor_enable = bool(c['rtor_enable'])
+        self.rtor_allow_stale = bool(c['rtor_allow_stale_red'])
+        self.rtor_exclude = {int(x) for x in (c.get('rtor_exclude_tl_ids') or [])}
+        self.rtor_turn_win_m = float(c['rtor_turn_event_window_m'])
+        self.rtor_stop_v = float(c['rtor_stop_v_max'])
+        self.rtor_zone_m = float(c['rtor_stop_zone_m'])
+        self.rtor_hold_ticks = int(round(float(c['rtor_stop_hold_s']) * self.hz))
+        self.rtor_ped_guard_m = float(c['rtor_ped_guard_m'])
+        self.rtor_cross_gap_m = float(c['rtor_cross_gap_m'])
+        self.rtor_cross_ttc_s = float(c['rtor_cross_ttc_s'])
+        self.rtor_go_v = float(c['rtor_go_speed_kph']) / 3.6
+        self.rtor_release_m = float(c['rtor_release_dist_m'])
 
         # ── 상태 ──────────────────────────────────────────────────────────
         self._ap = None
@@ -123,6 +190,24 @@ class Ctrl24:
         self._sig_go = False                          # 커밋 2 (timeout GO)
         self._rtor_go = False                         # 커밋 2 (RTOR)
         self.ot_span = None                           # 커밋 3 (회피)
+        self._corridor: list = []                     # 이번 틱 회랑 안 정지 객체 (커밋 3 이 채운다)
+        self._tick_lg = None
+        self._tick_ego_lane = None
+        # 지시등
+        self.sig_plan: list | None = None
+        self.sig_on_ticks = 0
+        self.sig_off_left = 0
+        self.sig_held: int = SIG_OFF
+        # 미보고 신호 / timeout GO
+        self._obs_tick = 0
+        self._light_seen: dict = {}
+        self._sig_wait_ticks = 0
+        self._sig_go_tl = None
+        # RTOR
+        self._rtor_go_tl = None
+        self._rtor_stop_s = None
+        self._rtor_junction_seen = False
+        self._rtor_hold_cnt = 0
 
     # ── 훅 호환 ───────────────────────────────────────────────────────────
     def breakout_creep(self) -> bool:
@@ -243,8 +328,6 @@ class Ctrl24:
         return bool(self.y_decision == 'go' or self.cross_guard or self._sig_go
                     or self._rtor_active(getattr(ap, '_waypoint_planner', None)))
 
-    def _rtor_active(self, planner) -> bool:          # 커밋 2 에서 채운다
-        return False
 
     # ── K1·K2 ─────────────────────────────────────────────────────────────
     def _stop_target(self, planner, ap) -> tuple | None:
@@ -532,6 +615,380 @@ class Ctrl24:
                 self.cw_wait.pop(wid, None)
         return best
 
+    # ── 자차 차로 ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _ego_lane(lg, ap):
+        if lg is None:
+            return None
+        loc = ap._vehicle.get_location()
+        vx, vy = frame.from_carla_xy(loc.x, loc.y)
+        try:
+            m = lg.locate(vx, vy)
+        except Exception:                                  # noqa: BLE001
+            return None
+        return m.lane if m is not None else None
+
+    def _in_junction_lane(self, ap) -> bool:
+        lg, lane = self._tick_lg, self._tick_ego_lane
+        if lg is not None and lane is not None and lane in lg.lanes:
+            return lg.lanes[lane]['junction'] != -1
+        return bool(getattr(ap, 'junction', False))
+
+    # ── 회랑 (정지 객체, 관찰 시계 없음) ──────────────────────────────────
+    @staticmethod
+    def _is_walker(actor) -> bool:
+        return 'walker' in str(getattr(actor, 'type_id', ''))
+
+    def _corridor_blockers(self, ap, planner, include_moving: bool = False) -> list:
+        """전방 detect_max_m 안에서 주행 회랑을 침범한 객체 [(s_rel, lat, half_w, actor)].
+
+        정지 = GT 속도 < blocker_speed_max, 이번 틱 값 그대로 (정지 지속 시간 조건 없음).
+        침범 = |lat| < 자차반폭 + 객체반폭 + percep.obstacle_clearance_m (P1 과 같은 축).
+        경로점은 현재 route_points 라 시프트 활성 중에는 밀린 경로 회랑이다.
+        보행자(walker)는 제외 — 그건 K3 의 정지 대상이지 비켜갈 대상이 아니다
+        (항목 10: 횡단 완료 전 통과 = 중대). include_moving 은 timeout GO 의 이동 차량 검사용.
+        """
+        try:
+            actors = list(ap._world.get_actors())
+        except Exception:                                  # noqa: BLE001
+            return []
+        ego_id = ap._vehicle.id
+        out = []
+        for a in actors:
+            if a.id == ego_id or self._is_walker(a):
+                continue
+            if not include_moving and float(getattr(a, 'speed', 0.0)) >= self.v_static:
+                continue
+            loc = a.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None:
+                continue
+            s_rel, lat = pr
+            if not (0.5 < s_rel <= self.detect_max_m):
+                continue
+            bb = getattr(a, 'bounding_box', None)
+            hw = float(bb.extent.y) if bb is not None else 0.9
+            if abs(lat) < self.half_ego + hw + self.clr:
+                out.append((s_rel, lat, hw, a))
+        out.sort(key=lambda z: z[0])
+        return out
+
+    # ── 미보고 신호 · timeout GO ───────────────────────────────────────────
+    def observe_lights(self, lights) -> None:
+        """9910 lights [(id, state)] — 보고 시각만 센다 (state 는 플래너가 갱신)."""
+        self._obs_tick += 1
+        for lid, _state in lights or []:
+            self._light_seen[int(lid)] = self._obs_tick
+
+    def _signal_stale(self, planner) -> dict | None:
+        """다음 정지선 controller 의 미보고 판정 → 진단 dict. 관측이 없거나 대상 없음 → None."""
+        if not (self.sig_timeout_go or self.rtor_enable) or self._obs_tick <= 0:
+            return None
+        tls = getattr(planner, 'next_traffic_lights', None)
+        tl = tls[planner.route_index] if tls is not None else None
+        if tl is None:
+            return None
+        ids = [int(i) for i in (getattr(tl, 'controller_ids', None) or [getattr(tl, 'id', -1)])]
+        seen = max((self._light_seen.get(i, 0) for i in ids), default=0)
+        age = self._obs_tick - seen
+        return {'signal_stale': age >= self.sig_stale_ticks,
+                'signal_stale_s': round(age / self.hz, 1),
+                'signal_last_state': getattr(getattr(tl, 'state', None), 'name', None),
+                'signal_ctrl': ids}
+
+    def _signal_timeout_tick(self, ap, planner, ego_speed: float) -> None:
+        """B-3(b) 시한 출발 — stale ∧ 정지 후보 있음 ∧ 정지 중 ∧ 앞차 없음(회랑 정지 객체 0 ∧
+        clear_m 안 이동 차량 0) ∧ 보행자 래치 없음 이 signal_unknown_timeout_s 이상.
+        PDM walker 플래그는 없다 (PDM 보행자 후보 제거) — 회랑 홀드·의도 래치가 그 축이다."""
+        if not self.sig_timeout_go:
+            return
+        sig = self.last_signal
+        nxt = self._next_stopline(planner)
+        tl_id = nxt[2] if nxt else None
+        stale = bool(sig and sig['signal_stale'])
+        if self._sig_go and (not stale or tl_id != self._sig_go_tl):
+            self._sig_go = False
+            self._sig_go_tl = None
+        ok = stale and self._stop_target_raw(planner, ap) is not None \
+            and ego_speed < 0.5 and not self._corridor \
+            and not (self.ped_intent or self.ped_hold_ids)
+        if ok:
+            moving = self._corridor_blockers(ap, planner, include_moving=True)
+            ok = not any(b[0] <= self.sig_timeout_clear_m for b in moving)
+        self._sig_wait_ticks = self._sig_wait_ticks + 1 if ok else 0
+        if ok and self._sig_wait_ticks >= self.sig_timeout_ticks and not self._sig_go:
+            self._sig_go = True
+            self._sig_go_tl = tl_id
+        if sig is not None:
+            sig['timeout_s'] = round(self._sig_wait_ticks / self.hz, 1)
+            sig['timeout_go'] = self._sig_go
+
+    # ── RTOR (kr_rules 원문 — 정지 유지 rtor_stop_hold_s 0.5) ─────────────
+    def _rtor_reset(self) -> None:
+        self._rtor_go = False
+        self._rtor_go_tl = None
+        self._rtor_stop_s = None
+        self._rtor_junction_seen = False
+        self._rtor_hold_cnt = 0
+
+    def _rtor_active(self, planner) -> bool:
+        """래치가 지금 전방 신호에 붙어 있는가 — _stop_target·signal_release 의 게이트."""
+        if not self._rtor_go or planner is None:
+            return False
+        nxt = self._next_stopline(planner)
+        return nxt is not None and nxt[2] == self._rtor_go_tl
+
+    def _rtor_sig(self, planner) -> tuple:
+        tls = getattr(planner, 'next_traffic_lights', None)
+        tl = tls[planner.route_index] if tls is not None else None
+        if tl is None:
+            return None, []
+        ids = [int(i) for i in (getattr(tl, 'controller_ids', None) or [getattr(tl, 'id', -1)])]
+        if self._obs_tick <= 0:
+            return 'fresh', ids
+        seen = max((self._light_seen.get(i, 0) for i in ids), default=0)
+        return ('stale' if self._obs_tick - seen >= self.sig_stale_ticks else 'fresh'), ids
+
+    def _rtor_lead(self, planner, ap, d_line: float):
+        """정지선 앞 앞차 → 사유, 없으면 None. 회랑 정지 객체 또는 PDM 선행차(이동 포함)."""
+        for b in (self._corridor or []):
+            if b[0] < d_line:
+                return f'corridor:{int(getattr(b[3], "id", -1))}'
+        try:
+            vehicles = list(ap._world.get_actors().filter('*vehicle*'))
+            ids = set(planner.compute_leading_vehicles(vehicles, ap._vehicle.id))
+        except Exception:                                  # noqa: BLE001 — 목 플래너
+            return None
+        for a in vehicles:
+            if a.id not in ids:
+                continue
+            loc = a.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is not None and 0.0 < pr[0] < d_line:
+                return f'lead:{int(a.id)}'
+        return None
+
+    def _rtor_ped_block(self, planner, ap, route_s: float, stop_s: float, end_s: float):
+        """보행자 차단 사유 — 회랑 홀드·의도 래치, 또는 정지선~회전 종료 주변 guard_m 안 보행자."""
+        if self.ped_hold_ids or self.ped_intent:
+            return 'latch'
+        g = self.rtor_ped_guard_m
+        s_lo, s_hi = stop_s - route_s - g, end_s - route_s + g
+        for w in self._walkers(ap):
+            loc = w.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is not None and s_lo <= pr[0] <= s_hi and abs(pr[1]) <= g:
+                return f'near:{int(getattr(w, "id", -1))}'
+        return None
+
+    def _rtor_cross_block(self, ap, lg, ego_lane, jid):
+        """교차 차량 차단 (kr_rules 원문). 정지 차량 제외, 좌측·전방 접근만."""
+        try:
+            vehicles = list(ap._world.get_actors().filter('*vehicle*'))
+        except Exception:                                  # noqa: BLE001
+            return None
+        ego = ap._vehicle
+        eloc = ego.get_location()
+        ex, ey = frame.from_carla_xy(eloc.x, eloc.y)
+        eyaw = frame.from_carla_yaw_deg(ego.get_transform().rotation.yaw)
+        ce, se = _math.cos(eyaw), _math.sin(eyaw)
+        for a in vehicles:
+            if a.id == ego.id:
+                continue
+            v = float(getattr(a, 'speed', 0.0))
+            if v < self.ped_stop_v:
+                continue
+            loc = a.get_location()
+            ax, ay = frame.from_carla_xy(loc.x, loc.y)
+            ayaw = frame.from_carla_yaw_deg(a.get_transform().rotation.yaw)
+            cand = None
+            if lg is not None and jid is not None:
+                try:
+                    m = lg.locate(ax, ay, yaw=ayaw)
+                except Exception:                          # noqa: BLE001
+                    m = None
+                if m is not None and m.lane in lg.lanes:
+                    key = m.lane
+                    in_j = (lg.lanes[key]['junction'] == jid
+                            or any(lg.lanes[s]['junction'] == jid
+                                   for s in lg.successors(key) if s in lg.lanes))
+                    same_road = ego_lane is not None and key[0] == ego_lane[0]
+                    cand = in_j and not same_road
+            if cand is False:
+                continue
+            dx, dy = ax - ex, ay - ey
+            lon, lat = dx * ce + dy * se, -dx * se + dy * ce
+            if not (lat > 0.0 or lon > 0.0):
+                continue
+            if (-dx) * _math.cos(ayaw) + (-dy) * _math.sin(ayaw) <= 0.0:
+                continue
+            dist = _math.hypot(dx, dy)
+            if dist < self.rtor_cross_gap_m or dist / max(v, 0.1) < self.rtor_cross_ttc_s:
+                return f'{int(a.id)}'
+        return None
+
+    def _rtor_log(self, diag: dict) -> None:
+        if self.last_signal is None:
+            self.last_signal = {}
+        self.last_signal['rtor'] = diag
+
+    def _rtor_tick(self, ap, planner, ego_speed: float) -> None:
+        """off → hold(정지 구역 안 정지 누적 rtor_stop_hold_s) → wait(보행자·교차) → go(래치).
+        리셋 = fresh 녹색 / 교차로 차로 이탈 / 정지선 + rtor_release_dist_m."""
+        if not self.rtor_enable:
+            return
+        route_s = float(planner.route_s[planner.route_index])
+        lg, ego_lane = self._tick_lg, self._tick_ego_lane
+        nxt = self._next_stopline(planner)
+        sig, ids = self._rtor_sig(planner)
+        diag = {'state': 'off', 'sig': sig, 'lead': None, 'turn_right': None,
+                'hold_s': 0.0, 'ped_block': None, 'cross_block': None, 'reason': None}
+        in_j = self._in_junction_lane(ap)
+        if self._rtor_go:
+            if in_j:
+                self._rtor_junction_seen = True
+            why = None
+            if (nxt is not None and nxt[2] == self._rtor_go_tl
+                    and nxt[1] == 'Green' and sig == 'fresh'):
+                why = 'green'
+            elif self._rtor_junction_seen and not in_j:
+                why = 'junction_exit'
+            elif route_s >= float(self._rtor_stop_s) + self.rtor_release_m:
+                why = 'release_dist'
+            if why is not None:
+                self._rtor_reset()
+                diag['reason'] = 'reset:' + why
+            else:
+                diag['state'] = 'go'
+                diag['hold_s'] = round(self._rtor_hold_cnt / self.hz, 1)
+            self._rtor_log(diag)
+            return
+        tl_id = nxt[2] if nxt else None
+        state = nxt[1] if nxt else None
+        reason = None
+        if nxt is None:
+            reason = 'no_signal'
+        elif tl_id in self.rtor_exclude or any(i in self.rtor_exclude for i in ids):
+            reason = 'excluded'
+        else:
+            tgt = self._stop_target_raw(planner, ap)
+            red = (tgt is not None and state == 'Red'
+                   and (sig == 'fresh' or (self.rtor_allow_stale and sig == 'stale')))
+            if not red:
+                reason = 'not_red'
+        d_line = float(nxt[0]) if nxt else None
+        stop_s = route_s + d_line if d_line is not None else None
+        turn = None
+        if reason is None:
+            if self.sig_plan is None:
+                self.sig_plan = turn_intervals(planner)
+            turn = next((iv for iv in self.sig_plan if iv['sig'] == SIG_RIGHT
+                         and stop_s - 0.5 <= iv['ev_s'] <= stop_s + self.rtor_turn_win_m), None)
+            diag['turn_right'] = turn is not None
+            if turn is None:
+                reason = 'no_turn_right'
+        if reason is None:
+            lead = self._rtor_lead(planner, ap, d_line)
+            diag['lead'] = lead
+            if lead is not None:
+                reason = 'lead'
+        if reason is not None:
+            self._rtor_hold_cnt = 0
+            diag['reason'] = reason
+            self._rtor_log(diag)
+            return
+        zone = (d_line - self.front) <= self.rtor_zone_m and ego_speed <= self.rtor_stop_v
+        self._rtor_hold_cnt = self._rtor_hold_cnt + 1 if zone else 0
+        diag['hold_s'] = round(self._rtor_hold_cnt / self.hz, 1)
+        route = getattr(planner, 'route', None) or {}
+        jid = next((ev.get('junction') for ev in (route.get('events') or [])
+                    if str(ev.get('kind', '')) == 'turn_right'
+                    and abs(float(ev.get('s', -1e9)) - turn['ev_s']) < 1e-6), None)
+        ped = self._rtor_ped_block(planner, ap, route_s, stop_s, float(turn['end_s']))
+        cross = self._rtor_cross_block(ap, lg, ego_lane, jid)
+        diag['ped_block'] = ped
+        diag['cross_block'] = cross
+        if self._rtor_hold_cnt < self.rtor_hold_ticks:
+            diag['state'] = 'hold'
+            diag['reason'] = 'zone' if zone else 'out_of_zone'
+        elif ped is not None or cross is not None:
+            diag['state'] = 'wait'
+            diag['reason'] = 'ped' if ped is not None else 'cross'
+        else:
+            self._rtor_go = True
+            self._rtor_go_tl = tl_id
+            self._rtor_stop_s = stop_s
+            self._rtor_junction_seen = False
+            diag['state'] = 'go'
+            diag['reason'] = 'latch'
+        self._rtor_log(diag)
+
+    # ── 지시등 (kr_rules 원문) ─────────────────────────────────────────────
+    def _lane_shift(self, planner, ego_speed: float):
+        """앞 창에서 경로가 차로 중심 기준으로 옆으로 갈 예정인가 → (sig, 남은거리).
+        planner.lat_shift 는 계획 차선변경 + 런타임 회피 시프트를 함께 담는다."""
+        lat = getattr(planner, 'lat_shift', None)
+        if lat is None or len(lat) == 0:
+            return None
+        i = int(getattr(planner, 'route_index', 0))
+        if i >= len(lat):
+            return None
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        look = max(ego_speed * self.lc_lead_s, self.sig_lead_min_m)
+        j = min(len(lat), i + int(look * ppm) + 1)
+        seg = lat[i:j] - lat[i]
+        if seg.size == 0:
+            return None
+        k = int(np.argmax(np.abs(seg)))
+        if abs(float(seg[k])) < self.lat_on_m:
+            return None
+        over = np.nonzero(np.abs(seg) >= self.lat_on_m)[0]
+        remain = float(over[0]) / ppm if over.size else 0.0
+        return (SIG_LEFT if seg[k] > 0 else SIG_RIGHT), remain
+
+    def _turn_signal(self, planner, route_s: float, ego_speed: float) -> tuple:
+        """이번 틱 지시등 → (sig, src, lead_s). 회전(이벤트) 대 차로 이동(기하) —
+        남은거리 짧은 쪽, 동률 회전 우선. 유지는 min_on / off_delay 둘뿐 (상한 있음)."""
+        if self.sig_plan is None:
+            self.sig_plan = turn_intervals(planner)
+        best = None
+        for iv in self.sig_plan:
+            if route_s > iv['end_s']:
+                continue
+            remain = iv['ev_s'] - route_s
+            if remain > max(ego_speed * self.turn_lead_s, self.sig_lead_min_m):
+                continue
+            key = (max(0.0, remain), 0)
+            if best is None or key < best[0]:
+                best = (key, iv['sig'], 'turn', remain)
+        shift = self._lane_shift(planner, ego_speed)
+        if shift is not None:
+            sig, remain = shift
+            key = (max(0.0, remain), 1)
+            if best is None or key < best[0]:
+                best = (key, sig, 'lc', remain)
+        if best is None:
+            sig, src, remain = SIG_OFF, None, None
+        else:
+            _k, sig, src, remain = best
+        if sig != SIG_OFF:
+            if self.sig_held != sig:
+                self.sig_on_ticks = 0
+            self.sig_held = sig
+            self.sig_on_ticks += 1
+            self.sig_off_left = self.sig_off_delay_ticks
+        elif self.sig_held != SIG_OFF and (self.sig_off_left > 0
+                                           or self.sig_on_ticks < self.sig_min_on_ticks):
+            self.sig_off_left = max(0, self.sig_off_left - 1)
+            self.sig_on_ticks += 1
+            sig, src = self.sig_held, 'hold'
+        else:
+            self.sig_held = SIG_OFF
+            self.sig_on_ticks = 0
+        lead = (max(0.0, remain) / ego_speed
+                if remain is not None and ego_speed > 0.1 else None)
+        return sig, src, lead
+
     # ── 리셋 ──────────────────────────────────────────────────────────────
     def on_reset(self) -> None:
         """courseRespawn — 순간이동 전 래치는 전부 무효 (run_agent 가 부른다)."""
@@ -551,6 +1008,10 @@ class Ctrl24:
         self.ped_hold_ids.clear()
         self.ped_miss.clear()
         self.ped_last.clear()
+        self._sig_go = False                          # timeout GO 래치
+        self._sig_go_tl = None
+        self._sig_wait_ticks = 0
+        self._rtor_reset()                            # RTOR 래치·정지 누적 (순간이동 = 새 접근)
 
     # ── 틱 ────────────────────────────────────────────────────────────────
     def _tick_head(self, ap, planner, ego_speed: float) -> None:
@@ -563,10 +1024,20 @@ class Ctrl24:
         self.last_kr_winner = None
         self.ped_emergency = False
         self._yellow_latch(planner, ego_speed, ap)
+        # 회랑 안 정지 객체 (관찰 시계 없음) — timeout GO·RTOR 의 앞차 판정 입력.
+        # 회피 틱(커밋 3)이 경로를 밀거나 원복하면 그쪽에서 다시 잰다.
+        self._corridor = self._corridor_blockers(ap, planner)
 
     def _tick_signals(self, ap, planner, ego_speed: float, route_s: float) -> None:
-        """timeout GO · RTOR · 지시등 — 커밋 2."""
-        self.last_turn_signal, self.last_sig_src, self.last_sig_lead_s = SIG_OFF, None, None
+        """timeout GO · RTOR · 지시등. 회랑(self._corridor)은 회피 틱이 먼저 채운다."""
+        self._tick_lg = getattr(planner, 'lg', None)
+        self._tick_ego_lane = (getattr(ap, '_kr_ego_lane', None)
+                               or self._ego_lane(self._tick_lg, ap))
+        self.last_signal = self._signal_stale(planner)
+        self._signal_timeout_tick(ap, planner, ego_speed)
+        self._rtor_tick(ap, planner, ego_speed)
+        (self.last_turn_signal, self.last_sig_src,
+         self.last_sig_lead_s) = self._turn_signal(planner, route_s, ego_speed)
 
     def _candidates(self, ap, planner, ego_speed: float, target_speed: float):
         """kr 후보 → (candidate, ped_bind, ped). 전부 min() 후보다."""
@@ -626,7 +1097,10 @@ class Ctrl24:
                                       key=lambda k: kr[k])
         return candidate, ped_bind, ped
 
-    def _rtor_cap(self):                              # 커밋 2
+    def _rtor_cap(self):
+        """RTOR 래치 중 속도 상한 — min() 후보."""
+        if self._rtor_go and self.rtor_go_v > 0.0:
+            return self.rtor_go_v
         return None
 
     def apply(self, control, target_speed: float, ap):
