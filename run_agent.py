@@ -45,6 +45,7 @@ from vtd_adapter.world import VtdWorld                     # noqa: E402
 
 from autopilot import AutoPilot                            # noqa: E402  (team_code)
 from config import GlobalConfig                            # noqa: E402  (team_code)
+from ctrl24 import Ctrl24                                  # noqa: E402  (team_code)
 from kr_rules import KrRules                               # noqa: E402  (team_code)
 
 
@@ -164,9 +165,27 @@ class LoggingAutoPilot(AutoPilot):
         return ts
 
 
+class Ctrl24AutoPilot(LoggingAutoPilot):
+    """ctrl24 조립 — PDM 보행자 후보를 없앤다 (2026-09-08 설계 [제거]).
+
+    forecast_walkers 를 빈 목록으로 돌려 compute_target_speeds_wrt_all_actors 의
+    pedestrian 후보가 initial 그대로가 된다 (walker_hazard 도 서지 않는다). 보행자는
+    ctrl24 의 K3(의도 래치·회랑 홀드)·K4(비상)가 전담한다 — 30건 로그 실측에서 PDM
+    보행자 후보가 K3 없이 단독으로 구속한 틱은 0 이었다. bicycle 후보는 VtdActor 에
+    base_type 이 없어 원문 분기가 이미 죽어 있다 (코드 변경 없음). 판단 원문 무수정.
+    """
+
+    def forecast_walkers(self, actors, ego_vehicle_location, number_of_future_frames):
+        return [], []
+
+
 # decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등은 kr_rules 가 따로 낸다.
 _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
                 'vehicle': 'vehicle', 'bicycle': 'bicycle', 'route_end': 'route_end'}
+# ctrl24 kr 후보(reasons.kr) → winner 어휘. 기존 어휘를 유지해 score/batch_run 의
+# GREEN_EXEMPT_WINNERS·CROSSING_WINNERS 판정이 그대로 맞는다 (K1/K2 = light 는 면책 아님).
+_KR24_NAME = {'stop_profile': 'light', 'stop_hold': 'light', 'ped_intent': 'walker',
+              'crosswalk': 'walker', 'rtor_cap': 'rtor'}
 
 
 class Runner:
@@ -207,11 +226,14 @@ class Runner:
         self.longc = VtdLongitudinalController(self.cfg)
         self.max_steer = float(self.cfg['vehicle']['max_steer'])
 
-        self.agent = LoggingAutoPilot()
+        # 제어기 선택 (won_24): ctrl24.enable 이면 Ctrl24 + PDM 보행자 후보 없는 조립,
+        # 아니면 kr_rules — 이 경로는 won 과 틱 단위 동일하다 (리플레이 diff 0 이 근거).
+        self.ctrl24 = bool((self.cfg.get('ctrl24') or {}).get('enable', False))
+        self.agent = Ctrl24AutoPilot() if self.ctrl24 else LoggingAutoPilot()
         self.agent.setup(self.world, self.vmap, self.planner, self.longc,
                          self.world.ego, config=self.pdm_config)
         # 한국 대회 규칙 계층 — autopilot._get_control 끝의 한 줄이 호출한다
-        self.kr = KrRules(self.cfg)
+        self.kr = Ctrl24(self.cfg) if self.ctrl24 else KrRules(self.cfg)
         self.agent.kr_rules = self.kr
 
         log_path = args.log
@@ -293,12 +315,15 @@ class Runner:
         cand = dict(getattr(a, 'candidates', {}))
         initial = getattr(a, 'initial_target', None)
         brake, target, reduced = getattr(a, 'final', (False, 0.0, None))
+        if self.kr.last_target is not None:
+            target = float(self.kr.last_target)
+
+        if self.ctrl24:
+            return self._build_decision_24(cand, initial, target, reduced)
 
         # kr_rules 의 route_end 후보를 같은 중재 축에 합친다 (작업2)
         if self.kr.last_candidate is not None:
             cand['route_end'] = float(self.kr.last_candidate)
-        if self.kr.last_target is not None:
-            target = float(self.kr.last_target)
 
         winner = 'none'
         if cand:
@@ -328,6 +353,44 @@ class Runner:
                    # 붉은 구간 진입 전 감속 후보 (2b-B) — 후보가 산 틱에만 채워진다.
                    'red_zone': self.kr.last_red_zone}
         # 신호 미보고 진단 — 스위치 on 일 때만 키가 생긴다 (off 는 로그까지 동일).
+        if self.kr.last_signal is not None:
+            reasons['signal'] = self.kr.last_signal
+        if reduced is not None and reduced[1] is not None:
+            reasons['speed_reduced_by'] = {
+                'type': reduced[1], 'id': reduced[2],
+                'dist': None if reduced[3] is None else round(float(reduced[3]), 1)}
+        return Decision(v_target=float(target), path=[],
+                        turn_signal=int(self.kr.last_turn_signal),
+                        state=winner, reasons=reasons)
+
+    def _build_decision_24(self, cand: dict, initial, target, reduced) -> Decision:
+        """ctrl24 로그 스키마 (2026-09-08 설계 (b)).
+
+        남는 키: initial / winner / leading / vehicle / red_light / sig_src / sig_lead_s /
+        yellow / ped / avoid / speed_reduced_by / signal. 사라지는 키: bicycle / pedestrian
+        (후보 자체가 없다) / route_end / red_zone. 새 키: kr = {stop_profile, stop_hold,
+        rtor_cap, ped_intent, crosswalk} (없는 후보는 null) · prepass_ms.
+        winner 어휘는 기존 그대로 (_KR24_NAME) + 'rtor'.
+        """
+        cand.pop('bicycle', None)
+        cand.pop('pedestrian', None)
+        kr = dict(self.kr.last_kr or {})
+        winner = 'none'
+        pool = {k: v for k, v in cand.items() if v is not None}
+        pool.update({f'kr:{k}': v for k, v in kr.items() if v is not None})
+        if pool:
+            low = min(pool, key=pool.get)
+            if initial is None or pool[low] < initial - 1e-6:
+                winner = (_KR24_NAME[low[3:]] if low.startswith('kr:')
+                          else _HAZARD_NAME[low])
+        reasons = {'initial': initial, 'winner': winner, **cand, 'kr': kr,
+                   'sig_src': self.kr.last_sig_src,
+                   'sig_lead_s': (None if self.kr.last_sig_lead_s is None
+                                  else round(float(self.kr.last_sig_lead_s), 2)),
+                   'yellow': self.kr.last_yellow,
+                   'ped': self.kr.last_ped,
+                   'avoid': self.kr.last_avoid,
+                   'prepass_ms': self.kr.last_prepass_ms}
         if self.kr.last_signal is not None:
             reasons['signal'] = self.kr.last_signal
         if reduced is not None and reduced[1] is not None:

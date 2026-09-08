@@ -480,6 +480,31 @@ class VtdRoutePlanner:
             rs += step
             ext += step
 
+        # ── 종점 패드 (ctrl24 D, won_24) ─────────────────────────────────
+        # ctrl24 는 종점에 서지 않고 마지막 헤딩·제한속도로 계속 달린다 (VTD 가 종료할
+        # 때까지). 경로 배열이 끝나면 PDM _get_steer 의 룩어헤드가 마지막 점으로 고정돼
+        # 통과 후 뒤를 향해 조향하므로, successor 가 끝난 뒤 마지막 헤딩으로 직선을
+        # end_pad_m 만큼 붙인다. 키·제한속도는 마지막 점 것을 그대로 (VtdWaypoint 가 s 를
+        # 차로 길이로 클램프한다). kr_rules 경로(enable false)는 0 = 패드 없음 = 이전 동일.
+        pad_m = (float(self.cfg['ctrl24'].get('end_pad_m', 0.0))
+                 if self.ctrl24 and self.cfg.get('ctrl24') else 0.0)
+        self.end_pad_pts = 0
+        if pad_m > 0.0 and len(pts) >= 2:
+            x0, y0, z0 = pts[-1]
+            x1, y1, _z1 = pts[-2]
+            hdg = _math.atan2(y0 - y1, x0 - x1)
+            key_last, s_last = keys[-1]
+            n_pad = int(round(pad_m / step))
+            for k in range(1, n_pad + 1):
+                pts.append((x0 + k * step * _math.cos(hdg), y0 + k * step * _math.sin(hdg), z0))
+                keys.append((key_last, s_last))
+                cmds.append(int(RoadOption.LANEFOLLOW))
+                rs_list.append(rs)                     # 본 루프와 같은 순서 (append 뒤 증가)
+                limits.append(limits[-1])
+                lat.append(lat_acc)
+                rs += step
+            self.end_pad_pts = n_pad
+
         # ── 배열화 (CARLA 프레임) ────────────────────────────────────────
         self.route_points = frame.to_carla_np(np.array(pts, dtype=float))
         self.original_route_points = np.copy(self.route_points)
