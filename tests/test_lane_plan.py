@@ -332,3 +332,33 @@ def test_moving_object_does_not_block_the_middle_lane():
     mover = Box(9, 6.0, -3.0, 5.0, half_w=0.9)
     ap._world._a.append(mover)
     assert kr._mid_lanes_clear(p.lg, p, ap, L0, 'right', 2) is True
+
+
+# ── [2] 보행자는 회피 대상이 아니다 ──────────────────────────────────────
+class Walker(Box):
+    """`VtdActor(cls='pedestrian')` 과 같은 표면 — type_id 로 갈린다."""
+
+    def __init__(self, oid, x, y, speed=0.0):
+        super().__init__(oid, x, y, speed, half_w=0.3)
+        self.type_id = 'walker.vtd.pedestrian'
+
+
+def test_pedestrian_does_not_shorten_free_run():
+    """서 있는 보행자가 free_run 을 깎으면 시프트 후보가 만들어진다 —
+    보행자는 **세우는** 축(_ped_intent·walker_hazard)이 맡는다."""
+    kr, p, ap = rig(on_cfg(), actors=[Walker(2, 20.0, 0.0)])
+    m = kr.lane_map(ap, p)
+    assert m['blocked_by'] == {}
+    assert m['free_run'][str(list(L0))] == pytest.approx(kr.lane_map_ahead_m)
+
+
+def test_pedestrian_does_not_trigger_a_plan():
+    _kr, pl = plan(on_cfg(), [Walker(2, 20.0, 0.0)])
+    assert pl is None
+
+
+def test_vehicle_still_shortens_free_run():
+    """대조 — 같은 자리 차량은 그대로 잡힌다 (필터가 너무 넓지 않다)."""
+    kr, p, ap = rig(on_cfg(), actors=[obj(2, 20.0, 0.0)])
+    m = kr.lane_map(ap, p)
+    assert m['blocked_by'].get(str(list(L0))) == 2

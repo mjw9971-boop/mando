@@ -1615,6 +1615,14 @@ class KrRules:
         for a in actors:
             if a.id == ego_id or a.id in drop:
                 continue
+            # **보행자는 회피 대상이 아니라 정지 대상이다** (2026-09-09).
+            # 지도에 넣으면 서 있는 보행자 하나가 free_run 을 깎아 시프트 후보가
+            # 만들어지고 지시등·램프가 그려진다. 보행자는 `_ped_intent`·PDM 의
+            # walker_hazard 가 **세우는** 축으로 이미 다루고, 그쪽이 먼저 선다.
+            # 판정은 `type_id` 로 한다 — `_blocker` 의 `filter('*vehicle*')` 과
+            # 같은 규약이다 (VtdActor: 'walker.vtd.pedestrian').
+            if 'walker' in str(getattr(a, 'type_id', '')):
+                continue
             if float(getattr(a, 'speed', 0.0)) >= self.lane_map_static_v:
                 continue                                   # 움직이는 것은 여유를 안 깎는다
             pr = self._project(planner, a.get_location().x, a.get_location().y)
