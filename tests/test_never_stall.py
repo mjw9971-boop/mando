@@ -39,6 +39,8 @@ from kr_rules import KrRules                                       # noqa: E402
 from test_avoid import Ap, Box, GeomPlanner, HZ, LgOne             # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
+# 위와 같다 — hazard 가 never_stall 시계를 0 으로 묶는다는 이전 계약을 본다.
+CFG['speed']['tl_hazard_far_blocker_enable'] = False
 OT = CFG['overtake']
 MAX_TICKS = int(round(OT['deadlock_max_s'] * HZ))
 STEP_TICKS = int(round(OT['never_stall_step_s'] * HZ))

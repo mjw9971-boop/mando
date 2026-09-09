@@ -32,6 +32,11 @@ from test_route_end import FakeEgo, FakePlanner, TOTAL, _apply  # noqa: E402
 from vtd_adapter.carla_types import VehicleControl  # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
+# 정지 유지 홀드(B-1)의 계약을 보는 파일이다. 2026-09-09 에 추가된 미세 전진
+# 래치는 홀드가 끝난 **뒤**를 맡으므로 여기서는 명시적으로 끈다 —
+# 그 래치의 계약은 tests/test_stop_micro.py 가 따로 본다
+# (2026-09-07 드리프트 원칙: 기본값을 읽지 말고 사본에서 명시할 것).
+CFG['speed']['stopline_creep_latch_enable'] = False
 FRONT = CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m']
 GAP_SL = CFG['speed']['stop_gap_stopline_m']
 HOLD_TICKS = round(CFG['speed']['stopline_hold_s'] * CFG['comm']['send_hz'])

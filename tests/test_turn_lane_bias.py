@@ -40,9 +40,21 @@ def lg():
     return LaneGraph(str(GRAPH), cfg=CFG)
 
 
-def test_default_is_off():
-    """기본 0 — 켜는 것은 사람이 정한다 (표는 docs/NIGHT_2026-09-09.md [3])."""
-    assert CFG['route']['turn_lane_bias_m'] == 0.0
+def test_bias_is_sixty():
+    """**60** — taper on 기준에서 회전 차로 위반 19 → 12, 총거리 −55.7 m,
+    rc≠0 신규 0 (사용자 결정, 2026-09-09). 15 이하는 LC_PENALTY(25)를 못 넘어
+    아무것도 안 바뀐다."""
+    assert CFG['route']['turn_lane_bias_m'] == 60.0
+
+
+def test_bias_cannot_buy_an_impossible_lane_change():
+    """bias 가 살 수 있는 회랑 부족분은 bias / LC_SHORT_PENALTY_PER_M 뿐이다.
+
+    60 이면 3.0 m — 07 의 13.5 m 창(부족분 11.5 m)은 못 산다. 즉 이 값으로는
+    실행 불가능한 차선변경이 만들어지지 않는다.
+    """
+    buy = CFG['route']['turn_lane_bias_m'] / br.LC_SHORT_PENALTY_PER_M
+    assert buy < br.LC_MIN_CORRIDOR_M - 13.5
 
 
 def test_connector_turn_reads_geometry_not_arrows(lg):
@@ -101,10 +113,16 @@ def test_taper_alternative_needs_no_lane_change(lg):
 
 
 # ── 회전 차로 **제약** (turn_lane_constraint_enable) ──────────────────────
-def test_constraint_is_on_and_bias_is_off():
-    """제약이 가산점을 대체한다 — 두 축이 같은 일을 하면 안 된다."""
-    assert CFG['route']['turn_lane_constraint_enable'] is True
-    assert CFG['route']['turn_lane_bias_m'] == 0.0
+def test_constraint_is_off_because_the_window_is_too_short():
+    """제약은 **꺼져 있다** — 판정은 옳은데 지도 기하가 못 따라간다.
+
+    화살표 제약을 켜면 회전 차로 위반이 19 → 3 으로 줄지만, `report()` 의
+    rc≠0 이 1 → 5 로 늘어난다 (신규 4건 전부 `lane_change_right window 13.5 m
+    < MIN_LC_WINDOW_M 20`). 제약이 고르는 (146,0,2) 는 테이퍼로 열리는 차로라
+    점선 창이 13.5 m 뿐인데, **경로 검증기 자신의 기준**이 그것을 실행 불가로
+    본다. 지도의 모순이지 탐색이 고를 문제가 아니다.
+    """
+    assert CFG['route']['turn_lane_constraint_enable'] is False
 
 
 def test_lanelink_cannot_express_the_constraint(lg):

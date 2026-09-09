@@ -36,6 +36,8 @@ sys.path.insert(0, str(ROOT / 'team_code'))
 from kr_rules import KrRules                                   # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
+# 위와 같다 — PDM hazard 에서 훅이 거짓이라는 이전 계약을 본다.
+CFG['speed']['tl_hazard_far_blocker_enable'] = False
 OT = CFG['overtake']
 SUP_M = OT['stopline_suppress_m']
 HZ = CFG['comm']['send_hz']

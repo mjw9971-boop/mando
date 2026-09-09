@@ -139,7 +139,10 @@ def test_switch_off_is_previous_behaviour(lg, monkeypatch):
     b, _w, _s = _build(lg, csv)
     # 이 CSV 는 짝 2(좌회전)·짝 4(직진)의 진입 차로가 바뀌는 게 확인된 케이스다
     assert a['lanes'] != b['lanes']
-    assert abs(b['total_length'] - a['total_length']) > 1.0
+    # 길이 차이는 **0 이 아니면 된다**. 크기에 하한을 두면 경로 비용이 바뀔 때마다
+    # 깨진다 — 2026-09-09 route.turn_lane_bias_m 60 도입으로 이 픽스처의 두 결과가
+    # 0.34 m 까지 수렴했다 (차로는 여전히 다르다 = 계약은 그대로다).
+    assert abs(b['total_length'] - a['total_length']) > 1e-6
     _on(monkeypatch, hint=False)
     c, _w, _s = _build(lg, csv)
     assert a['lanes'] == c['lanes'] and a['total_length'] == c['total_length']

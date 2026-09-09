@@ -182,6 +182,36 @@ class KrRules:
         self.last_red_zone = None                     # 진단
         # 황색 딜레마 원샷 판정 (C). 0 이면 비활성 = 황색을 PDM 원문에만 맡긴다.
         self.a_yellow = float(sp.get('a_yellow', 0.0))
+        # 황색 판정 **거리 한계** [m] (2026-09-09 (D)). 0 = 무제한(이전 동작).
+        # 황색 딜레마는 정지선이 가까울 때만 존재한다. 지금은 거리 조건이 없어
+        # **300 m 밖 황색에도 STOP 을 래치**하고, 그 래치(y_decision)가
+        # `_obstacle_cause` 를 거짓으로 만들어 **크립·BREAKOUT·never_stall 을
+        # 전부 죽인다**. 그래서 20 m 앞 정지 차량에 막혀도 탈출구가 하나도 안 열린다.
+        # 실측 20260909_093415:
+        #   11_직진10  rs 477.7  황색 STOP 래치 d_line **150.8 m** (장애물 20.1 m)
+        #   18_연속…   rs 2590.5 황색 STOP 래치 d_line **317.3 m** (장애물 22.0 m)
+        #   → 둘 다 30 s 무전진으로 blocked 종료.
+        # 기본은 speed.red_lookahead_m 를 그대로 읽는다 ("적색이 의미를 갖는 거리"
+        # 의 단일 출처). 그 밖의 황색은 도착 전에 적색→녹색으로 한 바퀴 돈다.
+        self.y_gate_m = float(sp.get('yellow_decide_max_m', 0.0))
+        # PDM 의 traffic_light_hazard 를 **장애물이 정지선보다 훨씬 앞일 때** 무시할지.
+        # (2026-09-09 (D)) false = 이전 동작.
+        self.tl_hazard_far = bool(sp.get('tl_hazard_far_blocker_enable', False))
+        # 적신호 접근에서 **가속 금지** (2026-09-09 (C)).
+        # PDM 의 red-light IDM 은 차간모형이라 남은 거리가 s* 보다 조금만 커도
+        # **가속을 요구한다**(_stopline_profile 주석). ④′ 는 √ 프로파일이라
+        # 아직 v 위에 있어 min() 에서 지고, 그 사이 차가 붙었다 급제동한다 —
+        # 이것이 "정지선 앞 찔끔찔끔" 의 정체다.
+        # 실측 20260909_093415/실경로_02: 적색 접근 667틱 중 **290틱(43.5 %)**
+        # 이 목표 > 현재속도였고 최대 **+4.17 m/s** 였다 (slf −14.7 에서 v 5.44
+        # 인데 목표 6.15 → accel +0.57 로 적신호를 향해 가속).
+        # 상한형이므로 cap 축이다 (err/dt 금지 — CLAUDE.md 확정 사실).
+        # false = 이전 동작.
+        self.no_accel_red = bool(sp.get('no_accel_toward_red_enable', False))
+        # 정지 후 **미세 전진** 방지 래치 (2026-09-09 (C)).
+        # 실측: 02 정지 3회 중 2회, 07 5회 중 2회에서 정지 뒤 v 가 0.1 을 넘어
+        # 0.2 m 씩 기어갔다. false = 이전 동작.
+        self.stop_creep_latch = bool(sp.get('stopline_creep_latch_enable', False))
         # ④′ 정지 프로파일·황색 판정의 **jerk 램프 보정** (2026-09-09 [2]).
         # 둘 다 "지금부터 a 를 즉시 낼 수 있다" 를 전제로 √(2·a·d) 를 쓰는데,
         # 종방향에는 jerk 제한이 있어 a 에 도달하는 데 t = a / jerk_rate 가 걸리고
@@ -236,6 +266,13 @@ class KrRules:
         sig = cfg['signal']
         self.turn_lead_s = float(sig['turn_lead_s'])
         self.lc_lead_s = float(sig['lc_lead_s'])
+        # 회전 지시등 **꼬리**가 반대 방향 차로 이동에 양보할지 (2026-09-09).
+        # 회전 구간은 연결로 끝까지 유지되는데(_turn_end_s), 그 직후 차로 인계가
+        # 오면 선행 점등 시간이 남지 않는다. 실측 20260909_093415/실경로_02:
+        # 우회전 연결로가 rs 638.1 에 끝나고 인계 경계가 **647.2** 라 좌측 점등이
+        # 9.1 m(1.5 s)뿐 — scoring.signal_lead_s(3.0) 미달로 항목 13 이 났다.
+        # false = 이전 동작(회전이 언제나 우선).
+        self.sig_tail_yield = bool(sig.get('signal_turn_tail_yield_enable', False))
         self.sig_lead_min_m = float(sig['lead_min_m'])
         self.lat_on_m = float(sig['lat_shift_on_m'])
         self.sig_min_on_ticks = int(round(float(sig['min_on_s'])
@@ -756,6 +793,7 @@ class KrRules:
             self.sig_plan = turn_intervals(planner)
 
         best = None                                  # (정렬키, sig, src, remain)
+        tail = False                                 # 승자가 회전의 **꼬리**인가
         for iv in self.sig_plan:
             if route_s > iv['end_s']:
                 continue
@@ -765,12 +803,24 @@ class KrRules:
             key = (max(0.0, remain), 0)              # 0 = 회전 우선
             if best is None or key < best[0]:
                 best = (key, iv['sig'], 'turn', remain)
+                # 회전 지점을 이미 지났으면 남은 구간은 연결로를 도는 **꼬리**다.
+                # 회전 전 선행 점등이라는 목적은 이미 달성됐다.
+                tail = route_s > iv['ev_s']
 
         shift = self._lane_shift(planner, ego_speed)
         if shift is not None:
             sig, remain = shift
             key = (max(0.0, remain), 1)
             if best is None or key < best[0]:
+                best = (key, sig, 'lc', remain)
+            elif (self.sig_tail_yield and tail and best[2] == 'turn'
+                  and sig != best[1]):
+                # **꼬리는 반대 방향 차로 이동에 양보한다.**
+                # 회전 이후 remain 은 max(0, 음수) = 0 이라 회전이 무조건 이긴다 —
+                # 그 사이 반대쪽 지시등이 못 켜져 선행 시간이 통째로 깎인다.
+                # 채점 항목 13 은 **차로 변경** 지시등만 본다(회전 꼬리는 안 본다)
+                # 이므로, 양보로 잃는 것이 없고 얻는 것이 선행 점등이다.
+                # 같은 방향이면 양보할 이유가 없다(그대로 유지되면 되므로).
                 best = (key, sig, 'lc', remain)
 
         if best is None:
@@ -978,6 +1028,34 @@ class KrRules:
         if d is None or self.red_pause_max_m <= 0.0 or d <= self.red_pause_max_m:
             return d
         return None
+
+    def _blocker_before_stopline(self, ap, planner) -> bool:
+        """막고 선 장애물이 정지선보다 **훨씬 앞**인가 — 그 신호의 대기열이 아니다.
+
+        PDM 의 `traffic_light_hazard` 는 적신호가 앞에 있으면 선다. 그걸 그대로
+        "신호가 정지 원인" 으로 보면, 정지선이 **150 m** 밖인데 20 m 앞 정지
+        차량에 막힌 경우까지 신호 대기로 분류돼 크립·BREAKOUT·never_stall 이
+        전부 안 열린다 (실측 20260909_093415: 11_직진10 정지 1635틱 중 **1167틱**
+        이 이 분기, 18_연속교차로14 도 같은 꼴 — 둘 다 30 s 무전진으로 blocked).
+
+        기준은 새로 만들지 않는다 — 대기열 판정이 쓰는 `overtake.queue_head_max_m`
+        를 그대로 읽는다 (`_head_near_stopline` 과 같은 잣대: "대기열 선두는
+        정지선을 향해 선다"). 장애물이 정지선보다 그만큼 이상 앞이면 대기열이 아니다.
+
+        스위치가 꺼져 있으면 항상 거짓 = 이전 동작.
+        """
+        if not self.tl_hazard_far:
+            return False
+        b = self._blocker(ap, planner)
+        if b is None:
+            return False
+        d_line = self._stopline_d(planner)
+        if d_line is None:
+            return True                                # 정지선이 없다 = 신호 원인 아님
+        pr = self._project(planner, b.get_location().x, b.get_location().y)
+        if pr is None:
+            return False
+        return (float(d_line) - float(pr[0])) > self.q_head_m
 
     def _blocker(self, ap, planner):
         """앞을 막고 선 정적 장애물 → VtdActor. 없으면 None.
@@ -1874,7 +1952,8 @@ class KrRules:
         if self._rtor_go:
             return False
         if getattr(ap, 'traffic_light_hazard', False):
-            return False
+            if not self._blocker_before_stopline(ap, planner):
+                return False
         if getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False):
             return False
         if getattr(ap, 'stop_sign_hazard', False):
@@ -3667,6 +3746,8 @@ class KrRules:
             return
         if self.a_yellow <= 0.0 or self.y_decision is not None or state != 'Yellow':
             return                                    # 비활성 / 이미 래치 / 황색 아님
+        if self.y_gate_m > 0.0 and d_line > self.y_gate_m:
+            return                                    # 딜레마 구간 밖 — 래치하지 않는다
         # 판정도 같은 램프를 겪는다 — 실행 축과 **같은 보정**을 쓴다 ([2]).
         d_eff = (d_line - self._s0(ap)
                  - self._jerk_ramp_m(self.a_yellow, ego_speed))
@@ -4959,6 +5040,23 @@ class KrRules:
             return v                                       # 진입 전 감속
         return None
 
+    def _no_accel_red_cap(self, planner, ap, ego_speed: float) -> float | None:
+        """적신호 정지 대상이 **가까이** 있으면 목표를 현재 속도로 덮는다 — 상한 후보.
+
+        "적신호를 향해 가속하지 않는다" 는 것뿐이다. 감속은 ④′·IDM 이 그대로 한다.
+        거리 한계는 `speed.red_lookahead_m` 를 그대로 읽는다 (새 상수 없음) —
+        300 m 밖 적색에까지 걸면 정상 주행이 죽는다.
+        """
+        if not self.no_accel_red:
+            return None
+        tgt = self._stop_target(planner, ap)
+        if tgt is None:
+            return None
+        d_line = float(tgt[0])
+        if d_line > self.red_look_m:
+            return None
+        return max(0.0, float(ego_speed))
+
     def _stopline_profile(self, planner, ap, ego_speed: float = 0.0) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
 
@@ -5037,6 +5135,12 @@ class KrRules:
 
         if self.sl_hold_left > 0:
             self.sl_hold_left -= 1
+            return 0.0
+        # 정지 대상이 **아직 살아 있는데** 이미 선 상태면 계속 0 이다 ((C)).
+        # 안 그러면 ④′·IDM 이 0.03~0.12 m/s 를 내주어 0.2 m 씩 기어간다 —
+        # 실측 20260909_093415: 02 정지 3회 중 2회, 07 5회 중 2회.
+        # 녹색이 되면 tgt 가 None 이 되어 저절로 풀린다 (출발 지연 0).
+        if self.stop_creep_latch and self.sl_stopped and tgt is not None:
             return 0.0
         return None
 
@@ -5203,6 +5307,14 @@ class KrRules:
                 candidate = lmv
             if cap_cand is None or lmv < cap_cand:
                 cap_cand = lmv
+
+        # 적신호 접근 가속 금지 ((C)) — "이 속도를 넘지 마라" 이므로 cap 축이다.
+        nar = self._no_accel_red_cap(planner, ap, ego_speed)
+        if nar is not None:
+            if candidate is None or nar < candidate:
+                candidate = nar
+            if cap_cand is None or nar < cap_cand:
+                cap_cand = nar
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)

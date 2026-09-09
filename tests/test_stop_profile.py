@@ -39,6 +39,9 @@ from test_route_end import FakeEgo, FakePlanner, TOTAL, _apply    # noqa: E402
 from test_stopline_stop import FakePlannerTL                     # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
+# ④′ 정지 프로파일 자체의 계약을 보는 파일이다. 2026-09-09 에 추가된
+# '적신호 접근 가속 금지' 상한은 별개 축이라 여기서는 명시적으로 끈다.
+CFG['speed']['no_accel_toward_red_enable'] = False
 FRONT = CFG['vehicle']['wheelbase'] + CFG['vehicle']['front_overhang_m']
 A_STOP = CFG['speed']['stop_profile_a']
 PDM = build_pdm_config(CFG)

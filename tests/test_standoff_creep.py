@@ -27,6 +27,10 @@ from test_avoid import Ap, Box, Planner, make                      # noqa: E402
 from vtd_adapter.config import load_params_yaml                    # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
+# 신호·보행자 hazard 가 크립을 막는다는 **이전 계약**을 보는 파일이다.
+# 2026-09-09 의 완화(장애물이 정지선보다 훨씬 앞이면 신호 원인이 아니다)는
+# 별개 축이라 여기서는 명시적으로 끈다.
+CFG['speed']['tl_hazard_far_blocker_enable'] = False
 OT = CFG['overtake']
 VH = CFG['vehicle']
 A_STOP = CFG['speed']['stop_profile_a']

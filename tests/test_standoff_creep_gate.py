@@ -31,6 +31,8 @@ from test_avoid import Ap, Box, make                               # noqa: E402
 from vtd_adapter.config import load_params_yaml                    # noqa: E402
 
 CFG = load_params_yaml(PARAMS_YAML)
+# 위와 같다 — hazard 배제의 이전 계약을 본다.
+CFG['speed']['tl_hazard_far_blocker_enable'] = False
 OT = CFG['overtake']
 NEED = OT['transition_m'] + OT['shift_ahead_m'] + OT['shift_geom_margin_m']
 NEED_L3 = OT['transition_m'] + OT['shift_ahead_l3_m'] + OT['shift_geom_margin_m']
