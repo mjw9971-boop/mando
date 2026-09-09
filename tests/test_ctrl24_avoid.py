@@ -330,3 +330,18 @@ def test_prepass_obb_prefilter_skips_unreachable_stopped_vehicles():
     ap2 = ObbAp(p2, [near], hit_ids={4})
     kr2.pre_pass(ap2, p2.route_points, [near], 12.5, 8.0)
     assert ap2.forecast_calls == 1 and kr2.last_avoid['trigger'] == 'obb'
+
+
+def test_prepass_obb_result_is_cached_while_ego_is_stopped():
+    """자차 정지·후보 집합 동일 → forecast 재실행 없이 직전 결과. 움직이면 다시 돈다."""
+    c = car(2, 15.0, 2.5)                                        # 정지 상태 도달 범위(22.7 m) 안
+    kr, p, _ap = rig(actors=[c])
+    ap = ObbAp(p, [c], hit_ids=set())                            # 교차 없음 (시프트 안 생김)
+    kr.pre_pass(ap, p.route_points, [c], 12.5, 0.0)
+    kr.pre_pass(ap, p.route_points, [c], 12.5, 0.0)
+    assert ap.forecast_calls == 1 and kr.last_obb_cached is True
+    kr.pre_pass(ap, p.route_points, [c], 12.5, 3.0)             # 주행 중 — 매 틱
+    assert ap.forecast_calls == 2 and kr.last_obb_cached is False
+    ap._world.get_actors().append(car(5, 12.0, 2.5))            # 후보 집합이 바뀌면 다시
+    kr.pre_pass(ap, p.route_points, [c, ap._world.get_actors()[-1]], 12.5, 0.0)
+    assert ap.forecast_calls == 3

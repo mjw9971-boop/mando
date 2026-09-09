@@ -212,6 +212,8 @@ class Ctrl24:
         self.last_overtake: str | None = None
         self._prepass_done = False
         self.last_prepass_ms: float | None = None     # pre_pass 실행 시간 (틱 비용 보고용)
+        self._obb_cache = None                        # (후보 id·route_index·span, 교차 id) — 정지 중 재사용
+        self.last_obb_cached = False
         self._corridor: list = []                     # 이번 틱 회랑 안 정지 객체 (커밋 3 이 채운다)
         self._tick_lg = None
         self._tick_ego_lane = None
@@ -1064,6 +1066,7 @@ class Ctrl24:
         t0 = time.perf_counter()
         planner = ap._waypoint_planner
         obb_ids = None
+        self.last_obb_cached = False
         if self.ot_enabled and self.prepass_obb:
             obb_ids = self._obb_static_ids(ap, route_np, vehicles, target_speed, ego_speed)
         self._corridor = self._corridor_blockers(ap, planner)
@@ -1097,7 +1100,16 @@ class Ctrl24:
                     continue
                 stopped.append(v)
             if not stopped:
+                self._obb_cache = None
                 return set()
+            # 자차가 서 있고(v < blocker_speed_max) 후보 집합·경로가 그대로면 예측 결과는
+            # 바뀔 수 없다 — 직전 결과를 재사용한다 (적신호 대기 중 매 틱 forecast 방지).
+            key = (tuple(sorted(v.id for v in stopped)), int(ap._waypoint_planner.route_index),
+                   self.ot_span)
+            if float(ego_speed) < self.v_static and self._obb_cache is not None \
+                    and self._obb_cache[0] == key:
+                self.last_obb_cached = True
+                return set(self._obb_cache[1])
             near_lc = ap.is_near_lane_change(ego_speed, route_np)
             n = int(cfg.bicycle_frame_rate * (cfg.forecast_length_lane_change if near_lc
                                               else cfg.default_forecast_length))
@@ -1112,6 +1124,7 @@ class Ctrl24:
                 if i < len(bbs) and ap.check_obb_intersection(ebb, bbs[i]):
                     out.add(vid)
                     break
+        self._obb_cache = (key, frozenset(out))
         return out
 
     def _avoid_tick(self, ap, planner, ego_speed: float, obb_ids) -> None:
