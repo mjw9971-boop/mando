@@ -345,3 +345,19 @@ def test_prepass_obb_result_is_cached_while_ego_is_stopped():
     ap._world.get_actors().append(car(5, 12.0, 2.5))            # 후보 집합이 바뀌면 다시
     kr.pre_pass(ap, p.route_points, [c, ap._world.get_actors()[-1]], 12.5, 0.0)
     assert ap.forecast_calls == 3
+
+
+def test_prepass_clears_stale_diag_when_nothing_to_avoid():
+    """훅이 도는 틱마다 진단은 새로 만들어진다 — 시프트가 없으면 None (직전 틱 잔류 금지)."""
+    c = car(2, 40.0, 0.0)
+    kr, p, _ap = rig(actors=[c])
+    ap = ObbAp(p, [c], hit_ids=set())
+    kr.pre_pass(ap, p.route_points, [c], 12.5, 8.0)
+    assert kr.last_avoid['shift'] == 'left'                      # 이 틱에 생성
+    ap._world._a.remove(c)                                       # 대상 소멸 · span 은 유지
+    kr.pre_pass(ap, p.route_points, [], 12.5, 8.0)
+    assert kr.last_avoid.get('shift') is None                    # 잔류하지 않는다
+    assert kr.last_avoid['state'] == 'SHIFT_ACTIVE'
+    p.route_index = kr.ot_span[1] + 1
+    kr.pre_pass(ap, p.route_points, [], 12.5, 8.0)
+    assert kr.last_avoid == {'state': 'RESTORED'} and kr.ot_span is None

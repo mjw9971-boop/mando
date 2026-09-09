@@ -1067,6 +1067,12 @@ class Ctrl24:
         planner = ap._waypoint_planner
         obb_ids = None
         self.last_obb_cached = False
+        # 이번 틱 회피 진단은 여기서 **한 번만** 비운다. apply 의 _tick_head 는 훅이 돈
+        # 틱에는 건드리지 않는다 — 두 곳에서 비우면 훅이 만든 진단이 지워지고(7310077),
+        # 아무 데서도 안 비우면 직전 틱 진단이 남아 시프트가 매 틱 재기록된다
+        # (2026-09-09 리플레이: 1,410틱 로그에 shift 473 — 실제 생성은 그보다 훨씬 적다).
+        self.last_avoid = None
+        self.last_overtake = None
         if self.ot_enabled and self.prepass_obb:
             obb_ids = self._obb_static_ids(ap, route_np, vehicles, target_speed, ego_speed)
         self._corridor = self._corridor_blockers(ap, planner)
