@@ -62,14 +62,39 @@ def yellow(d_tl, tl_id=7):
 
 # ── 판정 경계 ───────────────────────────────────────────────────────────
 def test_judgement_uses_a_yellow_not_stop_profile_a():
-    """판정 감속은 a_yellow(4.0)이지 프로파일의 a_stop(3.0)이 아니다 —
-    STOP 영역을 넓히는 것이 설계 의도다."""
-    assert A_Y > A_STOP
+    """판정 감속은 **a_yellow** 이지 프로파일의 stop_profile_a 가 아니다.
+
+    2026-09-09 부터 두 값이 우연히 같다 (a_yellow 4.0 → 3.0, jerk 지연 보정).
+    그래서 기본값 비교로는 둘을 못 가른다 — **사본에서 a_yellow 만 올려**
+    판정이 그쪽을 따라가는지 본다 (기본값이 또 움직여도 안 깨진다).
+    """
+    a_hi = A_STOP + 2.0
+    c = copy.deepcopy(CFG)
+    c['speed']['a_yellow'] = a_hi
     d = S0 + 20.0
-    p, ap = yellow(d), None
-    ap = make_ap(p)
-    ap.kr_rules._yellow_latch(p, v_allow(d, A_STOP) + 0.5, ap)   # a_stop 기준으론 GO
-    assert ap.kr_rules.y_decision == 'stop'                       # a_yellow 기준이면 STOP
+    p = yellow(d)
+    ap = make_ap(p, cfg=c)
+    # stop_profile_a 기준으론 GO, a_yellow(사본) 기준이면 STOP 인 속도
+    v = v_allow(d, A_STOP) + 0.5
+    assert v > v_allow(d, A_STOP) and v < v_allow(d, a_hi)
+    ap.kr_rules._yellow_latch(p, v, ap)
+    assert ap.kr_rules.y_decision == 'stop'
+
+
+def test_a_yellow_accounts_for_the_jerk_ramp():
+    """a_yellow 는 **실효** 감속이어야 한다 — jerk 램프 지연분을 포함한다.
+
+    4.0 은 "판정 순간부터 −4.0 이 즉시 걸린다" 는 값인데, 종방향은 jerk 제한
+    (jerk_max × jerk_dec_mult = 0.3 m/s²/틱)으로 −4.0 도달에 0.67 s 가 걸리고
+    그동안 평균 감속이 절반이라 v·t/2 를 더 간다 (8 m/s 에서 2.7 m).
+    실측 20260908_233155/실경로_02 rs 588.8 이 그 오차로 +1.59 m 침범했다.
+    그래서 판정 감속은 **a_dec_max 보다 작아야** 한다.
+    """
+    a_dec = abs(float(CFG['control']['a_dec_max']))
+    assert 0.0 < A_Y < a_dec, 'a_yellow 가 a_dec_max 와 같으면 jerk 지연분이 없다'
+    # 그 실측 조건이 이제 GO 로 갈린다 (설 수 없는데 서려다 걸치지 않는다)
+    d_eff = 9.29                       # 실측 d_line − s0
+    assert math.sqrt(2.0 * A_Y * d_eff) < 8.06 < math.sqrt(2.0 * a_dec * d_eff)
 
 
 @pytest.mark.parametrize('margin,expect', [(-0.5, 'stop'), (-0.01, 'stop'),
@@ -84,16 +109,23 @@ def test_decision_boundary_at_v_equals_v_allow(margin, expect):
 
 
 def test_stop_executes_with_stop_profile_a_not_a_yellow():
-    """판정은 a_yellow(4.0), **실행은 stop_profile_a(3.0)** — 상수가 다른 것이
-    의도다. 같게 두면 진입 시 프로파일이 느슨해 늦게 구속되고, 그때는 최대
-    감속을 여유 0 으로 요구해 jerk 램프인에 진다 (폐루프 걸침 6/12)."""
+    """판정은 a_yellow, **실행은 stop_profile_a** — 둘은 별개 상수다.
+
+    같게 두면 진입 시 프로파일이 느슨해 늦게 구속되고, 그때는 최대 감속을
+    여유 0 으로 요구해 jerk 램프인에 진다 (폐루프 걸침 6/12).
+    2026-09-09 부터 기본값이 우연히 같으므로 (둘 다 3.0) **사본에서 a_yellow 만
+    올려** 실행이 그쪽을 따라가지 **않는** 것을 본다.
+    """
+    c = copy.deepcopy(CFG)
+    c['speed']['a_yellow'] = A_STOP + 2.0
     d = S0 + 15.0
     p = yellow(d)
-    ap = make_ap(p)
+    ap = make_ap(p, cfg=c)
     ap.kr_rules._yellow_latch(p, 1.0, ap)
     assert ap.kr_rules.y_decision == 'stop'
+    # 실행 프로파일은 a_yellow 를 올려도 stop_profile_a 를 쓴다
     assert ap.kr_rules._stopline_profile(p, ap) == pytest.approx(v_allow(d, A_STOP))
-    assert v_allow(d, A_STOP) < v_allow(d, A_Y)
+    assert v_allow(d, A_STOP) < v_allow(d, c['speed']['a_yellow'])
 
 
 def test_yellow_stop_is_identical_to_red():
