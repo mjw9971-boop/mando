@@ -182,6 +182,20 @@ class KrRules:
         self.last_red_zone = None                     # 진단
         # 황색 딜레마 원샷 판정 (C). 0 이면 비활성 = 황색을 PDM 원문에만 맡긴다.
         self.a_yellow = float(sp.get('a_yellow', 0.0))
+        # ④′ 정지 프로파일·황색 판정의 **jerk 램프 보정** (2026-09-09 [2]).
+        # 둘 다 "지금부터 a 를 즉시 낼 수 있다" 를 전제로 √(2·a·d) 를 쓰는데,
+        # 종방향에는 jerk 제한이 있어 a 에 도달하는 데 t = a / jerk_rate 가 걸리고
+        # 그동안 평균 감속이 절반이라 **v·t/2 만큼 더 간다**.
+        # 실측 20260909_093415: 정지선 침범 9건, 최대 +3.28 m. 침범 지점의 접근
+        # 속도가 전부 43~49 km/h(12~13.6 m/s)고, a 3.0 / jerk 6.0 → t 0.5 s 라
+        # 보정량이 3.0~3.4 m — 실측 침범량과 같은 자릿수다.
+        # 저속 접근은 v 에 비례해 보정이 작아진다 (상수를 낮추는 것과 다른 점).
+        # false = 이전 동작.
+        self.stop_jerk_comp = bool(sp.get('stop_jerk_compensate_enable', False))
+        # 감속측 jerk 한계 [m/s³]. **control 이 실제로 쓰는 두 상수를 그대로 읽는다**
+        # (VtdLongitudinalController: prev − jerk_dec_mult·jerk_max·dt).
+        # 새 상수를 만들면 제동 램프의 정의가 두 벌이 된다.
+        self.jerk_rate = float(cfg['control']['jerk_dec_mult']) * float(sp.get('jerk_max', 2.0))
         # 보행자 의도 감지 (P4). 0 이면 비활성 = PDM forecast_walkers 에만 맡긴다.
         self.ped_intent_v = float(sp.get('ped_intent_v', 0.0))
         self.ped_emg_ratio = float(sp.get('ped_emergency_ratio', 0.0))
@@ -1120,6 +1134,21 @@ class KrRules:
         s = self._actor_route_s(planner, actor)
         return s is not None and s >= gate
 
+    def _in_finish_gate(self, planner) -> bool:
+        """**자차**가 종료 구간 안인가 — `finish_gate_by_object_enable` 이 꺼졌을
+        때만 쓰는 이전 판정이다. 켜져 있으면 아무도 부르지 않는다.
+
+        이 축이 왜 틀렸는지는 스위치 주석(`fg_by_obj`) 참조 — 회피 결정이
+        자차가 구간에 들기 훨씬 전에 끝나므로 판정 시점이 늦다.
+        """
+        gate = self._finish_gate_s()
+        if gate is None:
+            return False
+        try:
+            return float(planner.route_s[planner.route_index]) >= gate
+        except Exception:                                   # noqa: BLE001
+            return False
+
     def finish_gate_drop(self, planner, actor) -> bool:
         """이 객체를 **종료 구간의 정지 장애물**로 보고 빼야 하나 (실주행 2차 [3]).
 
@@ -1143,21 +1172,6 @@ class KrRules:
         if float(getattr(actor, 'speed', 0.0)) >= self.ot_v_max:
             return False
         return self._fg_drop_static(planner, actor)
-
-    def _in_finish_gate(self, planner) -> bool:
-        """**자차**가 종료 구간 안인가 — `finish_gate_by_object_enable` 이 꺼졌을
-        때만 쓰는 이전 판정이다. 켜져 있으면 아무도 부르지 않는다.
-
-        이 축이 왜 틀렸는지는 스위치 주석(`fg_by_obj`) 참조 — 회피 결정이
-        자차가 구간에 들기 훨씬 전에 끝나므로 판정 시점이 늦다.
-        """
-        gate = self._finish_gate_s()
-        if gate is None:
-            return False
-        try:
-            return float(planner.route_s[planner.route_index]) >= gate
-        except Exception:                                   # noqa: BLE001
-            return False
 
     def _crossable_runs(self, lg, key, side) -> list:
         """side 로 **넘을 수 있는** 구간 [(s0, s1) …] — 점선 조각 + (E-8 ①) 마킹
@@ -3429,7 +3443,10 @@ class KrRules:
             return
         if self.a_yellow <= 0.0 or self.y_decision is not None or state != 'Yellow':
             return                                    # 비활성 / 이미 래치 / 황색 아님
-        v_allow = _math.sqrt(2.0 * self.a_yellow * max(0.0, d_line - self._s0(ap)))
+        # 판정도 같은 램프를 겪는다 — 실행 축과 **같은 보정**을 쓴다 ([2]).
+        d_eff = (d_line - self._s0(ap)
+                 - self._jerk_ramp_m(self.a_yellow, ego_speed))
+        v_allow = _math.sqrt(2.0 * self.a_yellow * max(0.0, d_eff))
         self.y_decision = 'stop' if ego_speed <= v_allow else 'go'
         self.y_ctrl = tl_id
         self.y_v_allow = v_allow
@@ -3488,6 +3505,20 @@ class KrRules:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
         return float(getattr(ap.config, 'idm_red_light_minimum_distance',
                              self.stop_gap_sl_fallback))
+
+    def _jerk_ramp_m(self, a_eff: float, v: float) -> float:
+        """감속 `a_eff` 에 **도달하기까지** jerk 램프가 더 가는 거리 [m].
+
+        t_ramp = a_eff / jerk_rate 동안 감속이 0 → a_eff 로 선형 증가하므로
+        평균 감속이 a_eff/2 다. 같은 t 를 완전감속으로 갔다면 줄었을 거리와의
+        차이가 v·t/2 다 (2차항은 상쇄된다).
+
+        √ 프로파일에서 이 거리를 **미리 빼면** 상한이 그만큼 일찍 구속하고,
+        램프가 다 서는 시점에 계획 정지점에 선다. 스위치가 꺼지면 0 이다.
+        """
+        if not self.stop_jerk_comp or self.jerk_rate <= 0.0 or a_eff <= 0.0:
+            return 0.0
+        return max(0.0, float(v)) * (float(a_eff) / self.jerk_rate) / 2.0
 
     def _cross_guard(self, planner, ap, d_line) -> bool:
         """교차로 통과 가드 — 앞범퍼가 정지선을 넘은 뒤 교차로를 벗어날 때까지
@@ -4704,7 +4735,7 @@ class KrRules:
             return v                                       # 진입 전 감속
         return None
 
-    def _stopline_profile(self, planner, ap) -> float | None:
+    def _stopline_profile(self, planner, ap, ego_speed: float = 0.0) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
 
         PDM 의 적신호 IDM 은 차간모형이라 정지 컨트롤러가 아니다: 평형이
@@ -4735,7 +4766,9 @@ class KrRules:
         d_line, a_eff = tgt
         if a_eff <= 0.0:
             return None
-        return _math.sqrt(2.0 * a_eff * max(0.0, d_line - self._s0(ap)))
+        # jerk 램프 보정 ([2]) — 스위치가 꺼지면 0 이라 이전 식 그대로다.
+        d_eff = d_line - self._s0(ap) - self._jerk_ramp_m(a_eff, ego_speed)
+        return _math.sqrt(2.0 * a_eff * max(0.0, d_eff))
 
     def _stopline_hold(self, planner, ego_speed: float) -> float | None:
         """적신호 정지선 정지의 최소 유지 (speed.stopline_hold_s) — 목표 0 후보.
@@ -4951,7 +4984,7 @@ class KrRules:
 
         # 정지선 정지 프로파일 (④′) — 적색일 때만, min 으로 합류.
         # route_end 는 대상이 아니다 (검증 통과 후 별건).
-        prof = self._stopline_profile(planner, ap)
+        prof = self._stopline_profile(planner, ap, ego_speed)
         self.last_stop_profile = prof
         if prof is not None and (candidate is None or prof < candidate):
             candidate = prof
