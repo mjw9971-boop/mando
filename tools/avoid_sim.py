@@ -138,7 +138,9 @@ class Sim:
         v = self.v0
         rec = {'t_off': 0.0, 'sat': 0, 'min_gap': 9e9, 'signal': set(),
                'shift_v': None, 'shift_s': None, 'lane_hist': [], 'stopped': 0,
-               'v_min': 9e9, 'end_s': 0.0, 'collide': 0}
+               'v_min': 9e9, 'end_s': 0.0, 'collide': 0, 'shift_n': 0,
+               'shift_pass': None, 'solid_relaxed': False, 'states': set(),
+               'never_stall': False}
         half_ego = self.cfg['vehicle']['width'] / 2.0
         prev_span = None
         for _i in range(self.ticks):
@@ -159,7 +161,16 @@ class Sim:
             if span is not None and prev_span is None:      # 시프트가 붙은 틱
                 rec['shift_v'] = v
                 rec['shift_s'] = float(self.planner.route_s[self.planner.route_index])
+                rec['shift_n'] += 1
+                rec['shift_pass'] = (self.ap.kr_rules.last_avoid or {}).get('pass')
+                rec['solid_relaxed'] = bool(
+                    (self.ap.kr_rules.last_avoid or {}).get('solid_relaxed'))
             prev_span = span
+            la = self.ap.kr_rules.last_avoid or {}
+            if la.get('state'):
+                rec['states'].add(la['state'])
+            if (self.ap.kr_rules.ns_info or {}).get('state'):
+                rec['never_stall'] = True
             # 운동 (자전거 모델)
             delta = st * float(self.cfg['vehicle']['max_steer'])
             v = max(0.0, v + accel * DT)
@@ -190,12 +201,14 @@ class Sim:
 
 
 # ── 무대 손질 (케이스 6·7·8) ──────────────────────────────────────────────
-class FakeTL:
-    """`_next_stopline` 이 읽는 최소 표면 — state.name 과 id 뿐이다."""
-
-    def __init__(self, name, tl_id=1):
-        self.state = type('S', (), {'name': name})()
-        self.id = tl_id
+def make_tl(state_name, route_s, tl_id=1):
+    """실제 `VtdTrafficLight` 를 그대로 쓴다 — 스텁을 만들면 PDM 이 만지는
+    표면(type_id 등)을 하나씩 빠뜨린다 (액터와 같은 원칙)."""
+    from vtd_adapter.route import VtdTrafficLight
+    from vtd_adapter.carla_types import TrafficLightState
+    tl = VtdTrafficLight([tl_id], [tl_id], float(route_s))
+    tl.state = getattr(TrafficLightState, state_name)
+    return tl
 
 
 def red_light_at(s_line):
@@ -207,22 +220,30 @@ def red_light_at(s_line):
         n = len(sim.planner.route_s)
         sim.planner.distances_to_next_traffic_lights = np.maximum(
             0.0, float(s_line) - np.asarray(sim.planner.route_s, dtype=float))
-        sim.planner.next_traffic_lights = [FakeTL('Red')] * n
+        tl = make_tl('Red', s_line)
+        sim.planner.next_traffic_lights = [tl] * n
     return setup
 
 
 def solid_line(side='right'):
-    """그 방향 마킹을 **실선**으로 만든다 (케이스 7).
+    """그 방향 마킹을 **실선**으로 바꾼다 (케이스 7).
 
-    `lg.dashed_runs` 가 차선변경 허용 구간의 단일 출처라 거기만 비우면 된다
-    (build_route 와 제어기 플래너가 같은 함수를 본다).
+    `dashed_runs` 만 비우면 안 된다 — `kr_rules._crossable_runs` 가 마킹
+    타입이 `'none'`(선 없음) 인 조각도 넘을 수 있는 구간으로 더한다. 그래서
+    **원본 마크 데이터**를 실선으로 바꾼다 (실제 실선 도로와 같은 상태).
     """
+    field = 'left_mark' if side == 'left' else 'right_mark'
     def setup(sim):
-        lg = sim.lg
-        orig = lg.dashed_runs
-        def patched(key, sd, _o=orig):
-            return [] if sd == side else _o(key, sd)
-        sim.lg.dashed_runs = patched
+        for k in LANES:
+            marks = sim.lg.lanes[k].get(field) or []
+            sim.lg.lanes[k][field] = [(a, b, 'solid', c, False)
+                                      for a, b, _t, c, _ok in marks]
+        # 반대편 차로가 보는 같은 경계도 같이 바꿔야 한다 (좌/우 한 쌍)
+        other = 'left_mark' if field == 'right_mark' else 'right_mark'
+        for k in LANES:
+            marks = sim.lg.lanes[k].get(other) or []
+            sim.lg.lanes[k][other] = [(a, b, 'solid', c, False)
+                                      for a, b, _t, c, _ok in marks]
     return setup
 
 
@@ -248,31 +269,37 @@ def obj_at(lg, lane, s, aid, lat=0.0, **kw):
 
 
 def cases(lg):
-    """(번호, 이름, ego 차로, 장애물들, 기대) — NIGHT 파일 목록 그대로."""
+    """(번호, 이름, ego 차로, 장애물들, 기대, 무대손질) — NIGHT 파일 목록 그대로.
+
+    무대가 4차로 직선·점선 하나뿐이라 적신호(6)·실선(7)·다음 좌회전(8)은
+    **무대손질 콜백으로 명시**해야 한다. 안 하면 셋 다 케이스 1 과 같은 상황이
+    되어 같은 답이 나온다 (2026-09-09 처음 돌렸을 때 실제로 그랬다).
+    """
     L1, L2, L3, L4 = LANES                                  # -1 .. -4
     return [
         (1, '단독 장애물 (내 차로 60 m)', L1, [obj_at(lg, L1, 60, 2)],
-         '옆 차로로 비켜 통과'),
+         '옆 차로로 비켜 통과', None),
         (2, '대회장: 1·2차로 나란히, 3차로 빔', L1,
-         [obj_at(lg, L1, 60, 2), obj_at(lg, L2, 62, 3)], '두 칸으로 3차로, 충돌 0'),
+         [obj_at(lg, L1, 60, 2), obj_at(lg, L2, 62, 3)], '두 칸으로 3차로, 충돌 0', None),
         (3, '엇갈림: 1차로 60, 2차로 100', L1,
-         [obj_at(lg, L1, 60, 2), obj_at(lg, L2, 100, 3)], '2차로 → 다시 1차로'),
+         [obj_at(lg, L1, 60, 2), obj_at(lg, L2, 100, 3)], '2차로 → 다시 1차로', None),
         (4, '걸쳐 선 차 (1·2차로 경계), 3차로 빔', L1,
-         [obj_at(lg, L1, 60, 2, lat=-1.5)], '3차로로 (두 차로 다 막힘)'),
+         [obj_at(lg, L1, 60, 2, lat=-1.5)], '3차로로 (두 차로 다 막힘)', None),
         (5, '연속 3대 30 m 간격', L1,
          [obj_at(lg, L1, 60, 2), obj_at(lg, L1, 90, 3), obj_at(lg, L1, 120, 4)],
-         '옆 차로 유지, 복귀 없음'),
+         '옆 차로 유지, 복귀 없음', None),
         (6, '신호 대기 줄 (적색, 정지선 앞 3대)', L1,
          [obj_at(lg, L1, 60, 2), obj_at(lg, L1, 68, 3), obj_at(lg, L1, 76, 4)],
-         '추월 안 함 (큐)'),
-        (7, '실선 구간', L1, [obj_at(lg, L1, 60, 2)], '시프트 안 함 → standoff'),
+         '추월 안 함 (큐)', red_light_at(84.0)),
+        (7, '실선 구간', L1, [obj_at(lg, L1, 60, 2)], '시프트 안 함 → standoff',
+         solid_line('right')),
         (8, '다음 좌회전, 우측 회피', L1, [obj_at(lg, L1, 60, 2)],
-         '데드라인 전 복귀'),
+         '데드라인 전 복귀', next_turn_left(150.0)),
         (9, '양쪽 다 막힘', L2,
          [obj_at(lg, L2, 60, 2), obj_at(lg, L1, 62, 3), obj_at(lg, L3, 62, 4)],
-         'never_stall'),
+         'never_stall', None),
         (10, '먼 차로에만 장애물 (내 차로 비었음)', L1, [obj_at(lg, L4, 60, 2)],
-         '반응 없음 (트리거 아님)'),
+         '반응 없음 (트리거 아님)', None),
     ]
 
 
@@ -297,11 +324,13 @@ def main():
 
     print(f'무대: road {ROAD} sec {SEC} — 4차로 · {lg.length(LANES[0]):.0f} m · κ=0 직선 · 점선')
     print(f'진입속도 {a.v0:.2f} m/s ({a.v0 * 3.6:.0f} km/h)\n')
-    hdr = (f"{'#':>2} {'케이스':<34} "
-           f"{'off: 충돌':>8} {'|t_off|':>8} {'포화':>5} {'차로':>10} | "
-           f"{'on: 충돌':>8} {'|t_off|':>8} {'포화':>5} {'차로':>10}")
+    hdr = (f"{'#':>2} {'케이스':<30} "
+           f"{'off 충돌':>7} {'|t_off|':>7} {'포화':>4} {'시프트':>6} {'차로':>12} "
+           f"{'최저v':>6} {'정지s':>6} | "
+           f"{'on 충돌':>7} {'|t_off|':>7} {'포화':>4} {'시프트':>6} {'차로':>12} "
+           f"{'최저v':>6} {'정지s':>6}")
     print(hdr); print('─' * len(hdr))
-    for no, name, lane, objs, expect in cases(lg):
+    for no, name, lane, objs, expect, setup in cases(lg):
         if want and no not in want:
             continue
         row = []
@@ -309,17 +338,22 @@ def main():
             objs2 = [make_obj(o.id, o.x, o.y, o.yaw_deg, o.speed, o.length, o.width)
                      for o in objs]
             try:
-                r = Sim(cfg_with(cfg, lm), lg, lane, objs2, v0=a.v0).run()
+                r = Sim(cfg_with(cfg, lm), lg, lane, objs2, v0=a.v0, setup=setup).run()
                 row.append(r)
             except Exception as e:                          # noqa: BLE001
                 row.append({'err': f'{type(e).__name__}: {e}'})
         def fmt(r):
             if 'err' in r:
-                return f"{'실패':>8} {r['err'][:26]:>34}"
-            return (f"{r['collide']:>8} {r['t_off']:>8.2f} {r['sat']:>5} "
-                    f"{str(r['lanes_used']):>10}")
-        print(f'{no:>2} {name:<34} {fmt(row[0])} | {fmt(row[1])}')
-        print(f"{'':>2} {'기대: ' + expect:<34}")
+                return f"{'실패':>7} {r['err'][:40]:>45}"
+            sh = ('—' if not r['shift_n']
+                  else f"{r['shift_n']}p{r['shift_pass']}" + ('!' if r['solid_relaxed'] else ''))
+            return (f"{r['collide']:>7} {r['t_off']:>7.2f} {r['sat']:>4} {sh:>6} "
+                    f"{str(r['lanes_used']):>12} {r['v_min']:>6.2f} "
+                    f"{r['stopped'] / HZ:>6.1f}")
+        print(f'{no:>2} {name:<30} {fmt(row[0])} | {fmt(row[1])}')
+        ns = ' · never_stall' if row[0].get('never_stall') else ''
+        st = ','.join(sorted(row[0].get('states') or [])) if 'err' not in row[0] else ''
+        print(f"{'':>2} {'기대: ' + expect:<30}   off 상태: {st}{ns}")
     print('\n주의: 자전거 모델 폐루프다 (통신 지연·액추에이터·타이어 없음).')
     print('      절대값이 아니라 on/off 차이와 순위를 본다.')
     return 0
