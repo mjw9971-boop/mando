@@ -247,15 +247,21 @@ def solid_line(side='right'):
     return setup
 
 
-def next_turn_left(s_turn):
-    """경로에 **다음 좌회전** 이벤트를 심는다 (케이스 8).
+def next_turn_left(s_turn, valid_lane=None):
+    """경로에 **다음 좌회전**과 그 **유효 진입 차로**를 심는다 (케이스 8).
 
-    never_stall 의 회전 여유(never_stall_turn_margin_m)와 복귀 데드라인이
-    이 이벤트를 읽는다.
+    복귀 데드라인(커밋 C)과 never_stall (c) 는 둘 다 route.pkl 의
+    `valid_entry_lanes` 를 읽는다 — 그게 없으면 "제약 없음" 이라 데드라인이
+    아예 생기지 않는다. 무대 경로는 build_route 산출이 아니라 손으로 만든
+    한 차로짜리라 이 필드가 비어 있어서, 케이스 8 이 커밋 C 를 전혀 못 밟았다.
     """
     def setup(sim):
+        lane = valid_lane or LANES[0]
         sim.planner.route['events'] = [{'kind': 'turn_left', 's': float(s_turn)}]
-        sim.route['events'] = sim.planner.route['events']
+        sim.planner.route['waypoint_s'] = [0.0, float(s_turn)]
+        sim.planner.route['valid_entry_lanes'] = [
+            {'seg': 0, 'target': 'pair', 'turn': 'left', 'lanes': [list(lane)]}]
+        sim.route.update(sim.planner.route)
     return setup
 
 
@@ -294,7 +300,7 @@ def cases(lg):
         (7, '실선 구간', L1, [obj_at(lg, L1, 60, 2)], '시프트 안 함 → standoff',
          solid_line('right')),
         (8, '다음 좌회전, 우측 회피', L1, [obj_at(lg, L1, 60, 2)],
-         '데드라인 전 복귀', next_turn_left(150.0)),
+         '데드라인 전 복귀', next_turn_left(150.0, valid_lane=L1)),
         (9, '양쪽 다 막힘', L2,
          [obj_at(lg, L2, 60, 2), obj_at(lg, L1, 62, 3), obj_at(lg, L3, 62, 4)],
          'never_stall', None),
@@ -304,9 +310,12 @@ def cases(lg):
 
 
 def cfg_with(base, lane_map: bool):
+    """on 은 커밋 B·C 를 **같이** 켠다 — 둘은 한 기능의 앞뒤다 (후보를 고르는
+    쪽과, 고른 차로에 머무는 쪽)."""
     import copy
     c = copy.deepcopy(base)
     c['avoid_map']['lane_map_avoid_enable'] = lane_map
+    c['avoid_map']['lane_map_no_return_enable'] = lane_map
     return c
 
 

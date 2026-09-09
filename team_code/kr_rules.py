@@ -555,6 +555,8 @@ class KrRules:
         # 커밋 B — 후보 선택·시점·감속.
         self.lm_decide_m = float(_lm.get('lane_map_decide_m', 50.0))
         self.lm_avoid_v = float(_lm.get('lane_map_avoid_speed_kph', 20.0)) / 3.6
+        # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
+        self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
         self.last_lane_plan: dict | None = None    # 이번 틱 결정 (진단·후보)
         # "정지 객체" 임계는 회피 계층과 같은 출처를 읽는다 (상수 복제 금지).
         self.lane_map_static_v = self.ot_v_max
@@ -2910,6 +2912,70 @@ class KrRules:
         print(f'[kr_rules] 회피 span 연장 — {side} 끝 {b}→{b2} (id={chain["ids"]}, '
               f'예상 최소 이격 {c:.2f} m, {self.span_extend_n}회)', flush=True)
 
+    def _lm_deadline_s(self, planner, ap, ego_speed: float) -> float | None:
+        """**언제까지** 유효 차로로 돌아와 있어야 하나 — 절대 route_s. 없으면 None.
+
+        재료는 `_ns_turn_lane_pending` 과 **같은 것 하나**다: route.pkl 의
+        `valid_entry_lanes`. 그 필드의 목적이 문서상 바로 이것이다.
+
+        · 지금 세그먼트가 `target='pair'` 이고 유효 차로 집합이 비어 있지 않을 때만
+          데드라인이 있다 (`'finish'` 는 "제약 없음").
+        · 데드라인 = 세그먼트 끝 − 복귀 전이거리 − `never_stall_turn_margin_m`.
+          전이거리 식은 시프트와 같다 (상수를 복제하지 않는다).
+        · 제약이 없으면 None → 호출자가 "세그먼트 끝까지" 로 해석한다.
+        """
+        route = getattr(planner, 'route', None) or {}
+        vel = route.get('valid_entry_lanes')
+        wps = route.get('waypoint_s')
+        if not vel or not wps:
+            return None
+        route_s = float(planner.route_s[planner.route_index])
+        for e in vel:
+            if e.get('target') != 'pair' or not e.get('lanes'):
+                continue
+            seg = int(e['seg'])
+            if seg + 1 >= len(wps):
+                continue
+            s0, s1 = float(wps[seg]), float(wps[seg + 1])
+            if not (s0 <= route_s < s1):
+                continue
+            need = (max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
+                    + self.ns_turn_margin_m)
+            return max(route_s, float(s1) - need)
+        return None
+
+    def _lm_no_return_m(self, planner, ap, ego_speed: float,
+                        chain: dict) -> float | None:
+        """복귀 전이를 **데드라인까지 미루는** extra_after [m]. 안 미루면 None.
+
+        커밋 C "복귀 없음" 을 **새 기계 없이** 실현한다. 지금은 시프트 span 이
+        마지막 장애물 + `extra_after_m`(10) 에서 끝나 곧바로 원래 차로로 돌아온다.
+        원래 차로에 돌아갈 이유가 없다면(다음 회전이 그 차로를 요구하지 않는다면)
+        그 복귀는 **불필요한 차로변경 두 번**이고, 그 사이 또 막히면 처음부터다.
+
+        그래서 span 끝을 **데드라인**(유효 차로로 돌아와 있어야 하는 지점)까지
+        민다. 데드라인이 없으면(제약 없는 세그먼트) 그대로 둔다 — 경로 끝까지
+        미는 것은 span 이 영영 안 풀리는 [1] 의 버그를 다시 만드는 짓이다.
+
+        `_ns_turn_lane_pending`(never_stall (c))과 **같은 재료·같은 식**을 쓴다.
+        """
+        if not self.lm_no_return:
+            return None
+        lp = self.last_lane_plan or {}
+        if not lp.get('pick'):
+            return None
+        dl = self._lm_deadline_s(planner, ap, ego_speed)
+        if dl is None:
+            return None
+        route_s = float(planner.route_s[planner.route_index])
+        last = chain.get('last') or chain.get('first')
+        pr = self._project(planner, last.get_location().x, last.get_location().y)
+        if pr is None:
+            return None
+        end_rel = float(pr[0])                             # 마지막 장애물까지
+        want = (dl - route_s) - end_rel                    # 그 뒤로 더 끌 거리
+        return want if want > self.ot_after_m else None
+
     def _lm_hops(self, side: str) -> int | None:
         """이번 틱 차로 지도가 이 side 로 **몇 칸** 가라고 하는가. 아니면 None.
 
@@ -3437,6 +3503,10 @@ class KrRules:
         # 칸 수에 맞춰 늘린다 — 같은 길이로 두 칸을 가면 횡가속이 4배가 되고
         # _shift_speed_cap 이 곧바로 상한을 바닥까지 내린다.
         n_steps = self._lm_hops(side)
+        # 커밋 C — 복귀를 데드라인까지 미룬다 (원래 차로 우선권 없음).
+        nr = self._lm_no_return_m(planner, ap, ego_speed, chain)
+        if nr is not None:
+            extra_after = max(extra_after, nr)
         extra_kw = {}
         if n_steps is not None:
             lane_w = self._lane_width_at(planner.lg, ego_lane, local_s)
@@ -5275,6 +5345,11 @@ class KrRules:
             # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
             self.last_avoid = dict(self.last_avoid or {}, curv=self.last_curv_info)
+        if self.last_lane_plan is not None:
+            # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
+            # 이전과 동일해야 회귀 비교(58 지문)가 성립한다.
+            self.last_avoid = dict(self.last_avoid or {},
+                                   lane_plan=self.last_lane_plan)
         if self.fg_dropped:
             # 스위치가 꺼져 있으면 항상 0 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.

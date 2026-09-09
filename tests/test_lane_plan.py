@@ -197,3 +197,82 @@ def test_queue_is_still_suppressed():
     """신호 대기 줄은 지도에서 빠지므로 트리거되지 않는다 (억제 기준 단일 출처)."""
     _kr, pl = plan(on_cfg(), [obj(2, 25.0, 0.0)], queue=True)
     assert pl is None
+
+
+# ── 커밋 C: 복귀 없음 ────────────────────────────────────────────────────
+def nr_cfg(**over):
+    c = on_cfg(**over)
+    c['avoid_map']['lane_map_no_return_enable'] = True
+    return c
+
+
+def with_vel(p, turn_s=150.0, lanes=(L0,)):
+    """route.pkl 의 valid_entry_lanes 를 심는다 — 데드라인의 유일한 재료다."""
+    p.route = dict(getattr(p, 'route', None) or {})
+    p.route['waypoint_s'] = [0.0, float(turn_s)]
+    p.route['valid_entry_lanes'] = [
+        {'seg': 0, 'target': 'pair', 'turn': 'left',
+         'lanes': [list(k) for k in lanes]}]
+    return p
+
+
+def test_deadline_uses_valid_entry_lanes():
+    """데드라인 = 세그먼트 끝 − 복귀 전이거리 − never_stall_turn_margin_m.
+
+    `_ns_turn_lane_pending`(never_stall (c)) 와 **같은 식**이어야 한다.
+    """
+    kr, p, ap = rig(nr_cfg(), actors=[])
+    with_vel(p, turn_s=150.0)
+    need = max(kr.ot_trans_m, kr.shift_k_s * 8.0) + kr.ns_turn_margin_m
+    assert kr._lm_deadline_s(p, ap, 8.0) == pytest.approx(150.0 - need)
+
+
+def test_no_deadline_without_valid_entry_lanes():
+    """제약이 없으면 미루지 않는다 — 경로 끝까지 밀면 span 이 영영 안 풀린다."""
+    kr, p, ap = rig(nr_cfg(), actors=[])
+    assert kr._lm_deadline_s(p, ap, 8.0) is None
+
+
+def test_no_deadline_for_a_finish_segment():
+    """target='finish' 는 '제약 없음' 이라 데드라인이 아니다."""
+    kr, p, ap = rig(nr_cfg(), actors=[])
+    with_vel(p)
+    p.route['valid_entry_lanes'][0]['target'] = 'finish'
+    assert kr._lm_deadline_s(p, ap, 8.0) is None
+
+
+def test_extra_after_is_pushed_to_the_deadline():
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0)])
+    with_vel(p, turn_s=150.0)
+    kr.lane_plan(ap, p)
+    chain = {'first': ap._world.get_actors()[0], 'last': ap._world.get_actors()[0]}
+    got = kr._lm_no_return_m(p, ap, 8.0, chain)
+    need = max(kr.ot_trans_m, kr.shift_k_s * 8.0) + kr.ns_turn_margin_m
+    assert got == pytest.approx((150.0 - need) - 40.0, abs=1.0)
+    assert got > kr.ot_after_m                             # 기본 10 m 보다 멀리
+
+
+def test_switch_off_keeps_the_old_return():
+    kr, p, ap = rig(on_cfg(), actors=[obj(2, 40.0, 0.0)])   # no_return 은 off
+    with_vel(p)
+    kr.lane_plan(ap, p)
+    chain = {'first': ap._world.get_actors()[0], 'last': ap._world.get_actors()[0]}
+    assert kr._lm_no_return_m(p, ap, 8.0, chain) is None
+
+
+def test_no_push_when_the_deadline_is_already_close():
+    """데드라인이 기존 extra_after 보다 가까우면 미루지 않는다 (되돌리지 않는다)."""
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0)])
+    with_vel(p, turn_s=55.0)
+    kr.lane_plan(ap, p)
+    chain = {'first': ap._world.get_actors()[0], 'last': ap._world.get_actors()[0]}
+    assert kr._lm_no_return_m(p, ap, 8.0, chain) is None
+
+
+def test_no_push_without_a_plan():
+    """지도가 목표를 안 골랐으면 관여하지 않는다."""
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0)])
+    with_vel(p)
+    kr.last_lane_plan = None
+    chain = {'first': ap._world.get_actors()[0], 'last': ap._world.get_actors()[0]}
+    assert kr._lm_no_return_m(p, ap, 8.0, chain) is None
