@@ -271,5 +271,12 @@ def test_reset_clears_latch():
     _expire(kr)
     assert kr._standoff_profile(0.0) == pytest.approx(OT['standoff_creep_v'])
     kr.on_reset()
-    assert kr._standoff_profile(0.0) == pytest.approx(0.0)
-    assert kr._creep_diag['creep_hold_s'] == pytest.approx(0.0)
+    # 2026-09-09: on_reset 이 standoff **대상까지** 버린다 (순간이동 전 관측이라
+    # 새 문맥과 무관하다). 그래서 프로파일은 0.0 이 아니라 **None**(후보 없음)이다 —
+    # "리셋 뒤 크립이 안 열린다" 는 계약은 그대로고, 오히려 더 엄격하다.
+    assert kr._standoff_profile(0.0) is None
+    assert kr.wait_target_d is None and kr.standoff_id is None
+    # 진단도 비워진다 — 대상이 없으면 `_standoff_profile` 이 일찍 반환해 갱신하지
+    # 않으므로, 안 지우면 리스폰 **전** 값이 그대로 남는다.
+    assert kr._creep_diag is None
+    assert kr._creep_hold_ticks == 0

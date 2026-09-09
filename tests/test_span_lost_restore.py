@@ -127,3 +127,62 @@ def test_restore_resets_the_id_list():
     make_shift(kr, p, ap)
     kr._restore_span(p)
     assert kr.ot_ids == []
+
+
+# ── [3] courseRespawn — on_reset 이 회피·큐·BREAKOUT 상태를 전부 버린다 ──
+def test_on_reset_restores_and_drops_the_span():
+    """`ot_span` 은 **경로점 인덱스**다. `planner.reset_index()` 로 자차가 경로
+    위 다른 곳으로 옮겨간 뒤에도 남으면 `_restore_span` 이 엉뚱한 구간의
+    `original_route_points` 를 되돌린다. 그래서 먼저 원복하고 비운다.
+    """
+    import numpy as np
+    kr, p, ap = rig(cfg_on(), [Car(7, 22.4, 0.0)])
+    span = make_shift(kr, p, ap)
+    a, b = span
+    assert not np.allclose(p.route_points[a:b], p.original_route_points[a:b])
+    kr.on_reset(p)
+    assert kr.ot_span is None and kr.ot_ids == []
+    # 경로가 원상 복구됐다 — 남겨 두면 리스폰 뒤 발밑 경로가 옆으로 밀린 채다
+    assert np.allclose(p.route_points[a:b], p.original_route_points[a:b])
+
+
+def test_on_reset_clears_every_avoid_state():
+    """19개 상태 전부 — 하나라도 남으면 리스폰 뒤 옛 문맥으로 판단한다."""
+    kr, p, ap = rig(cfg_on(), [Car(7, 22.4, 0.0)])
+    make_shift(kr, p, ap)
+    kr.ot_blocked_ticks = 5
+    kr.ot_reject_ticks = 5
+    kr.preempt_latch_id = 7
+    kr.wait_target_d = 12.0
+    kr.standoff_id = 7
+    kr.standoff_half_len = 2.0
+    kr.q_ticks = 30
+    kr.q_info = {'x': 1}
+    kr.bo_state = 'BREAKOUT'
+    kr.bo_level = 3
+    kr.bo_stop_ticks = 40
+    kr.fg_dropped = 2
+    kr.last_lane_plan = {'pick': 'x'}
+    kr.lm_hop_n = 2
+    kr.on_reset(p)
+    assert (kr.ot_span, kr.ot_side, kr.ot_ids, kr.lm_hop_n) == (None, None, [], 0)
+    assert (kr.ot_blocked_ticks, kr.ot_reject_ticks, kr.preempt_latch_id) == (0, 0, None)
+    assert (kr.wait_target_d, kr.standoff_id, kr.standoff_half_len) == (None, None, None)
+    assert (kr.q_ticks, kr.q_info, kr._tick_queue, kr._tick_corridor) == (0, None, False, [])
+    assert (kr.bo_state, kr.bo_level, kr.bo_stop_ticks) == (None, 0, 0)
+    assert (kr.fg_dropped, kr.last_lane_plan, kr.last_avoid) == (0, None, None)
+    assert not kr.obj_ticks
+
+
+def test_on_reset_works_without_a_planner():
+    """planner 는 선택 인자다 — 안 줘도 나머지는 지운다 (목 플래너 테스트용)."""
+    kr, p, ap = rig(cfg_on(), [Car(7, 22.4, 0.0)])
+    make_shift(kr, p, ap)
+    kr.on_reset()
+    assert kr.ot_span is None and kr.q_ticks == 0
+
+
+def test_run_agent_passes_the_planner():
+    """접합부가 planner 를 넘기지 않으면 span 원복이 안 된다."""
+    src = (ROOT / 'run_agent.py').read_text(encoding='utf-8')
+    assert 'self.kr.on_reset(self.planner)' in src

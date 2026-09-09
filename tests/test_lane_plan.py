@@ -362,3 +362,49 @@ def test_vehicle_still_shortens_free_run():
     kr, p, ap = rig(on_cfg(), actors=[obj(2, 20.0, 0.0)])
     m = kr.lane_map(ap, p)
     assert m['blocked_by'].get(str(list(L0))) == 2
+
+
+# ── [4](e) 활성 시프트 중 재타겟 ─────────────────────────────────────────
+def rt_cfg(**over):
+    c = nr_cfg(**over)
+    c['avoid_map']['lane_map_retarget_enable'] = True
+    return c
+
+
+def test_retarget_is_off_by_default_switch():
+    kr, p, ap = rig(nr_cfg(), actors=[])
+    assert kr.lm_retarget is False
+    assert kr._lm_retarget(ap, p, 8.0) is False
+
+
+def test_retarget_needs_a_pick():
+    kr, p, ap = rig(rt_cfg(), actors=[])
+    kr.last_lane_plan = None
+    assert kr._lm_retarget(ap, p, 8.0) is False
+
+
+def test_retarget_skips_when_already_heading_there():
+    """이미 그 차로로 가는 중이면 갈아탈 이유가 없다."""
+    kr, p, ap = rig(rt_cfg(), actors=[obj(2, 40.0, 0.0)])
+    kr.lane_plan(ap, p)
+    kr.ot_target = L1
+    kr.ot_span = (0, 100)
+    assert kr._lm_retarget(ap, p, 8.0) is False
+
+
+def test_retarget_needs_a_new_blocker():
+    """회랑의 객체가 전부 `ot_ids` 에 있으면 새 장애물이 아니다 — 진행 중인
+    시프트를 끝내면 된다."""
+    kr, p, ap = rig(rt_cfg(), actors=[obj(2, 20.0, 0.0)])
+    kr.lane_plan(ap, p)
+    kr.ot_target = L2
+    kr.ot_span = (0, 100)
+    kr.ot_ids = [2]
+    assert kr._lm_retarget(ap, p, 8.0) is False
+
+
+def test_span_is_merged_not_rebuilt():
+    """재타겟은 램프를 새로 만드는 것이 아니라 span 을 **이어 붙인다** —
+    원복이 `original_route_points` 에서 통째로 되돌리므로 합집합이 맞다."""
+    src = (ROOT / 'team_code' / 'kr_rules.py').read_text(encoding='utf-8')
+    assert 'span = (min(self.ot_span[0], span[0]), max(self.ot_span[1], span[1]))' in src

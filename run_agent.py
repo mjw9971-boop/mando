@@ -273,7 +273,10 @@ class Runner:
             self.agent._turn_controller.error_history = []
             # 황색 GO 래치·교차로 가드도 버린다 — 정지선 뒤로 되돌아간 채
             # GO 가 살아 있으면 적신호를 그대로 통과한다 (항목7 중대)
-            self.kr.on_reset()
+            # planner 를 넘긴다 — 회피 시프트 span 은 **경로점 인덱스**라
+            # reset_index() 뒤에 남으면 엉뚱한 구간을 되돌린다. on_reset 이
+            # 먼저 원복하고 비운다.
+            self.kr.on_reset(self.planner)
             self.longc._prev_accel = 0.0
 
         self.world.update(pkt, world_state.ego)

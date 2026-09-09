@@ -370,7 +370,9 @@ class KrRules:
         # false = 이전 동작.
         self.span_lost_restore = bool(ot.get('span_lost_restore_enable', False))
         self.ot_ids: list = []                     # 이 시프트를 만든 객체 id
+        self.ot_target = None                      # 지금 향하는 차로 (재타겟 판정)
         self.lm_hop_n = 0                          # 이번 시프트의 칸 수 (커밋 B)
+        self.lm_retarget_n = 0                     # 재타겟 횟수
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -594,6 +596,10 @@ class KrRules:
         self.lm_avoid_v = float(_lm.get('lane_map_avoid_speed_kph', 20.0)) / 3.6
         # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
         self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
+        # 활성 시프트 중에도 차로 지도가 다른 목표를 고르면 갈아탈지 (2026-09-09).
+        # 차로 지도는 매 틱 목표를 다시 고르므로 "활성 중엔 생성 금지"(B-9 (5))가
+        # 필요 없다. false = 이전 동작.
+        self.lm_retarget = bool(_lm.get('lane_map_retarget_enable', False))
         self.last_lane_plan: dict | None = None    # 이번 틱 결정 (진단·후보)
         # "정지 객체" 임계는 회피 계층과 같은 출처를 읽는다 (상수 복제 금지).
         self.lane_map_static_v = self.ot_v_max
@@ -2785,6 +2791,14 @@ class KrRules:
                 self._restore_span(planner)
                 self.last_avoid = {'state': 'RESTORE', 'why': 'targets_lost'}
                 return False
+            # 차로 지도가 **다른 목표 차로**를 고르면 목표만 갈아 끼운다 (재타겟).
+            # 차로 지도는 매 틱 목표를 다시 고르므로 "활성 중엔 생성 금지" 가
+            # 필요 없다 — 필요한 것은 램프를 새로 만드는 것이 아니라 **이어 붙이는**
+            # 것이다. 실측 07: rs 2714.1 에 blocker 4 로 시프트한 뒤 rs 2757.6 에
+            # **새 blocker 6** 이 나타났는데 span 이 활성이라 생성이 건너뛰어져
+            # 그대로 정지했다 (rs 2805~2822, ot_span 이 끝까지 None 이 안 된다).
+            if self._lm_retarget(ap, planner, ego_speed):
+                return False
             if self.span_active_standoff:
                 corridor = self._corridor_blockers(ap, planner)
                 self._standoff_target(ap, planner, corridor)
@@ -3113,6 +3127,44 @@ class KrRules:
         want = (dl - route_s) - end_rel                    # 그 뒤로 더 끌 거리
         return want if want > self.ot_after_m else None
 
+    def _lm_retarget(self, ap, planner, ego_speed: float) -> bool:
+        """활성 시프트 중 차로 지도가 **다른 목표**를 고르면 갈아탄다 (재타겟).
+
+        조건은 좁다:
+          1. 스위치 on ∧ 차로 지도가 목표를 골랐다.
+          2. 그 목표가 **지금 향하는 차로와 다르다** (`ot_target`).
+          3. 회랑에 **`ot_ids` 에 없는** 정지 객체가 있다 — 새 장애물이라는 뜻이다.
+             (없으면 그냥 진행 중인 시프트를 끝내면 된다.)
+
+        갈아타기는 `_side_pass` 를 그대로 다시 태운다 — 게이트 7개가 전부 걸리고,
+        `_apply_shift` 가 span 을 **합집합으로 이어 붙인다**. 램프를 새로 만드는
+        것이 아니라 목표 차로만 바꾸는 것이다.
+        """
+        if not (self.lm_retarget and self.lane_map_on):
+            return False
+        lp = self.last_lane_plan or {}
+        pick = lp.get('pick')
+        if not pick:
+            return False
+        if self.ot_target is not None and str(list(self.ot_target)) == str(pick):
+            return False                                   # 이미 그리로 가는 중
+        corridor = self._corridor_blockers(ap, planner)
+        new = [c for c in corridor if c[3].id not in set(self.ot_ids)]
+        if not new:
+            return False                                   # 새 장애물이 없다
+        lg = getattr(planner, 'lg', None)
+        ego_lane = self._tick_ego_lane or self._ego_lane(lg, ap)
+        if lg is None or ego_lane is None:
+            return False
+        chain = self._chain(corridor, new[0][3])
+        side = lp.get('side')
+        n_pass = 1
+        self.last_avoid = {'state': 'RETARGET', 'from': list(self.ot_target or ()),
+                           'to': pick, 'new_blocker': int(new[0][3].id),
+                           'span_before': list(self.ot_span)}
+        return self._side_pass(ap, planner, ego_speed, chain, False,
+                               lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
+
     def _lm_hops(self, side: str) -> int | None:
         """이번 틱 차로 지도가 이 side 로 **몇 칸** 가라고 하는가. 아니면 None.
 
@@ -3166,7 +3218,9 @@ class KrRules:
         self.ot_span = None
         self.ot_side = None
         self.ot_ids = []
+        self.ot_target = None
         self.lm_hop_n = 0
+        self.lm_retarget_n = 0
         self.span_extend_n = 0
         self.last_overtake = 'restored'
 
@@ -3676,7 +3730,13 @@ class KrRules:
             min_start_ahead=ahead_eff * ppm,
             **extra_kw)
         planner._kd = _cKDTree(planner.route_points[:, :2])
+        if self.ot_span is not None:
+            # 재타겟 — 램프를 새로 만드는 것이 아니라 **span 을 이어 붙인다**.
+            # 원복은 original_route_points 에서 통째로 되돌리므로 합집합이 맞다.
+            span = (min(self.ot_span[0], span[0]), max(self.ot_span[1], span[1]))
+            self.lm_retarget_n += 1
         self.ot_span = span
+        self.ot_target = target                            # 지금 향하는 차로 (재타겟 판정)
         self.lm_hop_n = int(n_steps or 1)                  # 몇 칸짜리 시프트였나
         self.ot_ids = list(chain['ids'])                   # 대상 상실 판정의 기준
         self.ot_side = side                                # 연장이 같은 방향을 쓴다
@@ -3838,11 +3898,27 @@ class KrRules:
         self.y_ctrl = None
         self.y_v_allow = None
 
-    def on_reset(self) -> None:
+    def on_reset(self, planner=None) -> None:
         """courseRespawn — 순간이동 전 래치는 전부 무효 (run_agent 가 부른다).
 
         특히 GO 래치를 살려 두면, 리스폰으로 정지선 **뒤로** 되돌아간 뒤에도
         "이미 가기로 했다"가 유지돼 적신호를 그대로 통과한다 (항목7 중대).
+
+        **회피·큐·BREAKOUT 상태도 같이 버린다 (2026-09-09).** 이전에는 신호·
+        보행자 래치만 지웠다. 남은 것들은 리스폰 뒤 의미가 없거나 **틀린다**:
+
+        · `ot_span` 은 **경로점 인덱스**다. `planner.reset_index()` 로 자차
+          위치가 경로 위 다른 곳으로 옮겨간 뒤에도 남으면, `_restore_span` 이
+          엉뚱한 구간의 `original_route_points` 를 되돌린다. 그래서 여기서
+          **먼저 원복하고** 비운다 — planner 를 받는 이유다.
+        · standoff 대상·큐 시계·객체 정지 타이머(`obj_ticks`)는 순간이동 전
+          관측이라 새 문맥과 무관하다.
+        · BREAKOUT 사다리·기각 시계는 "여기서 얼마나 갇혔나" 인데 자리가 바뀌었다.
+        · `last_lane_plan`·`fg_dropped` 는 그 틱 진단이라 다음 틱에 다시 채워진다
+          (남겨 두면 리스폰 직후 한 틱이 옛 값으로 판단된다).
+
+        `planner` 는 선택 인자다 — 안 주면 span 원복만 건너뛰고 나머지는 지운다
+        (목 플래너를 쓰는 테스트가 그대로 돈다).
         """
         self._yellow_reset()
         self.cross_guard = False
@@ -3875,6 +3951,41 @@ class KrRules:
         self.ns_ref_s = None
         self.ns_level = 0
         self.ns_turn_ticks = 0
+        self.ns_info = None
+        # ── 회피 시프트 ── span 은 경로점 인덱스라 **먼저 원복**하고 버린다.
+        if self.ot_span is not None:
+            try:
+                self._restore_span(planner)
+            except Exception:                         # noqa: BLE001
+                pass                                  # planner 없음·배열 불일치
+        self.ot_span = None
+        self.ot_side = None
+        self.ot_ids = []
+        self.lm_hop_n = 0
+        self.span_extend_n = 0
+        self.ot_blocked_ticks = 0
+        self.ot_reject_ticks = 0
+        self.preempt_latch_id = None
+        self.last_overtake = None
+        self.last_avoid = None
+        self.last_lane_plan = None
+        # ── standoff · 큐 · 객체 타이머 ── 순간이동 전 관측이라 새 문맥과 무관하다.
+        self.wait_target_d = None
+        self.standoff_id = None
+        self.standoff_half_len = None
+        self.q_ticks = 0
+        self.q_info = None
+        self._tick_corridor = []
+        self._tick_queue = False
+        self.obj_ticks.clear()
+        # ── BREAKOUT 사다리 ── "여기서 얼마나 갇혔나" 인데 자리가 바뀌었다.
+        self.bo_state = None
+        self.bo_level = 0
+        self.bo_stop_ticks = 0
+        self.fg_dropped = 0
+        # 진단도 비운다 — standoff 대상이 사라지면 `_standoff_profile` 이 일찍
+        # 반환해 갱신하지 않으므로, 안 지우면 리스폰 전 값이 그대로 남는다.
+        self._creep_diag = None
 
     def _s0(self, ap) -> float:
         """계획 정지점의 뒷축 gap — PDM 주입값이 단일 출처."""
