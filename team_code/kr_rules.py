@@ -591,6 +591,10 @@ class KrRules:
         self.lane_map_hops = int(_lm.get('lane_map_max_hops', 2))
         self.lane_map_ahead_m = float(_lm.get('lane_map_ahead_m', 80.0))
         self.lane_map_min_w = float(_lm.get('lane_map_min_width_m', 2.0))
+        # 섹션 경계에서 지도가 끊기는 것을 막는다 (2026-09-09 실측, 아래 참조).
+        # false = 이전 동작 (자차 섹션 안의 차로만 hop 으로 센다).
+        self.lane_map_span_sec = bool(
+            _lm.get('lane_map_span_sections_enable', True))
         # 커밋 B — 후보 선택·시점·감속.
         self.lm_decide_m = float(_lm.get('lane_map_decide_m', 50.0))
         self.lm_avoid_v = float(_lm.get('lane_map_avoid_speed_kph', 20.0)) / 3.6
@@ -1538,6 +1542,46 @@ class KrRules:
                 out[k] = sign * h
         return out
 
+    def _lane_chain_alias(self, lg, hops: dict, ahead_m: float) -> dict:
+        """전방 승계 차로 → **그 차로가 이어받는 hop 차로들**.
+
+        `_lane_hops` 는 `lg.neighbor` 로 자차 **섹션 안**만 훑는다. 그런데 차로
+        지도가 재는 창(`lane_map_ahead_m` 80 m)은 섹션을 여러 개 건넌다 —
+        xodr 은 폭이 변하는 곳마다 섹션을 쪼개므로 11~13 m 짜리 섹션이 흔하다.
+        그러면 창 안의 객체가 `(도로, **다른 섹션**, 차로)` 로 투영돼 `hops` 에
+        없고, `_actor_lanes` 가 빈 집합을 돌려준다 → `free_run` 이 전 차로
+        `ahead_m` 로 남고 `blocked_by` 가 늘 비어 `lane_plan` 이 null 이다.
+        방향 결정 시점에 지도가 비어 있으면 옛 로직이 정보 없이 방향을 고른다.
+
+        실측 (2026-09-09, run_20260909_232350 t 55.6 rs 450.2): 자차
+        `(2756, 3, 5)`, 정지 차량 3대가 55.7~57.7 m 앞. 창(80 m) 안인데
+        `lg.locate` 는 `(2756, 0, 3/4/5)` — **섹션 3 개 앞**이라 hop 밖으로
+        빠졌다. 그 틱 `free_run` 전 차로 80.0, `blocked_by {}`, `lane_plan`
+        null. 승계를 이으면 id 4 → 내 차로(hop 0), id 2 → 좌 1, id 3 → 좌 2 로
+        **왼쪽이 전부 막힌 것**이 보인다 (실제 주행은 왼쪽으로 갔다).
+
+        따라가는 것은 `next` 가 **하나뿐일 때만**이다 — 분기는 어느 쪽이 내
+        경로인지 여기서 알 수 없고, 아닌 쪽 객체로 여유를 깎으면 안 된다.
+        합류(두 hop 차로가 같은 차로로 이어짐)는 **양쪽 다** 막힌 것이 맞으므로
+        별칭을 집합으로 둔다.
+        """
+        alias: dict = {}
+        if not self.lane_map_span_sec:
+            return alias
+        for k in hops:
+            cur, run, seen = k, 0.0, {k}
+            while run < float(ahead_m):
+                nxt = (lg.lanes.get(cur) or {}).get('next') or []
+                if len(nxt) != 1:
+                    break                                  # 분기·종료는 안 따라간다
+                cur = nxt[0]
+                if cur in seen or cur not in lg.lanes or cur in hops:
+                    break
+                seen.add(cur)
+                alias.setdefault(cur, set()).add(k)
+                run += float(lg.lanes[cur].get('length', 0.0) or 0.0)
+        return alias
+
     def _lane_width_at(self, lg, key, s: float) -> float:
         """그 지점의 차로 폭 [m]. 폭 배열은 s 격자라 **평균이 아니라 보간**이다 —
         소멸 차로는 끝에서 0 이 되므로 평균으로 보면 통과 가능해 보인다."""
@@ -1547,7 +1591,7 @@ class KrRules:
         except Exception:                                  # noqa: BLE001
             return 0.0
 
-    def _actor_lanes(self, lg, actor, hops: dict) -> set:
+    def _actor_lanes(self, lg, actor, hops: dict, alias: dict | None = None) -> set:
         """객체가 **걸친** 차로 집합 (hops 안의 것만).
 
         객체 lane 은 9910 에 없다(로그 `lane: null` 은 설계다). 중심 + 좌우 폭
@@ -1568,13 +1612,20 @@ class KrRules:
         pts = [(vx, vy),
                (vx + nx * half_w, vy + ny * half_w),
                (vx - nx * half_w, vy - ny * half_w)]
+        alias = alias or {}
         out = set()
+        prefer = list(hops.keys()) + list(alias.keys())
         for x, y in pts:
-            m = lg.locate(x, y, prefer=list(hops.keys()))
+            m = lg.locate(x, y, prefer=prefer)
             # LaneMatch 의 차로 필드는 `.lane` 이다 (`.key` 가 아니다 — _ego_lane
             # 과 같은 규약). 커밋 A 는 `.key` 를 읽어 매번 예외였다.
-            if m is not None and m.lane in hops:
+            if m is None:
+                continue
+            if m.lane in hops:
                 out.add(m.lane)
+            else:
+                # 섹션이 달라도 같은 차로면 그 hop 이 막힌 것이다
+                out |= alias.get(m.lane, set())
         return out
 
     def lane_map(self, ap, planner) -> dict | None:
@@ -1599,6 +1650,7 @@ class KrRules:
             return None
         hops = self._lane_hops(lg, ego_lane, self.lane_map_hops)
         ahead = self.lane_map_ahead_m
+        alias = self._lane_chain_alias(lg, hops, ahead)
         ego_s = self._ego_local_s(lg, ap)
         free = {k: ahead for k in hops}
         passable = {}
@@ -1634,7 +1686,7 @@ class KrRules:
             pr = self._project(planner, a.get_location().x, a.get_location().y)
             if pr is None or not (0.0 < pr[0] <= ahead):
                 continue
-            for k in self._actor_lanes(lg, a, hops):
+            for k in self._actor_lanes(lg, a, hops, alias):
                 if pr[0] < free.get(k, ahead):
                     free[k] = pr[0]
                     blocked[k] = int(a.id)
@@ -1642,7 +1694,9 @@ class KrRules:
                 'free_run': {str(list(k)): round(v, 1) for k, v in free.items()},
                 'passable': {str(list(k)): bool(v) for k, v in passable.items()},
                 'blocked_by': {str(list(k)): v for k, v in blocked.items()},
-                'queue_dropped': len(drop)}
+                'queue_dropped': len(drop),
+                # 승계로 이어 붙인 전방 차로 수 — 0 이면 섹션 확장이 안 걸린 것이다
+                'span_alias': len(alias)}
 
     # ── 차로 지도 커밋 B — 후보 선택·시점·감속 ───────────────────────────
     def _ramp_len_m(self, hops: int, lane_w: float, v: float) -> float:

@@ -218,3 +218,93 @@ def test_no_queue_keeps_objects():
     m = M(kr, p, ap)
     assert m['queue_dropped'] == 0
     assert fr(m, L1) == pytest.approx(20.0, abs=0.6)
+
+
+# ── 섹션 경계 (lane_map_span_sections_enable) ────────────────────────────
+#
+# `_lane_hops` 는 `lg.neighbor` 로 **자차 섹션 안**만 훑는데, 창(80 m)은 섹션을
+# 여러 개 건넌다 — xodr 은 폭이 변할 때마다 섹션을 쪼개므로 11~13 m 짜리가 흔하다.
+# 그러면 창 안의 정지 객체가 `(도로, 다른 섹션, 차로)` 로 투영돼 hop 밖으로 빠지고,
+# free_run 이 전 차로 ahead_m 로 남아 blocked_by 가 통째로 빈다.
+#
+# 실측 2026-09-09 run_20260909_232350 t 55.6 rs 450.2: 자차 (2756,3,5), 정지
+# 차량 3 대가 55.7~57.7 m 앞인데 lg.locate 는 (2756,0,3/4/5) — 섹션 3 개 앞이라
+# 전부 빠졌다. blocked_by {}, lane_plan null → 방향을 옛 로직이 정보 없이 골랐다.
+S0, S1 = (1, 0, -1), (1, 1, -1)
+
+
+class LgSec(Lg3):
+    """Lg3 에 **다음 섹션**을 붙인 목. 각 차로 30 m, x>30 은 섹션 1 로 잡힌다."""
+
+    def __init__(self):
+        super().__init__()
+        s = np.linspace(0.0, 30.0, 7)
+        for k in (L0, L1, L2):
+            self.lanes[k].update({'s': s, 'width': np.full_like(s, 3.0),
+                                  'length': 30.0,
+                                  'next': [(1, 1, k[2])], 'prev': []})
+        for k in (L0, L1, L2):
+            nk = (1, 1, k[2])
+            self.lanes[nk] = {'junction': -1, 'dir': -1, 's': s,
+                              'width': np.full_like(s, 3.0), 'length': 30.0,
+                              'next': [], 'prev': [k]}
+
+    def locate(self, x, y, prefer=None, **kw):
+        m = super().locate(x, y, prefer=prefer, **kw)
+        if m is None or x <= 30.0:
+            return m
+        return type('M', (), {'lane': (1, 1, m.lane[2]),
+                              's': float(x) - 30.0, 't': 0.0})()
+
+
+def test_object_in_the_next_section_still_blocks_its_lane():
+    """섹션이 달라도 승계로 이어진 같은 차로면 그 hop 이 막힌 것이다."""
+    a = Box(2, 50.0, -3.0, 0.0)                 # 옆 차로 50 m 앞 = 섹션 1
+    kr, p, ap = rig(on_cfg(), actors=[a], lg=LgSec())
+    m = M(kr, p, ap)
+    assert m['span_alias'] > 0
+    assert m['blocked_by'][str(list(L1))] == 2
+    assert fr(m, L1) == pytest.approx(50.0, abs=0.6)
+    assert fr(m, L0) == 80.0                    # 내 차로는 그대로 비어 있다
+
+
+def test_span_sections_off_reproduces_the_old_blind_map():
+    """false = 이전 동작 — 다음 섹션의 객체를 못 보고 지도가 빈다."""
+    a = Box(2, 50.0, -3.0, 0.0)
+    kr, p, ap = rig(on_cfg(lane_map_span_sections_enable=False),
+                    actors=[a], lg=LgSec())
+    m = M(kr, p, ap)
+    assert m['span_alias'] == 0
+    assert m['blocked_by'] == {}
+    assert fr(m, L1) == 80.0
+
+
+def test_same_section_object_is_unchanged_by_the_alias():
+    """섹션 안 객체는 별칭과 무관하게 예전 그대로 잡힌다."""
+    a = Box(2, 20.0, -3.0, 0.0)
+    kr, p, ap = rig(on_cfg(), actors=[a], lg=LgSec())
+    m = M(kr, p, ap)
+    assert m['blocked_by'][str(list(L1))] == 2
+    assert fr(m, L1) == pytest.approx(20.0, abs=0.6)
+
+
+def test_alias_stops_at_a_branch():
+    """`next` 가 둘 이상이면 어느 쪽이 내 경로인지 모른다 — 따라가지 않는다."""
+    lg = LgSec()
+    lg.lanes[L1]['next'] = [(1, 1, -2), (1, 2, -2)]
+    a = Box(2, 50.0, -3.0, 0.0)
+    kr, p, ap = rig(on_cfg(), actors=[a], lg=lg)
+    m = M(kr, p, ap)
+    assert str(list(L1)) not in m['blocked_by']
+    assert fr(m, L1) == 80.0
+
+
+def test_alias_is_a_set_so_a_merge_blocks_both_lanes():
+    """두 hop 차로가 같은 차로로 합류하면 **양쪽 다** 막힌 것이 맞다."""
+    lg = LgSec()
+    lg.lanes[L1]['next'] = [(1, 1, -3)]         # L1·L2 가 같은 차로로 합류
+    a = Box(2, 50.0, -6.0, 0.0)                 # 섹션 1 의 그 합류 차로
+    kr, p, ap = rig(on_cfg(), actors=[a], lg=lg)
+    m = M(kr, p, ap)
+    assert m['blocked_by'][str(list(L1))] == 2
+    assert m['blocked_by'][str(list(L2))] == 2
