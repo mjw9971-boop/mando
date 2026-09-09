@@ -20,6 +20,12 @@ kr_rules 와의 차이 (설계 결정 2026-09-08, 사용자 승인):
   복원  K6 red_zone 붉은 구간 진입 전 감속 (2026-09-09 Q3 번복 — 근거는 _red_approach_profile)
         K7 shift_cap 시프트 전이 횡가속 상한 (2026-09-09 — geom 게이트 삭제의 대가를
         기각이 아니라 속도로 갚는다. 근거는 _shift_speed_cap)
+  추가  K8 span_v_req 이웃 연속 창 (2026-09-09, B-30) — 시프트 목표 이웃이 span 중간에서
+        끊기면 route.py 폴백이 경로에 계단을 만든다. **기각하지 않는다**: 장애물 지점에
+        목표가 없으면 반대편 side 를 보고, 뒤가 끊기면 span 을 자르는 대신 창에 전이
+        2회가 들어가는 속도를 min() 후보로 낸다 (근거는 _span_speed_req).
+        side 게이트 부활이 아니다 — no_neighbor 는 그 side 를 **기각**했고, no_target 은
+        반대편으로 **넘긴다**.
   변경  정적 장애물은 첫 틱에 PREEMPT (관찰·대기·예산 없음) · side 게이트는 span_too_far 하나 ·
         중첩 시프트 (활성 span 위에 같은 방향으로 한 칸 더, 횟수 제한 없음 — 요동 방지는
         "같은 (객체, 방향) 은 **그 span 동안 1회**", 2026-09-09 사양 확정) ·
@@ -159,6 +165,9 @@ class Ctrl24:
         # 미리보기 창의 바닥 [m] — 전이에 **닿기 전에** 감속이 시작돼야 한다.
         # 창의 속도항은 ctrl24 자신의 전이 계수(trans_k)를 쓴다 (전이 길이와 같은 축).
         self.shift_cap_look_m = float(ot.get('shift_latest_m', 25.0))
+        # ── K8 span 이웃 연속성 (B-30) ─────────────────────────────────────
+        self.span_cont = bool(c['span_v_req_enable'])
+        self.span_v_min = float(c['span_v_req_min'])
         # ── 지시등 ─────────────────────────────────────────────────────────
         self.turn_lead_s = float(c['turn_lead_s'])
         self.lc_lead_s = float(c['lc_lead_s'])
@@ -236,6 +245,8 @@ class Ctrl24:
         self.nested = 0                               # 활성 span 에 겹쳐 만든 시프트 수
         self._shifted_for: set = set()                # 이미 시프트를 만든 객체 id (요동 방지)
         self.last_span_plan: tuple | None = None
+        self.span_v_req: float | None = None      # K8 후보 (감속하면 담기는 속도)
+        self._nb_cache: dict = {}                 # (side, n_steps) → 이웃 연속성 bool 배열
         self.last_overtake: str | None = None
         self._prepass_done = False
         self.last_prepass_ms: float | None = None     # pre_pass 실행 시간 (틱 비용 보고용)
@@ -1175,8 +1186,94 @@ class Ctrl24:
         self._obb_cache = (key, frozenset(out))
         return out
 
+    # ── K8 span 이웃 연속성 (B-30, 2026-09-09) ────────────────────────────
+    def _nb_ok(self, planner, left: bool, n_steps: int):
+        """경로 전 구간의 "그 side 로 n_steps 칸 갈 목표가 있나" bool 배열.
+
+        `route.py::_shift_target_wp` 와 **같은 판정**이다 (거기서 None 이면 폴백이
+        원 차로 중심으로 스냅해 계단이 된다). 시프트는 route_points 만 바꾸고
+        route_waypoints 는 건드리지 않으므로 (side, n_steps) 당 한 번만 계산하면 된다.
+        차로 키가 바뀌는 지점에서만 재조회한다 — 한 차로가 수백 점이라 그만큼 싸다.
+        """
+        key = ('left' if left else 'right', int(n_steps))
+        hit = self._nb_cache.get(key)
+        wps = getattr(planner, 'route_waypoints', None)
+        if wps is None:
+            return None
+        if hit is not None and len(hit) == len(wps):
+            return hit
+        f = getattr(planner, '_shift_target_wp', None)
+        if f is None:
+            return None
+        out = np.zeros(len(wps), dtype=bool)
+        prev_key = object()
+        val = False
+        for i in range(len(wps)):
+            k = getattr(wps[i], 'key', None)
+            if k != prev_key:
+                prev_key = k
+                try:
+                    val = f(i, left, n_steps) is not None
+                except Exception:                          # noqa: BLE001 — 목 플래너
+                    return None
+            out[i] = val
+        self._nb_cache[key] = out
+        return out
+
+    @staticmethod
+    def _cont_window(ok, i_lo: int, i_hi: int):
+        """[i_lo, i_hi] 를 모두 담는 최대 연속 True 창 (a, b) — 못 담으면 None."""
+        n = len(ok)
+        i_lo = max(0, min(int(i_lo), n - 1))
+        i_hi = max(0, min(int(i_hi), n - 1))
+        if not ok[i_lo] or not ok[i_hi]:
+            return None
+        a = i_lo
+        while a > 0 and ok[a - 1]:
+            a -= 1
+        b = i_hi
+        while b + 1 < n and ok[b + 1]:
+            b += 1
+        if not bool(ok[i_lo:i_hi + 1].all()):
+            return None
+        return a, b + 1
+
+    def _span_speed_req(self, planner, left: bool, steps: int, obs_i: int, last_i: int):
+        """이 side 로 이 장애물을 담으려면 필요한 속도 → (판정, v_req).
+
+        판정  'ok'        연속 — 이전과 같다
+              'no_target' 장애물 지점에 그 side 목표가 없다 (섹션에 그 차로가 없음).
+                          계단 이전에 목표가 틀린 것이므로 **반대편 side 를 본다**.
+              'wait'      창은 있는데 지금 속도로는 전이 2회가 안 들어간다 → v_req 로 감속
+              'no_room'   창이 하한(span_v_req_min)으로도 부족 → 담지 않는다
+
+            v_req = (창 − extra_before_m − extra_after_m) / (2 · trans_k)
+
+        장애물 전장(bounding box)은 빼지 않는다 — 사양의 식 그대로다.
+        """
+        ok = self._nb_ok(planner, left, steps)
+        if ok is None or len(ok) == 0:
+            return 'ok', None
+        win = self._cont_window(ok, obs_i, last_i)
+        if win is None:
+            return 'no_target', None
+        w0, w1 = win
+        if w0 == 0 and w1 == len(ok):
+            return 'ok', None                              # 경로 전체가 연속
+        try:
+            rs = planner.route_s
+            L = float(rs[min(w1, len(rs) - 1)]) - float(rs[w0])
+        except Exception:                                  # noqa: BLE001 — 목 플래너
+            ppm = float(getattr(planner, 'points_per_meter', 10))
+            L = (w1 - w0) / ppm
+        v_req = (L - self.ot_before_m - self.ot_after_m) / (2.0 * self.trans_k)
+        if v_req < self.span_v_min:
+            return 'no_room', round(v_req, 2)
+        return 'wait', round(v_req, 2)
+
     def _avoid_tick(self, ap, planner, ego_speed: float, obb_ids) -> None:
         """틱당 1회. 원복 → 트리거 수집 → 아직 시프트를 안 만든 첫 객체에 PREEMPT."""
+        self.span_v_req = None                       # K8 — 이번 틱 감속 요구 (틱마다 새로)
         i0 = int(planner.route_index)
         if self.ot_span is not None and i0 > self.ot_span[1]:
             self._restore_span(planner)
@@ -1230,6 +1327,18 @@ class Ctrl24:
         i0 = int(planner.route_index)
         trans = self._trans_m(ego_speed)
         rejects = []
+        v_reqs: list = []
+        # K8 이 쓸 장애물 인덱스 — 투영이 안 되면 연속성 판정을 건너뛴다 (이전 동작).
+        obs_i = last_i = None
+        try:
+            pa = self._project(planner, actor.get_location().x, actor.get_location().y)
+            pb = pa if chain_last is None else self._project(
+                planner, last.get_location().x, last.get_location().y)
+            if pa is not None and pb is not None:
+                obs_i = i0 + int(round(pa[0] * ppm))
+                last_i = i0 + int(round(pb[0] * ppm))
+        except Exception:                                  # noqa: BLE001 — 목 조립
+            obs_i = last_i = None
         for side in ('left', 'right'):
             left = side == 'left'
             try:
@@ -1254,6 +1363,23 @@ class Ctrl24:
                 continue
             ref = (a + b) // 2                            # 중첩 시프트의 밀림은 플래토에서 잰다
             steps = self._target_steps(planner, left, ref)
+            # K8 — 이 side 로 장애물을 담는 이웃 연속 창이 있나 (B-30).
+            # 게이트가 아니다: 'no_target' 은 반대편 side 로 넘기고, 'wait' 는
+            # 생성을 미루는 대신 감속 후보를 낸다. 'no_room' 만 담지 않는다.
+            if self.span_cont and obs_i is not None:
+                verdict, v_req = self._span_speed_req(planner, left, steps, obs_i, last_i)
+                if verdict == 'no_target':
+                    rejects.append(f'{side}:no_target')
+                    continue
+                if verdict == 'no_room':
+                    rejects.append(f'{side}:span_no_room')
+                    self.last_avoid[f'{side}_v_req'] = v_req
+                    continue
+                if verdict == 'wait' and float(ego_speed) > v_req + 1e-9:
+                    rejects.append(f'{side}:span_v_req')
+                    self.last_avoid[f'{side}_v_req'] = v_req
+                    v_reqs.append(v_req)
+                    continue
             try:
                 d = np.asarray(planner.planned_lateral_offsets(a, b, left, step_pts=int(ppm),
                                                                ref_index=ref), dtype=float)
@@ -1286,6 +1412,7 @@ class Ctrl24:
                 continue
             self._rebuild_kd(planner)
             self._shift_seq += 1                       # 경로가 바뀌었다 — 예측 캐시 무효
+            self.span_v_req = None                     # 만들었으니 감속 요구는 없다
             if self.ot_span is None:
                 self.ot_span = (a, b)
             else:
@@ -1304,9 +1431,17 @@ class Ctrl24:
                   f'(id={chain["ids"]}, 구간 {a}~{b}, 전이 {trans:.1f}/{back:.1f} m, '
                   f'{steps}칸, 중첩 {self.nested})', flush=True)
             return True
-        noop = bool(rejects) and all(r.endswith(':noop') for r in rejects)
-        self.last_avoid.update({'state': 'NOOP' if noop else self.last_avoid['state'],
+        # 감속하면 담기는 side 가 있으면 그 v_req 를 후보로 낸다 (가장 높은 쪽 —
+        # 거기까지만 줄이면 한쪽은 담긴다). 생성은 다음 틱 이하에서 자연히 일어난다.
+        self.span_v_req = max(v_reqs) if v_reqs else None
+        noop = bool(rejects) and all(
+            r.endswith((':noop', ':no_target', ':span_no_room')) for r in rejects)
+        state = ('SPAN_WAIT_V' if v_reqs else
+                 ('NOOP' if noop else self.last_avoid['state']))
+        self.last_avoid.update({'state': state,
                                 'reject': rejects[-1] if rejects else None, 'rejects': rejects})
+        if self.span_v_req is not None:
+            self.last_avoid['span_v_req'] = self.span_v_req
         self.last_overtake = rejects[-1] if rejects else 'no_plan'
         return False
 
@@ -1529,6 +1664,9 @@ class Ctrl24:
         # 신호·보행자가 더 낮으면 그쪽이 이긴다.
         cap = self._shift_speed_cap(planner, ego_speed)
         add('shift_cap', cap)
+        # K8 — 이웃 연속 창에 전이 2회가 들어가는 속도. 시프트를 **만들기 위한** 감속이라
+        # 생성 전에만 산다 (만든 틱에 None 이 된다). 상한이지 오버라이드가 아니다.
+        add('span_v_req', self.span_v_req)
         if cap is not None:
             self.last_avoid = dict(self.last_avoid or {'state': 'SHIFT_ACTIVE'},
                                    shift_cap=round(float(cap), 2))

@@ -73,6 +73,9 @@
   geom 게이트를 삭제한 대가는 **기각이 아니라 속도로** 갚는다 — K7 shift_cap
   (`ctrl24.shift_cap_enable`, 상수는 `overtake.a_lat_max`·`shift_cap_min_v`·
   `shift_latest_m`)이 시프트 활성 구간에서만 곡률 상한을 min() 후보로 낸다.
+  시프트 목표 이웃이 span 중간에서 끊기는 것도 기각하지 않는다 — K8 span_v_req
+  (`ctrl24.span_v_req_enable`)이 장애물 지점에 목표가 없으면 반대편 side 로 넘기고,
+  뒤가 끊기면 연속 창에 전이 2회가 들어가는 속도를 min() 후보로 낸다 (B-30).
 - `vtd_adapter/` — CARLA 표면을 흉내내는 어댑터 (플래너·월드·제어·로거).
 - `config/params.yaml` — VTD·차량·판정 상수의 단일 출처.
   판단(IDM·forecast·lateral) 상수는 `team_code/config.py` 가 단일 출처다.

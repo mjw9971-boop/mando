@@ -99,7 +99,8 @@ def test_apply_without_candidates_keeps_pdm_target():
     assert t == 12.5 and ctrl.accel == 1.0             # 되감지 않았다 (본류 값 그대로)
     assert kr.last_kr_winner is None
     assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
-                               'crosswalk', 'red_zone', 'shift_cap'}
+                               'crosswalk', 'red_zone', 'shift_cap',
+                               'span_v_req'}
 
 
 # ── K1 ───────────────────────────────────────────────────────────────────

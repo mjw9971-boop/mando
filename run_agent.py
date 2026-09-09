@@ -201,7 +201,7 @@ _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
 # GREEN_EXEMPT_WINNERS·CROSSING_WINNERS 판정이 그대로 맞는다 (K1/K2 = light 는 면책 아님).
 _KR24_NAME = {'stop_profile': 'light', 'stop_hold': 'light', 'ped_intent': 'walker',
               'crosswalk': 'walker', 'rtor_cap': 'rtor', 'red_zone': 'red_zone',
-              'shift_cap': 'avoid'}
+              'shift_cap': 'avoid', 'span_v_req': 'avoid'}
 
 
 class Runner:
@@ -385,8 +385,9 @@ class Runner:
         남는 키: initial / winner / leading / vehicle / red_light / sig_src / sig_lead_s /
         yellow / ped / avoid / speed_reduced_by / signal. 사라지는 키: bicycle / pedestrian
         (후보 자체가 없다) / route_end / red_zone. 새 키: kr = {stop_profile, stop_hold,
-        rtor_cap, ped_intent, crosswalk, red_zone, shift_cap} (없는 후보는 null) ·
-        prepass_ms. shift_cap 은 K7 (시프트 전이 횡가속 상한, winner 어휘 'avoid').
+        rtor_cap, ped_intent, crosswalk, red_zone, shift_cap, span_v_req} (없는 후보는 null) ·
+        prepass_ms. shift_cap 은 K7 (시프트 전이 횡가속 상한), span_v_req 는 K8 (이웃 연속 창에
+        전이 2회가 들어가는 속도) — 둘 다 winner 어휘는 'avoid'.
         red_zone 은 kr_rules 의 reasons.red_zone 과 같은 후보다 (K6, 2026-09-09 복원);
         상세 진단(진입점·남은거리)은 reasons.red_zone_detail 로 따로 싣는다.
         winner 어휘는 기존 그대로 (_KR24_NAME) + 'rtor'.
