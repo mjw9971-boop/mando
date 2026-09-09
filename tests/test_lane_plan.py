@@ -276,3 +276,59 @@ def test_no_push_without_a_plan():
     kr.last_lane_plan = None
     chain = {'first': ap._world.get_actors()[0], 'last': ap._world.get_actors()[0]}
     assert kr._lm_no_return_m(p, ap, 8.0, chain) is None
+
+
+# ── 두 칸 시프트: 게이트가 최종 목표를 본다 ──────────────────────────────
+def test_nth_neighbor_walks_the_chain():
+    kr, p, ap = rig(nr_cfg(), actors=[])
+    lg = p.lg
+    assert kr._nth_neighbor(lg, L0, 'right', 1) == L1
+    assert kr._nth_neighbor(lg, L0, 'right', 2) == L2
+    assert kr._nth_neighbor(lg, L0, 'right', 3) is None     # 끊기면 None
+    assert kr._nth_neighbor(lg, L0, 'left', 1) is None
+
+
+def test_gate_target_is_the_final_lane_not_the_middle_one():
+    """옛 코드는 언제나 바로 옆(1칸)만 봤다 — 두 칸 회피에서 중간 차로가 막히면
+    `occupied` 로 매 틱 기각돼 지도가 찾은 빈 차로로 영영 못 갔다.
+
+    실측 `tools/avoid_sim` 케이스 11 (내 차로 55 m, 중간 차로 **22 m**,
+    끝 차로 빔): `right:occupied@p1` **129 → 0**, 정지 **9.1 → 5.3 s**.
+    (케이스 2·4 는 중간 객체가 clear_radius_m(30) 밖이라 이 경로를 안 밟는다.)
+    """
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0), obj(3, 42.0, -3.0)])
+    kr.lane_plan(ap, p)
+    assert kr._lm_hops('right') == 2
+    assert kr._nth_neighbor(p.lg, L0, 'right', kr._lm_hops('right')) == L2
+
+
+def test_middle_lane_is_checked_only_inside_the_ramp():
+    """중간 차로는 목적지가 아니다 — 램프가 훑는 s 구간 밖 객체는 안 본다."""
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0), obj(3, 42.0, -3.0)])
+    lp = kr.lane_plan(ap, p)
+    reach = lp['ramp_m'] + kr.shift_ahead_m
+    assert reach < 42.0                                    # 중간 객체는 램프 밖
+    assert kr._mid_lanes_clear(p.lg, p, ap, L0, 'right', 2) is True
+
+
+def test_middle_lane_blocks_when_inside_the_ramp():
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0), obj(3, 6.0, -3.0)])
+    kr.lane_plan(ap, p)
+    assert kr._mid_lanes_clear(p.lg, p, ap, L0, 'right', 2) is False
+
+
+def test_one_hop_keeps_the_old_target():
+    """한 칸이면 이전과 글자 그대로 같다 — `_lm_hops` 가 None 이라 n=1 이다."""
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0)])
+    kr.lane_plan(ap, p)
+    assert kr._lm_hops('right') is None
+    assert kr._nth_neighbor(p.lg, L0, 'right', 1) == L1
+
+
+def test_moving_object_does_not_block_the_middle_lane():
+    """움직이는 것은 지나간다 — 정지 객체만 램프를 막는다."""
+    kr, p, ap = rig(nr_cfg(), actors=[obj(2, 40.0, 0.0), obj(3, 42.0, -3.0)])
+    kr.lane_plan(ap, p)
+    mover = Box(9, 6.0, -3.0, 5.0, half_w=0.9)
+    ap._world._a.append(mover)
+    assert kr._mid_lanes_clear(p.lg, p, ap, L0, 'right', 2) is True

@@ -2631,6 +2631,56 @@ class KrRules:
             return None, None, info
         return delay, after, info
 
+    @staticmethod
+    def _nth_neighbor(lg, key, side: str, n: int):
+        """side 로 n 칸 떨어진 차로. 도중에 끊기면 None."""
+        for _ in range(max(1, int(n))):
+            key = lg.neighbor(key, side)
+            if key is None:
+                return None
+        return key
+
+    def _mid_lanes_clear(self, lg, planner, ap, ego_lane, side, n_hops) -> bool:
+        """두 칸 이상 갈 때 **중간 차로**가 램프 구간에서 비어 있나.
+
+        중간 차로는 목적지가 아니다 — 거기 서서 기다릴 것이 아니라 지나간다.
+        그래서 `_side_is_clear`(차로 전체 점유)를 걸면 안 되고, **램프가 훑는
+        s 구간**에 객체가 있는지만 보면 된다. 범위는 차로 지도가 계산한 램프
+        길이 + `shift_ahead_m` 이다 (같은 값을 두 곳에서 다시 만들지 않는다).
+
+        스위치는 따로 없다 — `_lm_hops` 가 None 이면 호출되지 않는다.
+        """
+        lp = self.last_lane_plan or {}
+        reach = float(lp.get('ramp_m') or 0.0) + self.shift_ahead_m
+        if reach <= 0.0:
+            return True
+        mids = set()
+        k = ego_lane
+        for _ in range(int(n_hops) - 1):
+            k = lg.neighbor(k, side)
+            if k is None:
+                return False
+            mids.add(k)
+        if not mids:
+            return True
+        try:
+            actors = list(ap._world.get_actors())
+        except Exception:                                  # noqa: BLE001
+            return False
+        ego_id = ap._vehicle.id
+        hops = {m: 0 for m in mids}
+        for a in actors:
+            if a.id == ego_id:
+                continue
+            if float(getattr(a, 'speed', 0.0)) >= self.ot_v_max:
+                continue                                   # 움직이는 것은 지나간다
+            pr = self._project(planner, a.get_location().x, a.get_location().y)
+            if pr is None or not (0.0 < pr[0] <= reach):
+                continue                                   # 램프 구간 밖
+            if self._actor_lanes(lg, a, hops):
+                return False
+        return True
+
     def _side_is_clear(self, lg, planner, ap, target) -> bool:
         """목표 차로에 차가 없는가 (lc_clear 대용 — 아직 후방 추종차는 안 본다)."""
         ego = ap._vehicle
@@ -3355,7 +3405,13 @@ class KrRules:
                 # (C-8 로 no_neighbor 도 라벨이 붙어) 앞선 사유가 가려진다.
                 la.setdefault('rejects', []).append(f'{side}:{gate}@p{n_pass}')
 
-            target = lg.neighbor(ego_lane, side)
+            # 차로 지도가 두 칸을 고르면 게이트도 **최종 목표 차로**를 봐야 한다.
+            # 옛 코드는 언제나 바로 옆(1칸)만 봤다 — 그래서 두 칸 회피에서
+            # 중간 차로가 막혀 있으면 `occupied` 로 기각되고, 지도가 찾은
+            # 빈 차로로 영영 못 간다 (실측 07 rs 2814: lane_plan 이 (2076,3,4)를
+            # 골랐는데 rejects=['right:occupied@p1'] 로 매 틱 기각 → 58 s 갇힘).
+            n_hops = self._lm_hops(side) or 1
+            target = self._nth_neighbor(lg, ego_lane, side, n_hops)
             if target is None:
                 reject('no_neighbor')                      # C-8: 무라벨이던 기각
                 continue
@@ -3462,6 +3518,12 @@ class KrRules:
                                         or self.bo_stop_ticks >= self.bo_hard_ticks)
             if not occ_relaxed and not self._side_is_clear(lg, planner, ap, target):
                 reject('occupied')
+                continue
+            # 중간 차로는 **목적지가 아니라 지나가는 구간**이다. 전체 점유가 아니라
+            # 램프가 실제로 훑는 s 구간에 객체가 있는지만 본다.
+            if n_hops >= 2 and not self._mid_lanes_clear(
+                    lg, planner, ap, ego_lane, side, n_hops):
+                reject('occupied_mid')
                 continue
             ppm = float(getattr(planner, 'points_per_meter', 10))
             # ⑤ 기하 계단 검사 (B-7 임시 가드) — 다른 게이트를 다 통과한 뒤에만
