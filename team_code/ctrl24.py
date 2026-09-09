@@ -214,6 +214,11 @@ class Ctrl24:
         self.last_prepass_ms: float | None = None     # pre_pass 실행 시간 (틱 비용 보고용)
         self._obb_cache = None                        # (후보 id·route_index·span, 교차 id) — 정지 중 재사용
         self.last_obb_cached = False
+        # 자차 OBB 예측 재사용 — pre_pass 와 PDM 이 **같은 입력**으로 두 번 돌지 않게.
+        # 시프트를 적용하면 경로가 달라지므로 _shift_seq 를 올려 캐시를 무효화한다.
+        self._fc_cache: tuple | None = None
+        self._shift_seq = 0
+        self.fc_reused = 0
         self._corridor: list = []                     # 이번 틱 회랑 안 정지 객체 (커밋 3 이 채운다)
         self._tick_lg = None
         self._tick_ego_lane = None
@@ -1045,6 +1050,7 @@ class Ctrl24:
         if getattr(planner, '_lat_build', None) is not None:
             planner.lat_shift[a:b] = planner._lat_build[a:b]
         self._rebuild_kd(planner)
+        self._shift_seq += 1                           # 원복도 경로 변경이다
         self.ot_span = None
         self.ot_side = None
         self.nested = 0
@@ -1079,6 +1085,12 @@ class Ctrl24:
         self._avoid_tick(ap, planner, ego_speed, obb_ids)
         self._prepass_done = True
         self.last_prepass_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+    def fc_key(self, ap, ego_speed, target_speed, n) -> tuple:
+        """자차 OBB 예측의 입력 동일성 키. 하나라도 다르면 캐시 미스(= 다시 계산)다.
+        경로 동일성은 (route_index, _shift_seq) 로 본다 — 시프트·원복이 seq 를 올린다."""
+        return (int(n), repr(float(ego_speed)), repr(float(target_speed)),
+                int(ap._waypoint_planner.route_index), self._shift_seq)
 
     def _obb_static_ids(self, ap, route_np, vehicles, target_speed, ego_speed) -> set:
         """원 경로 기준 자차 OBB 예측(2 s, 차선변경 근처 1.1 s)과 교차하는 **정지** 차량 id.
@@ -1121,6 +1133,9 @@ class Ctrl24:
                                               else cfg.default_forecast_length))
             ego_bbs = ap.forecast_ego_agent(ego.get_transform(), ego_speed, n,
                                             target_speed, route_np)
+            # PDM 이 이번 틱 뒤에 같은 입력으로 다시 부른다 — 시프트를 안 만들었으면
+            # 그 호출이 이 결과를 그대로 쓴다 (Ctrl24AutoPilot.forecast_ego_agent).
+            self._fc_cache = (self.fc_key(ap, ego_speed, target_speed, n), ego_bbs)
             pred = ap.predict_other_actors_bounding_boxes(False, stopped, loc, n, near_lc)
         except Exception:                                  # noqa: BLE001 — 목 조립
             return set()
@@ -1243,6 +1258,7 @@ class Ctrl24:
                 rejects.append(f'{side}:noop')
                 continue
             self._rebuild_kd(planner)
+            self._shift_seq += 1                       # 경로가 바뀌었다 — 예측 캐시 무효
             if self.ot_span is None:
                 self.ot_span = (a, b)
             else:

@@ -178,6 +178,21 @@ class Ctrl24AutoPilot(LoggingAutoPilot):
     def forecast_walkers(self, actors, ego_vehicle_location, number_of_future_frames):
         return [], []
 
+    def forecast_ego_agent(self, transform, speed, n, target, route_points):
+        """ctrl24 pre_pass 가 이번 틱에 **같은 입력**으로 이미 계산했으면 그 결과를 쓴다.
+
+        원문 예측은 자전거 모델 40스텝 + 매 스텝 경로 재조회라 호출당 ≈7 ms 다 (2026-09-09
+        프로파일: 3,000틱에서 3,764회·26.9 s, 그중 764회가 pre_pass 몫). 시프트를 만들면
+        경로가 달라져 캐시가 무효가 되므로(_shift_seq) 그 틱에는 원문대로 다시 돈다.
+        키가 하나라도 다르면 미스 — 판단은 바뀌지 않는다.
+        """
+        kr = self.kr_rules
+        c = getattr(kr, '_fc_cache', None)
+        if c is not None and c[0] == kr.fc_key(self, speed, target, n):
+            kr.fc_reused += 1
+            return c[1]
+        return super().forecast_ego_agent(transform, speed, n, target, route_points)
+
 
 # decision.state 에 쓰는 hazard 명 (이긴 원인). 지시등은 kr_rules 가 따로 낸다.
 _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
