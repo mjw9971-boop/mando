@@ -171,7 +171,9 @@ python3 tools/plot_lane_graph.py data/lane_graph.pkl -o docs/images/map_full.png
    - 출력의 `total_length` / 창 경고 / `events` 개수를 눈으로 확인
 3. `tools/plot_lane_graph.py` 로 경로를 그려서 **의도한 길인지 확인**
 4. `python3 tools/probe_9910.py --host <VTD_IP>` 로 프레임 수신 확인
-5. 종료 지점 좌표를 받으면 `scoring.finish_xy` 에 기입 (완주 판정·종점 정지가 이 값을 쓴다)
+5. 종료 지점 좌표를 받으면 `scoring.finish_xy` 에 기입 (완주 판정이 이 값을 쓴다.
+   `ctrl24.enable=true` 인 현행 제어기는 **종점에 서지 않고 계속 주행**한다 — 완주 판정은
+   `batch_run` 이 임계 도달 뒤 유예로 끝낸다. `kr_rules` 경로에서는 종점 정지도 이 값을 쓴다)
 
 **연결 후**
 
@@ -228,6 +230,7 @@ python3 tools/plot_lane_graph.py data/lane_graph.pkl -o docs/images/map_full.png
 | `vtd_adapter/control` | 종방향 P + 감속 클램프 + jerk 제한 |
 | `vtd_adapter/lanegraph` | 창 병합·cum_s·lookahead·dashed_runs(점선 단일 출처) 완비 |
 | `team_code/autopilot` | PDM-Lite 원문 (`_manage_route_obstacle_scenarios` 는 stub) |
-| `team_code/kr_rules` | route_end 종점 정지 + 적신호 정지선 최소 유지 + 방향지시등. RTOR·황색 딜레마는 미착수 |
+| `team_code/kr_rules` | route_end 종점 정지 + 적신호 정지선 최소 유지 + 방향지시등 (won 제어기 — `ctrl24.enable=false`) |
+| `team_code/ctrl24` | **현행 기본.** 정지선 프로파일·유지 · 황색 원샷 · RTOR · 보행자 래치 · 지시등 + 정적 장애물 첫 틱 회피·중첩 시프트. 종점 정지 없음 |
 | shield (corridor·실선·중앙선·TTC 비상제동) | **없음** — 안전망은 SAFE_STOP·watchdog·리셋 초기화뿐 |
 | tools | replay·summarize_run·score·scp_client·batch_run·gen_scenarios 실전 사용 중 |
