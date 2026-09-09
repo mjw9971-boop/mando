@@ -98,3 +98,64 @@ def test_taper_alternative_needs_no_lane_change(lg):
     """대안이 successor 로 이어져야 벌점이 실제로 먹힌다 (차선변경 축과 분리)."""
     assert (1821, 0, -3) in lg.lanes
     assert lg.neighbor((1821, 0, -2), 'right') == (1821, 0, -3)
+
+
+# ── 회전 차로 **제약** (turn_lane_constraint_enable) ──────────────────────
+def test_constraint_is_on_and_bias_is_off():
+    """제약이 가산점을 대체한다 — 두 축이 같은 일을 하면 안 된다."""
+    assert CFG['route']['turn_lane_constraint_enable'] is True
+    assert CFG['route']['turn_lane_bias_m'] == 0.0
+
+
+def test_lanelink_cannot_express_the_constraint(lg):
+    """**laneLink 로는 못 만든다** — 노면 표시보다 관대하다.
+
+    junction connection 의 laneLink 로 차로별 허용 회전 집합을 만들면
+    (146,0,1) 은 L·S·R 을 전부 갖는다. 그래서 "회전 방향이 그 집합에 없으면
+    제외" 는 실측 위반 19건 중 한 건도 못 거른다. 화살표는 L 하나다.
+    """
+    import numpy as np
+    def link_turns(k):
+        out = set()
+        for k2 in lg.lanes[k]['next']:
+            if lg.lanes.get(k2, {}).get('junction', -1) == -1:
+                continue
+            h = np.asarray(lg.lanes[k2]['hdg'])
+            if len(h) < 2:
+                continue
+            d = np.degrees((h[-1] - h[0] + np.pi) % (2 * np.pi) - np.pi)
+            if abs(d) <= 135.0:
+                out.add('L' if d > 25 else ('R' if d < -25 else 'S'))
+        return out
+    assert 'R' in link_turns((146, 0, 1))               # laneLink 는 허용한다
+    assert br.arrow_allows(lg, (146, 0, 1), 'R') is False   # 화살표는 금지한다
+
+
+def test_constraint_blocks_the_measured_violation(lg):
+    """(146,0,1) 에서 우회전 금지 — 옆 (146,0,2) 가 SR 을 갖고 있다."""
+    assert br.turn_lane_blocked(lg, (146, 0, 1), 'R') is True
+    assert br.turn_lane_blocked(lg, (146, 0, 2), 'R') is False
+
+
+def test_constraint_blocks_the_left_turn_case(lg):
+    """(126,7,-2) 화살표 S·SR 에서 좌회전 금지 — (126,7,-1) 이 L 을 갖는다."""
+    assert br.turn_lane_blocked(lg, (126, 7, -2), 'L') is True
+    assert br.turn_lane_blocked(lg, (126, 7, -1), 'L') is False
+
+
+def test_safety_net_when_no_lane_has_the_arrow(lg):
+    """접근로 전체에 그 화살표가 없으면 **막지 않는다** — 지도 데이터 공백.
+
+    막으면 경로가 통째로 불가능해진다. 실측 (190,0,1) 은 그 방향 유일 차로인데
+    화살표가 L 인데도 경로는 우회전한다.
+    """
+    assert br.arrow_allows(lg, (190, 0, 1), 'R') is False
+    assert br.turn_lane_blocked(lg, (190, 0, 1), 'R') is False
+
+
+def test_lane_without_arrows_is_never_blocked(lg):
+    """화살표가 없는 차로는 판정 대상이 아니다 (지도의 60 %)."""
+    k = next(k for k, r in lg.lanes.items()
+             if r.get('junction', -1) == -1 and not r.get('arrows'))
+    assert br.arrow_allows(lg, k, 'R') is None
+    assert br.turn_lane_blocked(lg, k, 'R') is False

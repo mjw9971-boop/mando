@@ -90,6 +90,71 @@ def is_taper_lane(lg, key, veh_width=None) -> bool:
     return lg.width_at(key, lg.length(key)) < veh_width
 
 
+_TURN_CONSTRAINT = None
+
+
+def turn_constraint_on(reload=False) -> bool:
+    """params.yaml route.turn_lane_constraint_enable — 회전 차로 **제약**.
+
+    가산점(turn_lane_bias_m)이 아니라 후보 제외다. false = 이전 동작.
+    """
+    global _TURN_CONSTRAINT
+    if _TURN_CONSTRAINT is None or reload:
+        from vtd_adapter.config import load_params_yaml
+        _TURN_CONSTRAINT = bool((load_params_yaml().get('route') or {})
+                                .get('turn_lane_constraint_enable', False))
+    return _TURN_CONSTRAINT
+
+
+def arrow_allows(lg, key, turn: str):
+    """노면 화살표가 이 차로에서 `turn`('L'/'S'/'R')을 허용하나. 화살표 없으면 None.
+
+    **laneLink 는 쓰면 안 된다.** junction connection 의 laneLink 는 노면 표시보다
+    관대하다 — 실측(2026-09-09, 진입 차로 552개 중 화살표 보유 472개):
+    laneLink 와 화살표가 같은 것 327, **laneLink 가 더 관대한 것 69**,
+    화살표가 더 관대한 것 76. 그래서 "회전 방향이 laneLink 에 없으면 제외" 는
+    회전 차로 위반 19건 중 **한 건도 못 거른다** (전부 laneLink 에는 있다).
+    예: (146,0,1) 화살표 L(좌회전 전용)인데 laneLink 는 L·S·R 전부 있다.
+
+    표기는 조합 문자열이다 — 'SR'(직진+우회전) · 'LU'(좌회전+유턴) · 'SL'.
+    """
+    a = lg.lanes[key].get('arrows') or []
+    if not a:
+        return None
+    return any(turn in t for _s, t in a)
+
+
+def _same_dir_siblings(lg, key):
+    """같은 방향 이웃 전부 (자기 포함) — lg.neighbor 만 쓴다."""
+    out = [key]
+    for side in ('left', 'right'):
+        k = key
+        for _ in range(8):
+            k = lg.neighbor(k, side)
+            if k is None or k in out:
+                break
+            out.append(k)
+    return out
+
+
+def turn_lane_blocked(lg, key, turn: str) -> bool:
+    """회전 차로 제약 — 이 차로에서 `turn` 이 **금지**되나.
+
+    참이 되는 조건은 둘 다여야 한다:
+      1. 이 차로의 노면 화살표가 `turn` 을 허용하지 않는다.
+      2. **같은 방향 이웃 중 허용하는 차로가 있다.**
+
+    2번이 안전망이다 — 접근로 전체에 그 회전 화살표가 하나도 없으면 지도의
+    데이터 공백이므로(실측: road 62·100 의 우회전 등) 막으면 경로가 통째로
+    불가능해진다. 그때는 이전 동작 그대로 통과시킨다.
+    """
+    ok = arrow_allows(lg, key, turn)
+    if ok is None or ok:
+        return False
+    return any(arrow_allows(lg, k, turn) for k in _same_dir_siblings(lg, key)
+               if k != key)
+
+
 _TURN_BIAS = None
 _TURN_KIND: dict = {}
 _SIDE_N: dict = {}
@@ -715,6 +780,8 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset(),
     taper_pen = tp_m if (tp_on and tp_m > 0.0) else 0.0
     # 회전 방향 차로 선호 [m/칸]. 0 이면 이전 동작 (계산도 안 한다).
     turn_bias = turn_bias_m()
+    # 회전 차로 **제약** — 노면 화살표가 금지하는 회전은 후보에서 뺀다.
+    turn_con = turn_constraint_on()
     for key, s in starts:
         if key in tgt and tgt[key] >= s - 1e-6:
             # 같은 차로 안에서 도달
@@ -741,14 +808,15 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset(),
             L2 = lg.length(k2)
             pen = taper_pen if (taper_pen > 0.0 and lg.lanes[k2].get('junction', -1) != -1
                                 and is_taper_lane(lg, k2, veh_w)) else 0.0
-            if turn_bias > 0.0:
-                # 우회전 연결로에 드는데 진입 차로 오른쪽에 차로가 남아 있으면
-                # 그 칸 수만큼 문다 (좌회전은 왼쪽). 규정은 "회전은 그 방향
-                # 끝 차로에서" 다. 벌점은 successor 진입에만 붙는다 —
-                # 대안이 차선변경이면 그 비용(LC_PENALTY + 회랑 부족분)과 겨룬다.
+            if turn_bias > 0.0 or turn_con:
                 tk = connector_turn(lg, k2)
                 if tk is not None:
-                    pen += turn_bias * lanes_on_side(lg, key, tk)
+                    if turn_con and turn_lane_blocked(lg, key, 'L' if tk == 'left' else 'R'):
+                        continue          # 노면 화살표가 금지한다 — 후보에서 제외
+                    if turn_bias > 0.0:
+                        # 우회전 연결로에 드는데 진입 차로 오른쪽에 차로가 남아
+                        # 있으면 그 칸 수만큼 문다 (좌회전은 왼쪽).
+                        pen += turn_bias * lanes_on_side(lg, key, tk)
             if k2 in tgt:
                 heapq.heappush(heap, (cost + tgt[k2] + pen, k2, 0.0, (key, s_enter), root, True))
             heapq.heappush(heap, (cost + L2 + pen, k2, 0.0, (key, s_enter), root, False))
