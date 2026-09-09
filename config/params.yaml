@@ -1824,7 +1824,9 @@ pdm:
 # 각자 한 곳에서 읽는다" 이지 이원화가 아니다 — ctrl24 는 위 섹션을 읽지 않는다.
 # 예외(여기 없고 다른 섹션을 읽는 값): vehicle.* · control.a_dec_max · speed.a_emergency ·
 # speed.stop_gap_stopline_m(PDM 주입 s0) · percep.obstacle_clearance_m(회랑 여유 —
-# P1 정지 객체 폭 판정과 같은 값이어야 한다) · comm.send_hz.
+# P1 정지 객체 폭 판정과 같은 값이어야 한다) · comm.send_hz ·
+# K6 이 읽는 speed.approach_decel_mps2 · speed.red_lookahead_m · speed.red_zone_target_kph
+# 와 red_zone.exit_margin_m (lanegraph 경유).
 # ══════════════════════════════════════════════════════════════════════════
 ctrl24:
   enable: true
@@ -1856,6 +1858,13 @@ ctrl24:
   ped_crosswalk_lat_m: 4.0
   ped_crosswalk_wait_s: 3.0
   ped_crosswalk_creep_v: 2.0
+  # ── K6 붉은 구간(보호구역) 진입 전 감속 — 2026-09-09 복원 ────────────────
+  # 뺀 채로 돌린 mock 폐루프 32경로에서 보호구역 속도 초과가 13경로에서 5 km/h(항목 2
+  # 중대 기준)를 넘었고 최대 15.8 km/h 였다 (kr_rules 는 0경로·최대 0.5). 그래서 되살린다.
+  # **상수는 기존 speed.* / red_zone.* 를 그대로 읽는다** — approach_decel_mps2 ·
+  # red_lookahead_m · red_zone_target_kph · (lanegraph 경유) red_zone.exit_margin_m.
+  # 여기에는 켜고 끄는 스위치만 둔다. false = 2026-09-08~09 의 동작(후보 없음).
+  red_zone_enable: true
   # ── 지시등 (signal.* 과 같은 값) ───────────────────────────────────────
   turn_lead_s: 4.0
   lc_lead_s: 3.0

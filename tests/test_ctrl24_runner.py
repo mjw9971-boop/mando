@@ -107,7 +107,9 @@ def test_runner_selects_controller_by_switch(tmp_path):
     # route_end 는 logger.SPEED_CANDIDATES 의 옛 이름이라 null 로 깔린다 (값 없음이 계약)
     assert 'bicycle' not in r and 'pedestrian' not in r and 'red_zone' not in r
     assert r['route_end'] is None
-    assert set(r['kr']) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent', 'crosswalk'}
-    assert r['winner'] in ('none', 'lead', 'vehicle', 'light', 'walker', 'rtor')
+    assert set(r['kr']) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
+                            'crosswalk', 'red_zone'}
+    assert r['winner'] in ('none', 'lead', 'vehicle', 'light', 'walker', 'rtor', 'red_zone')
+    assert 'red_zone_detail' in r
     assert 'prepass_ms' in r and 'signal' in r
     assert ticks[-1]['decision']['turn_signal'] in (0, 1, 2)

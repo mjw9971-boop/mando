@@ -98,7 +98,8 @@ def test_apply_without_candidates_keeps_pdm_target():
     ctrl, t = apply(kr, ap, v=5.0, target=12.5)
     assert t == 12.5 and ctrl.accel == 1.0             # 되감지 않았다 (본류 값 그대로)
     assert kr.last_kr_winner is None
-    assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent', 'crosswalk'}
+    assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
+                               'crosswalk', 'red_zone'}
 
 
 # ── K1 ───────────────────────────────────────────────────────────────────
@@ -245,3 +246,59 @@ def test_on_reset_clears_latches():
     assert kr.y_decision == 'stop'
     kr.on_reset()
     assert kr.y_decision is None and kr.sl_hold_left == 0 and not kr.ped_intent
+
+
+# ── K6 붉은 구간 진입 전 감속 (2026-09-09 복원) ──────────────────────────
+class RedPlanner(Planner):
+    """붉은 구간이 entry_s 부터 있는 경로 목 — route_waypoints/lg.red_spans 를 흉내낸다."""
+
+    def __init__(self, entry_s=40.0, exit_s=52.0, **kw):
+        super().__init__(**kw)
+        key = (7, 0, -1)
+        self.lg = type('LG', (), {
+            'lanes': {key: {'red_spans': [(entry_s, exit_s)], 'junction': -1}},
+            '_red_cfg': (True, 30.0, 0.0)})()
+        self.route_waypoints = [type('W', (), {'key': key, 's': float(x)})()
+                                for x in self.route_s]
+
+
+def red_rig(cfg=CFG, entry_s=40.0):
+    p = RedPlanner(entry_s=entry_s, d_tl=float('inf'))
+    ap = Ap(p, [])
+    ap._longitudinal_controller = VtdLongitudinalController(cfg)
+    kr = Ctrl24(cfg)
+    kr._sl_all = []
+    return kr, p, ap
+
+
+def test_k6_reads_existing_speed_constants():
+    kr, _p, _ap = red_rig()
+    assert kr.red_approach is True
+    assert kr.red_a == CFG['speed']['approach_decel_mps2']
+    assert kr.red_look_m == CFG['speed']['red_lookahead_m']
+    assert kr.red_v_zone == pytest.approx(CFG['speed']['red_zone_target_kph'] / 3.6)
+
+
+def test_k6_ceiling_matches_kr_rules_formula_and_stops_inside_zone():
+    kr, p, ap = red_rig(entry_s=40.0)
+    p.route_index = int(20.0 / 0.1)                  # 진입점 20 m 앞
+    _c, t = apply(kr, ap, v=12.0)
+    vz = CFG['speed']['red_zone_target_kph'] / 3.6
+    want = math.sqrt(vz * vz + 2.0 * CFG['speed']['approach_decel_mps2'] * 20.0)
+    assert t == pytest.approx(want)
+    assert kr.last_kr['red_zone'] == pytest.approx(round(want, 3))
+    assert kr.last_kr_winner == 'red_zone'
+    assert kr.last_red_zone['entry_s'] == 40.0 and kr.last_red_zone['d'] == 20.0
+    p.route_index = int(45.0 / 0.1)                  # 구간 안 — 후보 없음 (제한속도 소관)
+    _c, t = apply(kr, ap, v=7.0)
+    assert kr.last_kr['red_zone'] is None and t == 12.5
+
+
+def test_k6_silent_beyond_lookahead_and_when_off():
+    kr, p, ap = red_rig(entry_s=200.0)               # lookahead 60 m 밖
+    _c, t = apply(kr, ap, v=12.0)
+    assert kr.last_kr['red_zone'] is None and t == 12.5
+    kr2, p2, ap2 = red_rig(cfg_with(red_zone_enable=False), entry_s=40.0)
+    p2.route_index = int(20.0 / 0.1)
+    _c, t = apply(kr2, ap2, v=12.0)
+    assert kr2.last_kr['red_zone'] is None and t == 12.5

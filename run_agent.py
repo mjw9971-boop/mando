@@ -200,7 +200,7 @@ _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
 # ctrl24 kr 후보(reasons.kr) → winner 어휘. 기존 어휘를 유지해 score/batch_run 의
 # GREEN_EXEMPT_WINNERS·CROSSING_WINNERS 판정이 그대로 맞는다 (K1/K2 = light 는 면책 아님).
 _KR24_NAME = {'stop_profile': 'light', 'stop_hold': 'light', 'ped_intent': 'walker',
-              'crosswalk': 'walker', 'rtor_cap': 'rtor'}
+              'crosswalk': 'walker', 'rtor_cap': 'rtor', 'red_zone': 'red_zone'}
 
 
 class Runner:
@@ -384,7 +384,9 @@ class Runner:
         남는 키: initial / winner / leading / vehicle / red_light / sig_src / sig_lead_s /
         yellow / ped / avoid / speed_reduced_by / signal. 사라지는 키: bicycle / pedestrian
         (후보 자체가 없다) / route_end / red_zone. 새 키: kr = {stop_profile, stop_hold,
-        rtor_cap, ped_intent, crosswalk} (없는 후보는 null) · prepass_ms.
+        rtor_cap, ped_intent, crosswalk, red_zone} (없는 후보는 null) · prepass_ms.
+        red_zone 은 kr_rules 의 reasons.red_zone 과 같은 후보다 (K6, 2026-09-09 복원);
+        상세 진단(진입점·남은거리)은 reasons.red_zone_detail 로 따로 싣는다.
         winner 어휘는 기존 그대로 (_KR24_NAME) + 'rtor'.
         """
         cand.pop('bicycle', None)
@@ -405,6 +407,7 @@ class Runner:
                    'yellow': self.kr.last_yellow,
                    'ped': self.kr.last_ped,
                    'avoid': self.kr.last_avoid,
+                   'red_zone_detail': self.kr.last_red_zone,
                    'prepass_ms': self.kr.last_prepass_ms}
         if self.kr.last_signal is not None:
             reasons['signal'] = self.kr.last_signal

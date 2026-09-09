@@ -13,12 +13,14 @@ kr_rules 와의 차이 (설계 결정 2026-09-08, 사용자 승인):
         K3 ped_intent(walkin·multi hold·release) · K4 emergency · K5 crosswalk(기본 off) ·
         황색 원샷 STOP/GO · 교차로 통과 가드 · 보행자 래치 · timeout GO · RTOR · 지시등
   제거  PDM bicycle·pedestrian 후보(run_agent 가 forecast_walkers 를 비운다) · route_end ·
-        BREAKOUT · standoff(프로파일·크립·delay) · shift_cap · gap_v_req · red_zone 접근 감속 ·
+        BREAKOUT · standoff(프로파일·크립·delay) · shift_cap · gap_v_req ·
         큐 판정·SUPPRESS · WAIT/WAIT_EXPIRED/REACTIVE · 정지 관찰 시계 전부 · span_extend ·
         preempt_latch · side 게이트 8개(no_neighbor/center_line/geom/zone/solid/occupied/
         kappa·lc_overlap/entry_block) · side_pick · gap_fit · shift_entry
+  복원  K6 red_zone 붉은 구간 진입 전 감속 (2026-09-09 Q3 번복 — 근거는 _red_approach_profile)
   변경  정적 장애물은 첫 틱에 PREEMPT (관찰·대기·예산 없음) · side 게이트는 span_too_far 하나 ·
-        중첩 시프트 (활성 span 위에 같은 방향으로 한 칸 더, 횟수 제한 없음) ·
+        중첩 시프트 (활성 span 위에 같은 방향으로 한 칸 더, 횟수 제한 없음 — 요동 방지는
+        "같은 (객체, 방향) 은 **그 span 동안 1회**", 2026-09-09 사양 확정) ·
         종점 정지 없이 계속 주행 (route.py 의 종점 패드) · P2 정지 객체는 pre_pass 시프트로 넘긴다
 
 상수는 config/params.yaml 의 `ctrl24:` 섹션이 단일 출처다. 차량 제원·종방향 한계
@@ -114,6 +116,16 @@ class Ctrl24:
         self.cw_lat_m = float(c['ped_crosswalk_lat_m'])
         self.cw_wait_ticks = int(round(float(c['ped_crosswalk_wait_s']) * self.hz))
         self.cw_creep_v = float(c['ped_crosswalk_creep_v'])
+        # ── K6 붉은 구간(보호구역) 진입 전 감속 — 2026-09-09 복원 (Q3 번복) ──
+        # 상수는 **기존 speed.* / red_zone.* 를 그대로 읽는다** (값을 두 곳에 적지 않는다):
+        #   speed.approach_decel_mps2 · speed.red_lookahead_m · speed.red_zone_target_kph,
+        #   구간 이탈 여유는 lanegraph 의 red_span_cfg (red_zone.exit_margin_m).
+        # ctrl24 는 켜고 끄는 스위치 하나(ctrl24.red_zone_enable)만 자기 섹션에 둔다.
+        sp = cfg['speed']
+        self.red_approach = bool(c['red_zone_enable'])
+        self.red_a = float(sp['approach_decel_mps2'])
+        self.red_look_m = float(sp['red_lookahead_m'])
+        self.red_v_zone = float(sp['red_zone_target_kph']) / 3.6
         self.a_emergency = float(cfg['speed']['a_emergency'])
         self.a_dec_max = abs(float(cfg['control']['a_dec_max']))
         self.detect_max_m = float(c['detect_max_m'])
@@ -170,6 +182,8 @@ class Ctrl24:
         self.last_ped: dict | None = None
         self.last_yellow: dict | None = None
         self.last_signal: dict | None = None
+        self.red_ivals: list | None = None            # 경로당 1회 캐시 [(진입 s, 이탈 s)]
+        self.last_red_zone: dict | None = None        # K6 진단 (진입점·남은거리)
         self.ped_emergency = False
         self.last_turn_signal: int = SIG_OFF
         self.last_sig_src: str | None = None
@@ -1293,6 +1307,85 @@ class Ctrl24:
         except TypeError:
             return int(f(left))
 
+    # ── K6 붉은 구간 진입 전 감속 (kr_rules 원문 이식, 2026-09-09 복원) ────────
+    def _red_intervals(self, planner) -> list:
+        """경로 위 붉은 구간 [(진입 route_s, 이탈 route_s)] — 경로당 1회.
+
+        재료는 route_waypoints[i].key/.s 와 lane_graph 의 red_spans 다 — 제한속도
+        배열로 역추정하지 않는다 (그 배열은 carry 가 섞여 "구간에서 물고 나온 30" 과
+        "구간 안" 이 구분되지 않는다). 이탈 쪽은 red_zone.exit_margin_m 을 얹은
+        지점이라 speed_limit_at 이 캡을 푸는 지점과 같은 축이다.
+        """
+        lg = getattr(planner, 'lg', None)
+        wps = getattr(planner, 'route_waypoints', None)
+        rs = getattr(planner, 'route_s', None)
+        if lg is None or not wps or rs is None:
+            return []
+        try:
+            from vtd_adapter.lanegraph import red_span_cfg
+            _on, _kph, exit_m = getattr(lg, '_red_cfg', None) or red_span_cfg()
+        except Exception:                                  # noqa: BLE001 — 목 플래너
+            exit_m = 0.0
+        out: list = []
+        inside = False
+        for i in range(min(len(wps), len(rs))):
+            wp = wps[i]
+            try:
+                spans = lg.lanes[wp.key].get('red_spans') or []
+            except Exception:                              # noqa: BLE001
+                spans = []
+            hit = any(s0 <= wp.s <= s1 + exit_m for s0, s1 in spans)
+            if hit and not inside:
+                out.append([float(rs[i]), float(rs[i])])
+                inside = True
+            elif hit:
+                out[-1][1] = float(rs[i])
+            else:
+                inside = False
+        return [(a, b) for a, b in out]
+
+    def _red_approach_profile(self, planner) -> float | None:
+        """K6: 붉은 구간 **진입 전** 감속 상한 — min() 후보. K1 과 같은 형태다.
+
+            v_ceiling = √(v_zone² + 2·a·d)      d = 진입점까지 남은 경로거리
+
+        구간 **안**에서는 후보를 내지 않는다 — 거기서는 제한속도(red_zone.limit_kph −
+        speed.margin_kph)가 이미 상한이고, 두 상한을 겹치면 어느 쪽이 묶는지 로그에서
+        갈리지 않는다.
+
+        2026-09-09 복원 근거 (Q3 번복). 이 후보를 뺀 채로 돌린 mock 폐루프 32경로에서
+        보호구역 속도 초과가 **13경로에서 5 km/h(항목 2 중대 기준) 초과**, 최대
+        15.8 km/h 였다. 같은 조건의 kr_rules(이 후보 있음)는 0경로·최대 0.5 km/h.
+        50 도로(45 km/h)에서 27 km/h 로 줄이려면 a=2.0 에 25 m 가 드는데 붉은 구간
+        124개 중 43개가 18 m 미만이라, 진입 뒤에 줄이기 시작하면 구간 안에서 초과가 난다.
+        """
+        if not self.red_approach or self.red_a <= 0.0:
+            return None
+        if self.red_ivals is None:
+            self.red_ivals = self._red_intervals(planner)
+        if not self.red_ivals:
+            return None
+        try:
+            route_s = float(planner.route_s[planner.route_index])
+        except Exception:                                  # noqa: BLE001
+            return None
+        nxt = None
+        for a, b in self.red_ivals:
+            if a <= route_s <= b:
+                return None                                # 구간 안 — 제한속도 소관
+            if a > route_s:
+                nxt = a
+                break
+        if nxt is None:
+            return None
+        d = nxt - route_s
+        if d > self.red_look_m:
+            return None
+        v = _math.sqrt(self.red_v_zone * self.red_v_zone + 2.0 * self.red_a * max(0.0, d))
+        self.last_red_zone = {'d': round(d, 1), 'v_allow': round(v, 2),
+                              'entry_s': round(nxt, 1)}
+        return v
+
     # ── 리셋 ──────────────────────────────────────────────────────────────
     def on_reset(self) -> None:
         """courseRespawn — 순간이동 전 래치는 전부 무효 (run_agent 가 부른다)."""
@@ -1326,6 +1419,7 @@ class Ctrl24:
         self.last_ped = None
         self.last_kr = {}
         self.last_kr_winner = None
+        self.last_red_zone = None
         self.ped_emergency = False
         if not self._prepass_done:
             # pre_pass 가 이미 이 틱의 회피 진단을 만들었으면 지우지 않는다 (2026-09-08
@@ -1365,6 +1459,7 @@ class Ctrl24:
         prof = self._stopline_profile(planner, ap)
         self.last_stop_profile = prof
         add('stop_profile', prof)
+        add('red_zone', self._red_approach_profile(planner))
         add('stop_hold', self._stopline_hold(planner, ego_speed))
         add('rtor_cap', self._rtor_cap())
         ped = self._ped_intent(planner, ap, ego_speed)
