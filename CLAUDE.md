@@ -70,6 +70,9 @@
   won 과 틱 단위 동일(리플레이 diff 0 확인). 상수는 `ctrl24:` 섹션이 단일 출처.
   정적 장애물은 첫 틱 PREEMPT(게이트 span_too_far 하나)·중첩 시프트, 종점에 서지
   않고 계속 주행(route.py 종점 패드 300 m, batch_run 완주 래치).
+  geom 게이트를 삭제한 대가는 **기각이 아니라 속도로** 갚는다 — K7 shift_cap
+  (`ctrl24.shift_cap_enable`, 상수는 `overtake.a_lat_max`·`shift_cap_min_v`·
+  `shift_latest_m`)이 시프트 활성 구간에서만 곡률 상한을 min() 후보로 낸다.
 - `vtd_adapter/` — CARLA 표면을 흉내내는 어댑터 (플래너·월드·제어·로거).
 - `config/params.yaml` — VTD·차량·판정 상수의 단일 출처.
   판단(IDM·forecast·lateral) 상수는 `team_code/config.py` 가 단일 출처다.

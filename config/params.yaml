@@ -1919,6 +1919,20 @@ ctrl24:
   prepass_obb_reach_k: 1.5
   prepass_obb_reach_extra_m: 10.0
   prepass_obb_lat_m: 8.0
+  # ── K7 시프트 전이 횡가속 상한 (2026-09-09) ────────────────────────────
+  # geom 게이트(전이 + shift_ahead + 여유가 장애물까지 거리에 들어가는가)를 삭제한
+  # 대가로, 공간이 부족한 채 만들어진 시프트가 남는다 — 리플레이 40건 실측
+  # 2026-09-09: 시프트 활성 41구간 중 5구간(319틱)이 생성 시 geom 여유 음수
+  # (−5.3 ~ −20.7 m, 02_직진11 3건 · 16_직진6 1건)이고 그 구간에서 조향이
+  # |steer| ≥ 0.47 로 포화했다.
+  # 게이트를 되살리면 정적 장애물 고착이 돌아오므로 **기각하지 않고**, 그 전이를
+  # 지날 속도만 제한한다 (kr_rules._shift_speed_cap 원문 이식):
+  #   κ = |d²(lat_shift − _lat_build)/ds²|,  v ≤ max(shift_cap_min_v, √(a_lat_max/κ))
+  # 상수는 overtake.a_lat_max · overtake.shift_cap_min_v · overtake.shift_latest_m
+  # 을 **그대로 읽는다** (값을 두 곳에 적지 않는다. shift_latest_m 은 params 주석이
+  # 이미 "_shift_speed_cap 의 미리보기 창" 이라고 소비처를 적어 둔 값이다).
+  # 게이트가 아니다 — 시프트 생성·중첩 판정에 관여하지 않는다. false = 이전 동작.
+  shift_cap_enable: true
   # ── 종점 (D) — route.py 가 읽는다 ─────────────────────────────────────
   # successor 가 끝난 뒤 마지막 헤딩으로 붙이는 직선 패드 [m]. 0 = 패드 없음.
   # 없으면 PDM 룩어헤드가 마지막 점으로 고정돼 통과 후 뒤를 향해 조향한다.

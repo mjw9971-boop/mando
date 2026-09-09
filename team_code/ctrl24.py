@@ -13,11 +13,13 @@ kr_rules 와의 차이 (설계 결정 2026-09-08, 사용자 승인):
         K3 ped_intent(walkin·multi hold·release) · K4 emergency · K5 crosswalk(기본 off) ·
         황색 원샷 STOP/GO · 교차로 통과 가드 · 보행자 래치 · timeout GO · RTOR · 지시등
   제거  PDM bicycle·pedestrian 후보(run_agent 가 forecast_walkers 를 비운다) · route_end ·
-        BREAKOUT · standoff(프로파일·크립·delay) · shift_cap · gap_v_req ·
+        BREAKOUT · standoff(프로파일·크립·delay) · gap_v_req ·
         큐 판정·SUPPRESS · WAIT/WAIT_EXPIRED/REACTIVE · 정지 관찰 시계 전부 · span_extend ·
         preempt_latch · side 게이트 8개(no_neighbor/center_line/geom/zone/solid/occupied/
         kappa·lc_overlap/entry_block) · side_pick · gap_fit · shift_entry
   복원  K6 red_zone 붉은 구간 진입 전 감속 (2026-09-09 Q3 번복 — 근거는 _red_approach_profile)
+        K7 shift_cap 시프트 전이 횡가속 상한 (2026-09-09 — geom 게이트 삭제의 대가를
+        기각이 아니라 속도로 갚는다. 근거는 _shift_speed_cap)
   변경  정적 장애물은 첫 틱에 PREEMPT (관찰·대기·예산 없음) · side 게이트는 span_too_far 하나 ·
         중첩 시프트 (활성 span 위에 같은 방향으로 한 칸 더, 횟수 제한 없음 — 요동 방지는
         "같은 (객체, 방향) 은 **그 span 동안 1회**", 2026-09-09 사양 확정) ·
@@ -25,7 +27,8 @@ kr_rules 와의 차이 (설계 결정 2026-09-08, 사용자 승인):
 
 상수는 config/params.yaml 의 `ctrl24:` 섹션이 단일 출처다. 차량 제원·종방향 한계
 (vehicle.* / control.a_dec_max / speed.a_emergency)·회랑 여유(percep.obstacle_clearance_m —
-P1 의 정지 객체 폭 판정과 같은 값이어야 한다)는 그 섹션을 읽는다.
+P1 의 정지 객체 폭 판정과 같은 값이어야 한다)·K6 의 speed.*·red_zone.*·K7 의
+overtake.a_lat_max·shift_cap_min_v·shift_latest_m 은 그 섹션을 읽는다.
 """
 from __future__ import annotations
 
@@ -146,6 +149,16 @@ class Ctrl24:
         self.obb_reach_k = float(c['prepass_obb_reach_k'])
         self.obb_reach_extra_m = float(c['prepass_obb_reach_extra_m'])
         self.obb_lat_m = float(c['prepass_obb_lat_m'])
+        # ── K7 시프트 전이 횡가속 상한 ─────────────────────────────────────
+        # 상수는 overtake.* 를 그대로 읽는다 (K6 이 speed.* 를 읽는 것과 같은 규칙).
+        # ctrl24 는 켜고 끄는 스위치 하나(ctrl24.shift_cap_enable)만 자기 섹션에 둔다.
+        ot = cfg.get('overtake') or {}
+        self.shift_cap_on = bool(c['shift_cap_enable'])
+        self.a_lat_max = float(ot.get('a_lat_max', 0.0))
+        self.shift_cap_min_v = float(ot.get('shift_cap_min_v', 1.0))
+        # 미리보기 창의 바닥 [m] — 전이에 **닿기 전에** 감속이 시작돼야 한다.
+        # 창의 속도항은 ctrl24 자신의 전이 계수(trans_k)를 쓴다 (전이 길이와 같은 축).
+        self.shift_cap_look_m = float(ot.get('shift_latest_m', 25.0))
         # ── 지시등 ─────────────────────────────────────────────────────────
         self.turn_lead_s = float(c['turn_lead_s'])
         self.lc_lead_s = float(c['lc_lead_s'])
@@ -1386,6 +1399,58 @@ class Ctrl24:
                               'entry_s': round(nxt, 1)}
         return v
 
+    # ── K7 시프트 전이 횡가속 상한 (kr_rules._shift_speed_cap 원문 이식) ──────
+    def _shift_speed_cap(self, planner, ego_speed: float) -> float | None:
+        """진행 중인 회피 시프트의 전이 곡률에서 나오는 **속도 상한** — min() 후보.
+
+        전이 길이 `trans = max(trans_min_m, trans_k·v)` 는 시프트를 **만든 시점**의
+        속도로 굳는다. 정지 중 생성되면 8 m 인데 그대로 6~7 m/s 로 지나면 요구
+        횡가속이 a_lat_max 를 크게 넘어 조향이 풀락으로 포화한다.
+
+        ctrl24 는 geom 게이트(전이 + shift_ahead + 여유 ≤ 장애물까지 거리)를 삭제해
+        공간이 부족한 시프트를 **기각하지 않고 만든다** — 그 대가를 여기서 속도로
+        갚는다. 실측 2026-09-09 리플레이 40건: 시프트 활성 41구간 중 5구간(319틱)이
+        생성 시 geom 여유 −5.3 ~ −20.7 m 였고 그 구간에서 |steer| ≥ 0.47 였다.
+
+            κ = |d²(lat_shift)/ds²|            (전이의 횡곡률)
+            a_lat = κ·v²  ≤  a_lat_max   →   v ≤ √(a_lat_max / κ)
+
+        · **경로를 다시 밀지 않는다** — 진행 중인 시프트를 재생성하면 현재 위치의
+          경로가 옆으로 튀어 급조향이 된다. 대신 같은 기하를 통과 가능한 속도로 만든다.
+        · `lat_shift − _lat_build` 를 미분한다 — **회피 시프트 성분만** 본다.
+          `lat_shift` 자체에는 계획 차선변경 블렌드와 테이퍼 보정이 함께 실려 있어
+          그대로 미분하면 이미 검증된 계획 기하까지 세서 평지에서도 하한까지 내려간다.
+        · 평지(plateau)와 span 밖에서는 κ = 0 이라 스스로 비활성이다 — 시프트가 없는
+          틱에는 후보를 내지 않는다 (`ot_span is None` → None).
+        · 0.5 m 스텐실 — `lat_shift` 는 블렌드로 만든 해석적 배열이라 잡음이 없고,
+          폭을 넓히면 전이 경계(κ 최대 지점)에서 평지를 섞어 **과소평가**한다.
+        · 하한 `shift_cap_min_v` — 전이 한복판에서 완전히 서면 빠져나올 수 없다.
+        · **게이트가 아니다.** 시프트 생성·중첩·NOOP 판정 어디에도 관여하지 않는다.
+        """
+        if not self.shift_cap_on or self.a_lat_max <= 0.0 or self.ot_span is None:
+            return None
+        lat = getattr(planner, 'lat_shift', None)
+        if lat is None or len(lat) == 0:
+            return None
+        arr = np.asarray(lat, dtype=float)
+        base = getattr(planner, '_lat_build', None)
+        if base is not None and len(base) == len(arr):
+            arr = arr - np.asarray(base, dtype=float)       # 회피 시프트 성분만
+        i = int(getattr(planner, 'route_index', 0))
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        look = max(self.shift_cap_look_m, self.trans_k * max(ego_speed, 0.1))
+        h = max(1, int(round(0.5 * ppm)))                   # 0.5 m 스텐실 (위 참조)
+        j0 = max(i, int(self.ot_span[0]), h)
+        j1 = min(len(arr) - 1 - h, int(self.ot_span[1]), i + int(look * ppm))
+        if j1 <= j0:
+            return None
+        hs = h / ppm
+        d2 = np.abs(arr[j0 + h:j1 + h + 1] - 2.0 * arr[j0:j1 + 1] + arr[j0 - h:j1 - h + 1])
+        kappa = float(d2.max()) / (hs * hs)
+        if kappa <= 1e-6:
+            return None
+        return max(self.shift_cap_min_v, _math.sqrt(self.a_lat_max / kappa))
+
     # ── 리셋 ──────────────────────────────────────────────────────────────
     def on_reset(self) -> None:
         """courseRespawn — 순간이동 전 래치는 전부 무효 (run_agent 가 부른다)."""
@@ -1460,6 +1525,13 @@ class Ctrl24:
         self.last_stop_profile = prof
         add('stop_profile', prof)
         add('red_zone', self._red_approach_profile(planner))
+        # K7 — 진행 중인 회피 시프트에서만 산다. 게이트가 아니라 상한이라,
+        # 신호·보행자가 더 낮으면 그쪽이 이긴다.
+        cap = self._shift_speed_cap(planner, ego_speed)
+        add('shift_cap', cap)
+        if cap is not None:
+            self.last_avoid = dict(self.last_avoid or {'state': 'SHIFT_ACTIVE'},
+                                   shift_cap=round(float(cap), 2))
         add('stop_hold', self._stopline_hold(planner, ego_speed))
         add('rtor_cap', self._rtor_cap())
         ped = self._ped_intent(planner, ap, ego_speed)

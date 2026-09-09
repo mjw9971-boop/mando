@@ -21,6 +21,7 @@ team_code/          판단 계층 (PDM-Lite 이식, 수정한 줄에는 전부 `
   kinematic_bicycle_model.py 자차·타차 미래 궤적 외삽
   kr_rules.py         한국 대회 규칙 계층 (won 제어기 — ctrl24.enable=false 일 때)
   ctrl24.py           won_24 제어기 (기본, ctrl24.enable=true): 정적 장애물 첫 틱 PREEMPT·
+                      시프트 전이 횡가속 상한(K7, shift_cap_enable)·
                       중첩 시프트·종점 정지 없이 계속 주행. 상수는 params ctrl24: 섹션
 
 vtd_adapter/        VTD ↔ CARLA 어댑터. **판단 없음**
@@ -231,6 +232,6 @@ python3 tools/plot_lane_graph.py data/lane_graph.pkl -o docs/images/map_full.png
 | `vtd_adapter/lanegraph` | 창 병합·cum_s·lookahead·dashed_runs(점선 단일 출처) 완비 |
 | `team_code/autopilot` | PDM-Lite 원문 (`_manage_route_obstacle_scenarios` 는 stub) |
 | `team_code/kr_rules` | route_end 종점 정지 + 적신호 정지선 최소 유지 + 방향지시등 (won 제어기 — `ctrl24.enable=false`) |
-| `team_code/ctrl24` | **현행 기본.** 정지선 프로파일·유지 · 황색 원샷 · RTOR · 보행자 래치 · 지시등 + 정적 장애물 첫 틱 회피·중첩 시프트. 종점 정지 없음 |
+| `team_code/ctrl24` | **현행 기본.** 정지선 프로파일·유지 · 황색 원샷 · RTOR · 보행자 래치 · 지시등 · 붉은 구간 진입 전 감속(K6) · 시프트 전이 횡가속 상한(K7) + 정적 장애물 첫 틱 회피·중첩 시프트. 종점 정지 없음 |
 | shield (corridor·실선·중앙선·TTC 비상제동) | **없음** — 안전망은 SAFE_STOP·watchdog·리셋 초기화뿐 |
 | tools | replay·summarize_run·score·scp_client·batch_run·gen_scenarios 실전 사용 중 |
