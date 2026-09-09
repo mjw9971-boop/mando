@@ -333,6 +333,7 @@ class KrRules:
         # false = 이전 동작.
         self.span_lost_restore = bool(ot.get('span_lost_restore_enable', False))
         self.ot_ids: list = []                     # 이 시프트를 만든 객체 id
+        self.lm_hop_n = 0                          # 이번 시프트의 칸 수 (커밋 B)
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -551,6 +552,10 @@ class KrRules:
         self.lane_map_hops = int(_lm.get('lane_map_max_hops', 2))
         self.lane_map_ahead_m = float(_lm.get('lane_map_ahead_m', 80.0))
         self.lane_map_min_w = float(_lm.get('lane_map_min_width_m', 2.0))
+        # 커밋 B — 후보 선택·시점·감속.
+        self.lm_decide_m = float(_lm.get('lane_map_decide_m', 50.0))
+        self.lm_avoid_v = float(_lm.get('lane_map_avoid_speed_kph', 20.0)) / 3.6
+        self.last_lane_plan: dict | None = None    # 이번 틱 결정 (진단·후보)
         # "정지 객체" 임계는 회피 계층과 같은 출처를 읽는다 (상수 복제 금지).
         self.lane_map_static_v = self.ot_v_max
         self.last_lane_map: dict | None = None
@@ -1464,18 +1469,26 @@ class KrRules:
         걸쳐 선 차가 한 차로만 막은 것으로 보인다 (지시안 증상 3).
         """
         loc = actor.get_location()
+        # **좌표계 주의**: get_location 은 CARLA 프레임인데 lg.locate 는 VTD
+        # 프레임을 받는다 (_ego_lane 과 같은 규약). 커밋 A 는 이 변환을 빠뜨려
+        # 어떤 객체도 차로에 안 잡혔다 — free_run 이 항상 ahead_m 이었다
+        # (2026-09-09 avoid_sim 으로 발견: blocked_by 가 늘 비어 있었다).
+        vx, vy = frame.from_carla_xy(loc.x, loc.y)
         yaw = _math.radians(float(getattr(actor, 'yaw_deg', 0.0)))
         half_w = float(getattr(actor, 'width', 1.8)) / 2.0
-        # 차체 횡방향 단위벡터 (진행방향 +90°)
+        # 차체 횡방향 단위벡터 (진행방향 +90°). yaw 도 CARLA 라 미러 프레임에서
+        # 좌우가 뒤집히지만, **세 점의 합집합**을 쓰므로 결과는 같다.
         nx, ny = -_math.sin(yaw), _math.cos(yaw)
-        pts = [(loc.x, loc.y),
-               (loc.x + nx * half_w, loc.y + ny * half_w),
-               (loc.x - nx * half_w, loc.y - ny * half_w)]
+        pts = [(vx, vy),
+               (vx + nx * half_w, vy + ny * half_w),
+               (vx - nx * half_w, vy - ny * half_w)]
         out = set()
         for x, y in pts:
             m = lg.locate(x, y, prefer=list(hops.keys()))
-            if m is not None and m.key in hops:
-                out.add(m.key)
+            # LaneMatch 의 차로 필드는 `.lane` 이다 (`.key` 가 아니다 — _ego_lane
+            # 과 같은 규약). 커밋 A 는 `.key` 를 읽어 매번 예외였다.
+            if m is not None and m.lane in hops:
+                out.add(m.lane)
         return out
 
     def lane_map(self, ap, planner) -> dict | None:
@@ -1536,6 +1549,110 @@ class KrRules:
                 'passable': {str(list(k)): bool(v) for k, v in passable.items()},
                 'blocked_by': {str(list(k)): v for k, v in blocked.items()},
                 'queue_dropped': len(drop)}
+
+    # ── 차로 지도 커밋 B — 후보 선택·시점·감속 ───────────────────────────
+    def _ramp_len_m(self, hops: int, lane_w: float, v: float) -> float:
+        """`hops` 칸을 속도 v 로 옮기는 데 필요한 **횡전이 길이** [m].
+
+        `shift_route_smoothly` 가 쓰는 전이 형상 그대로 유도한다:
+
+            y(x) = Y·(1 − cos(π x / L)) / 2      Y = hops × 차로폭
+            y''  = Y·π² / (2 L²) · cos(…)  → |y''|max = Y π² / (2 L²)
+            a_lat = v²·|y''|max ≤ a_lat_max
+            ⇒ L ≥ v·π·√(Y / (2·a_lat_max))
+
+        `a_lat_max` 는 `overtake.a_lat_max` 를 그대로 읽는다 —
+        `_shift_speed_cap` 이 진행 중인 시프트를 재는 것과 **같은 축**이라야
+        "만들 때는 되는데 지나갈 땐 상한에 걸린다" 가 안 생긴다.
+        """
+        Y = max(0.0, float(hops)) * max(0.1, float(lane_w))
+        a = self.a_lat_max
+        if a <= 0.0 or Y <= 0.0:
+            return 0.0
+        return max(0.0, float(v)) * _math.pi * _math.sqrt(Y / (2.0 * a))
+
+    def lane_plan(self, ap, planner) -> dict | None:
+        """차로 지도로 **어느 차로로 언제 옮길지** 정한다 (커밋 B).
+
+        커밋 A 의 `lane_map()` 이 재료고 여기서 고른다. 개입은 두 가지뿐이다:
+          · 속도 상한 후보 (min() 에 덧대는 **상한형** — `cap_binds` 축)
+          · 시프트 방향 힌트 (기존 게이트 7개는 그대로 통과해야 한다)
+
+        규칙 (지시안 그대로):
+          트리거   내 차로 free_run < decide_m. **다른 차로가 막힌 것은 트리거가
+                   아니다** — 케이스 10 이 그 반례다.
+          후보     passable ∧ free_run > 램프 + shift_ahead_m
+          선택     free_run 최대 → 동률이면 hop 이 적은 쪽(가까운 쪽)
+          램프     길이 = `_ramp_len_m(hops, 차로폭, 상한속도)`
+          시작 s   목표 차로 첫 장애물 s − shift_ahead_m − 램프 길이.
+                   내 차로 장애물보다 뒤일 수는 없으므로 그쪽도 같이 본다.
+          늦었으면 더 감속해 램프를 줄인다. 그래도 안 되면 후보 없음(standoff).
+
+        반환 None = 개입 없음 (스위치 off · 지도 없음 · 트리거 아님).
+        """
+        if not self.lane_map_on:
+            return None
+        lm = self.lane_map(ap, planner)
+        if lm is None:
+            return None
+        lg = getattr(planner, 'lg', None)
+        ego_lane = self._tick_ego_lane or self._ego_lane(lg, ap)
+        if lg is None or ego_lane is None:
+            return None
+        key = str(list(ego_lane))
+        free = lm['free_run']
+        mine = float(free.get(key, self.lane_map_ahead_m))
+        if mine >= self.lm_decide_m:
+            return None                                    # 트리거 아님
+        hops = {k: h for k, h in lm['hops'].items()}
+        lane_w = self._lane_width_at(lg, ego_lane, self._ego_local_s(lg, ap))
+        v_cap = self.lm_avoid_v
+        # 후보 — 통행 가능하고, 램프 + 여유만큼 뚫려 있는 차로
+        cands = []
+        for k, h in hops.items():
+            if k == key or not lm['passable'].get(k):
+                continue
+            n = abs(int(h))
+            L = self._ramp_len_m(n, lane_w, v_cap)
+            need = L + self.shift_ahead_m
+            if float(free.get(k, 0.0)) > need:
+                cands.append((float(free[k]), -n, k, n, L, need))
+        plan = {'trigger_free_m': round(mine, 1), 'ego_lane': lm['ego_lane'],
+                'lane_w': round(lane_w, 2), 'v_cap': round(v_cap, 2),
+                'cands': {c[2]: {'free': round(c[0], 1), 'hops': c[3],
+                                 'ramp_m': round(c[4], 1)} for c in cands}}
+        if not cands:
+            plan['pick'] = None
+            plan['why'] = 'no_candidate'                   # → standoff → never_stall
+            self.last_lane_plan = plan
+            return plan
+        cands.sort(reverse=True)                           # free 최대 → hop 적은 쪽
+        _f, _nh, pick, n_hops, ramp_m, need = cands[0]
+        # 램프 시작 s — 목표 차로 첫 장애물과 내 차로 장애물 중 **먼저 걸리는 쪽**
+        first = min(float(free.get(pick, self.lane_map_ahead_m)), mine)
+        start = first - self.shift_ahead_m - ramp_m
+        late = start < 0.0
+        if late:
+            # 늦었다 — 남은 거리로 램프를 되풀어 필요한 속도를 낸다.
+            #   L_avail = first − shift_ahead_m,  L = v·π·√(Y/2a) → v = L / (π√(Y/2a))
+            avail = max(0.0, first - self.shift_ahead_m)
+            unit = self._ramp_len_m(n_hops, lane_w, 1.0)   # 1 m/s 당 램프 길이
+            v_need = avail / unit if unit > 0.0 else 0.0
+            if v_need < self.bo_creep_v:                   # 크립보다 느려야 한다 = 불가
+                plan.update({'pick': None, 'why': 'ramp_too_late',
+                             'avail_m': round(avail, 1), 'need_m': round(ramp_m, 1)})
+                self.last_lane_plan = plan
+                return plan
+            v_cap = min(v_cap, v_need)
+            ramp_m = avail
+            start = 0.0
+        plan.update({'pick': pick, 'hops': n_hops, 'ramp_m': round(ramp_m, 1),
+                     'start_s_rel': round(start, 1), 'late': late,
+                     'v_cap': round(v_cap, 2),
+                     'side': 'left' if hops[pick] < 0 else 'right',
+                     'armed': start <= 0.0})
+        self.last_lane_plan = plan
+        return plan
 
     def _stopline_d(self, planner) -> float | None:
         """다음 정지선까지 뒷축 거리 — 신호 정지선 우선, 없으면 무신호 정지선 최근접."""
@@ -2793,6 +2910,22 @@ class KrRules:
         print(f'[kr_rules] 회피 span 연장 — {side} 끝 {b}→{b2} (id={chain["ids"]}, '
               f'예상 최소 이격 {c:.2f} m, {self.span_extend_n}회)', flush=True)
 
+    def _lm_hops(self, side: str) -> int | None:
+        """이번 틱 차로 지도가 이 side 로 **몇 칸** 가라고 하는가. 아니면 None.
+
+        한 칸씩 두 번 가는 방식은 못 쓴다 — 옆 차로도 막혀 있으면 **첫 전이가
+        끝나기 전에 standoff 가 세워** 두 번째 칸으로 갈 기회가 영영 안 온다
+        (2026-09-09 avoid_sim 케이스 2·4: 23~25 초 정지). 그래서 처음부터
+        목표 칸 수로 연다.
+        """
+        if not self.lane_map_on:
+            return None
+        lp = self.last_lane_plan or {}
+        if not lp.get('pick') or lp.get('side') != side:
+            return None
+        n = int(lp.get('hops') or 1)
+        return n if n > 1 else None
+
     def _span_targets_lost(self, ap, planner) -> bool:
         """이 시프트를 만든 객체가 **전부 사라졌나** ([1] span 상실 원복).
 
@@ -2830,6 +2963,7 @@ class KrRules:
         self.ot_span = None
         self.ot_side = None
         self.ot_ids = []
+        self.lm_hop_n = 0
         self.span_extend_n = 0
         self.last_overtake = 'restored'
 
@@ -3061,7 +3195,13 @@ class KrRules:
         # side 에서 break 하므로 현행(좌측 우선)과 글자 그대로 같다.
         plans: dict = {}
         pick_on = self.side_pick and self.shift_entry      # 기준(플래토)이 있어야 한다
-        for side in ('left', 'right'):                     # 좌측 추월 우선
+        # 차로 지도(커밋 B)가 고른 쪽을 **먼저** 본다. 게이트는 그대로다 —
+        # 순서만 바꾸므로, 지도가 고른 쪽이 게이트에서 떨어지면 반대쪽으로 간다
+        # (이전 동작으로 자연히 되돌아온다). 스위치가 꺼져 있으면 좌측 우선 그대로.
+        _lp = self.last_lane_plan or {}
+        _order = (('right', 'left') if _lp.get('side') == 'right'
+                  else ('left', 'right'))
+        for side in _order:                                # 기본은 좌측 추월 우선
             def reject(gate, **extra):
                 self.last_overtake = f'{side}:{gate}@p{n_pass}'
                 la = self.last_avoid if self.last_avoid is not None else {}
@@ -3293,6 +3433,18 @@ class KrRules:
                  'gap_speed_hold_s': round(self.gap_hold_ticks / self.hz, 1),
                  'gap_speed_release': 'v_ok' if ego_speed <= v_req else 'no_room'})
         self.gap_hold_ticks = 0
+        # 차로 지도(커밋 B)가 두 칸을 고르면 **한 번에** 두 칸을 연다. 전이 길이도
+        # 칸 수에 맞춰 늘린다 — 같은 길이로 두 칸을 가면 횡가속이 4배가 되고
+        # _shift_speed_cap 이 곧바로 상한을 바닥까지 내린다.
+        n_steps = self._lm_hops(side)
+        extra_kw = {}
+        if n_steps is not None:
+            lane_w = self._lane_width_at(planner.lg, ego_lane, local_s)
+            trans_m = max(trans_m, self._ramp_len_m(n_steps, lane_w,
+                                                    max(ego_speed, self.lm_avoid_v)))
+            # 인자를 **조건부로만** 넘긴다 — off 에서는 호출 서명이 이전과 글자
+            # 그대로여야 한다 (목 플래너를 쓰는 테스트가 그 서명을 흉내낸다).
+            extra_kw['n_steps'] = n_steps
         span_m = 2.0 * trans_m + gap_before + extra_after + chain['extent_m']
         span = planner.shift_route_around_actors(
             actor, chain_last,
@@ -3302,9 +3454,11 @@ class KrRules:
             extra_length_after=extra_after * ppm,          # E-2 연장·복귀 단축 포함
             # 전이 시작을 자차 **앞**으로 — 뒤에서 시작하면 현재 위치의
             # 경로가 옆으로 밀려 정지 상태에서 조향이 풀락된다
-            min_start_ahead=ahead_eff * ppm)
+            min_start_ahead=ahead_eff * ppm,
+            **extra_kw)
         planner._kd = _cKDTree(planner.route_points[:, :2])
         self.ot_span = span
+        self.lm_hop_n = int(n_steps or 1)                  # 몇 칸짜리 시프트였나
         self.ot_ids = list(chain['ids'])                   # 대상 상실 판정의 기준
         self.ot_side = side                                # 연장이 같은 방향을 쓴다
         self.span_extend_n = 0
@@ -4888,6 +5042,10 @@ class KrRules:
         self._rtor_tick(ap, planner, ego_speed)
         if self.bo_enabled:
             self._breakout_tick(planner, ap, ego_speed)
+        # 차로 지도 결정 (커밋 B) — 시프트 방향 힌트로 쓰이므로 _try_overtake 앞이다.
+        # 스위치가 꺼져 있으면 None 이라 아무 것도 안 바뀐다 (진단 키도 안 생긴다).
+        self.last_lane_plan = None
+        self.lane_plan(ap, planner)
         # (지시등은 lat_shift 를 보므로 시프트를 자동으로 따라온다)
         self._try_overtake(ap, planner, ego_speed)
 
@@ -4964,6 +5122,17 @@ class KrRules:
             candidate = rz
         if rz is not None and (cap_cand is None or rz < cap_cand):
             cap_cand = rz
+
+        # 차로 지도 회피 속도 상한 (커밋 B) — 트리거 즉시 걸어 램프를 짧게 만든다.
+        # **상한형이다**: "이 속도를 넘지 마라" 지 "1틱 뒤에 이 속도가 되어라" 가
+        # 아니므로 cap 축에 태운다 (CLAUDE.md 확정 사실 — err/dt 금지).
+        lmv = (self.last_lane_plan or {}).get('v_cap') if self.last_lane_plan else None
+        if lmv is not None and (self.last_lane_plan or {}).get('why') != 'no_candidate':
+            lmv = float(lmv)
+            if candidate is None or lmv < candidate:
+                candidate = lmv
+            if cap_cand is None or lmv < cap_cand:
+                cap_cand = lmv
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)

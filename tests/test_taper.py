@@ -32,8 +32,13 @@ def lg():
     return LaneGraph(str(GRAPH), cfg=CFG)
 
 
-def test_params_present_default_off():
-    assert CFG['route']['taper_penalty_enable'] is False
+def test_params_present():
+    """키가 있고 벌점이 양수인가. **기본값이 꺼져 있는지는 안 본다** —
+    2026-09-09 에 켰다 (경로 34건 중 4건이 끝 폭 0.00 m 인 (1821,0,-2) 대신
+    (1821,0,-3) 을 타고, 대가는 +1.2 m 뿐이다). off 동작의 커버리지는
+    `test_penalty_off_takes_the_taper_connector` 가 사본에서 명시적으로 끄고 본다
+    (2026-09-07 드리프트 원칙)."""
+    assert isinstance(CFG['route']['taper_penalty_enable'], bool)
     assert float(CFG['route']['taper_penalty_m']) > 0
     assert float(CFG['scoring']['lane_departure_taper_handover_m']) == 0.0
 

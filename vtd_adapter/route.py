@@ -689,11 +689,21 @@ class VtdRoutePlanner:
         return VtdWaypoint(self.lg, key, min(wp.s, self.lg.length(key)))
 
     def shift_route_smoothly(self, start_index, end_index, shift_to_left_lane,
-                             transition_length=120.0, lane_transition_factor=1.0):
-        """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트."""
+                             transition_length=120.0, lane_transition_factor=1.0,
+                             n_steps=None):
+        """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트.
+
+        VTD: `n_steps` 를 주면 **몇 칸 옮길지를 호출자가 정한다** (차로 지도
+        커밋 B 의 두 칸 회피). None = 이전 동작 (`_shift_target_steps` 가 현재
+        변위에서 k+1 을 센다). 한 번에 두 칸을 여는 이유는, 옆 차로도 막힌
+        상황에서 한 칸씩 가면 **전이가 끝나기 전에 서 버려** 두 번째 칸으로
+        갈 기회가 영영 안 오기 때문이다 (2026-09-09 avoid_sim 케이스 2·4:
+        23~25 초 정지).
+        """
         # VTD: 원문은 목표가 route_waypoints[idx].get_*_lane() 고정이다.
         # 기준점만 현재 경로 차로로 옮긴다 (_shift_target_steps). off 면 1 단계 = 원문.
-        n_steps = self._shift_target_steps(shift_to_left_lane)
+        n_steps = (self._shift_target_steps(shift_to_left_lane)
+                   if n_steps is None else int(n_steps))
         for idx in range(start_index, end_index):
             wp_t = self._shift_target_wp(idx, shift_to_left_lane, n_steps)
             if wp_t is None and n_steps != 1:
@@ -816,11 +826,11 @@ class VtdRoutePlanner:
             out.append((tx * (ly - by) - ty * (lx - bx)) / d)
         return np.asarray(out, dtype=float)
 
-    def shift_route_around_actors(self, first_actor, last_actor=None,
+    def shift_route_around_actors(self, first_actor, last_actor=None,   # noqa: PLR0913
                                   obstacle_direction='right', transition_length=120.0,
                                   lane_transition_factor=1.0,
                                   extra_length_before=0.0, extra_length_after=0.0,
-                                  min_start_ahead=0):
+                                  min_start_ahead=0, n_steps=None):
         """PDM 원문 — 액터 주위로 경로 시프트. 발동은 phase4 에서.
 
         VTD 추가 min_start_ahead [경로점 수]: 전이 시작을 **자차보다 이만큼 앞**
@@ -831,13 +841,16 @@ class VtdRoutePlanner:
 
         구간 계산은 plan_shift_span 이 한다 (적용 전 검사와 같은 인덱스를 쓰려고
         뗐다). 아래 shift_route_smoothly 호출이 PDM 원문 그대로다.
+
+        VTD 추가 n_steps: 몇 칸 옮길지 (차로 지도 커밋 B). None = 이전 동작.
         """
         shift_start_index, shift_end_index, shift_to_left_lane = self.plan_shift_span(
             first_actor, last_actor, obstacle_direction, transition_length,
             extra_length_before, extra_length_after, min_start_ahead)
         self.shift_route_smoothly(shift_start_index, shift_end_index, shift_to_left_lane,
                                   transition_length=transition_length,
-                                  lane_transition_factor=lane_transition_factor)
+                                  lane_transition_factor=lane_transition_factor,
+                                  n_steps=n_steps)
         return shift_start_index, shift_end_index
 
     def compute_leading_vehicles(self, list_vehicles, ego_vehicle_id):

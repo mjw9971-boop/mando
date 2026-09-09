@@ -53,15 +53,25 @@ class Lg3:
         return 1000.0
 
     def locate(self, x, y, prefer=None, **kw):
-        """y 로 차로를 가른다: 0±1.5 → L0, −3±1.5 → L1, −6±1.5 → L2.
+        """VTD y 로 차로를 가른다: 0±1.5 → L0, **+3**±1.5 → L1, +6±1.5 → L2.
 
-        `_ego_local_s` 가 `.s` 를 읽으므로 x 를 그대로 s 로 준다 (직선 경로).
+        CARLA 는 y 미러라(`frame.from_carla_xy` = (x, −y)) 목의 오른쪽 이웃이
+        VTD 에서는 +y 다. 픽스처가 액터를 CARLA y = −3 에 놓으므로 여기서는 +3 이다.
+
+        **입력은 VTD 프레임이다** — `_ego_lane`·`_ego_local_s`·`_actor_lanes` 가
+        전부 `frame.from_carla_xy` 를 거쳐 부른다. 이 목이 예전에 CARLA y 를
+        그대로 받는 것처럼 굴어서, `_actor_lanes` 가 변환을 빠뜨린 버그를 오히려
+        **고정하고 있었다** (2026-09-09 avoid_sim 으로 발견 — 실지도에서는
+        blocked_by 가 늘 비어 free_run 이 항상 ahead_m 이었다).
+
+        반환 필드도 실제 `LaneMatch` 와 같은 이름이어야 한다 — `.key` 가 아니라
+        **`.lane`** 이다 (같은 버그의 다른 절반).
         """
         order = [L0, L1, L2]
-        i = int(round(-y / 3.0))
+        i = int(round(y / 3.0))
         if not (0 <= i < len(order)):
             return None
-        return type('M', (), {'key': order[i], 's': float(x), 't': 0.0})()
+        return type('M', (), {'lane': order[i], 's': float(x), 't': 0.0})()
 
 
 def on_cfg(**over):
