@@ -301,6 +301,13 @@ class KrRules:
         self.standoff_creep = bool(ot.get('standoff_creep_enable', False))
         self.standoff_creep_v = float(ot.get('standoff_creep_v', 0.8))
         self.standoff_creep_gap_m = float(ot.get('standoff_creep_gap_m', 1.0))
+        # 크립 게이트의 종점 배제 폭을 never_stall 과 같은 축으로 좁힌다.
+        # `_obstacle_cause` 기본값은 route_end.active_m(150) 인데 그 값은 유령차
+        # **후보를 만드는 창**이지 "종점이 세웠다" 는 뜻이 아니다 — never_stall 은
+        # 2026-09-08 에 이미 unlatch_m(30)으로 좁혔고(_ns_cause), 크립 게이트만
+        # 남아 있었다. false = 이전 동작(150 m).
+        self.creep_end_narrow = bool(
+            ot.get('standoff_creep_end_narrow_enable', False))
         # 크립 지연 게이트 (_creep_gate). 0 = 지연 없음(즉시 크립) = 이전 동작.
         # 시간 축은 ot_blocked_ticks 를 그대로 쓴다 — 신규 시계를 만들지 않는다.
         self.creep_delay_ticks = int(round(
@@ -5133,8 +5140,14 @@ class KrRules:
             return block('cause')
         # A2 는 UNKNOWN 큐까지 원인으로 본다 (_ns_cause). 적신호·보행자·종점은
         # 그 함수도 그대로 제외한다 — 배제 목록은 여전히 한 곳이다.
+        # 종점 배제 폭: 스위치가 켜지면 never_stall 과 같은 unlatch_m 을 쓴다.
+        # 실측 2026-09-09 run_20260909_231730 rs 485.3 — d_end 138.1 m 가
+        # active_m(150) 안이라 `_obstacle_cause` 가 매 틱 거짓이었고, 정지 차량
+        # 20.5 m 뒤에서 **189 s 내내** creep_block='cause' 였다. 적·녹 무관하게
+        # 얼어 있었다(녹색 구간에서도 v_target 0) — 억제는 신호가 아니라 이것이다.
+        _end_m = self.ns_end_m if self.creep_end_narrow else None
         if not (self._ns_cause(planner, ap) if ns
-                else self._obstacle_cause(planner, ap)):
+                else self._obstacle_cause(planner, ap, end_m=_end_m)):
             return block('cause')
         # 지연 게이트 — 시프트가 확실히 불가능해지기 전에는 열지 않는다 (_creep_gate).
         if self.standoff_id != self._creep_hold_id:     # 대상이 바뀌면 새로 센다

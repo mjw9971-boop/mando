@@ -1272,6 +1272,15 @@ overtake:
   # 반드시 더해야 한다 — 고정 2 m 로 두면 앞범퍼가 객체 중심을 1.8 m 지나쳐
   # 선다(=충돌). score.collision_dist_m(0.1)의 10 배 여유다.
   standoff_creep_gap_m: 1.0
+  # 크립 게이트(_standoff_creep)의 `_obstacle_cause` 종점 배제 폭을
+  # route_end.active_m(150) 대신 route_end.unlatch_m(30) 으로 좁힌다.
+  # active_m 은 종점 유령차 **후보를 만드는 창**이지 "종점이 세웠다" 가 아니다 —
+  # never_stall 은 같은 이유로 이미 unlatch_m 을 쓴다(_ns_cause, ns_end_m).
+  # 실측 2026-09-09 run_20260909_231730 rs 485.3: d_end 138.1 m 가 150 안이라
+  # 크립이 매 틱 creep_block='cause' 로 막혀 정지 차량 20.5 m 뒤에서 189 s
+  # 얼었다. 적신호 억제(SHIFT_HOLD)가 아니다 — **녹색 구간에도** v_target 0 이었다.
+  # false = 이전 동작(150 m).
+  standoff_creep_end_narrow_enable: false
   # 크립 **지연 게이트** [s] (2026-09-05, 실차 20260905_155735 근거).
   # 크립은 비가역이다 — s_rel 이 한 번 기하 게이트 need(정지 상태 19.0 =
   # transition_m 12 + shift_ahead_m 5 + shift_geom_margin_m 2) 아래로 내려가면
