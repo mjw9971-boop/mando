@@ -1903,6 +1903,13 @@ ctrl24:
   # avoid.state = NOOP, ot_span 없음.
   noop_disp_m: 0.5
   prepass_obb_enable: true     # P2 pre-pass: 원 경로 OBB 2 s 교차 정지 객체도 트리거
+  # OBB 예측을 돌릴 정지 차량의 사전 필터 (비용). 2 s 등속 예측이 닿을 수 없는 객체는
+  # 교차할 수 없으므로 판정은 같고 forecast 횟수만 준다. 종거리 상한 = v·2 s·reach_k +
+  # 2·전장 + extra, 횡거리 상한 = lat_m (경로 투영). 실측 2026-09-08 교통류_04(정지 차량이
+  # 50 m 안에 늘 있음): 필터 없이 prepass 중앙 34 ms / p95 355 ms (부하 중).
+  prepass_obb_reach_k: 1.5
+  prepass_obb_reach_extra_m: 10.0
+  prepass_obb_lat_m: 8.0
   # ── 종점 (D) — route.py 가 읽는다 ─────────────────────────────────────
   # successor 가 끝난 뒤 마지막 헤딩으로 붙이는 직선 패드 [m]. 0 = 패드 없음.
   # 없으면 PDM 룩어헤드가 마지막 점으로 고정돼 통과 후 뒤를 향해 조향한다.

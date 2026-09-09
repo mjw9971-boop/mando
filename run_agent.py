@@ -498,8 +498,13 @@ class Runner:
                         self.error_streak = 0
                     except Exception as e:                    # noqa: BLE001
                         # SPEC §4: 틱 예외로 루프가 죽지 않게. 직전 명령 유지.
+                        # 마지막 프레임(파일:줄)을 메시지에 붙인다 — 재현이 안 되는 예외의
+                        # 위치를 사후에 알 수 있게 (2026-09-09 ctrl24 리플레이 1회성 TypeError).
+                        import traceback
+                        tb = traceback.extract_tb(e.__traceback__)
+                        where = f' @ {tb[-1].filename.split("/")[-1]}:{tb[-1].lineno} {tb[-1].name}' if tb else ''
                         self.error_streak += 1
-                        self.logger.error(self.ticks, e, self.error_streak)
+                        self.logger.error(self.ticks, type(e)(f'{e}{where}'), self.error_streak)
                         if self.error_streak >= 3:
                             self.last_cmd = SAFE_STOP
                 elif self.args.replay:

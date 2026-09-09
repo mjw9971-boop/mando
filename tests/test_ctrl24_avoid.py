@@ -314,3 +314,19 @@ def test_prepass_obb_switch_off_uses_corridor_only():
     ap = ObbAp(p, [c], hit_ids={2})
     kr.pre_pass(ap, p.route_points, [c], 12.5, 8.0)
     assert ap.forecast_calls == 0 and kr.ot_span is None
+
+
+def test_prepass_obb_prefilter_skips_unreachable_stopped_vehicles():
+    """2 s 예측이 닿을 수 없는 정지 차량(종 60 m @ 8 m/s → 상한 8·2·1.5+9.7+10 = 43.7 m,
+    또는 횡 9 m)만 있으면 forecast 를 돌리지 않는다. 닿는 거리면 돌린다."""
+    far = car(2, 60.0, 2.5)
+    side = car(3, 20.0, 9.0)
+    kr, p, _ap = rig(actors=[far, side])
+    ap = ObbAp(p, [far, side], hit_ids={2, 3})
+    kr.pre_pass(ap, p.route_points, [far, side], 12.5, 8.0)
+    assert ap.forecast_calls == 0 and kr.ot_span is None
+    near = car(4, 30.0, 2.5)
+    kr2, p2, _ap2 = rig(actors=[near])
+    ap2 = ObbAp(p2, [near], hit_ids={4})
+    kr2.pre_pass(ap2, p2.route_points, [near], 12.5, 8.0)
+    assert ap2.forecast_calls == 1 and kr2.last_avoid['trigger'] == 'obb'

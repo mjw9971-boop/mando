@@ -130,6 +130,10 @@ class Ctrl24:
         self.span_gate_max_m = float(c['span_gate_max_m'])
         self.noop_disp_m = float(c['noop_disp_m'])
         self.prepass_obb = bool(c['prepass_obb_enable'])
+        # OBB 예측 후보 사전 필터 — 2 s 예측이 닿을 수 있는 종거리·횡거리 안의 정지 차량만.
+        self.obb_reach_k = float(c['prepass_obb_reach_k'])
+        self.obb_reach_extra_m = float(c['prepass_obb_reach_extra_m'])
+        self.obb_lat_m = float(c['prepass_obb_lat_m'])
         # ── 지시등 ─────────────────────────────────────────────────────────
         self.turn_lead_s = float(c['turn_lead_s'])
         self.lc_lead_s = float(c['lc_lead_s'])
@@ -1075,9 +1079,23 @@ class Ctrl24:
             cfg = ap.config
             ego = ap._vehicle
             loc = ego.get_location()
-            stopped = [v for v in vehicles
-                       if v.id != ego.id and float(getattr(v, 'speed', 0.0)) < self.v_static
-                       and v.get_location().distance(loc) < cfg.detection_radius]
+            # 예측 도달 범위 밖의 정지 차량은 뺀다 — 2 s 등속 예측이 닿을 수 없는 객체는
+            # 교차할 수 없으므로 판정은 같고 비용만 준다. 실측 2026-09-08 교통류_04: 정지
+            # 차량이 50 m 안에 늘 있어 매 틱 forecast → prepass 중앙값 34 ms / p95 355 ms.
+            reach = (max(float(ego_speed), 1.0) * float(cfg.default_forecast_length)
+                     * self.obb_reach_k + 2.0 * float(self.cfg['vehicle']['length'])
+                     + self.obb_reach_extra_m)
+            stopped = []
+            for v in vehicles:
+                if v.id == ego.id or float(getattr(v, 'speed', 0.0)) >= self.v_static:
+                    continue
+                vl = v.get_location()
+                if vl.distance(loc) >= cfg.detection_radius:
+                    continue
+                pr = self._project(ap._waypoint_planner, vl.x, vl.y)
+                if pr is None or not (-10.0 < pr[0] < reach) or abs(pr[1]) > self.obb_lat_m:
+                    continue
+                stopped.append(v)
             if not stopped:
                 return set()
             near_lc = ap.is_near_lane_change(ego_speed, route_np)
