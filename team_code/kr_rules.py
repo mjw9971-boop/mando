@@ -390,6 +390,10 @@ class KrRules:
         # 대기열 판별기 (3중 교정)
         self.q_clear_m = float(ot.get('queue_min_clear_m', 0.3))
         self.q_head_m = float(ot.get('queue_head_max_m', 25.0))
+        # 큐 뒤에서는 시프트 공간(standoff 22 m)이 필요 없다 — 비켜갈 것이 아니라
+        # 줄을 서는 것이다. false = 이전 동작(standoff_floor_m 그대로).
+        self.q_close_gap = bool(ot.get('queue_close_gap_enable', False))
+        self.q_stop_gap_m = float(ot.get('queue_stop_gap_m', 5.0))
         self.q_hold_ticks = int(round(float(ot.get('queue_hold_s', 15.0)) * self.hz))
         # 억제 단일화 (C). 'queue_only' = 억제는 _is_queue 하나, 적색·정지선·교차로는
         # 일시정지/게이트 입력. 'legacy' = 이전 3중 억제(_red_ahead·_signal_zone·_is_queue)
@@ -586,6 +590,7 @@ class KrRules:
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
+        self.cause_why: str | None = None          # _obstacle_cause 배제 사유 (진단)
         self.last_stop_profile: float | None = None   # 이번 틱 정지 프로파일 상한 (로그용)
         # 이번 틱 최종 목표를 정상상태 상한(곡률·LC)이 정했나 (실주행 2차 [1], 로그용)
         self.last_cap_binds: bool = False
@@ -2024,31 +2029,38 @@ class KrRules:
         서지 않으므로, 교차로 안 정지 차량이 크립·BREAKOUT 을 열지 못하게 막는다
         (그 차량은 IDM 추종·standoff 만).
         """
-        if self._rtor_go:
+        # 어느 배제에 걸렸는지 남긴다 — `creep_block: 'cause'` 만으로는 "신호인가
+        # 종점인가 큐인가" 를 로그로 답할 수 없었다 (2026-09-09 실측 두 건에서
+        # 각각 종점(150 m)과 큐였는데 진단이 같았다). 판단에는 관여하지 않는다.
+        def no(why):
+            self.cause_why = why
             return False
+        self.cause_why = None
+        if self._rtor_go:
+            return no('rtor')
         if getattr(ap, 'traffic_light_hazard', False):
             if not self._blocker_before_stopline(ap, planner):
-                return False
+                return no('tl_hazard')
         if getattr(ap, 'walker_hazard', False) or getattr(ap, 'walker_close', False):
-            return False
+            return no('walker')
         if getattr(ap, 'stop_sign_hazard', False):
-            return False
+            return no('stop_sign')
         if self.latched or self.sl_hold_left > 0:          # 종점 래치 / 정지선 홀드
-            return False
+            return no('end_latch' if self.latched else 'sl_hold')
         if self.y_decision is not None or self.cross_guard:  # 황색 래치 / 통과 가드
-            return False
+            return no('yellow' if self.y_decision is not None else 'cross_guard')
         end_m = self.active_m if end_m is None else end_m
         if self.last_d_end is not None and self.last_d_end <= end_m:
-            return False                                   # route_end 유령차 사정권
+            return no('route_end')                         # route_end 유령차 사정권
         if self.suppress_mode == 'legacy':
             if self._red_ahead(planner) is not None:           # 절대 규칙 (신호 > 회피)
-                return False
+                return no('red_ahead')
             if self._signal_zone(planner, ap) is not None:     # 규칙 1
-                return False
+                return no('signal_zone')
         elif self._tick_queue and not ignore_queue:        # 큐 뒤에 선 것은 데드락이 아니다 (C-5)
             # ignore_queue 는 never_stall(A2) 전용이다 — UNKNOWN 큐만 그 경로로
             # 들어온다 (_ns_cause). BREAKOUT 은 기본값 False 로 옛 동작 그대로.
-            return False
+            return no('queue')
         if self._blocker(ap, planner) is not None:         # 실제로 앞이 막혀 있을 것
             return True
         # PDM 이 차량·OBB 로 세우고 있으면 그것도 장애물 정지다 (never_stall 전용).
@@ -2061,7 +2073,9 @@ class KrRules:
         if pdm_hazard_ok and getattr(ap, 'vehicle_hazard', False):
             return True
         # E-3: 회랑 후보가 있는데 양쪽 다 기각된 채면 30 m 밖이라도 장애물 원인이다
-        return self._reject_pending()
+        if self._reject_pending():
+            return True
+        return no('no_blocker')
 
     def _reject_pending(self) -> bool:
         """E-3 시계 입력 — 직전 틱 회피 시도가 양쪽 다 기각됐나 (스위치 꺼지면 거짓)."""
@@ -4901,6 +4915,14 @@ class KrRules:
         if self.wait_target_d is None or self.stop_profile_a <= 0.0:
             return None
         standoff = max(self.standoff_floor_m, self.shift_k_s * max(ego_speed, 0.1))
+        # 큐 뒤는 **줄을 서는 것**이지 비켜갈 것이 아니다 — 시프트 전이가 들어갈
+        # 공간을 비워 둘 이유가 없다. 22 m 를 띄우면 뒤차가 끼어들 만큼 벌어지고,
+        # 정지선까지의 거리도 그만큼 길어진다 (실측 2026-09-09:
+        # 18_연속교차로14 rs 78.4 standoff_d 20.6, run_232350 rs 485 20.5).
+        # 판정은 새로 만들지 않고 이번 틱 큐 플래그(`_tick_queue`)를 그대로 쓴다 —
+        # `lane_map` 의 큐 제외와 같은 축이라야 두 벌이 안 생긴다.
+        if self.q_close_gap and self._tick_queue:
+            standoff = self.q_stop_gap_m
         d = self.wait_target_d - standoff
         if d >= 0.0:
             v = _math.sqrt(2.0 * self.stop_profile_a * d)      # 기준선 밖 — 무수정
@@ -5109,6 +5131,8 @@ class KrRules:
             # 녹색 직후 지연이 이미 만료된 상태가 된다 (위 _creep_hold_ticks 주석).
             self._creep_hold_ticks = 0
             self._creep_diag = dict(diag, so_creep=False, creep_block=why)
+            if why == 'cause' and self.cause_why:
+                self._creep_diag['cause_why'] = self.cause_why
             # 배제(신호·보행자·큐)는 문맥이 바뀐 것이다 — delay 래치도 시계와 같이
             # 버린다 (비용은 최대 지연 1회). stop_gap·no_size 는 크립 완료·크기
             # 미상이라 문맥이 그대로다 — 래치 유지.

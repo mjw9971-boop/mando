@@ -1281,6 +1281,13 @@ overtake:
   # 얼었다. 적신호 억제(SHIFT_HOLD)가 아니다 — **녹색 구간에도** v_target 0 이었다.
   # false = 이전 동작(150 m).
   standoff_creep_end_narrow_enable: false
+  # 큐 뒤 정지 간격 — 줄을 서는 것이지 비켜갈 것이 아니므로 시프트 전이 공간
+  # (standoff_floor_m 22 m)이 필요 없다. 실측 2026-09-09: 18_연속교차로14
+  # rs 78.4 에서 standoff_d 20.6 m, run_20260909_232350 rs 485 에서 20.5 m —
+  # 앞차와 20 m 를 띄우고 서 있었다. 큐 판정은 `_tick_queue` 를 그대로 쓴다
+  # (lane_map 의 큐 제외와 같은 축). false = 이전 동작.
+  queue_close_gap_enable: false
+  queue_stop_gap_m: 5.0
   # 크립 **지연 게이트** [s] (2026-09-05, 실차 20260905_155735 근거).
   # 크립은 비가역이다 — s_rel 이 한 번 기하 게이트 need(정지 상태 19.0 =
   # transition_m 12 + shift_ahead_m 5 + shift_geom_margin_m 2) 아래로 내려가면
