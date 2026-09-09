@@ -610,6 +610,13 @@ class KrRules:
         # 커밋 B — 후보 선택·시점·감속.
         self.lm_decide_m = float(_lm.get('lane_map_decide_m', 50.0))
         self.lm_avoid_v = float(_lm.get('lane_map_avoid_speed_kph', 20.0)) / 3.6
+        # [3] 차로 지도가 시프트를 **소유한다**. 켜지면 "어디로" 는 lane_plan 만
+        # 정하고, 옛 _try_overtake 는 안전 검사(게이트 10개)와 안전망만 한다.
+        # false = 이전 동작 (지도는 순서만 바꾸는 힌트).
+        self.lm_owns = bool(_lm.get('lane_map_owns_shift_enable', False))
+        # 활성 목표를 갈아탈 최소 이득 [m] — 새 목표의 free_run 이 현재 목표보다
+        # 이만큼 길어야 바꾼다. 매 틱 목표가 흔들리면 램프가 계속 다시 그려진다.
+        self.lm_switch_margin = float(_lm.get('lane_switch_margin_m', 20.0))
         # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
         self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
         # 활성 시프트 중에도 차로 지도가 다른 목표를 고르면 갈아탈지 (2026-09-09).
@@ -1786,7 +1793,18 @@ class KrRules:
             plan['why'] = 'no_candidate'                   # → standoff → never_stall
             self.last_lane_plan = plan
             return plan
-        cands.sort(reverse=True)                           # free 최대 → hop 적은 쪽
+        # free 최대 → hop 적은 쪽. **동률이면** 우선순위를 명시한다 — 예전에는
+        # 차로 키 튜플 순서라는 임의값이 이겼다. 실측 2026-09-09 07 rs 2714.1:
+        # 양쪽 free_run 이 80.0 동률이라 방향이 사실상 무작위였다.
+        #   ① 다음 교차로 유효 차로가 있는 쪽 (돌아올 필요가 없다)
+        #   ② 오른쪽 (우측통행 — 추월이 아니라 회피이므로 갓길 쪽이 기본)
+        vel_side = self._lm_valid_side(planner, hops, key)
+        def _tie(c):
+            side = 'left' if hops[c[2]] < 0 else 'right'
+            return (c[0], -abs(int(hops[c[2]])),
+                    1 if (vel_side is not None and side == vel_side) else 0,
+                    1 if side == 'right' else 0)
+        cands.sort(key=_tie, reverse=True)
         _f, _nh, pick, n_hops, ramp_m, need = cands[0]
         # 램프 시작 s — 목표 차로 첫 장애물과 내 차로 장애물 중 **먼저 걸리는 쪽**
         first = min(float(free.get(pick, self.lane_map_ahead_m)), mine)
@@ -1813,6 +1831,36 @@ class KrRules:
                      'armed': start <= 0.0})
         self.last_lane_plan = plan
         return plan
+
+    def _lm_valid_side(self, planner, hops: dict, ego_key: str):
+        """다음 교차로 **유효 진입 차로**가 자차 기준 어느 쪽인가 ('left'/'right').
+
+        재료는 `_lm_deadline_s`·`_ns_turn_lane_pending` 과 **같은 것 하나**다 —
+        route.pkl 의 `valid_entry_lanes`. 새 재료를 만들지 않는다.
+        모르면 None (호출처가 우측통행 기본으로 떨어진다).
+        """
+        route = getattr(planner, 'route', None) or {}
+        vel = route.get('valid_entry_lanes')
+        wps = route.get('waypoint_s')
+        if not vel or not wps:
+            return None
+        try:
+            route_s = float(planner.route_s[planner.route_index])
+        except Exception:                                  # noqa: BLE001
+            return None
+        for e in vel:
+            if e.get('target') != 'pair' or not e.get('lanes'):
+                continue
+            seg = int(e['seg'])
+            if seg + 1 >= len(wps):
+                continue
+            if not (float(wps[seg]) <= route_s < float(wps[seg + 1])):
+                continue
+            want = {str(list(k)) for k in e['lanes']}
+            sides = {('left' if h < 0 else 'right')
+                     for k, h in hops.items() if k in want and k != ego_key}
+            return sides.pop() if len(sides) == 1 else None
+        return None
 
     def _stopline_d(self, planner) -> float | None:
         """다음 정지선까지 뒷축 거리 — 신호 정지선 우선, 없으면 무신호 정지선 최근접."""
@@ -2951,7 +2999,12 @@ class KrRules:
             if self.preempt_latch_id is not None and self.preempt_latch_id != cand.id:
                 self.preempt_latch_id = None                # 차단물이 바뀌었다 — 새로
             latched = self.preempt_latch and self.preempt_latch_id == cand.id
-            if (self._static_ok(cand) and t_left < budget) or latched:
+            # [3] owns_shift: **언제** 도 지도가 정한다 (`lane_plan.armed` =
+            # 램프 시작점을 이미 지났다). 옛 시간 예산은 standoff 기준
+            # (d − shift_latest_m)/v 인데, 지도는 램프 길이를 속도·칸수로
+            # 직접 풀므로 두 벌을 유지할 이유가 없다. 게이트 10개는 그대로다.
+            armed = self._owns_shift() and (self.last_lane_plan or {}).get('armed')
+            if (self._static_ok(cand) and t_left < budget) or latched or armed:
                 actor, preempt = cand, True
                 self.last_avoid = dict(base, state='PREEMPT', latched=latched)
             elif obj_s >= self.wait_s:
@@ -3021,6 +3074,12 @@ class KrRules:
         if self._side_pass(ap, planner, ego_speed, chain, preempt,
                            lg, ego_lane, local_s, 1):
             return False
+        # **2바퀴는 owns_shift 에서도 그대로 돈다.** 지시안은 건너뛰라고 했지만
+        # avoid_sim 11 케이스가 반대로 나왔다 (2026-09-10 실측): 건너뛰면
+        # 7·8 이 0.0 → 23.2 s, 11 이 5.5 → 21.2 s 로 **정지가 늘고** 두 칸
+        # 도달(케이스 11 [-3,-2,-1])을 잃는다. 그대로 두면 케이스 9(양쪽 다 막힘)가
+        # 25.9 → 0.0 s 로 오히려 좋아진다. 실선 완화 자체의 옳고 그름은
+        # `solid_second_pass_enable` 소관이지 이 스위치가 정할 일이 아니다.
         if self.solid_second_pass and self.ot_pass_solid:
             if self._side_pass(ap, planner, ego_speed, chain, preempt,
                                lg, ego_lane, local_s, 2):
@@ -3223,6 +3282,15 @@ class KrRules:
             return False
         if self.ot_target is not None and str(list(self.ot_target)) == str(pick):
             return False                                   # 이미 그리로 가는 중
+        # 최소 이득 — 새 목표가 지금 목표보다 lane_switch_margin_m 만큼은 더
+        # 뚫려 있어야 갈아탄다. 매 틱 목표가 흔들리면 램프를 계속 다시 그린다.
+        if self.lm_switch_margin > 0.0 and self.ot_target is not None:
+            free = ((self.last_lane_map or {}).get('free_run') or {})
+            new_f = free.get(str(pick))
+            cur_f = free.get(str(list(self.ot_target)))
+            if (new_f is not None and cur_f is not None
+                    and float(new_f) - float(cur_f) < self.lm_switch_margin):
+                return False
         corridor = self._corridor_blockers(ap, planner)
         new = [c for c in corridor if c[3].id not in set(self.ot_ids)]
         if not new:
@@ -3239,6 +3307,16 @@ class KrRules:
                            'span_before': list(self.ot_span)}
         return self._side_pass(ap, planner, ego_speed, chain, False,
                                lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
+
+    def _owns_shift(self) -> bool:
+        """이번 틱 **차로 지도가 시프트를 소유하는가** ([3]).
+
+        소유 조건은 셋 다다: 스위치 on ∧ 지도 on ∧ 이번 틱 lane_plan 이 목표를
+        골랐다. 하나라도 아니면 옛 로직이 그대로 "어디로" 를 정한다 — 지도가
+        비어 있는 틱에 소유권을 주면 아무 데도 못 간다.
+        """
+        return bool(self.lm_owns and self.lane_map_on
+                    and (self.last_lane_plan or {}).get('pick'))
 
     def _lm_hops(self, side: str) -> int | None:
         """이번 틱 차로 지도가 이 side 로 **몇 칸** 가라고 하는가. 아니면 None.
@@ -3531,8 +3609,14 @@ class KrRules:
         # 순서만 바꾸므로, 지도가 고른 쪽이 게이트에서 떨어지면 반대쪽으로 간다
         # (이전 동작으로 자연히 되돌아온다). 스위치가 꺼져 있으면 좌측 우선 그대로.
         _lp = self.last_lane_plan or {}
-        _order = (('right', 'left') if _lp.get('side') == 'right'
-                  else ('left', 'right'))
+        # [3] owns_shift: 지도가 고른 쪽 **하나만** 본다. 게이트에서 떨어지면
+        # 반대쪽으로 새지 않고 그 틱은 시프트를 포기한다 — 지도는 매 틱 다시
+        # 고르므로 다음 틱에 다른 목표가 나온다. 게이트 10개는 그대로 탄다.
+        if self._owns_shift():
+            _order = (_lp['side'],)
+        else:
+            _order = (('right', 'left') if _lp.get('side') == 'right'
+                      else ('left', 'right'))
         for side in _order:                                # 기본은 좌측 추월 우선
             def reject(gate, **extra):
                 self.last_overtake = f'{side}:{gate}@p{n_pass}'

@@ -2408,7 +2408,10 @@ avoid_map:
   # 다른 차로가 막힌 것은 트리거가 아니다 (케이스 10).
   # 50 근거: 램프 길이(아래 식)가 20 km/h·두 칸에서 24.7 m 라, 램프 + 여유
   # (shift_ahead_m 5) + 판단 시간이 들어가려면 그 두 배는 있어야 한다.
-  lane_map_decide_m: 50.0
+  # 2026-09-10: 50 → 80 으로 감지창(lane_map_ahead_m)과 맞춘다. 50 이면 창
+  # 안에 장애물이 보이는데도 트리거가 안 걸리는 구간이 생긴다 — 실측
+  # run_20260909_232350 t 55.6 은 free_run 57.7 이라 옛 로직이 방향을 정했다.
+  lane_map_decide_m: 80.0
   # 트리거 즉시 거는 **속도 상한** [km/h]. 상한형이므로 P + a_cap_dec_max 축이다
   # (err/dt 금지 — CLAUDE.md 확정 사실). 램프를 짧게 만들어 늦은 발견을 흡수한다.
   lane_map_avoid_speed_kph: 20.0
@@ -2444,3 +2447,16 @@ avoid_map:
   # span 은 합집합으로 이어 붙인다 (원복은 original_route_points 에서 통째로).
   # false = 이전 동작.
   lane_map_retarget_enable: false
+  # ── [3] 차로 지도가 시프트를 소유한다 ────────────────────────────────
+  # 켜지면 "어디로·언제" 는 lane_plan 만 정하고, 옛 _try_overtake 는 안전
+  # 검사(게이트 10개)와 안전망(REACTIVE·BREAKOUT·never_stall)만 한다.
+  #  · side 후보가 계획한 쪽 **하나**가 된다 (게이트에서 떨어지면 그 틱은 포기 —
+  #    지도가 매 틱 다시 고르므로 다음 틱에 다른 목표가 나온다).
+  #  · 실선 2바퀴 완화(solid_second_pass)는 **그대로 돈다** — 건너뛰게 해 봤더니
+  #    avoid_sim 7·8 이 0.0 → 23.2 s, 11 이 5.5 → 21.2 s 로 나빠졌다(2026-09-10).
+  #  · 시프트 시점은 lane_plan.armed (램프 시작점 통과) 가 정한다.
+  # false = 이전 동작 (지도는 side **순서**만 바꾸는 힌트).
+  lane_map_owns_shift_enable: false
+  # 활성 목표를 갈아탈 최소 이득 [m] — 새 목표의 free_run 이 지금 목표보다
+  # 이만큼 길어야 재타겟한다. 0 이면 이전 동작(이득 무관).
+  lane_switch_margin_m: 20.0
