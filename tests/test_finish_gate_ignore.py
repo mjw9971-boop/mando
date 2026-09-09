@@ -40,8 +40,18 @@ FINISH_S = 100.0
 
 
 def on_cfg(**over):
+    """이 파일은 **자차 기준 게이트**(이전 축)의 계약을 지킨다.
+
+    2026-09-09 에 기본 판정축이 객체 기준으로 바뀌었다
+    (`finish_gate_by_object_enable`). 두 축은 게이트가 **열리는 시점**이 다르므로
+    (객체 기준은 물체가 s_rel 만큼 앞서 있는 만큼 먼저 열린다) 같은 rig 에서
+    같은 답을 낼 수 없다. 여기서는 축을 **명시적으로 고정**해 off 경로 커버리지를
+    잃지 않게 하고, 새 축의 계약은 `test_finish_gate_object.py` 가 본다
+    (2026-09-07 드리프트 원칙: 기본값을 읽지 말고 사본에서 명시할 것).
+    """
     c = copy.deepcopy(CFG)
     c['speed']['finish_gate_ignore_enable'] = True
+    c['speed']['finish_gate_by_object_enable'] = False
     c['speed'].update(over)
     return c
 
@@ -50,6 +60,7 @@ def off_cfg(**over):
     """이전 동작 사본. 기본값을 읽지 않는다 (2026-09-07 드리프트 원칙)."""
     c = copy.deepcopy(CFG)
     c['speed']['finish_gate_ignore_enable'] = False
+    c['speed']['finish_gate_by_object_enable'] = False
     c['speed'].update(over)
     return c
 

@@ -279,6 +279,16 @@ class KrRules:
         # 종료 구간 정적 장애물 무시 (실주행 1차 [1](b)). 꺼지면 이전 동작.
         self.fg_ignore = bool(sp.get('finish_gate_ignore_enable', False))
         self.fg_m = float(sp.get('finish_gate_m', 10.0))
+        # 게이트를 **자차 위치**가 아니라 **객체 위치**로 판정할지 (2026-09-09 [1]).
+        # 왜: 자차 기준이면 "자차가 종료 구간에 들어왔을 때"만 무시가 시작되는데,
+        # 회피 시프트는 그보다 훨씬 앞에서 결정된다. 실측 20260909_093415/실경로_02 —
+        # 종료선 콘 2개의 **객체 route_s 가 749.2 로 종료선과 같은데**, 자차 rs 700
+        # (s_rel 49.3) 에서 이미 시프트가 생성돼 rs 723~751 을 0.9 m/s 로 25 초
+        # 왕복했다. 자차 기준 게이트를 아무리 넓혀도(30 → 49.3 초과 필요) 그
+        # 순간을 못 덮는다 — 판정 축 자체가 틀렸다.
+        # 객체 기준이면 그 콘은 **감지 즉시**(rs 192.5, 556 m 앞) 빠진다.
+        # false = 이전 동작(자차 route_s 기준).
+        self.fg_by_obj = bool(sp.get('finish_gate_by_object_enable', False))
         # A3: 미보고 신호 시한이 **정지 앞차가 있어도** 돌게 한다. off = 이전 동작.
         self.sig_lead_ok = bool(ot.get('signal_timeout_with_lead_enable', False))
         # 연결로 곡률 감속 (B1). 꺼지면 후보를 만들지 않는다 = 이전 동작.
@@ -295,6 +305,20 @@ class KrRules:
         self.lc_cap_v = float(sp.get('lc_speed_cap_kph', 20.0)) / 3.6
         self.lc_chain_sep_m = float(sp.get('lc_hop_chain_sep_m', 25.0))
         self.lc_look_m = float(sp.get('lc_speed_cap_look_m', 60.0))
+        # 시프트가 **대상을 잃으면** 즉시 원복할지 (2026-09-09 [1]).
+        # 지금은 `route_index > span[1]` 에서만 원복하는데, span 끝이 경로 끝
+        # 근처면 그 지점을 못 밟고 시프트가 영원히 남는다 — 실측
+        # 20260909_093415/실경로_02: span [7274,7760] = rs 776.0 인데 종료선이
+        # 749.2 다. rs 722.6 부터 blocker 가 None 인데도 시프트를 쥔 채
+        # 종료 차로(-1) 대신 -2 로 끝났다(횡오프셋 −3.07 m, 차로유지 −3).
+        # 콘과 무관한 일반 버그라 종료 구간에 한정하지 않는다. 다만 조건은
+        # **좁게** 둔다 — "회랑이 비었다" 는 시프트 중에 항상 참이라(밀린 경로
+        # 기준 회랑에는 피한 물체가 안 들어온다) 그것만 보면 모든 시프트가
+        # 즉시 원복돼 왕복이 된다. 그래서 **시프트를 만든 그 id 들이 전부
+        # 사라졌을 때**만 푼다 (게이트로 빠졌거나 월드에서 없어졌거나).
+        # false = 이전 동작.
+        self.span_lost_restore = bool(ot.get('span_lost_restore_enable', False))
+        self.ot_ids: list = []                     # 이 시프트를 만든 객체 id
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
         self.shift_ahead_m = float(ot.get('shift_ahead_m', 5.0))
         self.obj_static_ticks = int(round(float(ot.get('obj_static_s', 3.0)) * self.hz))
@@ -1006,12 +1030,13 @@ class KrRules:
         # 셋이 같이 빠진다. 움직이는 객체는 그대로 본다 — 속도 임계는
         # blocker_speed_max("회피가 정지로 보는 속도")를 그대로 읽는다.
         # PDM 의 IDM 추종·보행자 정지는 여기와 무관하게 계속 산다.
-        drop_static = self._in_finish_gate(planner)
+        gate_on = self._finish_gate_s() is not None
         out = []
         for a in actors:
             if a.id == ego_id or not static_ok(a):
                 continue
-            if drop_static and float(getattr(a, 'speed', 0.0)) < self.ot_v_max:
+            if (gate_on and float(getattr(a, 'speed', 0.0)) < self.ot_v_max
+                    and self._fg_drop_static(planner, a)):
                 self.fg_dropped += 1
                 continue
             loc = a.get_location()
@@ -1033,6 +1058,68 @@ class KrRules:
         out.sort(key=lambda z: z[0])
         return out
 
+    def _finish_gate_s(self) -> float | None:
+        """종료 구간이 **시작되는 route_s**. 꺼져 있거나 종료선을 모르면 None.
+
+        게이트 임계를 두 곳(회랑·PDM 접합)에 적지 않기 위한 단일 출처다.
+
+        왜 종료 구간만 따로 막나 — 종료 지점은 주최측이 라바콘 2개로 표시하고,
+        좁은 연결로에서는 그 콘이 주행 회랑 안에 들어온다. 실측
+        실경로_01_PathShape03: 콘(cls obstacle, 0.3 m)을 blocker 로 잡아 종료선
+        17 m 앞에서 영구 정지했다(미완주). 생성기 쪽은 콘을 도로 끝으로 옮겼지만
+        **주최측 콘 위치는 우리가 못 정한다** — 대회에서 같은 일이 그대로 난다.
+        하필 이 구간은 다른 안전망이 전부 죽어 있다: route_end.active_m(150 m)
+        안이라 `_obstacle_cause` 가 거짓이고, BREAKOUT·크립·never_stall 이
+        하나도 안 선다.
+        """
+        if not self.fg_ignore or self.finish_s is None:
+            return None
+        return self.finish_s - self.fg_m
+
+    def _actor_route_s(self, planner, actor) -> float | None:
+        """객체의 **경로 위 절대 s** [m]. 투영 실패면 None.
+
+        전후 범퍼까지 **세 점**을 투영해 그중 가장 **가까운**(작은) s 를 쓴다.
+        커밋 A 의 `_actor_lanes` 는 차로 소속을 보므로 좌우 폭 끝점을 투영하지만,
+        여기는 **종거리 게이트**라 의미 있는 퍼짐이 종방향이다. 가장 가까운 점을
+        쓰는 것이 보수적이다 — 게이트에 걸쳐 선 물체는 "아직 종료 구간 밖" 으로
+        보고 계속 장애물로 취급한다.
+
+        `_project` 가 전방 detect_max_m 창에서만 찾으므로, 그 밖의 객체는 창
+        끝으로 접혀 s 가 작게 나온다 = 무시되지 않는다(안전한 쪽). 회피·standoff
+        결정은 전부 이 창 안에서 일어나므로 실질적으로 "감지 즉시" 와 같다.
+        """
+        try:
+            base_s = float(planner.route_s[planner.route_index])
+            loc = actor.get_location()
+            yaw = _math.radians(float(getattr(actor, 'yaw_deg', 0.0)))
+            half_l = float(getattr(actor, 'length', 0.0)) / 2.0
+        except Exception:                                  # noqa: BLE001
+            return None
+        dx, dy = _math.cos(yaw) * half_l, _math.sin(yaw) * half_l
+        best = None
+        for x, y in ((loc.x, loc.y), (loc.x + dx, loc.y + dy), (loc.x - dx, loc.y - dy)):
+            pr = self._project(planner, x, y)
+            if pr is None:
+                continue
+            s = base_s + pr[0]
+            best = s if best is None else min(best, s)
+        return best
+
+    def _fg_drop_static(self, planner, actor) -> bool:
+        """이 **정지 객체**가 종료 구간 안에 있나 (속도·static 판정은 호출부 몫).
+
+        `finish_gate_drop` 과 `_actors_in_corridor` 가 같은 식을 두 벌 적지 않게
+        가운데로 뺀 것이다.
+        """
+        gate = self._finish_gate_s()
+        if gate is None:
+            return False
+        if not self.fg_by_obj:
+            return self._in_finish_gate(planner)           # 이전 동작 — 자차 기준
+        s = self._actor_route_s(planner, actor)
+        return s is not None and s >= gate
+
     def finish_gate_drop(self, planner, actor) -> bool:
         """이 객체를 **종료 구간의 정지 장애물**로 보고 빼야 하나 (실주행 2차 [3]).
 
@@ -1051,32 +1138,26 @@ class KrRules:
         (기본 10 m)부터 ∧ **정지 객체만**(속도 < blocker_speed_max). 움직이는
         것은 그대로 보이고, 보행자 정지·IDM 추종도 이 구간 밖에서는 전부 그대로다.
         """
-        if not self._in_finish_gate(planner):
-            return False
         if not self._static_ok(actor):
             return False
-        return float(getattr(actor, 'speed', 0.0)) < self.ot_v_max
+        if float(getattr(actor, 'speed', 0.0)) >= self.ot_v_max:
+            return False
+        return self._fg_drop_static(planner, actor)
 
     def _in_finish_gate(self, planner) -> bool:
-        """지금 **종료 구간**인가 — 종료선 앞 finish_gate_m 부터 꼬리 끝까지.
+        """**자차**가 종료 구간 안인가 — `finish_gate_by_object_enable` 이 꺼졌을
+        때만 쓰는 이전 판정이다. 켜져 있으면 아무도 부르지 않는다.
 
-        종료 지점은 주최측이 라바콘 2개로 표시하고, 좁은 연결로에서는 그 콘이
-        주행 회랑 안에 들어온다. 실측 실경로_01_PathShape03: 콘(cls obstacle,
-        0.3 m)을 blocker 로 잡아 종료선 17 m 앞에서 영구 정지했다(미완주).
-        생성기 쪽은 콘을 도로 끝으로 옮겼지만 **주최측 콘 위치는 우리가 못
-        정한다** — 대회에서 같은 일이 그대로 난다.
-
-        하필 이 구간은 다른 안전망이 전부 죽어 있다: route_end.active_m(150 m)
-        안이라 `_obstacle_cause` 가 거짓이고, BREAKOUT·크립·never_stall 이
-        하나도 안 선다. 그래서 여기서만 따로 막는다.
+        이 축이 왜 틀렸는지는 스위치 주석(`fg_by_obj`) 참조 — 회피 결정이
+        자차가 구간에 들기 훨씬 전에 끝나므로 판정 시점이 늦다.
         """
-        if not self.fg_ignore or self.finish_s is None:
+        gate = self._finish_gate_s()
+        if gate is None:
             return False
         try:
-            route_s = float(planner.route_s[planner.route_index])
+            return float(planner.route_s[planner.route_index]) >= gate
         except Exception:                                   # noqa: BLE001
             return False
-        return route_s >= self.finish_s - self.fg_m
 
     def _crossable_runs(self, lg, key, side) -> list:
         """side 로 **넘을 수 있는** 구간 [(s0, s1) …] — 점선 조각 + (E-8 ①) 마킹
@@ -2430,6 +2511,10 @@ class KrRules:
             # standoff·막힘 회계는 계속 돈다: 복귀 전이 위에 다음 장애물이 있으면
             # standoff 가 25 m 앞에 세운다. 적색이면 위 SHIFT_HOLD 가 먼저 반환한다.
             # false 면 이전 동작(아무것도 안 봄).
+            if self.span_lost_restore and self._span_targets_lost(ap, planner):
+                self._restore_span(planner)
+                self.last_avoid = {'state': 'RESTORE', 'why': 'targets_lost'}
+                return False
             if self.span_active_standoff:
                 corridor = self._corridor_blockers(ap, planner)
                 self._standoff_target(ap, planner, corridor)
@@ -2688,10 +2773,38 @@ class KrRules:
         planner._kd = _cKDTree(planner.route_points[:, :2])
         self.ot_span = (a, b2)
         self.span_extend_n += 1
+        self.ot_ids = sorted(set(self.ot_ids) | set(chain['ids']))
         self.last_avoid['span'] = [a, b2]
         self.last_avoid['extend'] = dict(diag, span_after=[a, b2], n=self.span_extend_n)
         print(f'[kr_rules] 회피 span 연장 — {side} 끝 {b}→{b2} (id={chain["ids"]}, '
               f'예상 최소 이격 {c:.2f} m, {self.span_extend_n}회)', flush=True)
+
+    def _span_targets_lost(self, ap, planner) -> bool:
+        """이 시프트를 만든 객체가 **전부 사라졌나** ([1] span 상실 원복).
+
+        사라짐 = 월드에 없거나, 종료 게이트로 빠졌거나, 더 이상 정지 객체가
+        아니다(스스로 움직여 갔다). 하나라도 남아 있으면 거짓 — 시프트 중에는
+        밀린 경로 기준 회랑이 비어 보이므로 "회랑이 비었다" 로는 판정할 수 없다.
+
+        id 를 모르는 옛 span(연장·리플레이 중 상태 유실)은 거짓을 돌려
+        이전 동작(`route_index > span[1]` 원복)에 맡긴다.
+        """
+        if not self.ot_ids:
+            return False
+        try:
+            actors = {a.id: a for a in ap._world.get_actors()}
+        except Exception:                                  # noqa: BLE001
+            return False
+        for i in self.ot_ids:
+            a = actors.get(i)
+            if a is None:
+                continue                                   # 월드에서 사라졌다
+            if float(getattr(a, 'speed', 0.0)) >= self.ot_v_max:
+                continue                                   # 움직여 갔다
+            if self._fg_drop_static(planner, a):
+                continue                                   # 종료 게이트로 빠졌다
+            return False
+        return True
 
     def _restore_span(self, planner) -> None:
         """지나간 시프트 span 원복 (다음 장애물용) — E-6 으로 호출처가 둘이 됐다."""
@@ -2702,6 +2815,7 @@ class KrRules:
         planner._kd = _cKDTree(planner.route_points[:, :2])
         self.ot_span = None
         self.ot_side = None
+        self.ot_ids = []
         self.span_extend_n = 0
         self.last_overtake = 'restored'
 
@@ -3177,6 +3291,7 @@ class KrRules:
             min_start_ahead=ahead_eff * ppm)
         planner._kd = _cKDTree(planner.route_points[:, :2])
         self.ot_span = span
+        self.ot_ids = list(chain['ids'])                   # 대상 상실 판정의 기준
         self.ot_side = side                                # 연장이 같은 방향을 쓴다
         self.span_extend_n = 0
         self.ot_blocked_ticks = 0
