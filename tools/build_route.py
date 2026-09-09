@@ -90,6 +90,63 @@ def is_taper_lane(lg, key, veh_width=None) -> bool:
     return lg.width_at(key, lg.length(key)) < veh_width
 
 
+_TURN_BIAS = None
+_TURN_KIND: dict = {}
+_SIDE_N: dict = {}
+
+
+def turn_bias_m(reload=False) -> float:
+    """params.yaml route.turn_lane_bias_m — 회전 방향 차로 선호 가중치 [m 환산].
+
+    0 = 끔(이전 동작). 다음이 우회전이면 진입 차로에서 **오른쪽에 남은 차로 수**
+    만큼, 좌회전이면 왼쪽에 남은 수만큼 비용을 더한다. dijkstra 가 경유점마다
+    여러 번 불리므로 한 번 읽고 캐시한다.
+    """
+    global _TURN_BIAS
+    if _TURN_BIAS is None or reload:
+        from vtd_adapter.config import load_params_yaml
+        _TURN_BIAS = float((load_params_yaml().get('route') or {})
+                           .get('turn_lane_bias_m', 0.0))
+    return _TURN_BIAS
+
+
+def connector_turn(lg, key) -> str | None:
+    """연결로의 회전 방향 — 시작·끝 헤딩 차이. 교차로 차로가 아니면 None.
+
+    노면 화살표(lanes[k]['arrows'])가 아니라 **기하**로 판정한다: 화살표는
+    비교차로 차로에만 있고(지도 전체 1773개 중 696개), 연결로에는 없다.
+    """
+    if key in _TURN_KIND:
+        return _TURN_KIND[key]
+    r = lg.lanes[key]
+    out = None
+    if r.get('junction', -1) != -1:
+        h = r.get('hdg')
+        if h is not None and len(h) >= 2:
+            d = math.degrees((float(h[-1]) - float(h[0]) + math.pi)
+                             % (2.0 * math.pi) - math.pi)
+            if abs(d) <= 135.0:
+                out = 'left' if d > 25.0 else ('right' if d < -25.0 else None)
+    _TURN_KIND[key] = out
+    return out
+
+
+def lanes_on_side(lg, key, side: str) -> int:
+    """key 에서 side 로 남은 같은 방향 차로 수 (0 = 그쪽 끝 차로)."""
+    ck = (key, side)
+    if ck in _SIDE_N:
+        return _SIDE_N[ck]
+    n, cur = 0, key
+    while n <= 6:
+        nb = lg.neighbor(cur, side)
+        if nb is None or nb == key:
+            break
+        n += 1
+        cur = nb
+    _SIDE_N[ck] = n
+    return n
+
+
 _CAND_CFG = None
 
 
@@ -656,6 +713,8 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset(),
     # 대안이 차선변경뿐이라 LC 비용 축과 섞이지 않게 둔다.
     tp_on, tp_m, veh_w = taper_cfg()
     taper_pen = tp_m if (tp_on and tp_m > 0.0) else 0.0
+    # 회전 방향 차로 선호 [m/칸]. 0 이면 이전 동작 (계산도 안 한다).
+    turn_bias = turn_bias_m()
     for key, s in starts:
         if key in tgt and tgt[key] >= s - 1e-6:
             # 같은 차로 안에서 도달
@@ -682,6 +741,14 @@ def dijkstra(lg, starts, targets, allow_lane_change=True, banned=frozenset(),
             L2 = lg.length(k2)
             pen = taper_pen if (taper_pen > 0.0 and lg.lanes[k2].get('junction', -1) != -1
                                 and is_taper_lane(lg, k2, veh_w)) else 0.0
+            if turn_bias > 0.0:
+                # 우회전 연결로에 드는데 진입 차로 오른쪽에 차로가 남아 있으면
+                # 그 칸 수만큼 문다 (좌회전은 왼쪽). 규정은 "회전은 그 방향
+                # 끝 차로에서" 다. 벌점은 successor 진입에만 붙는다 —
+                # 대안이 차선변경이면 그 비용(LC_PENALTY + 회랑 부족분)과 겨룬다.
+                tk = connector_turn(lg, k2)
+                if tk is not None:
+                    pen += turn_bias * lanes_on_side(lg, key, tk)
             if k2 in tgt:
                 heapq.heappush(heap, (cost + tgt[k2] + pen, k2, 0.0, (key, s_enter), root, True))
             heapq.heappush(heap, (cost + L2 + pen, k2, 0.0, (key, s_enter), root, False))
