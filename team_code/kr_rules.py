@@ -6214,24 +6214,38 @@ class KrRules:
         if not self.latched and d_end <= self.latch_m and ego_speed < self.latch_v:
             self.latched = True
 
-        candidate = None
-        # (4) 어느 kr 후보가 이겼나 — 로그의 `route_end` 슬롯은 kr 후보 **전체의
-        # min** 하나라서, 승자가 종점인지 회피 상한인지 정지 프로파일인지 사후에
-        # 가릴 수 없었다 (실측 2026-09-10 run_20260910_121651 t 63.6~65.7:
-        # winner=route_end 인데 실제 승자는 lane_plan.v_cap 이었다).
-        # 관측만 한다 — 중재는 아래 min() 그대로다.
-        kr_cands: dict = {}
-        def _cd(name, v):
+        # ── 속도 후보 표 ──────────────────────────────────────────────
+        # 예전에는 `if x is not None and (candidate is None or x < candidate)` 를
+        # **15번 손으로** 썼고, 후보마다 부수효과가 달랐다 (어떤 건 cap_cand 도
+        # 갱신하고 어떤 건 안 했다). 그 산만함이 실제 버그를 낳았다 —
+        # `no_accel_red` 가 같은 틱에 다른 후보가 낮춘 속도를 읽어 0 까지
+        # 내려가 자기잠금이 됐다 (커밋 118c0bf).
+        #
+        # 이제 후보를 (이름, 값, 종류) 로 **한 표에** 모은다.
+        #   kind='stop' — 거리 기반 정지 프로파일 계열. 서로 독립이다.
+        #   kind='cap'  — "이 속도를 넘지 마라". 종방향이 err/dt 축이 아니라
+        #                 `cap_target` 축으로 실행해야 한다 (CLAUDE.md 확정 사실).
+        # `cap_cand`·`kr_cands`·승자 이름은 전부 표에서 유도한다.
+        #
+        # **순서는 그대로 둔다.** `ped_bind`·`cw_wins` 는 "그 시점까지의 최저" 를
+        # 읽는 순서 의존 값이라, 표로 옮기면서 순서를 바꾸면 값이 달라진다.
+        cands: list[tuple[str, float, str]] = []
+
+        def add(name: str, v, kind: str = 'stop') -> None:
             if v is not None:
-                kr_cands[name] = round(float(v), 2)
+                cands.append((name, float(v), kind))
+
+        def best():
+            """지금까지의 최저 — 옛 `candidate` 와 같은 값."""
+            return min((c[1] for c in cands), default=None)
+
         if self.latched:
-            candidate = 0.0
-            _cd('latched', 0.0)
+            add('latched', 0.0)
         elif d_end <= self.active_m and target_speed > 0.1:
             # 종점의 유령 선행차 (정지, 길이 0). 유효거리는 앞범퍼 기준 —
             # IDM 이 net gap ≈ s0(stop_gap)에서 서므로 앞범퍼가 종점 − stop_gap.
             d_eff = max(0.1, d_end - self.front)
-            candidate = float(ap._compute_target_speed_idm(
+            add('route_end', float(ap._compute_target_speed_idm(
                 desired_speed=target_speed,
                 leading_actor_length=0.0,
                 ego_speed=ego_speed,
@@ -6239,14 +6253,11 @@ class KrRules:
                 distance_to_leading_actor=d_eff,
                 s0=self.stop_gap,
                 T=self.T,
-            ))
-            _cd('route_end', candidate)
+            )))
 
         # WAIT/관찰 감속 — standoff 앞에 서도록 하는 속도 상한 (④′ 형태)
         so = self._standoff_profile(ego_speed)
-        _cd('standoff', so)
-        if so is not None and (candidate is None or so < candidate):
-            candidate = so
+        add('standoff', so)
         if so is not None:
             self.last_avoid = dict(self.last_avoid or {'state': 'STANDOFF'},
                                    standoff_d=round(float(self.wait_target_d), 1),
@@ -6261,22 +6272,12 @@ class KrRules:
         # 20배 증폭돼 0.2 m/s 초과에도 −4.0 이 나간다 — 실주행 2차 [1]. 그래서
         # 상한형 후보의 최저값을 따로 들고 있다가, 최종 목표를 이쪽이 정했을 때만
         # 종방향에 cap_target 으로 알린다.
-        cap_cand: float | None = None
         cv = self._curvature_cap(planner)
-        _cd('curvature', cv)
         self.last_curv = cv
-        if cv is not None and (candidate is None or cv < candidate):
-            candidate = cv
-        if cv is not None and (cap_cand is None or cv < cap_cand):
-            cap_cand = cv
+        add('curvature', cv, 'cap')
 
         # 차선변경 구간 속도 상한 ([3](a)) — 같은 자리의 min() 후보.
-        lcv = self._lc_speed_cap(planner)
-        _cd('lc_cap', lcv)
-        if lcv is not None and (candidate is None or lcv < candidate):
-            candidate = lcv
-        if lcv is not None and (cap_cand is None or lcv < cap_cand):
-            cap_cand = lcv
+        add('lc_cap', self._lc_speed_cap(planner), 'cap')
 
         # 붉은 구간 진입 전 감속 (2b-B) — 구간 **밖**에서만 산다. min() 후보.
         # 이것도 **정상상태 상한**이다: 목표가 0 이 아니라 구간 제한속도 v_allow
@@ -6284,74 +6285,44 @@ class KrRules:
         # v_allow 6.79 인데 v 7.71 (err −0.92) 만으로 −4.0 이 나갔고, 구간에
         # 들어가 후보가 사라진 뒤에도 jerk 램프 때문에 10 m 를 더 감속해
         # 7.26 → 4.25 m/s 가 됐다.
-        rz = self._red_approach_profile(planner)
-        _cd('red_zone', rz)
-        if rz is not None and (candidate is None or rz < candidate):
-            candidate = rz
-        if rz is not None and (cap_cand is None or rz < cap_cand):
-            cap_cand = rz
+        add('red_zone', self._red_approach_profile(planner), 'cap')
 
         # 차로 지도 회피 속도 상한 (커밋 B) — 트리거 즉시 걸어 램프를 짧게 만든다.
         # **상한형이다**: "이 속도를 넘지 마라" 지 "1틱 뒤에 이 속도가 되어라" 가
         # 아니므로 cap 축에 태운다 (CLAUDE.md 확정 사실 — err/dt 금지).
         lmv = (self.last_lane_plan or {}).get('v_cap') if self.last_lane_plan else None
         if lmv is not None and (self.last_lane_plan or {}).get('why') != 'no_candidate':
-            lmv = float(lmv)
-            _cd('lane_map', lmv)
-            if candidate is None or lmv < candidate:
-                candidate = lmv
-            if cap_cand is None or lmv < cap_cand:
-                cap_cand = lmv
+            add('lane_map', float(lmv), 'cap')
 
         # 적신호 접근 가속 금지 ((C)) — "이 속도를 넘지 마라" 이므로 cap 축이다.
-        nar = self._no_accel_red_cap(planner, ap, ego_speed)
-        _cd('no_accel_red', nar)
-        if nar is not None:
-            if candidate is None or nar < candidate:
-                candidate = nar
-            if cap_cand is None or nar < cap_cand:
-                cap_cand = nar
+        add('no_accel_red', self._no_accel_red_cap(planner, ap, ego_speed), 'cap')
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)
-        _cd('shift_cap', cap)
-        if cap is not None and (candidate is None or cap < candidate):
-            candidate = cap
+        add('shift_cap', cap)
         if cap is not None:
             self.last_avoid = dict(self.last_avoid or {}, shift_cap=round(cap, 2))
         # gap_fit 속도 연동 — 짧은 전이를 만들려면 v ≤ trans / shift_k_s 여야 한다.
         # `_shift_speed_cap` 과 **같은 자리·같은 방식**의 min() 후보다. 오버라이드가
         # 아니라 상한이라, 신호·보행자·standoff 가 더 낮으면 그쪽이 이긴다.
-        vr = self.gap_v_req
-        _cd('gap_fit', vr)
-        if vr is not None and (candidate is None or vr < candidate):
-            candidate = vr
+        add('gap_fit', self.gap_v_req)
 
         # BREAKOUT 크립 — 훅이 PDM 후보를 무효화한 뒤, 상한은 여전히 min() 이다.
         if self.breakout_creep():
-            _cd('breakout_creep', self.bo_creep_v)
-            if candidate is None or self.bo_creep_v < candidate:
-                candidate = self.bo_creep_v
+            add('breakout_creep', self.bo_creep_v)
 
         # 정지선 정지 프로파일 (④′) — 적색일 때만, min 으로 합류.
         # route_end 는 대상이 아니다 (검증 통과 후 별건).
         prof = self._stopline_profile(planner, ap, ego_speed)
-        _cd('stopline_profile', prof)
         self.last_stop_profile = prof
-        if prof is not None and (candidate is None or prof < candidate):
-            candidate = prof
+        add('stopline_profile', prof)
 
         # 정지선 0.5 s 유지 홀드 — route_end 후보와 min 으로 합류
-        hold = self._stopline_hold(planner, ego_speed)
-        _cd('stopline_hold', hold)
-        if hold is not None and (candidate is None or hold < candidate):
-            candidate = hold
+        add('stopline_hold', self._stopline_hold(planner, ego_speed))
 
         # RTOR 진행 상한 — 래치가 살아 있는 동안(리셋까지) min() 후보.
         if self._rtor_go and self.rtor_go_v > 0.0:
-            _cd('rtor_go', self.rtor_go_v)
-            if candidate is None or self.rtor_go_v < candidate:
-                candidate = self.rtor_go_v
+            add('rtor_go', self.rtor_go_v)
 
         # 보행자 의도 후보 (P4) — PDM 예측선 교차를 기다리지 않는다.
         ped = self._ped_intent(planner, ap, ego_speed)
@@ -6361,10 +6332,10 @@ class KrRules:
             # '구속' = 이 후보가 min() 의 최저값이다 (동률 포함). 동률까지 세는
             # 이유는 PDM 의 walker 후보가 뒤늦게 같은 값에 도달했을 때도 비상
             # 우회가 이어져야 하기 때문이다.
-            ped_bind = candidate is None or v_allow <= candidate + 1e-9
-            if candidate is None or v_allow < candidate:
-                candidate = v_allow
-            _cd('pedestrian', v_allow)
+            # **순서 의존**: 이 시점까지의 최저와 견준다 (표로 옮겨도 그대로).
+            _prev = best()
+            ped_bind = _prev is None or v_allow <= _prev + 1e-9
+            add('pedestrian', v_allow)
             self.last_ped = {'id': int(wid), 'v_allow': round(float(v_allow), 2),
                              'a_req': round(float(a_req), 2), 'wins': bool(ped_bind),
                              **self.ped_diag.get(wid, {})}
@@ -6387,10 +6358,9 @@ class KrRules:
         cw = self._ped_crosswalk(planner, ap, ego_speed)
         if cw is not None:
             v_cw, info = cw
-            _cd('crosswalk_creep', v_cw)
-            if candidate is None or v_cw < candidate:
-                candidate = v_cw
-            cw_wins = bool(v_cw <= min(target_speed, candidate) + 1e-9)   # 최종 목표를 구속하나
+            add('crosswalk_creep', v_cw)
+            # 이쪽은 **추가한 뒤** 견준다 (옛 코드와 같은 순서다)
+            cw_wins = bool(v_cw <= min(target_speed, best()) + 1e-9)   # 최종 목표를 구속하나
             if self.last_ped is None:
                 self.last_ped = {'id': int(info['id']), 'wins': cw_wins, 'crosswalk': info}
             else:
@@ -6398,6 +6368,9 @@ class KrRules:
 
         # 보행자 비상 우회 — **보행자 후보가 최종 목표를 구속하는 틱 한정**이다.
         # 선행차·신호·종점·크립 후보가 이긴 틱에서는 절대 발동하지 않는다.
+        # ── 표 → 최종값 ──────────────────────────────────────────────
+        candidate = best()
+        cap_cand = min((v for _n, v, k in cands if k == 'cap'), default=None)
         final_t = target_speed if candidate is None else min(target_speed, candidate)
         emg = bool(ped_bind and self.ped_emg_ratio > 0.0
                    and ped[1] > self.ped_emg_ratio * self.a_dec_max
@@ -6409,9 +6382,11 @@ class KrRules:
 
         if candidate is not None:
             self.last_candidate = candidate
-        # 승자 이름 — 최종 후보와 같은 값을 낸 것 (동률이면 더 낮은 쪽 우선 나열).
-        if kr_cands:
-            self.last_kr_cands = dict(sorted(kr_cands.items(), key=lambda kv: kv[1]))
+        # 진단은 표에서 그대로 나온다 — 손으로 적는 `_cd` 호출이 사라졌다.
+        # 승자 이름 = 최종 후보와 같은 값을 낸 것 (동률이면 더 낮은 쪽 우선 나열).
+        if cands:
+            self.last_kr_cands = dict(sorted(
+                ((n, round(v, 2)) for n, v, _k in cands), key=lambda kv: kv[1]))
             if candidate is not None:
                 self.last_kr_win = next(
                     (n for n, v in self.last_kr_cands.items()
