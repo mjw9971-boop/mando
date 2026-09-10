@@ -2485,3 +2485,9 @@ avoid_map:
   # 활성 목표를 갈아탈 최소 이득 [m] — 새 목표의 free_run 이 지금 목표보다
   # 이만큼 길어야 재타겟한다. 0 이면 이전 동작(이득 무관).
   lane_switch_margin_m: 20.0
+  # (4) owns_shift 에서 계획한 쪽이 게이트에 떨어지면 **차선책으로 폴백**한다.
+  # 폴백이 없으면 그 틱은 끝이라(continue → 루프 종료) 좌우 2바퀴를 돌던 옛
+  # 로직보다 오히려 좁아진다. 순서는 ① 계획한 쪽 ② lane_plan 후보 free_run
+  # 2위의 쪽 ③ 반대쪽. 게이트 10개는 후보마다 그대로 탄다.
+  # false = 이전 동작 (계획한 쪽 하나만).
+  lane_map_fallback_side_enable: false

@@ -403,6 +403,7 @@ class KrRules:
         # 목표 차로 후방 감시 창 [m] — 이 안에 자차보다 빠른 차가 있으면 기각
         # (채점 항목 14). 0 = 후방을 안 본다.
         self.rear_clear_m = float(ot.get('rear_clear_m', 30.0))
+
         self.q_hold_ticks = int(round(float(ot.get('queue_hold_s', 15.0)) * self.hz))
         # 억제 단일화 (C). 'queue_only' = 억제는 _is_queue 하나, 적색·정지선·교차로는
         # 일시정지/게이트 입력. 'legacy' = 이전 3중 억제(_red_ahead·_signal_zone·_is_queue)
@@ -626,6 +627,9 @@ class KrRules:
         # 활성 목표를 갈아탈 최소 이득 [m] — 새 목표의 free_run 이 현재 목표보다
         # 이만큼 길어야 바꾼다. 매 틱 목표가 흔들리면 램프가 계속 다시 그려진다.
         self.lm_switch_margin = float(_lm.get('lane_switch_margin_m', 20.0))
+        # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
+        # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
+        self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
         # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
         self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
         # 활성 시프트 중에도 차로 지도가 다른 목표를 고르면 갈아탈지 (2026-09-09).
@@ -3391,6 +3395,33 @@ class KrRules:
         return self._side_pass(ap, planner, ego_speed, chain, False,
                                lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
 
+    def _lm_second_side(self, lp: dict):
+        """`lane_plan` 후보 중 **2위** 차로가 있는 쪽 ('left'/'right'). 없으면 None.
+
+        1위가 게이트에서 떨어졌을 때 갈 곳이다. 후보 목록(`cands`)은 이미
+        "통행 가능 ∧ 램프가 들어감" 을 통과한 것들이라 새로 거를 것이 없다 —
+        free_run 이 큰 순으로 두 번째를 고르면 된다.
+
+        칸 수를 줄이는 폴백(2칸 실패 → 1칸)은 여기서 하지 않는다. `_lm_hops` 가
+        side 별로 칸 수를 돌려주므로, 다른 쪽 후보가 1칸이면 자연히 1칸이 된다.
+
+        좌/우는 **차로 지도의 `hops` 부호**로 읽는다 — 차로 id 로 추정하면 안 된다.
+        진행 방향에 따라 부호 규약이 뒤집힌다 (road 2756 dir −1 은 왼쪽이 id
+        감소, road 128 의 음수 id 쪽은 왼쪽이 id 증가). `lane_plan` 자신도
+        `'left' if hops[pick] < 0 else 'right'` 로 같은 출처를 쓴다.
+        """
+        cands = lp.get('cands') or {}
+        pick = lp.get('pick')
+        hops = (self.last_lane_map or {}).get('hops') or {}
+        if not cands or not hops:
+            return None
+        rest = [(float(v.get('free', 0.0)), k) for k, v in cands.items()
+                if k != pick and k in hops]
+        if not rest:
+            return None
+        rest.sort(reverse=True)
+        return 'left' if int(hops[rest[0][1]]) < 0 else 'right'
+
     def _owns_shift(self) -> bool:
         """이번 틱 **차로 지도가 시프트를 소유하는가** ([3]).
 
@@ -3696,7 +3727,20 @@ class KrRules:
         # 반대쪽으로 새지 않고 그 틱은 시프트를 포기한다 — 지도는 매 틱 다시
         # 고르므로 다음 틱에 다른 목표가 나온다. 게이트 10개는 그대로 탄다.
         if self._owns_shift():
-            _order = (_lp['side'],)
+            # (4) 계획한 쪽이 게이트에서 떨어지면 **차선책으로 폴백**한다.
+            # 폴백이 없으면 그 틱은 끝이고(continue → 루프 종료), 옛 로직이
+            # 좌우 2바퀴를 돌던 것보다 오히려 좁아진다.
+            # 순서: ① 계획한 쪽 ② lane_plan 후보 중 free_run 2위의 쪽
+            #       ③ 반대쪽 (지도가 후보를 하나만 냈을 때의 최후 수단)
+            # 같은 쪽이 두 번 들어가지 않게 순서를 유지하며 중복만 뺀다.
+            _second = self._lm_second_side(_lp)
+            _cand = [_lp['side']]
+            if _second and _second not in _cand:
+                _cand.append(_second)
+            _other = 'right' if _lp['side'] == 'left' else 'left'
+            if _other not in _cand:
+                _cand.append(_other)
+            _order = tuple(_cand) if self.lm_fallback else (_lp['side'],)
         else:
             _order = (('right', 'left') if _lp.get('side') == 'right'
                       else ('left', 'right'))

@@ -107,3 +107,68 @@ def test_tie_break_prefers_right():
         route_s = [0.0]
         route_index = 0
     assert k._lm_valid_side(P(), hops, '[1, 0, -1]') is None
+
+
+# ── (4) 단일 후보 폴백 ───────────────────────────────────────────────────
+#
+# owns_shift 가 계획한 쪽 하나만 넘기면, 그 하나가 게이트에서 떨어졌을 때
+# 그 틱은 끝이다 (continue → 루프 종료). 좌우 2바퀴를 돌던 옛 로직보다 오히려
+# 좁아진다. 폴백은 ① 계획한 쪽 ② lane_plan 후보 free_run 2위의 쪽 ③ 반대쪽.
+EGO = [1, 0, -2]
+
+
+HOPS = {'[1, 0, -2]': 0, '[1, 0, -3]': 1, '[1, 0, -1]': -1, '[1, 0, -4]': 2}
+
+
+def plan(pick, cands, side='right'):
+    return {'pick': pick, 'side': side, 'ego_lane': EGO, 'cands': cands}
+
+
+def with_map(k):
+    k.last_lane_map = {'hops': HOPS}
+    return k
+
+
+def test_second_side_reads_the_hops_sign_not_the_lane_id():
+    """좌/우는 지도의 hops 부호로만 읽는다 — id 부호 규약은 방향마다 뒤집힌다."""
+    k = with_map(kr())
+    lp = plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0},
+                             '[1, 0, -1]': {'free': 40.0}})
+    assert k._lm_second_side(lp) == 'left'      # hops -1 → left
+
+
+def test_second_side_is_none_with_a_single_candidate():
+    k = with_map(kr())
+    assert k._lm_second_side(plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0}})) is None
+
+
+def test_second_side_is_none_without_a_map():
+    """지도가 없으면 부호를 알 수 없다 — 추정하지 않는다."""
+    k = kr()
+    lp = plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0},
+                             '[1, 0, -1]': {'free': 40.0}})
+    assert k._lm_second_side(lp) is None
+
+
+def test_second_side_is_none_without_a_plan():
+    assert with_map(kr())._lm_second_side({}) is None
+
+
+def test_fallback_switch_default_is_off():
+    assert CFG['avoid_map'].get('lane_map_fallback_side_enable') is False
+
+
+def test_fallback_order_has_no_duplicates():
+    """계획한 쪽·2위·반대쪽이 겹쳐도 한 번씩만 돈다."""
+    k = with_map(kr(lane_map_fallback_side_enable=True))
+    lp = plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0},
+                             '[1, 0, -1]': {'free': 60.0}}, side='right')
+    second = k._lm_second_side(lp)              # hops -1 → left
+    order = [lp['side']]
+    if second and second not in order:
+        order.append(second)
+    other = 'right' if lp['side'] == 'left' else 'left'
+    if other not in order:
+        order.append(other)
+    assert order == ['right', 'left']
+    assert len(order) == len(set(order))
