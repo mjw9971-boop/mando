@@ -4296,6 +4296,15 @@ class KrRules:
             # ⑤ 기하 계단 검사 (B-7 임시 가드) — 다른 게이트를 다 통과한 뒤에만
             # 잰다 (읽기 전용이지만 span 하나에 1.7~5.2 ms 든다). 상태를 남기지
             # 않으므로 기각은 **그 시점 그 경로 한정**이고 다음 틱에 다시 시도한다.
+            #
+            # 문턱(`shift_kappa_reject`·`shift_lc_overlap_m`)이 둘 다 0.0 이라
+            # 아래 두 기각은 지금 구조적으로 안 걸린다 (실측 2026-09-10: 로그
+            # 82개 240,551틱에서 kappa·lc_overlap 기각 **각 0건**). 그렇다고
+            # **호출을 건너뛸 수는 없다** — 이 함수가 `self.last_span_plan` 을
+            # 채우고, 그것을 `span_too_far`·`entry_block`(_shift_placement)·
+            # gap_fit 이 읽는다. 건너뛰면 그 셋이 조용히 죽는다 (실측: avoid_sim
+            # 케이스 9·11·12 가 통째로 달라졌다). 비용 1.7~5.2 ms 는 기각 검사가
+            # 아니라 **span 계획**의 값이다.
             geom = self._planned_shift_geom(planner, actor, side, trans_m, ahead_m,
                                             last_actor=chain_last, after_m=extra_after)
             if geom is not None:
