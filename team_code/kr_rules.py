@@ -652,6 +652,7 @@ class KrRules:
         self.retarget_hold_ticks = int(round(
             float(_lm.get('retarget_min_hold_s', 0.0)) * self.hz))
         self._retarget_lock = 0                    # 남은 잠금 틱
+        self._retarget_why = None                  # 이번 틱 재타겟 차단 사유 (진단)
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
@@ -3868,13 +3869,16 @@ class KrRules:
         `_apply_shift` 가 span 을 **합집합으로 이어 붙인다**. 램프를 새로 만드는
         것이 아니라 목표 차로만 바꾸는 것이다.
         """
+        self._retarget_why = None
         if not (self.lm_retarget and self.lane_map_on):
             return False
         lp = self.last_lane_plan or {}
         pick = lp.get('pick')
         if not pick:
+            self._retarget_why = 'no_pick'
             return False
         if self.ot_target is not None and str(list(self.ot_target)) == str(pick):
+            self._retarget_why = 'same_target'
             return False                                   # 이미 그리로 가는 중
         # 최소 유지 시간 — 한 번 정했으면 그동안은 안 바꾼다 (2026-09-10 [1]).
         # 마진만으로는 못 막는다: 마진은 "지금 목표 대비 이득" 인데 목표를 바꾼
@@ -3885,6 +3889,7 @@ class KrRules:
         # 74 m 있을 때 하나를 정해 끝냈으면 됐다. 0 이면 이전 동작.
         if self.retarget_hold_ticks > 0 and self._retarget_lock > 0:
             self._retarget_lock -= 1
+            self._retarget_why = 'hold:%d' % self._retarget_lock
             return False
         # 최소 이득 — 새 목표가 지금 목표보다 lane_switch_margin_m 만큼은 더
         # 뚫려 있어야 갈아탄다. 매 틱 목표가 흔들리면 램프를 계속 다시 그린다.
@@ -3894,14 +3899,17 @@ class KrRules:
             cur_f = self._free_of(free, self.ot_target)
             if (new_f is not None and cur_f is not None
                     and float(new_f) - float(cur_f) < self.lm_switch_margin):
+                self._retarget_why = 'margin:%+.1f' % (float(new_f) - float(cur_f))
                 return False
         corridor = self._corridor_blockers(ap, planner)
         new = [c for c in corridor if c[3].id not in set(self.ot_ids)]
         if not new:
+            self._retarget_why = 'no_new_blocker:%d' % len(corridor)
             return False                                   # 새 장애물이 없다
         lg = getattr(planner, 'lg', None)
         ego_lane = self._tick_ego_lane or self._ego_lane(lg, ap)
         if lg is None or ego_lane is None:
+            self._retarget_why = 'no_lane'
             return False
         chain = self._chain(corridor, new[0][3])
         side = lp.get('side')
@@ -3911,6 +3919,7 @@ class KrRules:
                            'span_before': list(self.ot_span)}
         ok = self._side_pass(ap, planner, ego_speed, chain, False,
                              lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
+        self._retarget_why = 'fired' if ok else 'side_pass_rejected'
         if ok:
             self._retarget_lock = self.retarget_hold_ticks
         return ok
@@ -6704,6 +6713,10 @@ class KrRules:
             # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(51 지문)가 성립한다.
             self.last_avoid = dict(self.last_avoid or {}, curv=self.last_curv_info)
+        if getattr(self, '_retarget_why', None):
+            # 재타겟이 **왜 안 돌았나**. 값이 있을 때만 키가 생긴다 (off 지문 보존).
+            self.last_avoid = dict(self.last_avoid or {},
+                                   retarget_why=self._retarget_why)
         if self.last_lane_plan is not None:
             # 스위치가 꺼져 있으면 항상 None 이라 키가 안 생긴다 — off 는 로그까지
             # 이전과 동일해야 회귀 비교(58 지문)가 성립한다.
