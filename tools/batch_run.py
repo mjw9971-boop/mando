@@ -225,7 +225,8 @@ def stop_excused(tick: dict, intent_mps: float, queue_excuse: bool = False,
 #                시프트가 NOOP/기각이거나 활성 중 앞이 막힌 것 (won_24)
 STOP_CAUSES = ('red_queue', 'pedestrian', 'breakout', 'standoff', 'stopped_lead',
                'avoid', 'red_light', 'unknown')
-AVOID24_STATES = ('PREEMPT', 'SHIFT_NESTED', 'NOOP', 'SHIFT_ACTIVE', 'HANDLED')
+AVOID24_STATES = ('PREEMPT', 'SHIFT_NESTED', 'NOOP', 'SHIFT_ACTIVE', 'HANDLED',
+                  'SPAN_WAIT_V')
 
 
 def stop_cause(tick: dict, intent_mps: float, head_gap_m: float = 10.0) -> str:
