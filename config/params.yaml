@@ -2575,6 +2575,13 @@ avoid_map:
   # 진입 차로 전부. laneLink 는 이미 레인그래프 `next` 에 있다.
   # false = 이전 동작 (route.pkl 만 본다).
   lane_map_valid_by_map_enable: false
+  # (1) 적색 홀드에도 `overtake.red_pause_max_m`(100) 거리 상한을 적용한다.
+  # `_red_ahead` 는 거리 무관이라 456 m 밖 적색도 SHIFT_HOLD 를 건다 (legacy
+  # 억제의 설계). 큐 판정·BREAKOUT pause 는 이미 상한을 쓴 `_red_pause` 쪽인데
+  # 홀드만 옛 축에 남아 있었다. 실측 run_20260910_144656 t 13.2: 정지선이 아직
+  # 전방 창에도 안 들어왔는데(dist_stop_line null) SHIFT_HOLD/red_ahead.
+  # false = 이전 동작.
+  shift_hold_red_bounded_enable: false
   # 큐로 판정된 객체를 free_run 에서 **빼지 말고 표시만** 한다.
   # 큐 제외의 목적은 "신호 대기 줄을 **추월 후보로 삼지 않기**" 지 "장애물이
   # 없는 셈 치기" 가 아니다. 그런데 제외는 `_tick_corridor`(= **내 차로** 회랑)

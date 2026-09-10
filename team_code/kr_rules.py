@@ -664,6 +664,9 @@ class KrRules:
         # v 가 0 이 되면 상한도 0 이 되어 영구 정지 — 자기잠금).
         _sp = cfg.get('speed') or {}
         self.nar_floor = float(_sp.get('red_approach_min_kph', 0.0)) / 3.6
+        # (1) 적색 홀드에도 `overtake.red_pause_max_m` 거리 상한을 적용한다.
+        # false = 이전 동작 (`_red_ahead` — 거리 무관).
+        self.hold_red_bounded = bool(_lm.get('shift_hold_red_bounded_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -3113,7 +3116,16 @@ class KrRules:
 
     def _try_overtake_inner(self, ap, planner, ego_speed: float) -> bool:
         """_try_overtake 본문. 반환 = 이번 틱 회피 시도가 전부 기각됐나 (E-3)."""
-        red_hold = self.ot_span is not None and self._red_ahead(planner) is not None
+        # 적색 홀드의 거리 판정. `_red_ahead` 는 **거리 무관**이라 456 m 밖
+        # 적색도 홀드를 건다 (legacy 억제의 설계). `_red_pause` 는 같은 값에
+        # `overtake.red_pause_max_m`(100) 상한을 씌운 것이고, 큐 판정·BREAKOUT
+        # pause 는 이미 그쪽을 쓴다. 홀드만 옛 축에 남아 있었다 — 실측
+        # 2026-09-10 run_20260910_144656 t 13.2: 정지선이 아직 전방 창에도 안
+        # 들어왔는데(dist_stop_line null) SHIFT_HOLD/red_ahead 가 걸렸다.
+        # false = 이전 동작 (거리 무관).
+        _rd = (self._red_pause(planner) if self.hold_red_bounded
+               else self._red_ahead(planner))
+        red_hold = self.ot_span is not None and _rd is not None
         # 지나갔으면 원복 (다음 장애물용). E-6: 적색이어도 **원복이 먼저다** —
         # 이미 통과한 span 을 쥔 채 SHIFT_HOLD 로 반환하면 다음 장애물의 회랑·
         # standoff·회계가 전부 멈춘다 (실측 2026-09-03 020439/01·03 접촉).
