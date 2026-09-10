@@ -1907,10 +1907,10 @@ ctrl24:
   # 3.24 = 코사인 전이 a_lat 1.5 m/s² (10 m/s → 32 m).
   trans_min_m: 8.0
   trans_k: 3.24
-  shift_ahead_m: 5.0           # 전이 시작을 자차 앞 이만큼 [m] (정지 상태 조향 풀락 방지)
-  extra_before_m: 5.0          # 장애물 앞뒤 여유 [m]
-  extra_after_m: 10.0
-  chain_gap_m: 18.0            # 연쇄 병합 [m] = extra_after + trans_min
+  shift_ahead_m: 0.5           # 전이 시작을 자차 앞 이만큼 [m] (정지 상태 조향 풀락 방지)
+  extra_before_m: 1.0          # 장애물 앞뒤 여유 [m]
+  extra_after_m: 1.0
+  chain_gap_m: 10            # 연쇄 병합 [m] = extra_after + trans_min
   # 유일한 side 게이트 — 시프트 시작점이 자차보다 이만큼 앞이면 기각 (순환 코스 안전망)
   span_gate_max_m: 100.0
   # 이 미만의 횡변위는 시프트가 아니다 (이웃 없음 → route.py 폴백이 원 경로 유지).
@@ -1987,14 +1987,14 @@ ctrl24:
   escape_enable: true         # 기본 off — 켜면 이전 동작과 달라진다
   escape_stuck_s: 3.0           # 이 시간 동안
   escape_progress_m: 0.1        # 경로 진행이 이 미만이면 고착
-  escape_v: 5.0            # 바닥 [m/s]
+  escape_v: 3.0            # 바닥 [m/s]
   escape_release_m: 5.0         # 걸린 뒤 이만큼 진행하면 푼다 (래치)
   # 바닥의 정의에 들어가는 물리 간격 [m] — 회랑 전방 최근접 객체까지 범퍼 간격이
   # 이 이하면 바닥은 0 이다 (원래 후보값 그대로). 붙어서 밀지 않는다.
-  escape_clear_m: 0.0
+  escape_clear_m: -4.0
   # 고착 래치가 서는 틱에 회랑 전방 객체를 요동 방지 집합(_shifted_for)에서 빼
   # 중첩 시프트가 재시도되게 한다. 바닥과 독립인 별도 스위치.
-  escape_rearm_shift_enable: false
+  escape_rearm_shift_enable: true
   # ── 가상 차로 시프트 (B-33, 2026-09-10) ────────────────────────────────
   # 옆에 차로가 없어 NOOP 인 자리에서 서 있지 않는다. 근거: 미완주 > 중앙선·차로이탈 −6.
   # 발동은 탈출 규칙의 한 갈래다 — 고착 래치가 서 있고 ∧ 양쪽이 no_target/NOOP 이고
