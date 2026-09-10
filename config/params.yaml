@@ -2582,6 +2582,15 @@ avoid_map:
   # 전방 창에도 안 들어왔는데(dist_stop_line null) SHIFT_HOLD/red_ahead.
   # false = 이전 동작.
   shift_hold_red_bounded_enable: false
+  # (5) 계획한 쪽이 게이트에서 떨어졌을 때 **큐 차로로는 폴백하지 않는다**.
+  # 실측 run_20260910_144656 t 65.3~66.5, 자차 (2533,0,5) free_run **80.0**:
+  #   plan  pick (2533,0,3) side left hops 2   ← 왼쪽 free 80.0
+  #   기각  ['left:occupied_mid@p1']           ← 중간 차로 4 가 id 9 로 막힘
+  #   폴백  picked 'right' → lane 6            ← queue_lanes 에 있다
+  #   결과  t 70.6 자차가 lane 6 (free 21.0, id 12 대기열) 안에 있다
+  # 비어 있는 차로에서 나와 막힌 차로로 들어간 것이다. 계획한 쪽 자체는
+  # 남긴다 — 지도가 고른 목표는 이미 큐가 아니다. false = 이전 동작.
+  lane_map_fallback_no_queue_enable: false
   # 큐로 판정된 객체를 free_run 에서 **빼지 말고 표시만** 한다.
   # 큐 제외의 목적은 "신호 대기 줄을 **추월 후보로 삼지 않기**" 지 "장애물이
   # 없는 셈 치기" 가 아니다. 그런데 제외는 `_tick_corridor`(= **내 차로** 회랑)

@@ -667,6 +667,9 @@ class KrRules:
         # (1) 적색 홀드에도 `overtake.red_pause_max_m` 거리 상한을 적용한다.
         # false = 이전 동작 (`_red_ahead` — 거리 무관).
         self.hold_red_bounded = bool(_lm.get('shift_hold_red_bounded_enable', False))
+        # (5) 폴백 side 가 큐 차로면 버린다. false = 이전 동작.
+        self.lm_fallback_no_queue = bool(
+            _lm.get('lane_map_fallback_no_queue_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -3494,6 +3497,21 @@ class KrRules:
         print(f'[kr_rules] 회피 span 연장 — {side} 끝 {b}→{b2} (id={chain["ids"]}, '
               f'예상 최소 이격 {c:.2f} m, {self.span_extend_n}회)', flush=True)
 
+    def _lm_side_lane(self, planner, side: str):
+        """자차 기준 그 쪽 **바로 옆** 차로 키. 모르면 None.
+
+        폴백 side 가 큐 차로인지 보려는 것뿐이라 한 칸이면 충분하다
+        (두 칸 시프트도 첫 칸은 여기를 지난다).
+        """
+        lg = getattr(planner, 'lg', None)
+        ego_lane = self._tick_ego_lane
+        if lg is None or ego_lane is None:
+            return None
+        try:
+            return lg.neighbor(ego_lane, side)
+        except Exception:                                  # noqa: BLE001
+            return None
+
     def _lm_valid_by_map(self, planner, lg, ego_lane):
         """다음 교차로 **유효 진입 차로**를 지도에서 유도한다 — 없으면 None.
 
@@ -4082,6 +4100,29 @@ class KrRules:
             if _other not in _cand:
                 _cand.append(_other)
             _order = tuple(_cand) if self.lm_fallback else (_lp['side'],)
+            # (5) **큐 차로로는 폴백하지 않는다.** 계획한 쪽이 게이트에서 떨어지면
+            # 반대쪽이 최후 수단인데, 그 반대쪽이 신호 대기열이면 "비어 있는
+            # 차로에서 나와 막힌 차로로 들어가는" 짓이 된다.
+            # 실측 2026-09-10 run_20260910_144656 t 65.3~66.5 (자차 (2533,0,5),
+            # **free_run 80.0 = 완전히 빈 차로**):
+            #   plan  pick (2533,0,3) side left  hops 2   ← 왼쪽 free 80.0
+            #   기각  ['left:occupied_mid@p1']            ← 중간 차로 4 가 id 9
+            #   폴백  side_pick picked 'right' → lane 6   ← queue_lanes 에 있다
+            #   결과  t 70.6 자차가 lane 6 (free 21.0, id 12 대기열) 안에 있다
+            # 계획한 쪽 자체는 남긴다 — 지도가 고른 목표는 큐가 아니다
+            # (`lane_plan` 이 이미 `qlanes` 를 후보에서 뺀다).
+            if self.lm_fallback_no_queue and len(_order) > 1:
+                _q = set((self.last_lane_map or {}).get('queue_lanes') or [])
+                if _q:
+                    _keep = [_order[0]]
+                    for _sd in _order[1:]:
+                        _n = self._lm_side_lane(planner, _sd)
+                        if _n is None or str(list(_n)) not in _q:
+                            _keep.append(_sd)
+                        else:
+                            (self.last_avoid or {}).setdefault(
+                                'fallback_skipped', []).append(f'{_sd}:queue')
+                    _order = tuple(_keep)
         else:
             _order = (('right', 'left') if _lp.get('side') == 'right'
                       else ('left', 'right'))
