@@ -121,6 +121,9 @@ class Sim:
         self.ap.kr_rules = KrRules(cfg)
         self.ap.kr_rules._sl_all = []
         self.lat = LateralPIDController(pdm)
+        # 틱 훅 — 무대 손질이 **시간에 따라** 변해야 하는 케이스용 (신호가 도중에
+        # 바뀌는 12번). setup 이 sim.on_tick 에 함수를 꽂는다.
+        self.on_tick = None
         if setup is not None:
             # 케이스별 무대 손질 (적신호·실선·다음 회전). 무대가 4차로 직선 점선
             # 하나뿐이라, 그 조건들은 여기서 **명시적으로** 얹지 않으면 케이스 1과
@@ -140,14 +143,22 @@ class Sim:
                'shift_v': None, 'shift_s': None, 'lane_hist': [], 'stopped': 0,
                'v_min': 9e9, 'end_s': 0.0, 'collide': 0, 'shift_n': 0,
                'shift_pass': None, 'solid_relaxed': False, 'states': set(),
-               'never_stall': False}
+               'never_stall': False,
+               # 12번용 — "얼어붙었나" 는 최대 t_off 가 아니라 **끝난 자리**와
+               # **한 번에 얼마나 오래 섰나** 로 봐야 안다.
+               't_off_end': 0.0, 'stop_max_s': 0.0, 'cause_why': {},
+               'arm_t_off': None, 'arm_s': None, 'd_end_at_freeze': None}
         half_ego = self.cfg['vehicle']['width'] / 2.0
         prev_span = None
+        run_stop = 0
         for _i in range(self.ticks):
             self.ego.update(cx, cy, 0.0, math.degrees(yaw), v,
                             self.ego.length, self.ego.width, self.ego.height)
             out = self.planner.run_step(np.array([cx, cy, 0.0]))
             rp = out[0]
+            if self.on_tick is not None:
+                self.on_tick(self, _i,
+                             float(self.planner.route_s[self.planner.route_index]))
             # tick_data 는 autopilot 이 ego 객체에서 직접 만든다 (input_data 무관)
             ctrl = self.ap.run_step({}, _i * DT)
             accel = float(getattr(ctrl, 'accel', getattr(ctrl, 'throttle', 0.0)))
@@ -192,6 +203,16 @@ class Sim:
             rec['v_min'] = min(rec['v_min'], v)
             if v < 0.3:
                 rec['stopped'] += 1
+                run_stop += 1
+                rec['stop_max_s'] = max(rec['stop_max_s'], run_stop / HZ)
+                if rec['d_end_at_freeze'] is None and run_stop > 20:
+                    rec['d_end_at_freeze'] = self.ap.kr_rules.last_d_end
+            else:
+                run_stop = 0
+            rec['t_off_end'] = best[0]
+            w = (self.ap.kr_rules.last_avoid or {}).get('cause_why')
+            if w:
+                rec['cause_why'][w] = rec['cause_why'].get(w, 0) + 1
             rec['end_s'] = float(self.planner.route_s[self.planner.route_index])
             if rec['end_s'] > lg.length(lane) - 8.0:
                 break
@@ -222,6 +243,48 @@ def red_light_at(s_line):
             0.0, float(s_line) - np.asarray(sim.planner.route_s, dtype=float))
         tl = make_tl('Red', s_line)
         sim.planner.next_traffic_lights = [tl] * n
+    return setup
+
+
+def red_light_turns_at(s_line, arm_s, red_s=None, green_s=None):
+    """정지선을 `s_line` 에 두고, 자차가 `arm_s` 를 지나는 순간 **녹→적**으로 바꾼다.
+
+    `red_light_at` 은 처음부터 적색이라 회피가 아예 시작되지 않는다. 12번이
+    재현하려는 것은 그 반대다 — **시프트가 이미 진행 중일 때** 적신호가 켜지는
+    조합이다 (run_20260909_232350 t 60.7: SHIFT_ACTIVE → SHIFT_HOLD,
+    t_off 1.27 에서 굳음, 정지선 99.8 m 앞).
+
+    `distances_to_next_traffic_lights` 는 정적이라 한 번만 깔고, 신호 **상태**만
+    틱 훅에서 바꾼다 (VtdTrafficLight 객체 하나를 공유하므로 그 객체의 state 를
+    바꾸면 전 틱에 반영된다).
+    """
+    def setup(sim):
+        n = len(sim.planner.route_s)
+        sim.planner.distances_to_next_traffic_lights = np.maximum(
+            0.0, float(s_line) - np.asarray(sim.planner.route_s, dtype=float))
+        tl = make_tl('Green', s_line)
+        sim.planner.next_traffic_lights = [tl] * n
+
+        # 켜진 뒤 red_s 초마다 녹↔적을 번갈아 준다 (green_s 가 녹색 길이).
+        # 231730 은 적 13 s / 녹 13 s 로 다섯 주기를 돌았고, **녹색 구간에도**
+        # v_target 0 이었다 — 그래서 주기를 돌려 봐야 "신호가 원인인가" 가 갈린다.
+        st = {'armed_i': None}
+
+        def tick(sm, i, route_s):
+            if st['armed_i'] is None:
+                if route_s >= float(arm_s):
+                    st['armed_i'] = i
+                    tl.state = TrafficLightState.Red
+                return
+            if red_s is None:
+                return
+            k = int((i - st['armed_i']) / (float(red_s) * HZ))
+            g = green_s if green_s is not None else red_s
+            period = float(red_s) + float(g)
+            dt = (i - st['armed_i']) / HZ
+            tl.state = (TrafficLightState.Red if (dt % period) < float(red_s)
+                        else TrafficLightState.Green)
+        sim.on_tick = tick
     return setup
 
 
@@ -313,16 +376,52 @@ def cases(lg):
         (11, '두 칸 필요 + 중간 차로가 코앞에서 점유', L1,
          [obj_at(lg, L1, 55, 2), obj_at(lg, L2, 22, 3), obj_at(lg, L2, 70, 4)],
          '3차로로 (중간은 지나갈 뿐)', None),
+        # 12 는 run_20260909_232350 의 재현이다 — **시프트 중(t_off≈1.3)에 93 m
+        # 앞이 적색으로 바뀌는** 조합. 그 로그는 SHIFT_HOLD 로 굳어 램프 중간
+        # (t_off 2.08 = 차로선 위)에서 70 s 정지했다. 얼린 것은 적신호가 아니라
+        # 크립 게이트였다(`_obstacle_cause` 의 종점 배제 150 m). 그래서 이 케이스는
+        # **[1] 스위치 축**(--axis creep_end)으로 돌려야 의미가 있다.
+        # 배치는 d_end 를 150 밑으로 만들지 못했다(경로 3 km) — 여기 무대는 200 m
+        # 라 정지 지점에서 d_end 가 자연히 150 안이다. 실측 조건과 같아진다.
+        # 장애물이 **둘**이라야 재현된다: 내 차로(A)를 피해 옆 차로로 램프를
+        # 그리는 도중, 그 옆 차로의 B 가 standoff 대상이 되어 **램프 중간에** 선다.
+        # 232350 이 정확히 이 꼴이었다 — 왼쪽으로 갔는데 왼쪽도 막혀 있었다
+        # (결정 시점 blocker id 4 → 시프트 후 blocker id 2, s_rel 20.5).
+        (12, '시프트 중 93 m 앞 적신호 (232350 재현)', L1,
+         [obj_at(lg, L1, 100, 2), obj_at(lg, L2, 110, 3)],
+         '램프를 끝내고 차로 안으로',
+         red_light_turns_at(181.0, 80.0, red_s=13.0, green_s=13.0)),
     ]
 
 
-def cfg_with(base, lane_map: bool):
-    """on 은 커밋 B·C 를 **같이** 켠다 — 둘은 한 기능의 앞뒤다 (후보를 고르는
-    쪽과, 고른 차로에 머무는 쪽)."""
+def cfg_with(base, on: bool, axis: str = 'lane_map'):
+    """비교 축을 켜고 끈다.
+
+    `lane_map` — 커밋 B·C 를 **같이** 켠다 (한 기능의 앞뒤다: 후보를 고르는
+    쪽과 고른 차로에 머무는 쪽).
+    `creep_end` — [1] `standoff_creep_end_narrow_enable` 만 켠다. 크립 게이트의
+    종점 배제 폭을 never_stall 과 같은 축(unlatch_m 30)으로 좁힌다.
+    `creep_fix` — 위에 `standoff_creep_delay_pause_enable` 까지 같이 켠다.
+    `side_clear` — (3) `side_clear_by_map_enable`. 지도는 양쪽 다 켜 둔다
+    (지도가 꺼져 있으면 이 스위치가 아무 일도 안 하므로 대조가 성립하지 않는다).
+    """
     import copy
     c = copy.deepcopy(base)
-    c['avoid_map']['lane_map_avoid_enable'] = lane_map
-    c['avoid_map']['lane_map_no_return_enable'] = lane_map
+    if axis == 'creep_end':
+        c['overtake']['standoff_creep_end_narrow_enable'] = on
+    elif axis == 'side_clear':
+        # (3) 목표 차로 점유 판정을 free_run 으로. 지도가 켜져 있어야 의미가 있다.
+        c['avoid_map']['lane_map_avoid_enable'] = True
+        c['avoid_map']['lane_map_no_return_enable'] = True
+        c['overtake']['side_clear_by_map_enable'] = on
+    elif axis == 'creep_fix':
+        # [1] 두 조각을 같이 켠다 — 종점 배제 폭(route_end)과 지연 시계 누적.
+        # 둘 중 하나만으로는 안 풀린다 (앞의 것을 풀면 뒤의 것이 이어받는다).
+        c['overtake']['standoff_creep_end_narrow_enable'] = on
+        c['overtake']['standoff_creep_delay_pause_enable'] = on
+    else:
+        c['avoid_map']['lane_map_avoid_enable'] = on
+        c['avoid_map']['lane_map_no_return_enable'] = on
     return c
 
 
@@ -332,6 +431,12 @@ def main():
     ap.add_argument('--cases', default='')
     ap.add_argument('--v0', type=float, default=8.33)
     ap.add_argument('--trace', type=int, default=0)
+    ap.add_argument('--ticks', type=int, default=900,
+                    help='케이스당 최대 틱 (기본 900 = 45 s). 신호 주기를 여러 번 '
+                         '보려면 늘린다 (12번).')
+    ap.add_argument('--axis', default='lane_map',
+                    choices=('lane_map', 'creep_end', 'creep_fix', 'side_clear'),
+                    help='off/on 으로 비교할 스위치 축')
     a = ap.parse_args()
 
     cfg = load_params_yaml()
@@ -339,6 +444,7 @@ def main():
     want = {int(x) for x in a.cases.split(',')} if a.cases else None
 
     print(f'무대: road {ROAD} sec {SEC} — 4차로 · {lg.length(LANES[0]):.0f} m · κ=0 직선 · 점선')
+    print(f'비교 축: {a.axis}')
     print(f'진입속도 {a.v0:.2f} m/s ({a.v0 * 3.6:.0f} km/h)\n')
     hdr = (f"{'#':>2} {'케이스':<30} "
            f"{'off 충돌':>7} {'|t_off|':>7} {'포화':>4} {'시프트':>6} {'차로':>12} "
@@ -354,7 +460,12 @@ def main():
             objs2 = [make_obj(o.id, o.x, o.y, o.yaw_deg, o.speed, o.length, o.width)
                      for o in objs]
             try:
-                r = Sim(cfg_with(cfg, lm), lg, lane, objs2, v0=a.v0, setup=setup).run()
+                # 12 는 신호 주기(적 13 s + 녹 13 s)를 **여러 번** 넘겨야
+                # 차이가 드러난다 — 기본 900틱(45 s)은 한 주기가 채 안 돼
+                # off·on 이 똑같이 나온다. 케이스가 자기 요구 틱을 갖는다.
+                ticks = max(a.ticks, 4000) if no == 12 else a.ticks
+                r = Sim(cfg_with(cfg, lm, a.axis), lg, lane, objs2,
+                        v0=a.v0, ticks=ticks, setup=setup).run()
                 row.append(r)
             except Exception as e:                          # noqa: BLE001
                 row.append({'err': f'{type(e).__name__}: {e}'})
@@ -366,10 +477,26 @@ def main():
             return (f"{r['collide']:>7} {r['t_off']:>7.2f} {r['sat']:>4} {sh:>6} "
                     f"{str(r['lanes_used']):>12} {r['v_min']:>6.2f} "
                     f"{r['stopped'] / HZ:>6.1f}")
+
+        def tail(r):
+            """끝난 자리 — "램프를 끝내고 차로 안에 들어갔나" 는 최대 t_off 로는
+            알 수 없다. 마지막 틱의 |t_off| 와 최장 연속 정지를 같이 본다."""
+            if 'err' in r:
+                return ''
+            cw = ','.join('%s %d' % kv for kv in sorted(r['cause_why'].items(),
+                                                        key=lambda x: -x[1])[:2])
+            return (f"끝 |t_off| {r['t_off_end']:.2f} · 최장정지 {r['stop_max_s']:.1f} s"
+                    f" · 도달 {r['end_s']:.0f} m"
+                    + (f" · cause_why {cw}" if cw else '')
+                    + (f" · d_end(정지) {r['d_end_at_freeze']:.0f} m"
+                       if r.get('d_end_at_freeze') is not None else ''))
         print(f'{no:>2} {name:<30} {fmt(row[0])} | {fmt(row[1])}')
         ns = ' · never_stall' if row[0].get('never_stall') else ''
         st = ','.join(sorted(row[0].get('states') or [])) if 'err' not in row[0] else ''
         print(f"{'':>2} {'기대: ' + expect:<30}   off 상태: {st}{ns}")
+        if no == 12:
+            print(f"{'':>2} {'':<30}   off  {tail(row[0])}")
+            print(f"{'':>2} {'':<30}   on   {tail(row[1])}")
     print('\n주의: 자전거 모델 폐루프다 (통신 지연·액추에이터·타이어 없음).')
     print('      절대값이 아니라 on/off 차이와 순위를 본다.')
     return 0

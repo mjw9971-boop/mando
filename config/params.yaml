@@ -1287,6 +1287,14 @@ overtake:
   # 앞차와 20 m 를 띄우고 서 있었다. 큐 판정은 `_tick_queue` 를 그대로 쓴다
   # (lane_map 의 큐 제외와 같은 축). false = 이전 동작.
   queue_close_gap_enable: false
+  # 크립 지연 시계(standoff_creep_delay_s)를 배제(적신호·큐·보행자) 틱에
+  # **멈추기만** 할지(true) 0 으로 되돌릴지(false).
+  # 배제 틱을 안 세는 의도는 같지만, 되돌리면 신호가 도는 동안 시계가 영영
+  # 만료에 도달하지 못한다. 실측 avoid_sim 12 (run_20260909_232350 재현,
+  # 적 13 s / 녹 13 s): 녹색마다 0 → **9.4 s** 까지 갔다가 적색 복귀에 리셋 —
+  # 10.0 에 **0.6 s 모자라** 다섯 주기 182 s 를 램프 중간(t_off 1.05 = 차로선
+  # 위)에서 굳었다. false = 이전 동작.
+  standoff_creep_delay_pause_enable: false
   queue_stop_gap_m: 5.0
   # 크립 **지연 게이트** [s] (2026-09-05, 실차 20260905_155735 근거).
   # 크립은 비가역이다 — s_rel 이 한 번 기하 게이트 need(정지 상태 19.0 =

@@ -312,6 +312,9 @@ class KrRules:
         # 시간 축은 ot_blocked_ticks 를 그대로 쓴다 — 신규 시계를 만들지 않는다.
         self.creep_delay_ticks = int(round(
             float(ot.get('standoff_creep_delay_s', 0.0)) * self.hz))
+        # 지연 시계를 배제 틱에 **멈추기만** 할지(true) 0 으로 되돌릴지(false).
+        self.creep_delay_pause = bool(
+            ot.get('standoff_creep_delay_pause_enable', False))
         # 교차로 안 자기잠금 해제 (A1). 꺼지면 이전 동작 — 교차로 lane 에서
         # 크립도 사다리도 없다. 무장 조건은 _junction_release 참조.
         self.j_release = bool(ot.get('junction_creep_release_enable', False))
@@ -5211,9 +5214,19 @@ class KrRules:
         # 을 나중에 써서(아래 bo_state 블록) 이름이 겹치면 덮인다 — 실측 02_직진3
         # 27틱에서 크립 발동이 False 로 뒤집혔다 (2026-09-05).
         def block(why):
-            # 배제로 막힌 틱은 지연 시계에 넣지 않는다 — 적신호 21 s 를 세면
+            # 배제로 막힌 틱은 지연 시계에 **넣지 않는다** — 적신호 21 s 를 세면
             # 녹색 직후 지연이 이미 만료된 상태가 된다 (위 _creep_hold_ticks 주석).
-            self._creep_hold_ticks = 0
+            #
+            # 다만 0 으로 **되돌리는 것**과 **멈춰 두는 것**은 다르다. 신호가 도는
+            # 동안 배제가 주기적으로 들어오면, 되돌리는 쪽은 시계가 영영 만료에
+            # 도달하지 못한다. 실측 avoid_sim 12 (232350 재현, 적 13 s / 녹 13 s):
+            # 녹색마다 creep_hold_s 가 0 → **9.4 s** 까지 갔다가 적색 복귀에
+            # 0 으로 리셋된다 — `standoff_creep_delay_s`(10.0)에 **0.6 s 모자라**
+            # 다섯 주기 182 s 를 램프 중간(t_off 1.05, 차로선 위)에서 굳었다.
+            # 멈춰 두면 배제 틱을 안 세는 원래 의도는 그대로면서 주기를 넘겨
+            # 누적된다. false = 이전 동작(0 으로 되돌림).
+            if not self.creep_delay_pause:
+                self._creep_hold_ticks = 0
             self._creep_diag = dict(diag, so_creep=False, creep_block=why)
             if why == 'cause' and self.cause_why:
                 self._creep_diag['cause_why'] = self.cause_why
