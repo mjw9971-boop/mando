@@ -178,6 +178,17 @@ speed:
   approach_decel_mps2: 2.0
   # 진입점 탐색 거리 [m]. 45 km/h → 27 km/h 에 25 m 이므로 60 이면 충분하다.
   red_lookahead_m: 60.0
+  # 적신호 가속금지 상한(`no_accel_toward_red_enable`)의 **바닥** [km/h].
+  # 0 = 이전 동작. cap = 현재 속도라 v 가 0 이 되면 상한도 0 이 되고, 그 상한이
+  # v 를 다시 못 올리게 막아 **영구 정지**가 된다 (자기잠금).
+  # 실측 2026-09-10 run_20260910_144656 rs 299.9, 정지선 **50.2 m** 앞:
+  #   t 52.5~53.1  shift_cap 4.3 이 감속 → v 5.34 → 4.67
+  #   t 53.4~54.9  no_accel_red 가 v 를 따라 3.70 → 0.86 → 0.00
+  #   t 54.9~      341틱(17 s) 목표 0.0, 승자 no_accel_red **단독**
+  #                (같은 틱 stopline_profile 16.32 — 정지선은 아무것도 요구 안 함)
+  # 정지는 이 축이 하는 일이 아니다 — ④′ 프로파일·hold·IDM 이 한다. 바닥이
+  # 있어도 정지선이 가까워지면 프로파일이 먼저 0 으로 내려가 min() 에서 이긴다.
+  red_approach_min_kph: 0.0
   # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
   a_max: 2.0
   a_min: -6.0

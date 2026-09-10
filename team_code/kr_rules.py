@@ -602,6 +602,7 @@ class KrRules:
         self.sl_stopped = False                    # 정지 연속성 (B-1 재무장 판정)
         self.sl_stop_ticks = 0                     # 현재 정지의 지속 틱
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
+        self._nar_ref_v: float | None = None       # 적신호 감지 시점 속도 (래치)
         self.last_kr_cands: dict | None = None     # (4) 후보별 값 (진단 전용)
         self.last_kr_win: str | None = None        # (4) 그중 최종 승자 이름
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
@@ -659,6 +660,10 @@ class KrRules:
         # false = 이전 동작 (route.pkl 의 valid_entry_lanes 만 본다).
         self.lm_valid_by_map = bool(
             _lm.get('lane_map_valid_by_map_enable', False))
+        # 적신호 가속금지 상한의 **바닥** [m/s]. 0 = 이전 동작 (cap = 현재 속도,
+        # v 가 0 이 되면 상한도 0 이 되어 영구 정지 — 자기잠금).
+        _sp = cfg.get('speed') or {}
+        self.nar_floor = float(_sp.get('red_approach_min_kph', 0.0)) / 3.6
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -5908,11 +5913,35 @@ class KrRules:
             return None
         tgt = self._stop_target(planner, ap)
         if tgt is None:
+            self._nar_ref_v = None                         # 대상이 사라졌다 — 래치 해제
             return None
         d_line = float(tgt[0])
         if d_line > self.red_look_m:
+            self._nar_ref_v = None
             return None
-        return max(0.0, float(ego_speed))
+        if not self.nar_floor:
+            return max(0.0, float(ego_speed))              # 이전 동작
+        # **상한이 0 이 되면 "가속 금지" 가 "영구 정지" 가 된다.**
+        # cap = v 는 자기잠금이다: 다른 축이 잠깐 감속시키면 cap 이 그 값을
+        # 따라 내려가고, cap 이 v 를 다시 못 올리게 하므로 되돌아올 길이 없다.
+        # 실측 2026-09-10 run_20260910_144656 rs 299.9 (정지선 **50.2 m** 앞):
+        #   t 52.5~53.1  shift_cap 4.3 이 감속 → v 5.34 → 4.67
+        #   t 53.4~54.9  no_accel_red 가 v 를 따라 3.70 → 0.86 → **0.00**
+        #   t 54.9~      341틱(17 s) 목표 0.0, 승자 no_accel_red 단독
+        #                (같은 틱 stopline_profile 16.32 — **정지선은 아무것도
+        #                 요구하지 않았다**)
+        # 그래서 두 가지를 둔다:
+        #   · 기준은 **적색을 감지한 시점의 속도**를 래치하고 거기서 v 를 따라
+        #     내려가기만 한다 (가속 금지라는 목적은 그대로).
+        #   · 그 아래로는 `speed.red_approach_min_kph` 로 **바닥을 깐다**.
+        # 정지는 이 축이 하는 일이 아니다 — 정지선 프로파일(④′)·hold·IDM 이
+        # 한다. 바닥이 있어도 d→0 에서 프로파일이 먼저 0 으로 내려가 이긴다.
+        v = max(0.0, float(ego_speed))
+        if self._nar_ref_v is None:
+            self._nar_ref_v = v                            # 감지 시점 속도
+        else:
+            self._nar_ref_v = min(self._nar_ref_v, v)      # 올라가지 않는다
+        return max(self._nar_ref_v, self.nar_floor)
 
     def _stopline_profile(self, planner, ap, ego_speed: float = 0.0) -> float | None:
         """적신호 정지선까지의 **정지 프로파일 속도 상한** — min() 후보.
