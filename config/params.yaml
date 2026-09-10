@@ -543,6 +543,9 @@ percep:
   speed_win_s: 0.4
   # respawnPoseToleranceM=1.5 라 실제 리셋 이동량은 3 m 남짓이다.
   reset_route_s_drop_m: 5.0
+  # 경로 차로에서 몇 칸까지 걸어가 route 인덱스를 찾을지. 1 = 이전 동작
+  # (2칸 시프트 중 off_route 로 떨어져 route_s 가 섹션 길이만큼 뒤로 뛴다).
+  route_index_hops: 1
   stall_dt_s: 0.2          # 이보다 긴 틱 간격은 '스톨'로 분류
   stall_teleport_m: 50.0   # 스톨이라도 이동량이 이보다 크면 텔레포트 = 리셋
   reset_speed_factor: 3.0

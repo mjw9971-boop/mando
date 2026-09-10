@@ -316,15 +316,32 @@ class EgoTracker(EgoSpeedEstimator):
             # 정차 차량 추월로 **경로 차로 바로 옆**에 있을 수 있다. 좌/우 이웃이
             # 경로 차로면 그 인덱스를 그대로 쓴다 — 나란한 차로는 s 매개화가 같아
             # route_s 가 이어진다.
+            #
+            # 한 칸으로 부족한 이유 (2026-09-10, run_20260910_121651):
+            # 2칸 시프트는 이웃이 경로 차로가 **아니다** → 옛 코드는 off_route 로
+            # 떨어지면서 `self._route_idx` 를 **그 자리에 얼린다**. 그런데
+            # route_s = cum_s[idx] + m.s 의 `m.s` 는 자차가 실제로 있는 차로의 s 라
+            # **섹션 경계마다 0 으로 돌아간다**. 얼린 cum_s + 새 섹션의 s 가 되어
+            # route_s 가 섹션 길이만큼 통째로 뒤로 뛴다 — 실측 −12.3 m(섹션 2 길이
+            # 12.44) · −10.8 m(섹션 1 길이 10.96), 총 23.4 m 과소보고가 10 s 지속.
+            # 한 칸 더 걸어가면 (3→4→5) 같은 섹션의 경로 차로를 찾아 cum_s 가
+            # 제 섹션을 가리킨다. hops=1 이면 이전 동작 그대로다.
+            max_hops = max(1, int(self.cfg['percep'].get('route_index_hops', 1)))
             for side in ('left', 'right'):
-                nb = self.lg.neighbor(lane, side)
-                if nb is None:
-                    continue
-                nb_hits = [i for i, k in enumerate(lanes) if k == nb]
-                if nb_hits:
-                    self._route_idx = min(nb_hits, key=lambda i: abs(i - self._route_idx))
-                    flags['beside_route'] = True
-                    return self._route_idx
+                cur = lane
+                for _h in range(max_hops):
+                    nb = self.lg.neighbor(cur, side)
+                    if nb is None:
+                        break
+                    nb_hits = [i for i, k in enumerate(lanes) if k == nb]
+                    if nb_hits:
+                        self._route_idx = min(nb_hits,
+                                              key=lambda i: abs(i - self._route_idx))
+                        flags['beside_route'] = True
+                        if _h:
+                            flags['beside_hops'] = _h + 1
+                        return self._route_idx
+                    cur = nb
             flags['off_route'] = True
             return self._route_idx
         self._route_idx = min(hits, key=lambda i: abs(i - self._route_idx))
