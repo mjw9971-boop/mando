@@ -43,6 +43,79 @@ def _num(v):
     return f
 
 
+# 스냅샷에 같이 싣는 주요 수치. `*_enable` 은 전부 자동 수집되지만 수치는
+# 이름을 알아야 하므로 여기에 둔다. 없는 키는 그냥 빠진다.
+CONFIG_NUMS = (
+    'percep.route_index_hops', 'percep.gt_range_m', 'percep.reset_route_s_drop_m',
+    'avoid_map.lane_map_decide_m', 'avoid_map.lane_map_ahead_m',
+    'avoid_map.lane_map_avoid_speed_kph', 'avoid_map.lane_map_max_hops',
+    'avoid_map.lane_switch_margin_m',
+    'overtake.rear_clear_m', 'overtake.obj_static_s', 'overtake.wait_before_shift_s',
+    'overtake.shift_latest_m', 'overtake.shift_k_s', 'overtake.shift_ahead_m',
+    'overtake.red_pause_max_m', 'overtake.zone_gate_margin_m',
+    'overtake.dash_slack_m', 'overtake.queue_stop_gap_m',
+    'speed.red_lookahead_m', 'speed.red_approach_min_kph', 'speed.stop_profile_a',
+    'control.a_cap_dec_max', 'vehicle.wheelbase', 'vehicle.max_steer_rad',
+)
+
+
+def _walk_enables(node, prefix, out) -> None:
+    """dict 를 훑어 `*_enable` 로 끝나는 키를 전부 모은다 (점 경로 → 값)."""
+    if not isinstance(node, dict):
+        return
+    for k, v in node.items():
+        path = f'{prefix}.{k}' if prefix else str(k)
+        if isinstance(v, dict):
+            _walk_enables(v, path, out)
+        elif str(k).endswith('_enable') or isinstance(v, bool):
+            out[path] = bool(v)
+
+
+def _dig(cfg: dict, dotted: str):
+    node = cfg
+    for part in dotted.split('.'):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _git_sha() -> str | None:
+    try:
+        import subprocess
+        return subprocess.run(['git', 'rev-parse', '--short', 'HEAD'],
+                              capture_output=True, text=True, timeout=2,
+                              cwd=str(pathlib.Path(__file__).resolve().parent.parent)
+                              ).stdout.strip() or None
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def _config_line(cfg: dict) -> str:
+    """런 시작 설정 스냅샷 한 줄.
+
+    **`"raw"` 를 포함하지 않는다** — score.py·batch_run.py·summarize_run.py 가
+    전부 `if '"raw"' not in line: continue` 로 거르므로 그 줄들에 영향이 없다.
+    """
+    sw: dict = {}
+    _walk_enables(cfg, '', sw)
+    nums = {}
+    for key in CONFIG_NUMS:
+        v = _dig(cfg, key)
+        if v is not None:
+            nums[key] = v
+    on = sorted(k for k, v in sw.items() if v)
+    return json.dumps({
+        'kind': 'config',
+        'git': _git_sha(),
+        'n_switch': len(sw),
+        'n_on': len(on),
+        'on': on,                                          # 켜진 것만 이름으로
+        'switches': dict(sorted(sw.items())),              # 전부 (off 포함)
+        'nums': nums,
+    }, ensure_ascii=False, sort_keys=False)
+
+
 class Probe:
     """틱 루프 프리즈 진단 계측 (params log.probe_*). 관측만 — 동작을 바꾸지 않는다.
 
@@ -150,6 +223,19 @@ class Logger:
         if path:
             pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._f = open(path, 'w', encoding='utf-8')
+            # **설정 스냅샷을 첫 줄에.** 큐를 열기 전에 동기로 쓴다 — 큐는
+            # 가득 차면 버리므로(maxsize=2000) 이 줄이 사라지면 안 된다.
+            #
+            # 2026-09-10: `lane_map_shift_on_pick_enable` 이 꺼진 채 돈 것을
+            # **폴백 경로를 역산해서야** 알았다 (`_lm_fb_hops` 는 `_owns_shift()`
+            # 안에서만 세팅되므로 2칸 폴백이 성립했다 = owns_shift 는 켜져 있었다
+            # → 그렇다면 on_pick 이 열렸어야 한다 → 그 스위치가 off). 대회날
+            # 이런 역산은 못 한다.
+            try:
+                self._f.write(_config_line(cfg) + '\n')
+                self._f.flush()
+            except OSError:                                # pragma: no cover
+                pass
             self._q = queue.Queue(maxsize=2000)
             self._writer = threading.Thread(target=self._writer_loop, daemon=True)
             self._writer.start()
