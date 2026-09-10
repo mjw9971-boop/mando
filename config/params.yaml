@@ -2538,6 +2538,15 @@ avoid_map:
   # + `overtake.dash_slack_m` 이다 (기준을 두 벌 만들지 않는다).
   # false = 이전 동작 (free → hop 수 → 유효차로 → 우측).
   lane_map_prefer_dashed_enable: false
+  # (1) 지도가 정지로 세어 **내 차로를 막은 것으로 판정한** 객체는 on_pick 에서
+  # `_static_ok` 의 관찰(overtake.obj_static_s 1.5 s)을 기다리지 않는다.
+  # 실측 run_20260910_121651: id 2·3 은 최초 관측 틱(t 52.81·52.96)부터 speed
+  # 0.00 이었고 `blocked_by` 에도 그 틱부터 들어 있었는데 PREEMPT 는 t 55.91 —
+  # 2.95 s 뒤다 (1.50 s `_static_ok` + 1.45 s WAIT→WAIT_EXPIRED).
+  # 잣대는 지도와 **같은 것**을 쓴다 (free_run 을 깎은 바로 그 조건).
+  # 범위는 on_pick 한 줄뿐 — `_static_ok` 자체는 standoff·큐·보행자가 같이
+  # 쓰므로 건드리지 않는다. false = 이전 동작.
+  lane_map_static_on_pick_enable: false
   # 큐로 판정된 객체를 free_run 에서 **빼지 말고 표시만** 한다.
   # 큐 제외의 목적은 "신호 대기 줄을 **추월 후보로 삼지 않기**" 지 "장애물이
   # 없는 셈 치기" 가 아니다. 그런데 제외는 `_tick_corridor`(= **내 차로** 회랑)

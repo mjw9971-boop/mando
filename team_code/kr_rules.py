@@ -647,6 +647,10 @@ class KrRules:
         # 않는다 — 게이트 2바퀴가 유일한 길인 경우를 잃지 않기 위해).
         # false = 이전 동작 (free → hop 수 → 유효차로 → 우측).
         self.lm_prefer_dashed = bool(_lm.get('lane_map_prefer_dashed_enable', False))
+        # (1) 지도가 정지로 세어 내 차로를 막은 객체는 on_pick 에서 `_static_ok`
+        # 의 관찰(obj_static_s)을 기다리지 않는다. false = 이전 동작.
+        self.lm_static_on_pick = bool(
+            _lm.get('lane_map_static_on_pick_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -3252,8 +3256,26 @@ class KrRules:
             #
             # 관찰의 알맹이(`_static_ok` = 그 객체가 obj_static_s 이상 정지)는
             # 그대로 둔다. 없애는 것은 **시간 예산**뿐이다 — 그것이 거리를 먹는다.
+            # (1) 지도가 이미 정지로 세어 **내 차로를 막은 것으로 판정한** 객체는
+            # `_static_ok` 의 관찰(obj_static_s 1.5 s)을 기다리지 않는다.
+            # 실측 2026-09-10 run_20260910_121651: id 2·3 은 최초 관측 틱
+            # (t 52.81·52.96)부터 speed 0.00 이었고 `blocked_by` 에도 그 틱부터
+            # 들어 있었다. 그런데 PREEMPT 는 t 55.91 — 2.95 s 뒤다. 내역은
+            #   1.50 s  `_static_ok` (obj_static_s)
+            #   1.45 s  그 뒤 WAIT — `t_left < budget` 은 **끝내 참이 안 된다**
+            #           (standoff = 3·v 가 v 를 따라가 t_left 가 4.5 에 고정,
+            #            budget = 3.0 − obj_s 만 0.1 까지 줄어든다) → 결국
+            #           `obj_s ≥ wait_before_shift_s` 의 WAIT_EXPIRED 가 열었다.
+            # 뒤의 1.45 s 는 `lm_shift_on_pick` 이 이미 없앤다. 앞의 1.50 s 를
+            # 없애는 것이 이 스위치다 — 판정 잣대는 지도와 **같은 것**을 쓴다
+            # (lane_map_static_v = ot_v_max, free_run 을 깎은 바로 그 조건).
+            # 범위는 on_pick 한 줄뿐이다. `_static_ok` 자체는 안 건드린다 —
+            # standoff·큐·보행자가 같은 함수를 쓰므로 축을 벌리면 안 된다.
+            static_pick = (self._static_ok(cand)
+                           or (self.lm_static_on_pick
+                               and self._lm_blocks_ego(cand)))
             on_pick = (self.lm_shift_on_pick and self._owns_shift()
-                       and self._static_ok(cand))
+                       and static_pick)
             if (self._static_ok(cand) and t_left < budget) or latched or armed or on_pick:
                 actor, preempt = cand, True
                 self.last_avoid = dict(base, state='PREEMPT', latched=latched)
@@ -3606,6 +3628,20 @@ class KrRules:
         """
         return bool(self.lm_owns and self.lane_map_on
                     and (self.last_lane_plan or {}).get('pick'))
+
+    def _lm_blocks_ego(self, actor) -> bool:
+        """(1) 이번 틱 차로 지도가 이 객체를 **내 차로의 차단물**로 세었나.
+
+        지도는 `speed < lane_map_static_v` 인 객체만 `free_run` 을 깎으므로,
+        여기 이름이 오른다는 것 자체가 "지도 기준으로 정지" 다. 관찰 시간을
+        따로 세지 않는 대신 **지도와 같은 잣대**를 쓴다.
+        """
+        lm = self.last_lane_map or {}
+        ego = lm.get('ego_lane')
+        if ego is None:
+            return False
+        bid = (lm.get('blocked_by') or {}).get(str(list(ego)))
+        return bid is not None and int(bid) == int(getattr(actor, 'id', -1))
 
     def _lm_dashed(self, lg, ego_lane, hop: int, local_s: float,
                    need_m: float) -> bool:
