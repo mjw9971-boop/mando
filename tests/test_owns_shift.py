@@ -129,49 +129,29 @@ def with_map(k):
     return k
 
 
-def test_second_side_reads_the_hops_sign_not_the_lane_id():
-    """좌/우는 지도의 hops 부호로만 읽는다 — id 부호 규약은 방향마다 뒤집힌다."""
-    k = with_map(kr())
-    lp = plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0},
-                             '[1, 0, -1]': {'free': 40.0}})
-    assert k._lm_second_side(lp) == 'left'      # hops -1 → left
-
-
-def test_second_side_is_none_with_a_single_candidate():
-    k = with_map(kr())
-    assert k._lm_second_side(plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0}})) is None
-
-
-def test_second_side_is_none_without_a_map():
-    """지도가 없으면 부호를 알 수 없다 — 추정하지 않는다."""
-    k = kr()
-    lp = plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0},
-                             '[1, 0, -1]': {'free': 40.0}})
-    assert k._lm_second_side(lp) is None
-
-
-def test_second_side_is_none_without_a_plan():
-    assert with_map(kr())._lm_second_side({}) is None
-
-
+# [4] 차선책은 `_lm_second_side`(삭제됨)가 아니라 `lane_plan['ranked']` 에서
+# 나온다. 게이트 층이 방향을 정하던 경로를 없앴으므로 그 함수도 같이 죽었다.
 def test_fallback_switch_default_is_off():
     assert CFG['avoid_map'].get('lane_map_fallback_side_enable') is False
 
 
-def test_fallback_order_has_no_duplicates():
-    """계획한 쪽·2위·반대쪽이 겹쳐도 한 번씩만 돈다."""
-    k = with_map(kr(lane_map_fallback_side_enable=True))
-    lp = plan('[1, 0, -3]', {'[1, 0, -3]': {'free': 80.0},
-                             '[1, 0, -1]': {'free': 60.0}}, side='right')
-    second = k._lm_second_side(lp)              # hops -1 → left
-    order = [lp['side']]
-    if second and second not in order:
-        order.append(second)
-    other = 'right' if lp['side'] == 'left' else 'left'
-    if other not in order:
-        order.append(other)
+def test_second_side_helper_is_gone():
+    """게이트 층의 방향 선택이 사라졌으므로 그 헬퍼도 남아 있으면 안 된다."""
+    src = (ROOT / 'team_code' / 'kr_rules.py').read_text()
+    assert '_lm_second_side' not in src
+    assert '_lm_fb_hops' not in src
+
+
+def test_fallback_order_has_no_duplicates_and_no_opposite():
+    """순위표에서 side 를 뽑되 중복은 한 번씩, **반대편은 붙이지 않는다**."""
+    ranked = [{'lane': 'a', 'side': 'right', 'hops': 1},
+              {'lane': 'b', 'side': 'right', 'hops': 2},
+              {'lane': 'c', 'side': 'left', 'hops': 2}]
+    order = list(dict.fromkeys(r['side'] for r in ranked))
     assert order == ['right', 'left']
     assert len(order) == len(set(order))
+    ranked_one_side = [r for r in ranked if r['side'] == 'right']
+    assert list(dict.fromkeys(r['side'] for r in ranked_one_side)) == ['right']
 
 
 # ── 복귀 차로 기준을 **hop 오프셋**으로 (섹션 독립) ──────────────────────
@@ -258,9 +238,9 @@ def rig_fb():
 
 
 def test_fallback_carries_the_runner_up_hop_count():
-    """차선책이 좌 2칸이면 폴백도 **2칸**이어야 한다."""
+    """차선책이 좌 2칸이면 폴백도 **2칸**이어야 한다 (순위표에서 온다)."""
     k = rig_fb()
-    assert k._lm_second_side(k.last_lane_plan) == 'left'
+    k._lm_rank_hops = {'right': 1, 'left': 2}       # lane_plan 이 채우는 값
     assert k._lm_hops('left') == 2                  # 1 이 아니다
     assert k._lm_hops('right') is None              # 계획한 쪽은 1칸이라 None
 
@@ -268,15 +248,13 @@ def test_fallback_carries_the_runner_up_hop_count():
 def test_fallback_hops_none_without_the_switch():
     """스위치가 꺼져 있으면 이전 동작 — 폴백 side 는 항상 None."""
     k = rig_fb()
+    k._lm_rank_hops = {'right': 1, 'left': 2}
     k.lm_fallback = False
-    k._lm_second_side(k.last_lane_plan)
     assert k._lm_hops('left') is None
 
 
 def test_fallback_hops_none_when_runner_up_is_one_hop():
     """차선책이 1칸이면 None (기존 관례 — n>1 일 때만 값을 준다)."""
     k = rig_fb()
-    k.last_lane_plan['cands'] = {'[2756, 3, 6]': {'free': 80.0, 'hops': 1},
-                                 '[2756, 3, 4]': {'free': 60.0, 'hops': 1}}
-    assert k._lm_second_side(k.last_lane_plan) == 'left'
+    k._lm_rank_hops = {'right': 1, 'left': 1}
     assert k._lm_hops('left') is None

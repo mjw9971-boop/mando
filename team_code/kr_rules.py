@@ -638,7 +638,7 @@ class KrRules:
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
-        self._lm_fb_hops = None                    # 이번 틱 차선책 (side, 칸수)
+        self._lm_rank_hops: dict = {}              # 이번 틱 순위표의 side → 칸수
         # 시프트 중 트리거가 **복귀할 차로**도 보게 할지. false = 이전 동작
         # (물리적으로 선 차로만 — 비켜 왔으니 늘 비어 보인다).
         self.lm_shift_ref = bool(_lm.get('lane_map_shift_ref_enable', False))
@@ -1922,6 +1922,12 @@ class KrRules:
                     1 if (vel_side is not None and side == vel_side) else 0,
                     1 if side == 'right' else 0)
         cands.sort(key=_tie, reverse=True)
+        # [4] **순위표를 그대로 내려준다.** 1순위가 게이트에서 떨어지면 게이트 층이
+        # 방향을 뒤집는 게 아니라(그게 오늘 버그다) 여기 2순위·3순위를 쓴다.
+        # side 는 **그 후보의 side** 지 반대편이 아니다.
+        plan['ranked'] = [{'lane': c[2], 'hops': c[3],
+                           'side': 'left' if hops[c[2]] < 0 else 'right'}
+                          for c in cands]
         _f, _nh, pick, n_hops, ramp_m, need, _dash = cands[0]
         # 램프 시작 s — 목표 차로 첫 장애물과 내 차로 장애물 중 **먼저 걸리는 쪽**
         #
@@ -3732,45 +3738,6 @@ class KrRules:
         return self._side_pass(ap, planner, ego_speed, chain, False,
                                lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
 
-    def _lm_second_side(self, lp: dict):
-        """`lane_plan` 후보 중 **2위** 차로가 있는 쪽 ('left'/'right'). 없으면 None.
-
-        1위가 게이트에서 떨어졌을 때 갈 곳이다. 후보 목록(`cands`)은 이미
-        "통행 가능 ∧ 램프가 들어감" 을 통과한 것들이라 새로 거를 것이 없다 —
-        free_run 이 큰 순으로 두 번째를 고르면 된다.
-
-        칸 수를 줄이는 폴백(2칸 실패 → 1칸)은 여기서 하지 않는다. `_lm_hops` 가
-        side 별로 칸 수를 돌려주므로, 다른 쪽 후보가 1칸이면 자연히 1칸이 된다.
-
-        좌/우는 **차로 지도의 `hops` 부호**로 읽는다 — 차로 id 로 추정하면 안 된다.
-        진행 방향에 따라 부호 규약이 뒤집힌다 (road 2756 dir −1 은 왼쪽이 id
-        감소, road 128 의 음수 id 쪽은 왼쪽이 id 증가). `lane_plan` 자신도
-        `'left' if hops[pick] < 0 else 'right'` 로 같은 출처를 쓴다.
-        """
-        cands = lp.get('cands') or {}
-        pick = lp.get('pick')
-        hops = (self.last_lane_map or {}).get('hops') or {}
-        self._lm_fb_hops = None
-        if not cands or not hops:
-            return None
-        rest = [(float(v.get('free', 0.0)), k) for k, v in cands.items()
-                if k != pick and k in hops]
-        if not rest:
-            return None
-        rest.sort(reverse=True)
-        best = rest[0][1]
-        h = int(hops[best])
-        # **칸 수도 같이 넘긴다.** 넘기지 않으면 `_lm_hops` 가 폴백 side 에 대해
-        # None 을 돌려 n_hops 가 1 이 되고, 2칸짜리 차선책이 **한 칸 옆**에
-        #떨어진다 — 그 한 칸이 막힌 차로면 정확히 최악이다.
-        # 실측 2026-09-10 run_20260910_115526 t 49.5: pick (2756,3,6)(우 1칸)이
-        # 기각돼 차선책 (2756,3,3)(**좌 2칸**, free 80.0)으로 갔어야 하는데,
-        # 좌 **1칸** = (2756,3,4) 로 갔다. 그 차로는 id 2 가 38.5 m 앞에서 막고
-        # 있었고(blocked_by 에 그렇게 찍혀 있다), 결국 5.8 m 까지 기어들어가
-        # `ramp_too_late` 로 갇혔다.
-        self._lm_fb_hops = (('left' if h < 0 else 'right'), abs(h))
-        return self._lm_fb_hops[0]
-
     def _owns_shift(self) -> bool:
         """이번 틱 **차로 지도가 시프트를 소유하는가** ([3]).
 
@@ -3827,10 +3794,10 @@ class KrRules:
         if not lp.get('pick'):
             return None
         if lp.get('side') != side:
-            # 폴백 side — 차선책의 칸 수를 쓴다 (없으면 옛 동작대로 None).
-            fb = getattr(self, '_lm_fb_hops', None)
-            if self.lm_fallback and fb is not None and fb[0] == side:
-                return fb[1] if fb[1] > 1 else None
+            # 폴백 side — **순위표에 적힌 그 후보의 칸 수**를 쓴다.
+            rk = getattr(self, '_lm_rank_hops', None) or {}
+            if self.lm_fallback and side in rk:
+                return rk[side] if rk[side] > 1 else None
             return None
         n = int(lp.get('hops') or 1)
         return n if n > 1 else None
@@ -4121,14 +4088,17 @@ class KrRules:
             # 순서: ① 계획한 쪽 ② lane_plan 후보 중 free_run 2위의 쪽
             #       ③ 반대쪽 (지도가 후보를 하나만 냈을 때의 최후 수단)
             # 같은 쪽이 두 번 들어가지 않게 순서를 유지하며 중복만 뺀다.
-            _second = self._lm_second_side(_lp)
-            _cand = [_lp['side']]
-            if _second and _second not in _cand:
-                _cand.append(_second)
-            _other = 'right' if _lp['side'] == 'left' else 'left'
-            if _other not in _cand:
-                _cand.append(_other)
+            # [4] **차선책은 lane_plan 의 순위표에서 나온다.** 반대편을 최후
+            # 수단으로 덧붙이지 않는다 — 그것이 오늘 실주행 버그의 직접 원인이다
+            # (run_20260910_144656 t 65.3: 계획 left, 게이트가 left 기각,
+            #  폴백이 right 로 뒤집어 free 80 인 차로에서 나와 free 21 인
+            #  대기열 차로로 들어갔다). 게이트 층은 방향을 **정하지 않는다**.
+            _ranked = _lp.get('ranked') or [{'side': _lp['side']}]
+            _cand = list(dict.fromkeys(
+                r['side'] for r in _ranked if r.get('side')))
             _order = tuple(_cand) if self.lm_fallback else (_lp['side'],)
+            self._lm_rank_hops = {r['side']: int(r.get('hops') or 1)
+                                  for r in reversed(_ranked) if r.get('side')}
             # (5) **큐 차로로는 폴백하지 않는다.** 계획한 쪽이 게이트에서 떨어지면
             # 반대쪽이 최후 수단인데, 그 반대쪽이 신호 대기열이면 "비어 있는
             # 차로에서 나와 막힌 차로로 들어가는" 짓이 된다.
@@ -4353,14 +4323,28 @@ class KrRules:
                            # 2026-09-05 202508: objs 에 id3 만 남아 no_better).
                            'span_plan': self.last_span_plan,
                            'avoid': dict(self.last_avoid or {})}
-            if not pick_on or not plans[side]['pinfo'].get('entry_plateau_ids'):
+            # [4] owns_shift 면 **첫 성공에서 끊는다** — 지도가 이미 순위를 정했고
+            # `_pick_side` 를 타지 않으므로 반대쪽을 재 볼 이유가 없다
+            # (cKDTree 재호출 ≈ 4.6 ms 를 아낀다).
+            if (self._owns_shift() or not pick_on
+                    or not plans[side]['pinfo'].get('entry_plateau_ids')):
                 # 단락 — 플래토가 비면 _pick_side 는 어느 경우에도 이 side 를 고른다
                 # (한쪽만 비면 그쪽, 둘 다 비면 좌측 유지). 반대쪽을 재지 않으므로
                 # 추가 비용이 0 이다. 스위치가 꺼져 있어도 여기서 끊어 현행과 같다.
                 break
         if not plans:
             return False
-        side, why = self._pick_side(plans, pick_on)
+        if self._owns_shift():
+            # [4] 지도가 결정자다 — 게이트를 통과한 것 중 **순위가 가장 앞선**
+            # side 를 그대로 쓴다. `_pick_side` 는 타지 않는다.
+            # 실측 2026-09-10: `side_pick` 이 기록된 시프트 생성 18건 중 **13건**
+            # (72 %)이 `lane_plan.side` 와 다른 쪽으로 실행됐다.
+            side = next((sd for sd in _order if sd in plans), None)
+            why = 'lane_map'
+            if side is None:                               # 있을 수 없다 (방어)
+                side, why = self._pick_side(plans, pick_on)
+        else:
+            side, why = self._pick_side(plans, pick_on)
         p = plans[side]
         trans_m, ahead_eff = p['trans_m'], p['ahead_eff']
         extra_after, span_m = p['extra_after'], p['span_m']
