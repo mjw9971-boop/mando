@@ -30,6 +30,11 @@ avoid_map:
   # 차로 지도 회피 일체 (커밋 A~C 계열). lane_map_avoid_enable 이 대장 스위치고
   # 나머지는 그 안의 세부 규칙이라 따로 켜도 lane_map_avoid_enable 없이는 죽는다.
   lane_map_avoid_enable: true
+  # 2026-09-10 [2] — OBB 각 프레임 수정. 정지 객체 1개가 평균 2.01 차로를
+  # 막던 것이 0.99 로 돌아온다 (run_20260910_230148 전수 8,814 표본).
+  lane_map_obb_yaw_vtd_enable: true
+  # 2026-09-10 [1] — 목표 최소 유지 3 s. 마진은 섹션 구멍 때문에 무효였다.
+  retarget_min_hold_s: 3.0
   lane_map_fallback_no_queue_enable: true
   lane_map_fallback_side_enable: true
   lane_map_no_return_enable: true
@@ -48,6 +53,7 @@ avoid_map:
   shift_hold_red_bounded_enable: true
 
 overtake:
+  span_restore_ramp_enable: true
   queue_close_gap_enable: true
   side_clear_by_map_enable: true
   standoff_creep_delay_pause_enable: true

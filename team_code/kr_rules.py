@@ -629,6 +629,9 @@ class KrRules:
         self.lane_map_min_w = float(_lm.get('lane_map_min_width_m', 2.0))
         # 객체 OBB 둘레 표본 간격 [m] 과 폭 바닥 [m] (`_obb_samples`).
         self.obb_step_m = float(_lm.get('lane_map_obb_step_m', 1.0))
+        # OBB 각을 VTD 프레임으로 되돌린다 (2026-09-10 [2]) — `_actor_lanes` 참고.
+        # false = 이전 동작(CARLA yaw 를 VTD 좌표에 그대로 씀 = 부호 반전).
+        self.obb_yaw_vtd = bool(_lm.get('lane_map_obb_yaw_vtd_enable', False))
         self.obj_pad_m = float(_lm.get('lane_map_obj_pad_m', 0.5))
         # 섹션 경계에서 지도가 끊기는 것을 막는다 (2026-09-09 실측, 아래 참조).
         # false = 이전 동작 (자차 섹션 안의 차로만 hop 으로 센다).
@@ -644,6 +647,11 @@ class KrRules:
         # 활성 목표를 갈아탈 최소 이득 [m] — 새 목표의 free_run 이 현재 목표보다
         # 이만큼 길어야 바꾼다. 매 틱 목표가 흔들리면 램프가 계속 다시 그려진다.
         self.lm_switch_margin = float(_lm.get('lane_switch_margin_m', 20.0))
+        # 재타겟 최소 유지 시간 [s] — 한 번 정하면 그동안 목표를 안 바꾼다.
+        # 0 이면 이전 동작 (`_lm_retarget` 주석 참고).
+        self.retarget_hold_ticks = int(round(
+            float(_lm.get('retarget_min_hold_s', 0.0)) * self.hz))
+        self._retarget_lock = 0                    # 남은 잠금 틱
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
@@ -1809,7 +1817,24 @@ class KrRules:
         # 어떤 객체도 차로에 안 잡혔다 — free_run 이 항상 ahead_m 이었다
         # (2026-09-09 avoid_sim 으로 발견: blocked_by 가 늘 비어 있었다).
         vx, vy = frame.from_carla_xy(loc.x, loc.y)
-        yaw = _math.radians(float(getattr(actor, 'yaw_deg', 0.0)))
+        # **위치는 VTD 로 되돌리면서 yaw 만 CARLA 로 쓰면 안 된다** (2026-09-10 [2]).
+        # `frame` 규약은 `yaw_c = −heading_v` 라, CARLA yaw 를 VTD 좌표에 그대로
+        # 쓰면 OBB 가 `+heading_v` 가 아니라 `−heading_v` 로 놓인다 = 도로축 기준
+        # **2·heading 만큼 돌아간 직사각형**이다. 옛 주석은 "둘레의 합집합이라
+        # 결과가 같다" 고 했는데 틀렸다 — 대칭이 성립하는 것은 yaw ≈ 0 · ±π/2 뿐이다.
+        #
+        # 실측 run_20260910_230148 틱 1808 (t 105.0, rs 250.9), 차량 id 8
+        # (4.394 × 1.808, heading_v 5.3829 = −0.9003):
+        #     올바른 Δ(도로 대비)  −2.3°  → 횡폭 1.99 m → 막힌 차로 **1개**
+        #     코드가 쓰던 Δ      +100.9°  → 횡폭 4.65 m → 막힌 차로 **3개**
+        #   (940,2,-1)·(-2)·(-3) 이 전부 free_run 12.0 으로 막혀 후보가 −4 만
+        #   남았고, 그 사이 여유를 다 써 `ramp_too_late`(avail 1.7 < need 25.5)로
+        #   rs 256.2 에서 13 s 정지했다.
+        # 정렬된 객체(Δ≈0)에서 옛 값과 갈리는 폭이 가장 크다 — 즉 일반 교통류가
+        # 그대로 이 버그를 밟는다. false = 이전 동작.
+        yaw = (frame.from_carla_yaw_deg(float(getattr(actor, 'yaw_deg', 0.0)))
+               if self.obb_yaw_vtd
+               else _math.radians(float(getattr(actor, 'yaw_deg', 0.0))))
         pts = self._obb_samples(vx, vy, yaw,
                                 float(getattr(actor, 'length', 4.5)),
                                 float(getattr(actor, 'width', 1.8)))
@@ -3851,12 +3876,22 @@ class KrRules:
             return False
         if self.ot_target is not None and str(list(self.ot_target)) == str(pick):
             return False                                   # 이미 그리로 가는 중
+        # 최소 유지 시간 — 한 번 정했으면 그동안은 안 바꾼다 (2026-09-10 [1]).
+        # 마진만으로는 못 막는다: 마진은 "지금 목표 대비 이득" 인데 목표를 바꾼
+        # 직후에는 기준이 새 목표로 갈아 끼워져 다음 전환의 문턱이 다시 낮아진다.
+        # 실측 run_20260910_230148 t 49~108: pick 이 −2 → −1 → −2 → −1 → None
+        # → −4 로 흔들리는 동안 여유가 76.7 → 9.5 m 로 줄었고, 결국
+        # `ramp_too_late`(avail 4.5 < need 25.5)로 rs 256.2 에서 13 s 섰다.
+        # 74 m 있을 때 하나를 정해 끝냈으면 됐다. 0 이면 이전 동작.
+        if self.retarget_hold_ticks > 0 and self._retarget_lock > 0:
+            self._retarget_lock -= 1
+            return False
         # 최소 이득 — 새 목표가 지금 목표보다 lane_switch_margin_m 만큼은 더
         # 뚫려 있어야 갈아탄다. 매 틱 목표가 흔들리면 램프를 계속 다시 그린다.
         if self.lm_switch_margin > 0.0 and self.ot_target is not None:
             free = ((self.last_lane_map or {}).get('free_run') or {})
-            new_f = free.get(str(pick))
-            cur_f = free.get(str(list(self.ot_target)))
+            new_f = self._free_of(free, pick)
+            cur_f = self._free_of(free, self.ot_target)
             if (new_f is not None and cur_f is not None
                     and float(new_f) - float(cur_f) < self.lm_switch_margin):
                 return False
@@ -3874,8 +3909,37 @@ class KrRules:
         self.last_avoid = {'state': 'RETARGET', 'from': list(self.ot_target or ()),
                            'to': pick, 'new_blocker': int(new[0][3].id),
                            'span_before': list(self.ot_span)}
-        return self._side_pass(ap, planner, ego_speed, chain, False,
-                               lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
+        ok = self._side_pass(ap, planner, ego_speed, chain, False,
+                             lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
+        if ok:
+            self._retarget_lock = self.retarget_hold_ticks
+        return ok
+
+    def _free_of(self, free: dict, key) -> float | None:
+        """`free_run` 에서 그 차로의 여유 — **섹션 인덱스는 무시하고** 찾는다.
+
+        `ot_target` 은 시프트를 만든 시점의 `(도로, 섹션, 차로)` 다. 그런데 xodr 은
+        폭이 변할 때마다 섹션을 쪼개므로(11~13 m 짜리가 흔하다 — `_lane_chain_alias`
+        주석) 자차가 몇 미터만 가도 `free_run` 의 키가 다음 섹션으로 바뀐다.
+        그러면 원래 코드의 `free.get(str(list(ot_target)))` 이 **None** 이 되고,
+        마진 게이트가 `cur_f is not None` 조건에서 조용히 통과한다 = 사실상 무효다.
+
+        실측 run_20260910_230148: `free_run` 키의 섹션이 t 79.4 에 0 → 1,
+        t 82.1 에 1 → 2 로 바뀐다. 시프트는 t 54.0(섹션 0)에 만들어졌으므로
+        그 뒤 모든 재타겟에서 마진 게이트가 한 번도 걸리지 않았다.
+        """
+        v = free.get(str(list(key)) if not isinstance(key, str) else key)
+        if v is not None:
+            return float(v)
+        # 섹션을 뺀 동일성은 `_key_road_lane` 이 이미 하는 일이다 — 새로 만들지
+        # 않는다 (`lane_map_valid_side_by_id` 가 쓰는 바로 그 함수다).
+        want = self._key_road_lane(key)
+        if want is None:
+            return None
+        for k2, v2 in free.items():
+            if self._key_road_lane(k2) == want:
+                return float(v2)
+        return None
 
     def _owns_shift(self) -> bool:
         """이번 틱 **차로 지도가 시프트를 소유하는가** ([3]).
@@ -4007,6 +4071,7 @@ class KrRules:
         self.ot_from_hop = 0
         self.lm_hop_n = 0
         self.lm_retarget_n = 0
+        self._retarget_lock = 0                    # 새 시프트를 막지 않는다
         self.span_extend_n = 0
         self.last_overtake = 'restored'
 
@@ -4662,6 +4727,9 @@ class KrRules:
                     span = (span[0], _i)
         self.ot_span = span
         self.ot_target = target                            # 지금 향하는 차로 (재타겟 판정)
+        # 목표를 **정한 순간부터** 최소 유지 시간이 흐른다 (2026-09-10 [1]) —
+        # 재타겟 직후만이 아니라 최초 시프트도 같다. 0 이면 이전 동작.
+        self._retarget_lock = self.retarget_hold_ticks
         # 시프트가 **떠나온** 차로 = span 끝에서 복귀할 차로. 트리거가 이것도
         # 같이 봐야 한다 (아래 lane_plan).
         # **차로 키가 아니라 hop 오프셋으로 기억한다.** 키로 두면 자차가 섹션을
@@ -4899,6 +4967,7 @@ class KrRules:
         self.ot_from_hop = 0
         self.lm_hop_n = 0
         self.span_extend_n = 0
+        self._retarget_lock = 0                    # 새 시프트를 막지 않는다
         self.ot_blocked_ticks = 0
         self.ot_reject_ticks = 0
         self.preempt_latch_id = None
