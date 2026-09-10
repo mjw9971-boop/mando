@@ -172,3 +172,27 @@ def test_fallback_order_has_no_duplicates():
         order.append(other)
     assert order == ['right', 'left']
     assert len(order) == len(set(order))
+
+
+# ── 복귀 차로 기준을 **hop 오프셋**으로 (섹션 독립) ──────────────────────
+#
+# 차로 **키**로 기억하면 자차가 섹션을 넘는 순간 `free_run` 의 키와 안 맞아
+# 조용히 무효가 된다. 실측 2026-09-10 run_20260910_110743: rs 459.0 에
+# (2756,**3**,5) 에서 좌측 시프트했는데 정지 지점의 지도는 (2756,**1**,*) 라
+# 조회가 전부 None 이었다 — 스위치를 켜고 돌렸는데 아무 일도 안 일어났다.
+# hop 은 매 틱 자차 기준으로 다시 계산되므로 섹션과 무관하다.
+def test_from_hop_is_opposite_of_the_shift_side():
+    """좌측으로 n 칸 갔으면 떠나온 차로는 목표 기준 **+n**(우측)이다."""
+    k = kr()
+    for side, n, want in (('left', 1, 1), ('left', 2, 2),
+                          ('right', 1, -1), ('right', 2, -2)):
+        k.ot_from_hop = int(n) * (1 if side == 'left' else -1)
+        assert k.ot_from_hop == want
+
+
+def test_from_hop_starts_cleared():
+    assert kr().ot_from_hop == 0
+
+
+def test_shift_ref_switch_default_is_off():
+    assert CFG['avoid_map'].get('lane_map_shift_ref_enable') is False

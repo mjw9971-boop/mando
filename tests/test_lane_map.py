@@ -308,3 +308,58 @@ def test_alias_is_a_set_so_a_merge_blocks_both_lanes():
     m = M(kr, p, ap)
     assert m['blocked_by'][str(list(L1))] == 2
     assert m['blocked_by'][str(list(L2))] == 2
+
+
+# ── 큐 표시 (lane_map_queue_mark_enable) ─────────────────────────────────
+#
+# 큐 제외의 목적은 "신호 대기 줄을 **추월 후보로 삼지 않기**" 지 "장애물이 없는
+# 셈 치기" 가 아니다. 그런데 제외는 `_tick_corridor`(= **내 차로** 회랑) id 를
+# 쓰므로, 구조적으로 **트리거를 만드는 바로 그 객체**만 정확히 지운다.
+#
+# 실측 2026-09-10 run_20260910_110743 rs 500.1: 회랑은 blocker 2 를 6.1 m 로
+# 보는데 지도의 내 차로는 80.0 이고 blocked_by 에 id 2 가 없다(queue_dropped 1)
+# → pick=None → 두 번째 시프트 없음 → 60 s 정지. 그 두 로그에서 "회랑 blocker
+# 있는데 지도 내 차로 80.0" 이 741틱(24.4 %)이고 **전부** queue_dropped>0 이다.
+def mark_cfg(**over):
+    c = on_cfg(**over)
+    c['avoid_map']['lane_map_queue_mark_enable'] = True
+    return c
+
+
+def test_queue_mark_keeps_the_object_in_free_run():
+    """표시로 바꾸면 free_run 은 **실값**이다 — 트리거가 산다."""
+    a = Box(2, 20.0, -3.0, 0.0)
+    kr, p, ap = rig(mark_cfg(), actors=[a], queue=True)
+    m = M(kr, p, ap)
+    assert m['queue_dropped'] == 0
+    assert fr(m, L1) == pytest.approx(20.0, abs=0.6)
+    assert m['blocked_by'][str(list(L1))] == 2
+
+
+def test_queue_mark_flags_the_lane_instead():
+    """대신 그 차로를 큐로 **표시**한다 — 후보 선정에서만 뺀다."""
+    a = Box(2, 20.0, -3.0, 0.0)
+    kr, p, ap = rig(mark_cfg(), actors=[a], queue=True)
+    assert M(kr, p, ap)['queue_lanes'] == [str(list(L1))]
+
+
+def test_queue_mark_off_reproduces_the_old_deletion():
+    """false = 이전 동작 — 객체가 지도에서 사라지고 free_run 이 창 끝이 된다."""
+    a = Box(2, 20.0, -3.0, 0.0)
+    kr, p, ap = rig(on_cfg(), actors=[a], queue=True)
+    m = M(kr, p, ap)
+    assert m['queue_dropped'] == 1
+    assert fr(m, L1) == 80.0
+    assert m['queue_lanes'] == []
+
+
+def test_non_queue_object_is_not_flagged():
+    a = Box(2, 20.0, -3.0, 0.0)
+    kr, p, ap = rig(mark_cfg(), actors=[a], queue=False)
+    m = M(kr, p, ap)
+    assert m['queue_lanes'] == []
+    assert fr(m, L1) == pytest.approx(20.0, abs=0.6)
+
+
+def test_queue_mark_switch_default_is_off():
+    assert CFG['avoid_map'].get('lane_map_queue_mark_enable') is False

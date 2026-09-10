@@ -381,7 +381,7 @@ class KrRules:
         self.span_lost_restore = bool(ot.get('span_lost_restore_enable', False))
         self.ot_ids: list = []                     # 이 시프트를 만든 객체 id
         self.ot_target = None                      # 지금 향하는 차로 (재타겟 판정)
-        self.ot_from_lane = None                   # 시프트가 떠나온 차로 (복귀 대상)
+        self.ot_from_hop = 0                       # 떠나온 차로의 hop 오프셋 (복귀 대상)
         self.lm_hop_n = 0                          # 이번 시프트의 칸 수 (커밋 B)
         self.lm_retarget_n = 0                     # 재타겟 횟수
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
@@ -637,6 +637,8 @@ class KrRules:
         # 시프트 중 트리거가 **복귀할 차로**도 보게 할지. false = 이전 동작
         # (물리적으로 선 차로만 — 비켜 왔으니 늘 비어 보인다).
         self.lm_shift_ref = bool(_lm.get('lane_map_shift_ref_enable', False))
+        # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
+        self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
         self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
         # 활성 시프트 중에도 차로 지도가 다른 목표를 고르면 갈아탈지 (2026-09-09).
@@ -1699,11 +1701,26 @@ class KrRules:
             passable[k] = bool(r['junction'] == -1
                                and r['dir'] == lg.lanes[ego_lane]['dir']
                                and w >= self.lane_map_min_w)
-        # 큐로 판정된 객체는 지도에서 뺀다
+        # 큐로 판정된 객체 — **빼는 것이 아니라 표시**한다 (queue_mark).
+        # 빼면 `free_run` 이 통째로 창 끝이 되어 `lane_plan` 트리거가 죽는다.
+        # 그런데 큐 제외의 목적은 "신호 대기 줄을 **추월 후보로 삼지 않기**"지
+        # "장애물이 없는 셈 치기" 가 아니다. 실측 2026-09-10
+        # run_20260910_110743 rs 500.1: 회랑은 blocker 2 를 6.1 m 로 보는데
+        # 지도의 내 차로는 80.0 이고 blocked_by 에 id 2 가 없다 (queue_dropped 1)
+        # → pick=None → 두 번째 시프트가 영영 안 생겨 60 s 정지.
+        # 큐 제외는 `_tick_corridor`(= **내 차로** 회랑) id 를 쓰므로, 구조적으로
+        # **트리거를 만드는 바로 그 객체**만 정확히 지운다.
+        # 표시로 바꾸면 트리거는 살고, 후보 선정에서만 그 차로를 뺀다.
         drop = set()
+        qmark = set()
         if self._tick_queue:
-            drop = {b[3].id for b in self._tick_corridor}
+            ids = {b[3].id for b in self._tick_corridor}
+            if self.queue_mark:
+                qmark = ids
+            else:
+                drop = ids                                 # 이전 동작
         blocked: dict = {}
+        qlanes: set = set()
         try:
             actors = list(ap._world.get_actors())
         except Exception:                                  # noqa: BLE001
@@ -1729,11 +1746,17 @@ class KrRules:
                 if pr[0] < free.get(k, ahead):
                     free[k] = pr[0]
                     blocked[k] = int(a.id)
+                    if a.id in qmark:
+                        qlanes.add(k)
+                    else:
+                        qlanes.discard(k)
         return {'ego_lane': list(ego_lane), 'hops': {str(list(k)): h for k, h in hops.items()},
                 'free_run': {str(list(k)): round(v, 1) for k, v in free.items()},
                 'passable': {str(list(k)): bool(v) for k, v in passable.items()},
                 'blocked_by': {str(list(k)): v for k, v in blocked.items()},
                 'queue_dropped': len(drop),
+                # 큐로 표시된 차로 — 후보 선정에서만 뺀다 (트리거는 살린다)
+                'queue_lanes': [str(list(k)) for k in sorted(qlanes)],
                 # 승계로 이어 붙인 전방 차로 수 — 0 이면 섹션 확장이 안 걸린 것이다
                 'span_alias': len(alias)}
 
@@ -1796,10 +1819,13 @@ class KrRules:
         #   복귀 차로 (2076,3,3) free_run  7.5  → 콘 5·6·7·9 가 그 차로에 있다
         # 회랑은 복귀 전이 뒤의 콘 9 를 78.3 m 앞으로 보고 있었다. 둘 다 맞고
         # 재는 대상이 달랐을 뿐이라, **둘 중 나쁜 쪽**을 트리거로 쓴다.
-        if self.lm_shift_ref and self.ot_span is not None and self.ot_from_lane:
-            back = free.get(str(list(self.ot_from_lane)))
-            if back is not None:
-                mine = min(mine, float(back))
+        if self.lm_shift_ref and self.ot_span is not None and self.ot_from_hop:
+            for _k, _h in (lm.get('hops') or {}).items():
+                if int(_h) == int(self.ot_from_hop):
+                    _b = free.get(_k)
+                    if _b is not None:
+                        mine = min(mine, float(_b))
+                    break
         if mine >= self.lm_decide_m:
             return None                                    # 트리거 아님
         hops = {k: h for k, h in lm['hops'].items()}
@@ -1807,9 +1833,12 @@ class KrRules:
         v_cap = self.lm_avoid_v
         # 후보 — 통행 가능하고, 램프 + 여유만큼 뚫려 있는 차로
         cands = []
+        qlanes = set(lm.get('queue_lanes') or [])
         for k, h in hops.items():
             if k == key or not lm['passable'].get(k):
                 continue
+            if k in qlanes:
+                continue                                   # 신호 대기 줄은 후보가 아니다
             n = abs(int(h))
             L = self._ramp_len_m(n, lane_w, v_cap)
             need = L + self.shift_ahead_m
@@ -3554,7 +3583,7 @@ class KrRules:
         self.ot_side = None
         self.ot_ids = []
         self.ot_target = None
-        self.ot_from_lane = None
+        self.ot_from_hop = 0
         self.lm_hop_n = 0
         self.lm_retarget_n = 0
         self.span_extend_n = 0
@@ -4100,9 +4129,15 @@ class KrRules:
             self.lm_retarget_n += 1
         self.ot_span = span
         self.ot_target = target                            # 지금 향하는 차로 (재타겟 판정)
-        # 시프트가 **떠나온** 차로 = span 끝에서 복귀할 차로. 시프트 중 차로 지도의
-        # 트리거가 이 차로도 같이 봐야 한다 (아래 lane_plan 참조).
-        self.ot_from_lane = ego_lane
+        # 시프트가 **떠나온** 차로 = span 끝에서 복귀할 차로. 트리거가 이것도
+        # 같이 봐야 한다 (아래 lane_plan).
+        # **차로 키가 아니라 hop 오프셋으로 기억한다.** 키로 두면 자차가 섹션을
+        # 넘는 순간 `free_run` 의 키와 안 맞아 조용히 무효가 된다 — 실측
+        # 2026-09-10 run_20260910_110743: rs 459.0 에 (2756,**3**,5) 에서 좌측
+        # 시프트했는데 정지 지점의 지도는 (2756,**1**,*) 라 조회가 전부 None 이었다.
+        # hop 은 매 틱 자차 기준으로 다시 계산되므로 섹션과 무관하다.
+        # 좌측으로 n 칸 갔으면 떠나온 차로는 목표 기준 **+n**(우측)이다.
+        self.ot_from_hop = int(n_steps or 1) * (1 if side == 'left' else -1)
         self.lm_hop_n = int(n_steps or 1)                  # 몇 칸짜리 시프트였나
         self.ot_ids = list(chain['ids'])                   # 대상 상실 판정의 기준
         self.ot_side = side                                # 연장이 같은 방향을 쓴다
@@ -4328,7 +4363,7 @@ class KrRules:
         self.ot_side = None
         self.ot_ids = []
         self.ot_target = None
-        self.ot_from_lane = None
+        self.ot_from_hop = 0
         self.lm_hop_n = 0
         self.span_extend_n = 0
         self.ot_blocked_ticks = 0
