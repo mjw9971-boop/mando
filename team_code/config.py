@@ -141,7 +141,7 @@ class GlobalConfig:
         self.minimum_speed_to_prevent_rolling_back = 0.5
         # Maximum seed in junctions in m/s
         # VTD: 원값 64/3.6. caps_kph.junction 30 이 이 코스 검증값이다.
-        self.max_speed_in_junction = 30 / 3.6
+        self.max_speed_in_junction = 40 / 3.6
         # Lookahead distance to check, whether the ego is close to a junction
         self.max_lookahead_to_check_for_junction = 30 * self.points_per_meter
         # Distance of the first checkpoint for TF++
