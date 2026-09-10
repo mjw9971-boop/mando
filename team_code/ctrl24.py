@@ -189,6 +189,10 @@ class Ctrl24:
         self.esc_release_m = float(c['escape_release_m'])
         self.esc_clear_m = float(c['escape_clear_m'])
         self.esc_rearm = bool(c['escape_rearm_shift_enable'])
+        # 적색 정지선 앞 탈출 유예 (2026-09-11)
+        self.esc_red_defer = bool(c['escape_red_defer_enable'])
+        self.esc_red_m = float(c['escape_red_defer_stopline_m'])
+        self.esc_red_ticks = int(round(float(c['escape_red_defer_s']) * self.hz))
         self.esc_virt = bool(c['escape_virtual_shift_enable'])
         self.esc_virt_extra = float(c['escape_virtual_extra_m'])
         self.esc_virt_v = float(c['escape_virtual_v'])
@@ -282,6 +286,8 @@ class Ctrl24:
         self._esc_xy: tuple | None = None         # 직전 틱 위치 (누적용)
         self.last_escape: dict | None = None      # 진단 (reasons.escape)
         self._esc_rearmed: list = []              # 이번 걸림에서 재무장한 객체 id
+        self._esc_defer_ticks = 0                 # 적색 정지선 앞 유예 누적 (조건 깨지면 0)
+        self._esc_deferring = False               # 이번 틱 유예 여부 (틱당 1회 계산)
         self._virt_span: tuple | None = None      # 가상 시프트 구간 (속도 상한용)
         self._virt_wait = 0                       # 대향 대기 틱 (진단)
         self._nb_cache: dict = {}                 # (side, n_steps) → 이웃 연속성 bool 배열
@@ -1923,6 +1929,8 @@ class Ctrl24:
         self._esc_engaged = False
         self._esc_mark = None
         self._esc_xy = None                           # 순간이동 변위를 누적하지 않는다
+        self._esc_defer_ticks = 0                     # 적색 유예 (순간이동 = 새 접근)
+        self._esc_deferring = False
         self._esc_rearmed = []
 
     # ── 틱 ────────────────────────────────────────────────────────────────
@@ -2129,6 +2137,40 @@ class Ctrl24:
         self._esc_engaged = True
         self._esc_mark = float(odo)
 
+    def _escape_defer(self, planner) -> bool:
+        """적색 정지선 앞 탈출 유예 — 유예 중이면 True. 틱당 1회만 부른다.
+
+            C = (전방 신호 정지선까지 거리 ≤ escape_red_defer_stopline_m)
+                ∧ (그 정지선 신호 state 가 Red)
+
+        거리·상태는 `_next_stopline` 하나에서 온다 — K1(_stopline_profile)·P3 이 읽는
+        그 배열·그 tl 이라 새 조회가 없다. **황색은 포함하지 않는다** (Red 만).
+        매핑이 없으면(tl None) C 는 거짓이다.
+
+        타이머는 `_esc_defer_ticks` 하나뿐이고 C 가 거짓이면 즉시 0 이다 — 녹색으로
+        바뀌는 순간 유예가 사라진다. escape_red_defer_s 를 채우면 그 뒤로는 유예하지
+        않아 현재 코드 경로 그대로 간다 (적색 실측 52.9 / 52 s → 한 주기보다 길게).
+        """
+        if not self.esc_red_defer:
+            self._esc_defer_ticks = 0
+            return False                                   # off — C 를 계산조차 않는다
+        nxt = self._next_stopline(planner)
+        ok = (nxt is not None and nxt[1] == 'Red'
+              and nxt[0] is not None and float(nxt[0]) <= self.esc_red_m)
+        if not (ok and self._esc_engaged):
+            self._esc_defer_ticks = 0
+            return False
+        self._esc_defer_ticks += 1
+        if self._esc_defer_ticks >= self.esc_red_ticks:
+            return False                                   # 한 주기를 다 기다렸다 — 그대로 진행
+        self.last_escape = {
+            'state': 'RED_DEFER',
+            'left_s': round((self.esc_red_ticks - self._esc_defer_ticks) / self.hz, 1),
+            'stopline_m': round(float(nxt[0]), 1),
+            'light_id': nxt[2],
+            'raised': False}
+        return True
+
     def _escape_floor(self, ap) -> float | None:
         """이번 틱에 깔 바닥 [m/s]. 안 걸렸거나 간격이 모자라면 None.
 
@@ -2137,6 +2179,8 @@ class Ctrl24:
         붙어서 밀지 않는다.
         """
         if not self._esc_engaged:
+            return None
+        if self._esc_deferring:                            # 적색 정지선 앞 유예 중
             return None
         gap = self._front_gap_m()
         if gap is not None and gap <= self.esc_clear_m:
@@ -2212,6 +2256,8 @@ class Ctrl24:
         목표가 연속 폴리라인이라 끊기는 지점이 없다.
         """
         if not (self.esc_virt and self._esc_engaged) or self.ot_span is not None:
+            return False
+        if self._esc_deferring:                            # 적색 정지선 앞 유예 중
             return False
         if not self._corridor:
             return False
@@ -2335,6 +2381,7 @@ class Ctrl24:
         other_min = min(other_vals) if other_vals else None
         base_t = target_speed if candidate is None else min(target_speed, candidate)
         self._escape_tick(ap, legit_min)
+        self._esc_deferring = self._escape_defer(planner)
         floor = self._escape_floor(ap)
         esc_t = None
         gap = self._front_gap_m() if self._esc_engaged else None
@@ -2350,7 +2397,7 @@ class Ctrl24:
                                            else round(self._esc_odo - self._esc_mark, 1))}
             if self._esc_rearmed:
                 self.last_escape['rearmed'] = list(self._esc_rearmed)
-        elif self._esc_engaged:
+        elif self._esc_engaged and not self._esc_deferring:
             # 걸렸지만 전방 간격이 모자란다 — 바닥이 0 이다 (원래 후보 그대로).
             self.last_escape = {'state': 'BLOCKED_GAP',
                                 'gap_m': None if gap is None else round(float(gap), 1),

@@ -78,8 +78,12 @@ def scan_len(v):
 
 # ── 스위치 ───────────────────────────────────────────────────────────────
 def test_params_defaults():
+    """킬스위치만 불변이다 — k·min·max 는 튜닝 대상이라 값을 고정하지 않는다
+    (params 가 정본, CLAUDE.md B-25 관례). 관계식만 본다."""
     assert C['neighbor_scan_enable'] is False
-    assert C['neighbor_scan_k'] == 4.0 and C['neighbor_scan_min_m'] == 20.0 and C['neighbor_scan_max_m'] == 80.0
+    assert C['neighbor_scan_k'] > 0.0
+    assert 0.0 < C['neighbor_scan_min_m'] <= C['neighbor_scan_max_m']
+    assert C['neighbor_scan_max_m'] <= C['detect_max_m']            # GT 범위 안
 
 
 # ── _neighbor_free_m 단위 ─────────────────────────────────────────────────
@@ -90,7 +94,9 @@ def test_free_none_without_target():
 
 
 def test_free_is_scan_len_when_empty():
-    kr, p, ap = rig(on_cfg())
+    """clip(k·v, min, max) — 산술을 보려고 사본에 값을 명시로 주입한다 (B-25 관례)."""
+    cfg = on_cfg(neighbor_scan_k=4.0, neighbor_scan_min_m=20.0, neighbor_scan_max_m=80.0)
+    kr, p, ap = rig(cfg)
     assert kr._neighbor_free_m(p, True, 0.0, ap=ap) == pytest.approx(20.0)      # 하한
     assert kr._neighbor_free_m(p, True, 8.0, ap=ap) == pytest.approx(32.0)      # 4·8
     assert kr._neighbor_free_m(p, True, 30.0, ap=ap) == pytest.approx(80.0)     # 상한
