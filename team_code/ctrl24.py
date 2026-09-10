@@ -168,6 +168,12 @@ class Ctrl24:
         # ── K8 span 이웃 연속성 (B-30) ─────────────────────────────────────
         self.span_cont = bool(c['span_v_req_enable'])
         self.span_v_min = float(c['span_v_req_min'])
+        # 교차로 관통 연장 — 상수는 overtake.* 를 그대로 읽는다 (kr_rules 와 같은 값).
+        self.span_jx = bool(c['span_junction_extend_enable'])
+        self.span_jump_m = float(c['span_target_jump_m'])
+        self.jx_exit_m = float(ot.get('zone_exit_margin_m', 5.0))
+        self.jx_gap_m = float(ot.get('zone_junction_gap_m', 5.0))
+        self.jx_max_m = float(ot.get('zone_extend_max_m', 120.0))
         # ── 지시등 ─────────────────────────────────────────────────────────
         self.turn_lead_s = float(c['turn_lead_s'])
         self.lc_lead_s = float(c['lc_lead_s'])
@@ -1188,12 +1194,17 @@ class Ctrl24:
 
     # ── K8 span 이웃 연속성 (B-30, 2026-09-09) ────────────────────────────
     def _nb_ok(self, planner, left: bool, n_steps: int):
-        """경로 전 구간의 "그 side 로 n_steps 칸 갈 목표가 있나" bool 배열.
+        """경로 전 구간의 "그 side 시프트 목표가 **이어지는가**" bool 배열.
 
-        `route.py::_shift_target_wp` 와 **같은 판정**이다 (거기서 None 이면 폴백이
-        원 차로 중심으로 스냅해 계단이 된다). 시프트는 route_points 만 바꾸고
-        route_waypoints 는 건드리지 않으므로 (side, n_steps) 당 한 번만 계산하면 된다.
-        차로 키가 바뀌는 지점에서만 재조회한다 — 한 차로가 수백 점이라 그만큼 싸다.
+        `route.py::_shift_target_wp` 와 같은 목표다 (거기서 None 이면 폴백이 원 차로
+        중심으로 스냅해 계단이 된다). 두 가지를 함께 본다:
+          · 목표가 없다 (이웃 차로 없음) — 무한 점프
+          · 목표가 있는데 **건너뛴다** — 경로가 계획 차선변경으로 차로를 바꾸면
+            목표도 한 칸 바깥으로 옮겨간다 (실측 2026-09-10 15_직진20: 3.07 m 점프,
+            κ 4.87). span_target_jump_m 을 넘는 점프는 끊김으로 센다.
+        시프트는 route_points 만 바꾸고 route_waypoints 는 건드리지 않으므로
+        (side, n_steps) 당 한 번만 계산하면 된다. 차로 키가 바뀌는 지점에서만
+        재조회한다 — 한 차로가 수백 점이라 그만큼 싸다.
         """
         key = ('left' if left else 'right', int(n_steps))
         hit = self._nb_cache.get(key)
@@ -1205,18 +1216,44 @@ class Ctrl24:
         f = getattr(planner, '_shift_target_wp', None)
         if f is None:
             return None
+
+        def tgt_xy(i):
+            try:
+                t = f(i, left, n_steps)
+            except Exception:                              # noqa: BLE001 — 목 플래너
+                return 'err'
+            if t is None:
+                return None
+            loc = getattr(getattr(t, 'transform', None), 'location', None)
+            if loc is None:
+                return (0.0, 0.0)                          # 좌표가 없는 목 — 점프는 안 본다
+            return (float(loc.x), float(loc.y))
+
         out = np.zeros(len(wps), dtype=bool)
         prev_key = object()
         val = False
         for i in range(len(wps)):
             k = getattr(wps[i], 'key', None)
+            jump = False
             if k != prev_key:
-                prev_key = k
-                try:
-                    val = f(i, left, n_steps) is not None
-                except Exception:                          # noqa: BLE001 — 목 플래너
+                xy = tgt_xy(i)
+                if xy == 'err':
                     return None
-            out[i] = val
+                val = xy is not None
+                # 경로 차로가 바뀌는 지점 — 직전 점의 목표와 이어지는지 본다.
+                # 끊기는 것은 **그 한 점**이다 (뒤는 다시 이어진다).
+                if val and i > 0 and self.span_jump_m > 0.0:
+                    pxy = tgt_xy(i - 1)
+                    if pxy is None or pxy == 'err':
+                        jump = True                        # 없던 목표가 생겼다 = 계단
+                    else:
+                        step = _math.hypot(xy[0] - pxy[0], xy[1] - pxy[1])
+                        # 경로 간격(1/ppm)만큼은 정상 전진이다 — 그만큼 빼고 잰다.
+                        if step - 1.0 / float(getattr(planner, 'points_per_meter', 10)) \
+                                > self.span_jump_m:
+                            jump = True
+                prev_key = k
+            out[i] = val and not jump
         self._nb_cache[key] = out
         return out
 
@@ -1238,38 +1275,170 @@ class Ctrl24:
             return None
         return a, b + 1
 
-    def _span_speed_req(self, planner, left: bool, steps: int, obs_i: int, last_i: int):
-        """이 side 로 이 장애물을 담으려면 필요한 속도 → (판정, v_req).
+    def _route_zones(self, planner, route_s: float) -> list:
+        """route_s 이후 정지선 route_s 목록 (kr_rules._route_zones 원문)."""
+        out = set()
+        try:
+            d = float(planner.distances_to_next_traffic_lights[planner.route_index])
+            if d < float('inf'):
+                out.add(round(route_s + d, 3))
+        except Exception:                                  # noqa: BLE001
+            pass
+        for x in self._all_stopline_s(planner):
+            if x >= route_s:
+                out.add(round(float(x), 3))
+        return sorted(out)
 
-        판정  'ok'        연속 — 이전과 같다
-              'no_target' 장애물 지점에 그 side 목표가 없다 (섹션에 그 차로가 없음).
-                          계단 이전에 목표가 틀린 것이므로 **반대편 side 를 본다**.
-              'wait'      창은 있는데 지금 속도로는 전이 2회가 안 들어간다 → v_req 로 감속
-              'no_room'   창이 하한(span_v_req_min)으로도 부족 → 담지 않는다
+    def _junction_extend(self, planner, side: str, route_s: float, span_end: float):
+        """교차로 관통 판정 + span 끝 연장 → (새 끝 route_s, 기각 사유 | None, 진단).
 
-            v_req = (창 − extra_before_m − extra_after_m) / (2 · trans_k)
+        kr_rules._zone_extension 원문 이식. 판정은 "옆 차로가 그 교차로를 경로와 같은
+        방향으로 관통하는가" 다 — 구간의 경로 차로마다 side 이웃이 있고, 이웃끼리
+        successor 로 이어져야 한다(`zone_no_through_lane`). 회전 이벤트가 끼면
+        `zone_turn` 으로 기각한다 (돌면서 옆 차로로 나가는 것은 관통이 아니다).
+        """
+        lg = getattr(planner, 'lg', None)
+        route = getattr(planner, 'route', None) or {}
+        lanes = [tuple(k) for k in (route.get('lanes') or [])]
+        cum = [float(x) for x in (route.get('cum_s') or [])]
+        lens = [float(x) for x in (route.get('lengths') or [])]
+        if (lg is None or not lanes or len(cum) != len(lanes) or len(lens) != len(lanes)):
+            return span_end, 'zone_no_route', {}
+        new_end = float(span_end)
+        zones = self._route_zones(planner, route_s)
+        info: dict = {'zones': []}
+        for _ in range(4):
+            ahead = [z for z in zones if route_s < z < new_end]
+            if not ahead:
+                break
+            z = ahead[0]
+            k0 = next((i for i in range(len(lanes))
+                       if lg.lanes.get(lanes[i], {}).get('junction', -1) != -1
+                       and cum[i] <= z + self.jx_gap_m and cum[i] + lens[i] > z), None)
+            if k0 is None:                                 # 정지선만 있다 (횡단보도)
+                info['zones'].append({'s': round(z, 1), 'junction': None})
+                zones = [q for q in zones if q > z]
+                continue
+            jid = lg.lanes[lanes[k0]]['junction']
+            k = k0
+            while (k + 1 < len(lanes)
+                   and lg.lanes.get(lanes[k + 1], {}).get('junction', -1) == jid):
+                k += 1
+            if k + 1 >= len(lanes):
+                return span_end, 'zone_no_exit', info
+            j_out = cum[k] + lens[k]
+            new_end = max(new_end, j_out + self.jx_exit_m)
+            info['zones'].append({'s': round(z, 1), 'junction': int(jid),
+                                  'out': round(j_out, 1)})
+            zones = [q for q in zones if q > j_out]
+        info['new_end'] = round(new_end, 1)
+        if new_end <= span_end + 1e-9:
+            return span_end, 'zone_no_junction', info
+        if new_end - span_end > self.jx_max_m:
+            return span_end, 'zone_extend_max', info
+        for ev in route.get('events') or []:
+            kind = str(ev.get('kind', ''))
+            if kind.startswith('turn_'):
+                if route_s <= float(ev['s']) <= new_end:
+                    return span_end, 'zone_turn', info
+            elif kind.startswith('lane_change'):
+                a0 = float(ev.get('window_s0', ev.get('s', 0.0)))
+                b0 = float(ev.get('window_s1', ev.get('s', 0.0)))
+                if a0 <= new_end and b0 >= route_s:
+                    return span_end, 'zone_lane_change', info
+        prev_nb, prev_cum = None, None
+        for i, key in enumerate(lanes):
+            if cum[i] + lens[i] < route_s or cum[i] > new_end:
+                continue
+            nb = lg.neighbor(key, side) if key in lg.lanes else None
+            if nb is None:
+                info['break_lane'] = list(key)
+                return span_end, 'zone_no_through_lane', info
+            if (prev_nb is not None and nb != prev_nb and prev_cum is not None
+                    and cum[i] > prev_cum + 1e-6):
+                try:
+                    if nb not in lg.successors(prev_nb):
+                        info['break_lane'] = list(key)
+                        return span_end, 'zone_no_through_lane', info
+                except Exception:                          # noqa: BLE001
+                    pass
+            prev_nb, prev_cum = nb, cum[i]
+        return new_end, None, info
 
-        장애물 전장(bounding box)은 빼지 않는다 — 사양의 식 그대로다.
+    def _span_fit(self, planner, left: bool, steps: int, a: int, b: int,
+                  obs_i: int, last_i: int, trans: float, back: float,
+                  ext_m: float, route_s: float):
+        """이 span 을 계단 없이 놓을 수 있나 → (판정, v_req, 새 b, 진단).
+
+        판정  'ok'        span 전 구간이 연속 — 그대로 만든다
+              'extend'    뒤가 끊긴 곳이 교차로이고 옆 차로가 관통한다 → 끝을 늘려 만든다
+              'no_target' 장애물 지점에 그 side 목표가 없다 → 반대편 side 를 본다
+              'wait'      감속하면 창 안에 놓인다 → v_req 로 감속 (K8 후보)
+              'no_room'   감속해도 못 놓는다 → 그 side 는 담지 않는다 (NOOP)
+
+        **계단은 어느 경우에도 남기지 않는다** (2026-09-10 결정): 만드는 것은
+        'ok'/'extend' 뿐이고 둘 다 span 전 구간의 연속을 확인한 뒤다.
+
+        v_req 는 창의 총 길이가 아니라 **장애물 앞뒤 여유**로 낸다. 총 길이를 쓰면
+        창이 뒤로 길고 앞으로 짧을 때 복귀 전이가 창 밖으로 나가 계단이 남는다
+        (실측 2026-09-09, 6건이 그랬다 — docs/BACKLOG.md B-30):
+            v ≤ (뒤여유 − extra_before_m − 객체 반길이) / trans_k
+            v ≤ (앞여유 − extra_after_m  − 객체 반길이) / trans_k
         """
         ok = self._nb_ok(planner, left, steps)
         if ok is None or len(ok) == 0:
-            return 'ok', None
+            return 'ok', None, b, {}
+        b = min(int(b), len(ok))
+        a = max(0, int(a))
+        if b <= a:
+            return 'ok', None, b, {}
+        if bool(ok[a:b].all()):
+            return 'ok', None, b, {}
         win = self._cont_window(ok, obs_i, last_i)
         if win is None:
-            return 'no_target', None
+            return 'no_target', None, b, {}
         w0, w1 = win
-        if w0 == 0 and w1 == len(ok):
-            return 'ok', None                              # 경로 전체가 연속
-        try:
-            rs = planner.route_s
-            L = float(rs[min(w1, len(rs) - 1)]) - float(rs[w0])
-        except Exception:                                  # noqa: BLE001 — 목 플래너
-            ppm = float(getattr(planner, 'points_per_meter', 10))
-            L = (w1 - w0) / ppm
-        v_req = (L - self.ot_before_m - self.ot_after_m) / (2.0 * self.trans_k)
+        rs = getattr(planner, 'route_s', None)
+
+        def s_at(i):
+            if rs is None:
+                return float(i) / float(getattr(planner, 'points_per_meter', 10))
+            return float(rs[max(0, min(int(i), len(rs) - 1))])
+
+        info = {'win': [int(w0), int(w1)]}
+        # 뒤가 끊겼다 — 그 자리가 교차로이고 옆 차로가 관통하면 끝을 늘린다.
+        # 실측 2026-09-10 (리플레이 40건의 해당 7건): 끊김은 **연결로에 side 이웃이
+        # 없어서** 생기고, 그것이 곧 관통 불가다 — 두 사실이 같아서 연장이 서는 경우가
+        # 관찰되지 않았다. 옆 차로의 successor 를 따라가 보면 같은 교차로 연결로는
+        # 있으나 전부 **다른 도로로** 나간다 (경로를 벗어난다). 그래서 이 가지는
+        # 판정 근거(info['jx'])를 남기는 역할을 하고, 성립하면 늘린다.
+        # 판정을 지도가 바꾸면(양방향 연결로) 그때 살아난다 — docs/BACKLOG.md B-30.
+        if b > w1 and self.span_jx:
+            new_end, why, jx = self._junction_extend(planner, 'left' if left else 'right',
+                                                     route_s, s_at(b))
+            info['jx'] = why or 'ok'
+            if jx:
+                info['jx_info'] = jx
+            if why is None:
+                try:
+                    b2 = int(np.searchsorted(rs, new_end)) if rs is not None else b
+                except Exception:                          # noqa: BLE001
+                    b2 = b
+                b2 = min(max(b2, b), len(ok))
+                if b2 > b and bool(ok[a:b2].all()):
+                    info['extended_to'] = round(float(new_end), 1)
+                    return 'extend', None, b2, info
+                info['jx'] = 'zone_no_through_lane'        # 연장해도 이웃이 끊긴다
+        behind = s_at(obs_i) - s_at(w0)
+        front = s_at(w1) - s_at(last_i)
+        v_back = (behind - self.ot_before_m - ext_m) / self.trans_k
+        v_front = (front - self.ot_after_m - ext_m) / self.trans_k
+        v_req = min(v_back, v_front)
+        info.update({'behind_m': round(behind, 1), 'front_m': round(front, 1),
+                     'v_req': round(v_req, 2)})
         if v_req < self.span_v_min:
-            return 'no_room', round(v_req, 2)
-        return 'wait', round(v_req, 2)
+            return 'no_room', round(v_req, 2), b, info
+        return 'wait', round(v_req, 2), b, info
 
     def _avoid_tick(self, ap, planner, ego_speed: float, obb_ids) -> None:
         """틱당 1회. 원복 → 트리거 수집 → 아직 시프트를 안 만든 첫 객체에 PREEMPT."""
@@ -1328,6 +1497,13 @@ class Ctrl24:
         trans = self._trans_m(ego_speed)
         rejects = []
         v_reqs: list = []
+        # 객체 반길이 — span 은 장애물 앞뒤로 이만큼 더 뻗는다 (plan_shift_span).
+        bb = getattr(actor, 'bounding_box', None)
+        ext_m = float(getattr(getattr(bb, 'extent', None), 'x', 0.0) or 0.0)
+        try:
+            route_s_now = float(planner.route_s[i0])
+        except Exception:                                  # noqa: BLE001 — 목 플래너
+            route_s_now = 0.0
         # K8 이 쓸 장애물 인덱스 — 투영이 안 되면 연속성 판정을 건너뛴다 (이전 동작).
         obs_i = last_i = None
         try:
@@ -1363,23 +1539,40 @@ class Ctrl24:
                 continue
             ref = (a + b) // 2                            # 중첩 시프트의 밀림은 플래토에서 잰다
             steps = self._target_steps(planner, left, ref)
-            # K8 — 이 side 로 장애물을 담는 이웃 연속 창이 있나 (B-30).
+            # K8 — 계단 없이 이 span 을 놓을 수 있나 (B-30).
             # 게이트가 아니다: 'no_target' 은 반대편 side 로 넘기고, 'wait' 는
-            # 생성을 미루는 대신 감속 후보를 낸다. 'no_room' 만 담지 않는다.
+            # 생성을 미루는 대신 감속 후보를 낸다. 뒤가 끊긴 곳이 교차로면 옆 차로가
+            # 관통하는지 보고 끝을 늘린다. 'no_room' 만 담지 않는다.
+            back = trans * _math.sqrt(max(1, steps)) if (
+                self.ot_span is not None and b > self.ot_span[1]) else trans
+            jx_diag = None
             if self.span_cont and obs_i is not None:
-                verdict, v_req = self._span_speed_req(planner, left, steps, obs_i, last_i)
+                verdict, v_req, b_fit, info = self._span_fit(
+                    planner, left, steps, a, b, obs_i, last_i, trans, back, ext_m, route_s_now)
+                jx_diag = info or None
                 if verdict == 'no_target':
                     rejects.append(f'{side}:no_target')
+                    self.last_avoid[f'{side}_fit'] = info or None
                     continue
                 if verdict == 'no_room':
                     rejects.append(f'{side}:span_no_room')
-                    self.last_avoid[f'{side}_v_req'] = v_req
+                    self.last_avoid[f'{side}_fit'] = info
                     continue
-                if verdict == 'wait' and float(ego_speed) > v_req + 1e-9:
-                    rejects.append(f'{side}:span_v_req')
-                    self.last_avoid[f'{side}_v_req'] = v_req
-                    v_reqs.append(v_req)
+                if verdict == 'wait':
+                    if float(ego_speed) > v_req + 1e-9:
+                        rejects.append(f'{side}:span_v_req')
+                        self.last_avoid[f'{side}_fit'] = info
+                        v_reqs.append(v_req)
+                        continue
+                    # v ≤ v_req 인데도 span 이 창을 벗어나면(있으면 안 되는 경우 —
+                    # v_req 는 객체 반길이까지 빼고 낸다) 만들지 않는다. 계단 금지가 먼저다.
+                    rejects.append(f'{side}:span_no_fit')
+                    self.last_avoid[f'{side}_fit'] = info
                     continue
+                if verdict == 'extend':
+                    b = int(b_fit)
+                    back = trans * _math.sqrt(max(1, steps)) if (
+                        self.ot_span is not None and b > self.ot_span[1]) else trans
             try:
                 d = np.asarray(planner.planned_lateral_offsets(a, b, left, step_pts=int(ppm),
                                                                ref_index=ref), dtype=float)
@@ -1391,8 +1584,6 @@ class Ctrl24:
             if d is not None and (d.size == 0 or float(np.abs(d).max()) < self.noop_disp_m):
                 rejects.append(f'{side}:noop')             # 이웃 없음 → 원 경로 유지
                 continue
-            back = trans * _math.sqrt(max(1, steps)) if (
-                self.ot_span is not None and b > self.ot_span[1]) else trans
             snap = (planner.route_points[a:b].copy(),
                     planner.commands[a:b].copy() if getattr(planner, 'commands', None) is not None else None,
                     planner.lat_shift[a:b].copy() if getattr(planner, 'lat_shift', None) is not None else None)
@@ -1426,7 +1617,7 @@ class Ctrl24:
                 'trans_m': round(trans, 1), 'back_m': round(back, 1), 'steps': int(steps),
                 'ahead_m': round(self.shift_ahead_m, 1), 'chain': list(chain['ids']),
                 'disp_m': round(disp, 2), 'nested': self.nested,
-                'rejects': rejects or None})
+                'fit': jx_diag, 'rejects': rejects or None})
             print(f'[ctrl24] 정적 장애물 회피 — {side} 로 경로 시프트 '
                   f'(id={chain["ids"]}, 구간 {a}~{b}, 전이 {trans:.1f}/{back:.1f} m, '
                   f'{steps}칸, 중첩 {self.nested})', flush=True)
@@ -1435,7 +1626,8 @@ class Ctrl24:
         # 거기까지만 줄이면 한쪽은 담긴다). 생성은 다음 틱 이하에서 자연히 일어난다.
         self.span_v_req = max(v_reqs) if v_reqs else None
         noop = bool(rejects) and all(
-            r.endswith((':noop', ':no_target', ':span_no_room')) for r in rejects)
+            r.endswith((':noop', ':no_target', ':span_no_room', ':span_no_fit'))
+            for r in rejects)
         state = ('SPAN_WAIT_V' if v_reqs else
                  ('NOOP' if noop else self.last_avoid['state']))
         self.last_avoid.update({'state': state,
