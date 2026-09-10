@@ -397,6 +397,12 @@ class KrRules:
         # 줄을 서는 것이다. false = 이전 동작(standoff_floor_m 그대로).
         self.q_close_gap = bool(ot.get('queue_close_gap_enable', False))
         self.q_stop_gap_m = float(ot.get('queue_stop_gap_m', 5.0))
+        # (3) occupied 판정을 차로 지도 free_run 으로 바꾼다. false = 이전 동작
+        # (`_side_is_clear` — 자차 반경 30 m ∧ successors·predecessors).
+        self.side_clear_map = bool(ot.get('side_clear_by_map_enable', False))
+        # 목표 차로 후방 감시 창 [m] — 이 안에 자차보다 빠른 차가 있으면 기각
+        # (채점 항목 14). 0 = 후방을 안 본다.
+        self.rear_clear_m = float(ot.get('rear_clear_m', 30.0))
         self.q_hold_ticks = int(round(float(ot.get('queue_hold_s', 15.0)) * self.hz))
         # 억제 단일화 (C). 'queue_only' = 억제는 _is_queue 하나, 적색·정지선·교차로는
         # 일시정지/게이트 입력. 'legacy' = 이전 3중 억제(_red_ahead·_signal_zone·_is_queue)
@@ -2821,6 +2827,80 @@ class KrRules:
                 return False
         return True
 
+    def _side_clear_by_map(self, lg, planner, ap, target, n_hops: int):
+        """목표 차로가 비었는가를 **차로 지도의 free_run 으로** 판정한다 (3).
+
+        `_side_is_clear` 는 축이 틀렸다. 그 함수의 `near` 는
+        `{target} ∪ successors ∪ predecessors` 이고 반경은 **자차 중심**
+        `clear_radius_m`(30) 이다. 그래서 셋 다 어긋난다:
+
+          · 목표 차로 **뒤**에 선 차가 기각 사유가 된다 (predecessors 포함)
+          · 목표 차로 **앞 50 m** 의 차는 안 본다 (반경 밖)
+          · 정지 차량 무리 안에 있으면 반경 안이 늘 차 있어 **항상 occupied**
+
+        차로 지도는 정반대 축이다 — **앞 `lane_map_ahead_m`(80) 을 차로별로**
+        잰다. 그것이 "저 차로로 가면 갈 수 있나" 의 올바른 질문이다.
+
+        판정: `free_run[target] > 램프 + shift_ahead_m`.
+        램프 길이는 `lane_plan` 이 이미 계산해 둔 값을 그대로 읽는다 — 같은 수를
+        두 곳에서 다시 만들지 않는다 (없으면 `_ramp_len_m` 으로 같은 식).
+
+        후방은 **따로** 본다: `rear_clear_m` 안에 자차보다 빠른 차가 있으면 거짓
+        (채점 항목 14 — 차로 변경 시 후방 차량 방해). 정지 차량은 후방 위험이
+        아니므로 속도 조건을 건다.
+
+        반환: True/False, 또는 **지도가 없으면 None** (호출처가 옛 판정으로 간다).
+        """
+        if not self.lane_map_on:
+            return None
+        lm = self.last_lane_map or {}
+        free = lm.get('free_run') or {}
+        key = str(list(target))
+        if key not in free:
+            return None                                    # 지도 밖 차로 — 판단 불가
+        lp = self.last_lane_plan or {}
+        ramp = lp.get('ramp_m')
+        if ramp is None:
+            w = self._lane_width_at(lg, target, self._ego_local_s(lg, ap))
+            ramp = self._ramp_len_m(max(1, int(n_hops)), w, self.lm_avoid_v)
+        if float(free[key]) <= float(ramp) + self.shift_ahead_m:
+            return False
+        return self._rear_clear(lg, planner, ap, target)
+
+    def _rear_clear(self, lg, planner, ap, target) -> bool:
+        """목표 차로 **후방** `rear_clear_m` 안에 자차보다 빠른 차가 있나 (항목 14).
+
+        `_side_is_clear` 는 후방을 "있기만 하면 기각" 으로 봤다. 그러면 정지
+        차량 무리 안에서는 영영 못 나간다. 위험한 것은 **다가오는** 차다.
+        """
+        if self.rear_clear_m <= 0.0:
+            return True
+        ego = ap._vehicle
+        try:
+            ev = float(getattr(ego, 'speed', 0.0) or 0.0)
+            actors = list(ap._world.get_actors())
+        except Exception:                                  # noqa: BLE001
+            return True
+        for a in actors:
+            if a.id == ego.id:
+                continue
+            if 'walker' in str(getattr(a, 'type_id', '')):
+                continue
+            av = float(getattr(a, 'speed', 0.0) or 0.0)
+            if av <= ev + 0.5:
+                continue                                   # 안 다가온다
+            loc = a.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None:
+                continue
+            if not (-self.rear_clear_m <= pr[0] < 0.0):
+                continue                                   # 후방 창 밖
+            if target in self._actor_lanes(lg, a, {target: 0},
+                                           self._lane_chain_alias(
+                                               lg, {target: 0}, self.rear_clear_m)):
+                return False
+        return True
+
     def _side_is_clear(self, lg, planner, ap, target) -> bool:
         """목표 차로에 차가 없는가 (lc_clear 대용 — 아직 후방 추종차는 안 본다)."""
         ego = ap._vehicle
@@ -3740,9 +3820,17 @@ class KrRules:
             # 꺼져 있으면 L1 자체가 정지 stuck_hard_s 뒤라 조건이 항상 참 = 이전 동작.
             occ_relaxed = lvl >= 1 and (not self.bo_reject_clock
                                         or self.bo_stop_ticks >= self.bo_hard_ticks)
-            if not occ_relaxed and not self._side_is_clear(lg, planner, ap, target):
-                reject('occupied')
-                continue
+            if not occ_relaxed:
+                # (3) 차로 지도가 켜져 있으면 **free_run** 으로 판정한다 —
+                # `_side_is_clear` 는 뒤를 보고 앞을 못 보는 축이다. 지도가
+                # 없거나 그 차로가 지도 밖이면 None 이라 옛 판정으로 간다.
+                by_map = (self._side_clear_by_map(lg, planner, ap, target, n_hops)
+                          if self.side_clear_map else None)
+                ok = (by_map if by_map is not None
+                      else self._side_is_clear(lg, planner, ap, target))
+                if not ok:
+                    reject('occupied', occ_src='map' if by_map is not None else 'radius')
+                    continue
             # 중간 차로는 **목적지가 아니라 지나가는 구간**이다. 전체 점유가 아니라
             # 램프가 실제로 훑는 s 구간에 객체가 있는지만 본다.
             if n_hops >= 2 and not self._mid_lanes_clear(
