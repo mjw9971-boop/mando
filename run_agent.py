@@ -347,6 +347,13 @@ class Runner:
                    'avoid': self.kr.last_avoid,
                    # 붉은 구간 진입 전 감속 후보 (2b-B) — 후보가 산 틱에만 채워진다.
                    'red_zone': self.kr.last_red_zone}
+        # (4) kr 후보별 값 + 승자 이름. `route_end` 슬롯은 kr 후보 **전체의 min**
+        # 하나라 (아래 315 줄) 승자가 종점인지 회피 상한인지 정지 프로파일인지
+        # 가릴 수 없었다 — 실측 run_20260910_121651 t 65.7 은 winner=route_end 로
+        # 찍혔지만 실제 승자는 lane_map(회피 속도 상한) 1.12 였다.
+        if self.kr.last_kr_cands:
+            reasons['kr_cands'] = self.kr.last_kr_cands
+            reasons['kr_win'] = self.kr.last_kr_win
         # 신호 미보고 진단 — 스위치 on 일 때만 키가 생긴다 (off 는 로그까지 동일).
         if self.kr.last_signal is not None:
             reasons['signal'] = self.kr.last_signal

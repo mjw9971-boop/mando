@@ -602,6 +602,8 @@ class KrRules:
         self.sl_stopped = False                    # 정지 연속성 (B-1 재무장 판정)
         self.sl_stop_ticks = 0                     # 현재 정지의 지속 틱
         self.last_candidate: float | None = None   # 이번 틱 route_end 후보 (로그용)
+        self.last_kr_cands: dict | None = None     # (4) 후보별 값 (진단 전용)
+        self.last_kr_win: str | None = None        # (4) 그중 최종 승자 이름
         self.last_target: float | None = None      # 이번 틱 최종 목표속도 (로그용)
         self.last_d_end: float | None = None
         self.cause_why: str | None = None          # _obstacle_cause 배제 사유 (진단)
@@ -638,6 +640,9 @@ class KrRules:
         # 시프트 중 트리거가 **복귀할 차로**도 보게 할지. false = 이전 동작
         # (물리적으로 선 차로만 — 비켜 왔으니 늘 비어 보인다).
         self.lm_shift_ref = bool(_lm.get('lane_map_shift_ref_enable', False))
+        # (4) 복귀 차로는 트리거에만 쓰고, 램프 길이·v_cap 은 물리 차로 기준으로.
+        # false = 이전 동작 (복귀 차로가 램프까지 정해 제자리 감속을 만든다).
+        self.lm_ramp_phys = bool(_lm.get('lane_map_ramp_by_phys_lane_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -1825,6 +1830,7 @@ class KrRules:
         #   복귀 차로 (2076,3,3) free_run  7.5  → 콘 5·6·7·9 가 그 차로에 있다
         # 회랑은 복귀 전이 뒤의 콘 9 를 78.3 m 앞으로 보고 있었다. 둘 다 맞고
         # 재는 대상이 달랐을 뿐이라, **둘 중 나쁜 쪽**을 트리거로 쓴다.
+        mine_phys = mine                                   # 물리 차로만 (램프 기준)
         if self.lm_shift_ref and self.ot_span is not None and self.ot_from_hop:
             for _k, _h in (lm.get('hops') or {}).items():
                 if int(_h) == int(self.ot_from_hop):
@@ -1835,7 +1841,8 @@ class KrRules:
         if mine >= self.lm_decide_m:
             return None                                    # 트리거 아님
         hops = {k: h for k, h in lm['hops'].items()}
-        lane_w = self._lane_width_at(lg, ego_lane, self._ego_local_s(lg, ap))
+        local_s = self._ego_local_s(lg, ap)
+        lane_w = self._lane_width_at(lg, ego_lane, local_s)
         v_cap = self.lm_avoid_v
         # 후보 — 통행 가능하고, 램프 + 여유만큼 뚫려 있는 차로
         cands = []
@@ -1873,7 +1880,19 @@ class KrRules:
         cands.sort(key=_tie, reverse=True)
         _f, _nh, pick, n_hops, ramp_m, need = cands[0]
         # 램프 시작 s — 목표 차로 첫 장애물과 내 차로 장애물 중 **먼저 걸리는 쪽**
-        first = min(float(free.get(pick, self.lane_map_ahead_m)), mine)
+        #
+        # (4) 복귀 차로는 **트리거**에만 쓴다. 램프 길이는 자차가 실제로 달리는
+        # 차로(와 목표 차로)의 장애물이 정해야 한다 — 이미 비켜 나온 차로의
+        # 잔여 거리로 램프를 재면 아무것도 사지 못하는 감속이 나온다.
+        # 실측 2026-09-10 run_20260910_121651 t 65.7 (2칸 좌 시프트 완료 직후):
+        #   물리 차로 (2756,1,3) free_run 80.0   ← 앞이 완전히 비었다
+        #   복귀 차로 (2756,1,5) free_run  8.7   ← 방금 비켜 온 정지차 id 3
+        #   → first 8.7 → late → avail 3.7 → v_cap **1.12 m/s**
+        # 그 8 틱 동안 v 4.33 → 1.93 으로 끌려 내려갔고, 램프 한복판에서
+        # 기어가느라 차선 위 체류만 길어졌다 (채점 항목 3).
+        # false = 이전 동작 (복귀 차로가 램프까지 정한다).
+        first = min(float(free.get(pick, self.lane_map_ahead_m)),
+                    mine_phys if self.lm_ramp_phys else mine)
         start = first - self.shift_ahead_m - ramp_m
         late = start < 0.0
         if late:
@@ -5819,6 +5838,8 @@ class KrRules:
         d_end = self.stop_s - route_s
         ego_speed = ap._vehicle.get_velocity().length()
         self.last_candidate = None
+        self.last_kr_cands = None
+        self.last_kr_win = None
         self.last_stop_profile = None
         self.last_red_zone = None
         # standoff 대상은 **매 틱 새로** 정한다 (B-8). 예전에는 _try_overtake 의
@@ -5895,8 +5916,18 @@ class KrRules:
             self.latched = True
 
         candidate = None
+        # (4) 어느 kr 후보가 이겼나 — 로그의 `route_end` 슬롯은 kr 후보 **전체의
+        # min** 하나라서, 승자가 종점인지 회피 상한인지 정지 프로파일인지 사후에
+        # 가릴 수 없었다 (실측 2026-09-10 run_20260910_121651 t 63.6~65.7:
+        # winner=route_end 인데 실제 승자는 lane_plan.v_cap 이었다).
+        # 관측만 한다 — 중재는 아래 min() 그대로다.
+        kr_cands: dict = {}
+        def _cd(name, v):
+            if v is not None:
+                kr_cands[name] = round(float(v), 2)
         if self.latched:
             candidate = 0.0
+            _cd('latched', 0.0)
         elif d_end <= self.active_m and target_speed > 0.1:
             # 종점의 유령 선행차 (정지, 길이 0). 유효거리는 앞범퍼 기준 —
             # IDM 이 net gap ≈ s0(stop_gap)에서 서므로 앞범퍼가 종점 − stop_gap.
@@ -5910,9 +5941,11 @@ class KrRules:
                 s0=self.stop_gap,
                 T=self.T,
             ))
+            _cd('route_end', candidate)
 
         # WAIT/관찰 감속 — standoff 앞에 서도록 하는 속도 상한 (④′ 형태)
         so = self._standoff_profile(ego_speed)
+        _cd('standoff', so)
         if so is not None and (candidate is None or so < candidate):
             candidate = so
         if so is not None:
@@ -5931,6 +5964,7 @@ class KrRules:
         # 종방향에 cap_target 으로 알린다.
         cap_cand: float | None = None
         cv = self._curvature_cap(planner)
+        _cd('curvature', cv)
         self.last_curv = cv
         if cv is not None and (candidate is None or cv < candidate):
             candidate = cv
@@ -5939,6 +5973,7 @@ class KrRules:
 
         # 차선변경 구간 속도 상한 ([3](a)) — 같은 자리의 min() 후보.
         lcv = self._lc_speed_cap(planner)
+        _cd('lc_cap', lcv)
         if lcv is not None and (candidate is None or lcv < candidate):
             candidate = lcv
         if lcv is not None and (cap_cand is None or lcv < cap_cand):
@@ -5951,6 +5986,7 @@ class KrRules:
         # 들어가 후보가 사라진 뒤에도 jerk 램프 때문에 10 m 를 더 감속해
         # 7.26 → 4.25 m/s 가 됐다.
         rz = self._red_approach_profile(planner)
+        _cd('red_zone', rz)
         if rz is not None and (candidate is None or rz < candidate):
             candidate = rz
         if rz is not None and (cap_cand is None or rz < cap_cand):
@@ -5962,6 +5998,7 @@ class KrRules:
         lmv = (self.last_lane_plan or {}).get('v_cap') if self.last_lane_plan else None
         if lmv is not None and (self.last_lane_plan or {}).get('why') != 'no_candidate':
             lmv = float(lmv)
+            _cd('lane_map', lmv)
             if candidate is None or lmv < candidate:
                 candidate = lmv
             if cap_cand is None or lmv < cap_cand:
@@ -5969,6 +6006,7 @@ class KrRules:
 
         # 적신호 접근 가속 금지 ((C)) — "이 속도를 넘지 마라" 이므로 cap 축이다.
         nar = self._no_accel_red_cap(planner, ap, ego_speed)
+        _cd('no_accel_red', nar)
         if nar is not None:
             if candidate is None or nar < candidate:
                 candidate = nar
@@ -5977,6 +6015,7 @@ class KrRules:
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
         cap = self._shift_speed_cap(planner, ego_speed)
+        _cd('shift_cap', cap)
         if cap is not None and (candidate is None or cap < candidate):
             candidate = cap
         if cap is not None:
@@ -5985,28 +6024,35 @@ class KrRules:
         # `_shift_speed_cap` 과 **같은 자리·같은 방식**의 min() 후보다. 오버라이드가
         # 아니라 상한이라, 신호·보행자·standoff 가 더 낮으면 그쪽이 이긴다.
         vr = self.gap_v_req
+        _cd('gap_fit', vr)
         if vr is not None and (candidate is None or vr < candidate):
             candidate = vr
 
         # BREAKOUT 크립 — 훅이 PDM 후보를 무효화한 뒤, 상한은 여전히 min() 이다.
-        if self.breakout_creep() and (candidate is None or self.bo_creep_v < candidate):
-            candidate = self.bo_creep_v
+        if self.breakout_creep():
+            _cd('breakout_creep', self.bo_creep_v)
+            if candidate is None or self.bo_creep_v < candidate:
+                candidate = self.bo_creep_v
 
         # 정지선 정지 프로파일 (④′) — 적색일 때만, min 으로 합류.
         # route_end 는 대상이 아니다 (검증 통과 후 별건).
         prof = self._stopline_profile(planner, ap, ego_speed)
+        _cd('stopline_profile', prof)
         self.last_stop_profile = prof
         if prof is not None and (candidate is None or prof < candidate):
             candidate = prof
 
         # 정지선 0.5 s 유지 홀드 — route_end 후보와 min 으로 합류
         hold = self._stopline_hold(planner, ego_speed)
+        _cd('stopline_hold', hold)
         if hold is not None and (candidate is None or hold < candidate):
             candidate = hold
 
         # RTOR 진행 상한 — 래치가 살아 있는 동안(리셋까지) min() 후보.
-        if self._rtor_go and self.rtor_go_v > 0.0 and (candidate is None or self.rtor_go_v < candidate):
-            candidate = self.rtor_go_v
+        if self._rtor_go and self.rtor_go_v > 0.0:
+            _cd('rtor_go', self.rtor_go_v)
+            if candidate is None or self.rtor_go_v < candidate:
+                candidate = self.rtor_go_v
 
         # 보행자 의도 후보 (P4) — PDM 예측선 교차를 기다리지 않는다.
         ped = self._ped_intent(planner, ap, ego_speed)
@@ -6019,6 +6065,7 @@ class KrRules:
             ped_bind = candidate is None or v_allow <= candidate + 1e-9
             if candidate is None or v_allow < candidate:
                 candidate = v_allow
+            _cd('pedestrian', v_allow)
             self.last_ped = {'id': int(wid), 'v_allow': round(float(v_allow), 2),
                              'a_req': round(float(a_req), 2), 'wins': bool(ped_bind),
                              **self.ped_diag.get(wid, {})}
@@ -6041,6 +6088,7 @@ class KrRules:
         cw = self._ped_crosswalk(planner, ap, ego_speed)
         if cw is not None:
             v_cw, info = cw
+            _cd('crosswalk_creep', v_cw)
             if candidate is None or v_cw < candidate:
                 candidate = v_cw
             cw_wins = bool(v_cw <= min(target_speed, candidate) + 1e-9)   # 최종 목표를 구속하나
@@ -6062,6 +6110,13 @@ class KrRules:
 
         if candidate is not None:
             self.last_candidate = candidate
+        # 승자 이름 — 최종 후보와 같은 값을 낸 것 (동률이면 더 낮은 쪽 우선 나열).
+        if kr_cands:
+            self.last_kr_cands = dict(sorted(kr_cands.items(), key=lambda kv: kv[1]))
+            if candidate is not None:
+                self.last_kr_win = next(
+                    (n for n, v in self.last_kr_cands.items()
+                     if abs(v - round(float(candidate), 2)) < 1e-9), None)
         kr_wins = candidate is not None and candidate < target_speed
         # ── 순수 제한속도도 '상한' 이다 ────────────────────────────────────
         # PDM 의 중재 전 목표(제한속도 ∧ 교차로 상한)를 **아무도 줄이지 않은**
