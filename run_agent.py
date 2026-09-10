@@ -146,6 +146,11 @@ class LoggingAutoPilot(AutoPilot):
         (실주행 2차 [1]). 판단에는 관여하지 않는다.
         """
         self.initial_target = float(target_speed)
+        # **매 틱 비운다.** `keep_driving` 분기에서는 아래 get_brake_and_target_speed
+        # 가 호출되지 않아 `self.final` 이 직전 틱 값으로 얼어붙는다. kr_rules 가
+        # 그걸 "이번 틱 PDM 이 본 장애물" 로 읽으면 **이미 지나간 객체**로 차로를
+        # 막는다 (`_pdm_hazard`). 이 훅은 두 분기보다 앞이라 여기서 비우면 된다.
+        self.final = None
         return super()._manage_route_obstacle_scenarios(target_speed, *a, **kw)
 
     def get_brake_and_target_speed(self, plant, route_points, dist_tl, next_tl,

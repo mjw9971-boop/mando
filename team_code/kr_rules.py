@@ -621,6 +621,9 @@ class KrRules:
         self.lane_map_hops = int(_lm.get('lane_map_max_hops', 2))
         self.lane_map_ahead_m = float(_lm.get('lane_map_ahead_m', 80.0))
         self.lane_map_min_w = float(_lm.get('lane_map_min_width_m', 2.0))
+        # 객체 OBB 둘레 표본 간격 [m] 과 폭 바닥 [m] (`_obb_samples`).
+        self.obb_step_m = float(_lm.get('lane_map_obb_step_m', 1.0))
+        self.obj_pad_m = float(_lm.get('lane_map_obj_pad_m', 0.5))
         # 섹션 경계에서 지도가 끊기는 것을 막는다 (2026-09-09 실측, 아래 참조).
         # false = 이전 동작 (자차 섹션 안의 차로만 hop 으로 센다).
         self.lane_map_span_sec = bool(
@@ -1180,6 +1183,15 @@ class KrRules:
 
     def _project(self, planner, x_carla, y_carla):
         """CARLA 좌표 → (route_s, 횡오프셋). 전방 창에서만 찾는다."""
+        pr = self._project_tan(planner, x_carla, y_carla)
+        return None if pr is None else (pr[0], pr[1])
+
+    def _project_tan(self, planner, x_carla, y_carla):
+        """`_project` 에 **그 지점 경로 접선 방위**를 덧붙인 것 → (s_rel, lat, tan_yaw).
+
+        접선은 어차피 여기서 구한다. 객체의 **횡방향 반폭**을 재려면 그 방위가
+        필요하다 (`_lat_half_extent`) — 두 번 구하지 않으려고 노출한다.
+        """
         pts = planner.route_points
         i0 = planner.route_index
         ppm = int(getattr(planner, 'points_per_meter', 10))
@@ -1196,7 +1208,32 @@ class KrRules:
         tan = tan / n
         dv = q - seg[j]
         lat = float(tan[0] * dv[1] - tan[1] * dv[0])
-        return (float(planner.route_s[i0 + j]) - float(planner.route_s[i0]), lat)
+        return (float(planner.route_s[i0 + j]) - float(planner.route_s[i0]), lat,
+                _math.atan2(float(tan[1]), float(tan[0])))
+
+    def _lat_half_extent(self, actor, tan_yaw: float) -> float:
+        """객체 OBB 의 **경로 횡방향 반폭** [m].
+
+        예전에는 `bounding_box.extent.y`(= 폭/2)만 썼다. 그건 객체가 경로와
+        **나란할 때만** 맞다 — 차로를 가로질러 누운 물체는 횡으로 길이/2 만큼
+        차지하는데 폭/2 로 재니 회랑 밖으로 나간다.
+        실측 2026-09-10 run_20260910_185406 rs 170.0: 자전거 id 21
+        (2.22 × 0.20 m)이 경로와 **98.9°** 로 누워 있었다.
+          옛 식  hw = 0.10 → reach = 0.9 + 0.10 + 0.3 = 1.30,  |lat| 1.68 → **미검출**
+          새 식  hw = 1.11·|sin Δ| + 0.10·|cos Δ| = 1.10 → reach 2.30 → 검출
+        그래서 회랑이 비어 보였고 standoff·PREEMPT 가 한 번도 안 섰다
+        (`lane_map` 을 고쳐 pick 이 떠도 `_try_overtake` 가 대상을 못 찾는다).
+
+        OBB 를 축 n 에 투영한 표준식이다: |L/2·(f·n)| + |W/2·(n_obj·n)|.
+        """
+        bb = getattr(actor, 'bounding_box', None)
+        ext = getattr(bb, 'extent', None) if bb is not None else None
+        if ext is None:
+            return 0.9
+        hl = float(getattr(ext, 'x', 0.9))
+        hw = float(getattr(ext, 'y', 0.9))
+        d = _math.radians(float(getattr(actor, 'yaw_deg', 0.0))) - float(tan_yaw)
+        return abs(hl * _math.sin(d)) + abs(hw * _math.cos(d))
 
     def _corridor_blockers(self, ap, planner, static_ok=None, lat_band=None):
         """전방 detect_max_m 안에서 **주행 회랑을 침범한 정지 객체** 목록.
@@ -1233,14 +1270,15 @@ class KrRules:
                 self.fg_dropped += 1
                 continue
             loc = a.get_location()
-            pr = self._project(planner, loc.x, loc.y)
+            pr = self._project_tan(planner, loc.x, loc.y)
             if pr is None:
                 continue
-            s_rel, lat = pr
+            s_rel, lat, tan_yaw = pr
             if not (0.5 < s_rel <= self.detect_max_m):
                 continue
-            hw = float(getattr(getattr(a, 'bounding_box', None), 'extent', None).y) \
-                if getattr(a, 'bounding_box', None) is not None else 0.9
+            # **경로 횡방향** 반폭이다 (폭/2 가 아니라). 가로누운 물체를 놓치던
+            # 자리 — `_lat_half_extent` 주석의 실측을 볼 것.
+            hw = self._lat_half_extent(a, tan_yaw)
             reach = half_ego + hw + clr
             if lat_band is None:
                 hit = abs(lat) < reach
@@ -1675,12 +1713,89 @@ class KrRules:
         except Exception:                                  # noqa: BLE001
             return 0.0
 
+    @staticmethod
+    def _pdm_hazard(ap):
+        """이번 틱 PDM 이 **특정 객체 때문에** 목표를 줄였나 → (id, 종거리) 또는 None.
+
+        `speed_reduced_by_obj` = [줄인속도, 종류, id, 거리] 다 (autopilot 원문).
+        `run_agent.LoggingAutoPilot` 이 `self.final` 로 잡아 두고, 매 틱
+        `_manage_route_obstacle_scenarios` 에서 **먼저 None 으로 비운다** —
+        `keep_driving` 분기에서는 `get_brake_and_target_speed` 가 아예 호출되지
+        않아 직전 틱 값이 얼어붙기 때문이다 (그 값을 쓰면 이미 지나간 객체로
+        차로를 막는다).
+
+        신호등·정지표지는 뺀다 — 차로를 물리적으로 막는 물체가 아니다.
+        훅이 없는 환경(기본 AutoPilot·테스트 목)에서는 None 이라 동작이 그대로다.
+        """
+        fin = getattr(ap, 'final', None)
+        if not fin or len(fin) < 3 or not fin[2]:
+            return None
+        obj = fin[2]
+        try:
+            kind, oid, dist = str(obj[1]), int(obj[2]), float(obj[3])
+        except (IndexError, TypeError, ValueError):
+            return None
+        if 'traffic_light' in kind or 'stop_sign' in kind:
+            return None
+        return (oid, dist)
+
+    def _obb_samples(self, vx: float, vy: float, yaw: float,
+                     length: float, width: float) -> list:
+        """객체 OBB 의 **둘레 + 중심** 표본점 (VTD 프레임).
+
+        예전에는 중심 + 좌우 폭 끝 **세 점**뿐이었다. 그러면 **길이축이 전혀
+        표본에 안 들어간다** — 차로를 가로질러 누운 물체를 못 본다.
+        실측 2026-09-10 run_20260910_185406 rs 170.0:
+          자전거 id 21, 2.22 × 0.20 m, heading 0.00 rad (도로는 1.73 rad —
+          **98.9° 로 거의 직각**). 세 점이 폭 0.2 m 안에 몰려 (2533,4,2) 에만
+          붙었고, 자차 차로 (2533,4,3) 의 free_run 은 80.0 으로 남았다.
+          그래서 트리거(< decide_m)가 영영 안 걸려 **회피 판단이 한 번도 돌지
+          않았고**(state·pick 전 구간 None), PDM 만 겹침을 보고 32 s 세웠다.
+          네 모서리를 찍으면 앞쪽 두 점이 (2533,4,3) 에 떨어진다.
+
+        **모서리만으로는 부족하다** — 긴 물체가 가운데 차로를 건너뛴다
+        (7 m 물체가 3차로를 가로지르면 양 끝만 잡히고 가운데가 빈다).
+        그래서 각 변을 `lane_map_obb_step_m` 간격으로 샘플한다.
+        자전거(2.22×0.2) ≈ 9점, 승용차(4.4×1.8) ≈ 14점 — 비용은 무시할 수준이다.
+
+        폭에는 `lane_map_obj_pad_m` 로 바닥을 깐다: 폭 0.2 m 짜리는 둘레를
+        훑어도 좌우 10 cm 뿐이라 차로 경계에 아슬하게 걸친 경우를 놓친다.
+        """
+        hl = max(float(length) / 2.0, 1e-6)
+        hw = max(float(width) / 2.0, self.obj_pad_m)
+        step = max(self.obb_step_m, 0.05)
+        fx, fy = _math.cos(yaw), _math.sin(yaw)            # 길이축
+        nx, ny = -_math.sin(yaw), _math.cos(yaw)           # 폭축
+        # (yaw 도 CARLA 라 미러 프레임에서 좌우가 뒤집히지만, **둘레 전체의
+        #  합집합**을 쓰므로 결과는 같다 — 옛 3점 주석과 같은 이유다.)
+
+        def span(h):
+            n = max(1, int(_math.ceil(2.0 * h / step)))
+            return [-h + 2.0 * h * i / n for i in range(n + 1)]
+
+        out, seen = [], set()
+
+        def push(a, b):
+            x, y = vx + fx * a + nx * b, vy + fy * a + ny * b
+            k = (round(x, 3), round(y, 3))
+            if k not in seen:
+                seen.add(k)
+                out.append((x, y))
+
+        push(0.0, 0.0)                                     # 중심
+        for a in span(hl):                                 # 양 옆면
+            push(a, -hw)
+            push(a, +hw)
+        for b in span(hw):                                 # 앞뒤 면
+            push(-hl, b)
+            push(+hl, b)
+        return out
+
     def _actor_lanes(self, lg, actor, hops: dict, alias: dict | None = None) -> set:
         """객체가 **걸친** 차로 집합 (hops 안의 것만).
 
-        객체 lane 은 9910 에 없다(로그 `lane: null` 은 설계다). 중심 + 좌우 폭
-        끝점 **세 점**을 각각 투영해 합집합을 취한다 — 중심만 보면 두 차로에
-        걸쳐 선 차가 한 차로만 막은 것으로 보인다 (지시안 증상 3).
+        객체 lane 은 9910 에 없다(로그 `lane: null` 은 설계다). OBB 둘레를
+        `_obb_samples` 로 훑어 각 점을 투영하고 합집합을 취한다.
         """
         loc = actor.get_location()
         # **좌표계 주의**: get_location 은 CARLA 프레임인데 lg.locate 는 VTD
@@ -1689,13 +1804,9 @@ class KrRules:
         # (2026-09-09 avoid_sim 으로 발견: blocked_by 가 늘 비어 있었다).
         vx, vy = frame.from_carla_xy(loc.x, loc.y)
         yaw = _math.radians(float(getattr(actor, 'yaw_deg', 0.0)))
-        half_w = float(getattr(actor, 'width', 1.8)) / 2.0
-        # 차체 횡방향 단위벡터 (진행방향 +90°). yaw 도 CARLA 라 미러 프레임에서
-        # 좌우가 뒤집히지만, **세 점의 합집합**을 쓰므로 결과는 같다.
-        nx, ny = -_math.sin(yaw), _math.cos(yaw)
-        pts = [(vx, vy),
-               (vx + nx * half_w, vy + ny * half_w),
-               (vx - nx * half_w, vy - ny * half_w)]
+        pts = self._obb_samples(vx, vy, yaw,
+                                float(getattr(actor, 'length', 4.5)),
+                                float(getattr(actor, 'width', 1.8)))
         alias = alias or {}
         out = set()
         prefer = list(hops.keys()) + list(alias.keys())
@@ -1754,6 +1865,7 @@ class KrRules:
         # 큐 제외는 `_tick_corridor`(= **내 차로** 회랑) id 를 쓰므로, 구조적으로
         # **트리거를 만드는 바로 그 객체**만 정확히 지운다.
         # 표시로 바꾸면 트리거는 살고, 후보 선정에서만 그 차로를 뺀다.
+        pdm_forced = False
         drop = set()
         qmark = set()
         if self._tick_queue:
@@ -1793,10 +1905,29 @@ class KrRules:
                         qlanes.add(k)
                     else:
                         qlanes.discard(k)
+        # ── PDM 이 본 것을 지도에도 강제로 반영한다 ────────────────────
+        # PDM 이 **특정 객체 때문에** 목표를 줄였다면 그 객체는 정의상 자차
+        # 경로와 겹친다. 그런데 지도가 자차 차로를 free 로 본다면 그건 지도가
+        # 틀린 것이다 — 두 시스템이 다른 것을 보면 안 된다.
+        # 실측 2026-09-10 run_20260910_185406 rs 156~170: PDM 은 id 21 을
+        # 20.2 → 6.7 m 로 좇으며 v_target 0 을 냈는데, 지도의 자차 차로
+        # free_run 은 내내 **80.0** 이었다 (같은 거리 6.7 을 **옆 차로**에
+        # 붙여 놓고 있었다). 트리거가 안 걸려 회피가 한 번도 안 돌았다.
+        # 전수: 물리 객체로 PDM 이 감속한 16,282틱 중 **12,194틱(74.9 %)** 이
+        # 이 지문이다 — 이 케이스는 처음이 아니다.
+        hz = self._pdm_hazard(ap)
+        if hz is not None:
+            hz_id, hz_d = hz
+            if 0.0 < hz_d <= ahead and hz_d < free.get(ego_lane, ahead):
+                free[ego_lane] = hz_d
+                blocked[ego_lane] = hz_id
+                qlanes.discard(ego_lane)                   # 큐 표시는 지도 판정 소관
+                pdm_forced = True
         return {'ego_lane': list(ego_lane), 'hops': {str(list(k)): h for k, h in hops.items()},
                 'free_run': {str(list(k)): round(v, 1) for k, v in free.items()},
                 'passable': {str(list(k)): bool(v) for k, v in passable.items()},
                 'blocked_by': {str(list(k)): v for k, v in blocked.items()},
+                'pdm_forced': pdm_forced,
                 'queue_dropped': len(drop),
                 # 큐로 표시된 차로 — 후보 선정에서만 뺀다 (트리거는 살린다)
                 'queue_lanes': [str(list(k)) for k in sorted(qlanes)],
