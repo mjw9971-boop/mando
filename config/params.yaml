@@ -1990,6 +1990,24 @@ ctrl24:
   # 고착 래치가 서는 틱에 회랑 전방 객체를 요동 방지 집합(_shifted_for)에서 빼
   # 중첩 시프트가 재시도되게 한다. 바닥과 독립인 별도 스위치.
   escape_rearm_shift_enable: false
+  # ── 가상 차로 시프트 (B-33, 2026-09-10) ────────────────────────────────
+  # 옆에 차로가 없어 NOOP 인 자리에서 서 있지 않는다. 근거: 미완주 > 중앙선·차로이탈 −6.
+  # 발동은 탈출 규칙의 한 갈래다 — 고착 래치가 서 있고 ∧ 양쪽이 no_target/NOOP 이고
+  # ∧ 정당한 정지 원인이 없을 때만. 정상 시프트가 불가능하다고 확정된 뒤다.
+  # 목표는 이웃 차로가 아니라 **원 경로를 옆으로 D 만큼 민 폴리라인**이다:
+  #   D = 자차반폭 + 장애물반폭 + escape_virtual_extra_m + percep.obstacle_clearance_m
+  # 방향 우선순위
+  #   (1) 좌 — 같은 섹션에 반대 방향(dir) 차로가 있으면 (중앙선 침범)
+  #   (2) 우 — sidewalk_right_m(차로 중심선 → 보도 안쪽 경계) 이 D 이상이면 (갓길)
+  #   (3) 둘 다 아니면 시도하지 않는다 (벽·건물일 수 있다)
+  # lane_graph 는 driving 차로만 노드로 담는다 (build_lane_graph.DRIVING) — 그래서
+  # 우측 여유는 차로 조회가 아니라 sidewalk_right_m 프로파일로 잰다.
+  escape_virtual_shift_enable: false
+  escape_virtual_extra_m: 0.3   # D 의 고정 여유 (그 위에 percep.obstacle_clearance_m)
+  escape_virtual_v: 3.0         # 가상 시프트 span 안 속도 상한 [m/s]
+  # 좌(대향) 진입 전 대향 방향 이동 차량이 이 안에 있으면 바닥 0 (대기) [m].
+  # 진입 뒤는 P2 가 이동 객체에 0 을 내므로 별도 장치를 두지 않는다.
+  escape_oncoming_clear_m: 80.0
   # ── 종점 (D) — route.py 가 읽는다 ─────────────────────────────────────
   # successor 가 끝난 뒤 마지막 헤딩으로 붙이는 직선 패드 [m]. 0 = 패드 없음.
   # 없으면 PDM 룩어헤드가 마지막 점으로 고정돼 통과 후 뒤를 향해 조향한다.

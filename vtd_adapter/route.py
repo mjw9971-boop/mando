@@ -694,31 +694,61 @@ class VtdRoutePlanner:
             return wp
         return VtdWaypoint(self.lg, key, min(wp.s, self.lg.length(key)))
 
+    def _offset_polyline(self, a, b, left, offset_m):
+        """[a, b) 구간의 **원 경로**를 옆으로 offset_m 만큼 민 점들 (N, 3).
+
+        차로를 조회하지 않는다 — 옆에 차로가 없어도 선다. 법선은 원 경로의 접선에서
+        낸다 (밀린 경로가 아니라 원본이라, 중첩 호출에도 기준이 흔들리지 않는다).
+        +좌 / −우 는 진행 방향 기준이다.
+        """
+        pts = np.asarray(self.original_route_points, dtype=float)
+        a, b = int(max(0, a)), int(min(len(pts), b))
+        seg = pts[a:b]
+        nxt = pts[np.minimum(np.arange(a, b) + 1, len(pts) - 1)]
+        tan = nxt[:, :2] - seg[:, :2]
+        n = np.linalg.norm(tan, axis=1)
+        n[n < 1e-9] = 1.0
+        tan = tan / n[:, None]
+        nrm = np.stack([-tan[:, 1], tan[:, 0]], axis=1)        # 좌측 법선
+        d = float(offset_m) * (1.0 if left else -1.0)
+        out = seg.copy()
+        out[:, :2] = seg[:, :2] + nrm * d
+        return out
+
     def shift_route_smoothly(self, start_index, end_index, shift_to_left_lane,
                              transition_length=120.0, lane_transition_factor=1.0,
-                             transition_length_back=None, ref_index=None):
+                             transition_length_back=None, ref_index=None,
+                             offset_m=None):
         """PDM 원문 (visualize 제외) — 경로를 옆 차로로 부드럽게 시프트.
 
         VTD 추가 인자 (ctrl24, 기본값이면 원문과 글자 그대로 같다):
           transition_length_back — 복귀(끝) 전이 길이 [경로점]. None = transition_length.
             중첩 시프트가 두 칸 이상에서 한 번에 원 경로로 돌아오면 √(D/D1) 배가 필요하다.
           ref_index — _shift_target_steps 의 밀림 계측 인덱스.
+          offset_m — 이웃 차로 대신 **원 경로를 옆으로 이 거리만큼 민 폴리라인**을
+            목표로 쓴다 [m]. 이웃 조회를 하지 않으므로 옆에 차로가 없는 자리에서도
+            선다 (ctrl24 K9 가상 차로 시프트, docs/BACKLOG.md B-33). None = 원문.
         """
         # VTD: 원문은 목표가 route_waypoints[idx].get_*_lane() 고정이다.
         # 기준점만 현재 경로 차로로 옮긴다 (_shift_target_steps). off 면 1 단계 = 원문.
         n_steps = self._shift_target_steps(shift_to_left_lane, ref_index=ref_index)
         back = transition_length if transition_length_back is None else float(transition_length_back)
+        virt = None if offset_m is None else self._offset_polyline(
+            start_index, end_index, shift_to_left_lane, float(offset_m))
         for idx in range(start_index, end_index):
-            wp_t = self._shift_target_wp(idx, shift_to_left_lane, n_steps)
-            if wp_t is None and n_steps != 1:
-                # VTD: 다단계 목표가 그 지점에서 끊겼다 (열 사슬이 짧아짐).
-                # 원문 폴백(원 경로 차로 중심)으로 가면 이미 밀려 있는 경로가
-                # 한 칸 되돌아가 계단이 생긴다 → 그 점은 그대로 둔다.
-                loc = np.array(self.route_points[idx], dtype=float)
+            if virt is not None:
+                loc = virt[idx - start_index]              # 가상 차로 — 이웃을 안 본다
             else:
-                loc = (self.route_waypoints[idx].transform.location
-                       if wp_t is None else wp_t.transform.location)
-                loc = np.array([loc.x, loc.y, loc.z])
+                wp_t = self._shift_target_wp(idx, shift_to_left_lane, n_steps)
+                if wp_t is None and n_steps != 1:
+                    # VTD: 다단계 목표가 그 지점에서 끊겼다 (열 사슬이 짧아짐).
+                    # 원문 폴백(원 경로 차로 중심)으로 가면 이미 밀려 있는 경로가
+                    # 한 칸 되돌아가 계단이 생긴다 → 그 점은 그대로 둔다.
+                    loc = np.array(self.route_points[idx], dtype=float)
+                else:
+                    loc = (self.route_waypoints[idx].transform.location
+                           if wp_t is None else wp_t.transform.location)
+                    loc = np.array([loc.x, loc.y, loc.z])
 
             transition_factor = 1.0
             if idx <= start_index + transition_length and idx - start_index < end_index - idx:

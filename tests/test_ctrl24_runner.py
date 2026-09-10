@@ -109,7 +109,7 @@ def test_runner_selects_controller_by_switch(tmp_path):
     assert r['route_end'] is None
     assert set(r['kr']) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
                             'crosswalk', 'red_zone', 'shift_cap',
-                            'span_v_req'}
+                            'span_v_req', 'virtual_cap'}
     assert r['winner'] in ('none', 'lead', 'vehicle', 'light', 'walker', 'rtor', 'red_zone')
     assert 'red_zone_detail' in r
     assert 'prepass_ms' in r and 'signal' in r

@@ -184,6 +184,10 @@ class Ctrl24:
         self.esc_release_m = float(c['escape_release_m'])
         self.esc_clear_m = float(c['escape_clear_m'])
         self.esc_rearm = bool(c['escape_rearm_shift_enable'])
+        self.esc_virt = bool(c['escape_virtual_shift_enable'])
+        self.esc_virt_extra = float(c['escape_virtual_extra_m'])
+        self.esc_virt_v = float(c['escape_virtual_v'])
+        self.esc_onc_m = float(c['escape_oncoming_clear_m'])
         self.jx_exit_m = float(ot.get('zone_exit_margin_m', 5.0))
         self.jx_gap_m = float(ot.get('zone_junction_gap_m', 5.0))
         self.jx_max_m = float(ot.get('zone_extend_max_m', 120.0))
@@ -273,6 +277,8 @@ class Ctrl24:
         self._esc_xy: tuple | None = None         # 직전 틱 위치 (누적용)
         self.last_escape: dict | None = None      # 진단 (reasons.escape)
         self._esc_rearmed: list = []              # 이번 걸림에서 재무장한 객체 id
+        self._virt_span: tuple | None = None      # 가상 시프트 구간 (속도 상한용)
+        self._virt_wait = 0                       # 대향 대기 틱 (진단)
         self._nb_cache: dict = {}                 # (side, n_steps) → 이웃 연속성 bool 배열
         self.last_overtake: str | None = None
         self._prepass_done = False
@@ -1506,7 +1512,12 @@ class Ctrl24:
                            'blocker': actor.id, 's_rel': round(s_rel, 1), 'lat': round(lat, 2),
                            'trigger': trig.get(actor.id, 'corridor'), 'nested': self.nested}
         chain = self._chain(corridor, actor)
-        self._try_shift(planner, ego_speed, chain)
+        if self._try_shift(planner, ego_speed, chain):
+            return
+        # 정상 시프트가 불가능하다고 확정됐다 — 고착 래치가 서 있으면 가상 차로로.
+        # 탈출 규칙의 한 갈래다 (새 상태기가 아니다).
+        if self._esc_engaged and self.esc_virt:
+            self._try_virtual_shift(planner, ap, ego_speed)
 
     def _try_shift(self, planner, ego_speed: float, chain: dict) -> bool:
         """좌측 우선, 좌측이 변위 0(이웃 없음 — route.py 폴백)이면 우측. 게이트는 span_too_far
@@ -1885,6 +1896,8 @@ class Ctrl24:
         # K8 — 이웃 연속 창에 전이 2회가 들어가는 속도. 시프트를 **만들기 위한** 감속이라
         # 생성 전에만 산다 (만든 틱에 None 이 된다). 상한이지 오버라이드가 아니다.
         add('span_v_req', self.span_v_req)
+        # 가상 차로 구간 상한 — 중앙선·갓길을 지나는 동안 느리게 간다.
+        add('virtual_cap', self._virtual_cap(planner))
         if cap is not None:
             self.last_avoid = dict(self.last_avoid or {'state': 'SHIFT_ACTIVE'},
                                    shift_cap=round(float(cap), 2))
@@ -2043,6 +2056,155 @@ class Ctrl24:
         if gap is not None and gap <= self.esc_clear_m:
             return None
         return self.esc_v
+
+    # ── 가상 차로 시프트 (B-33) ────────────────────────────────────────────
+    def _virtual_dir(self, planner, ap, obj_half_w: float):
+        """가상 차로를 어느 쪽으로 몇 미터 밀지 → (side, D, 사유).
+
+        방향 우선순위는 사양 그대로다:
+          (1) 좌 — 같은 (도로, 섹션) 에 반대 방향 차로가 있으면 (중앙선 침범)
+          (2) 우 — sidewalk_right_m 이 D 이상이면 (갓길·보도 앞)
+          (3) 둘 다 아니면 None — 벽·건물일 수 있다
+
+        자차의 왼쪽은 항상 도로 중심선(lane 0) 쪽이다: dir=+1 이면 lane_id<0,
+        dir=−1 이면 lane_id>0 이므로 두 경우 모두 중심이 왼쪽이다.
+        """
+        lg = self._tick_lg or getattr(planner, 'lg', None)
+        key = self._tick_ego_lane or self._ego_lane(lg, ap)
+        if lg is None or key is None or key not in getattr(lg, 'lanes', {}):
+            return None, 0.0, 'no_lane'
+        r = lg.lanes[key]
+        half = float(self.half_ego)
+        d = half + float(obj_half_w) + self.esc_virt_extra + self.clr
+        if r.get('junction', -1) != -1:
+            return None, d, 'junction'                 # 교차로 연결로 — 옆이 무엇인지 모른다
+        # (1) 반대 방향 차로가 같은 섹션에 있나
+        try:
+            opp = any(lg.lanes[q]['road'] == r['road'] and lg.lanes[q]['sec'] == r['sec']
+                      and lg.lanes[q]['dir'] != r['dir'] for q in lg.lanes)
+        except Exception:                              # noqa: BLE001 — 목 그래프
+            opp = False
+        if opp:
+            return 'left', d, 'oncoming_lane'
+        # (2) 우측 보도 안쪽 경계까지의 여유
+        sw = r.get('sidewalk_right_m')
+        try:
+            room = float(np.min(np.asarray(sw, dtype=float))) if sw is not None else None
+        except Exception:                              # noqa: BLE001
+            room = None
+        if room is not None and room >= d:
+            return 'right', d, f'shoulder({room:.1f}m)'
+        return None, d, 'no_room' if room is not None else 'no_side'
+
+    def _oncoming_clear(self, ap, planner) -> tuple:
+        """대향 방향 이동 차량이 escape_oncoming_clear_m 안에 있나 → (clear, 최근접 m)."""
+        best = None
+        try:
+            actors = list(ap._world.get_actors())
+        except Exception:                              # noqa: BLE001
+            return True, None
+        ego_id = ap._vehicle.id
+        for a in actors:
+            if a.id == ego_id or self._is_walker(a):
+                continue
+            if float(getattr(a, 'speed', 0.0)) < self.v_static:
+                continue                               # 정지 객체는 대향 위험이 아니다
+            loc = a.get_location()
+            pr = self._project(planner, loc.x, loc.y)
+            if pr is None:
+                continue
+            s_rel, _lat = pr
+            if 0.0 < s_rel <= self.esc_onc_m and (best is None or s_rel < best):
+                best = s_rel
+        return (best is None), best
+
+    def _try_virtual_shift(self, planner, ap, ego_speed: float) -> bool:
+        """정상 시프트가 불가능하다고 확정된 뒤의 마지막 수단. 성공하면 True.
+
+        이웃 차로를 조회하지 않고 원 경로를 옆으로 D 만큼 민 폴리라인을 목표로 준다
+        (route.py::shift_route_smoothly 의 offset_m). 계단은 정의상 생기지 않는다 —
+        목표가 연속 폴리라인이라 끊기는 지점이 없다.
+        """
+        if not (self.esc_virt and self._esc_engaged) or self.ot_span is not None:
+            return False
+        if not self._corridor:
+            return False
+        s_rel, _lat, hw, actor = self._corridor[0]
+        side, d, why = self._virtual_dir(planner, ap, hw)
+        diag = {'state': 'ESCAPE_VIRTUAL', 'blocker': int(actor.id),
+                's_rel': round(float(s_rel), 1), 'D': round(float(d), 2),
+                'side': side, 'why': why}
+        if side is None:
+            diag['state'] = 'ESCAPE_VIRTUAL_NONE'
+            self.last_avoid = dict(self.last_avoid or {}, **diag)
+            return False
+        if side == 'left':
+            clear, near = self._oncoming_clear(ap, planner)
+            if not clear:
+                self._virt_wait += 1
+                diag.update({'state': 'ESCAPE_VIRTUAL_WAIT', 'oncoming_m': round(near, 1),
+                             'wait_ticks': self._virt_wait})
+                self.last_avoid = dict(self.last_avoid or {}, **diag)
+                return False
+        ppm = float(getattr(planner, 'points_per_meter', 10))
+        trans = self._trans_m(min(float(ego_speed), self.esc_virt_v))
+        chain = self._chain(list(self._corridor), actor)
+        last = chain['last']
+        try:
+            a, b, _l = planner.plan_shift_span(
+                actor, None if last is actor else last,
+                obstacle_direction='right' if side == 'left' else 'left',
+                transition_length=trans * ppm,
+                extra_length_before=self.ot_before_m * ppm,
+                extra_length_after=self.ot_after_m * ppm,
+                min_start_ahead=self.shift_ahead_m * ppm)
+        except Exception:                              # noqa: BLE001 — 목 플래너
+            return False
+        a, b = int(a), int(b)
+        if b <= a + 1 or b > len(planner.route_points):
+            return False
+        snap = (planner.route_points[a:b].copy(),
+                planner.commands[a:b].copy() if getattr(planner, 'commands', None) is not None else None,
+                planner.lat_shift[a:b].copy() if getattr(planner, 'lat_shift', None) is not None else None)
+        try:
+            planner.shift_route_smoothly(a, b, side == 'left', transition_length=trans * ppm,
+                                         transition_length_back=trans * ppm,
+                                         ref_index=(a + b) // 2, offset_m=d)
+        except TypeError:                              # 구형 플래너 — 가상 시프트 없음
+            return False
+        disp = float(np.abs(planner.route_points[a:b, :2] - snap[0][:, :2]).max())
+        if disp < self.noop_disp_m:
+            planner.route_points[a:b] = snap[0]
+            if snap[1] is not None:
+                planner.commands[a:b] = snap[1]
+            if snap[2] is not None:
+                planner.lat_shift[a:b] = snap[2]
+            return False
+        self._rebuild_kd(planner)
+        self._shift_seq += 1
+        self.ot_span = (a, b)
+        self.ot_side = side
+        self._virt_span = (a, b)
+        self._shifted_for.add(actor.id)
+        self.last_overtake = f'virtual:{side}'
+        diag.update({'span': [a, b], 'trans_m': round(trans, 1),
+                     'disp_m': round(disp, 2), 'wait_ticks': self._virt_wait})
+        self.last_avoid = dict(self.last_avoid or {}, **diag)
+        print(f'[ctrl24] 가상 차로 시프트 — {side} {d:.2f} m '
+              f'(id={actor.id}, 구간 {a}~{b}, 전이 {trans:.1f} m, 사유 {why})', flush=True)
+        return True
+
+    def _virtual_cap(self, planner):
+        """가상 시프트 span 안 속도 상한 — min() 후보."""
+        if self._virt_span is None:
+            return None
+        a, b = self._virt_span
+        i = int(getattr(planner, 'route_index', 0))
+        if i > b or self.ot_span is None:
+            self._virt_span = None
+            self._virt_wait = 0
+            return None
+        return self.esc_virt_v if i >= a - int(self.shift_ahead_m * 10) else None
 
     def _escape_rearm(self) -> list:
         """래치가 걸려 있는 동안 회랑 전방 객체를 요동 방지 집합에서 뺀다 (별도 스위치).

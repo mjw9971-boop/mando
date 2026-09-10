@@ -201,7 +201,7 @@ _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
 # GREEN_EXEMPT_WINNERS·CROSSING_WINNERS 판정이 그대로 맞는다 (K1/K2 = light 는 면책 아님).
 _KR24_NAME = {'stop_profile': 'light', 'stop_hold': 'light', 'ped_intent': 'walker',
               'crosswalk': 'walker', 'rtor_cap': 'rtor', 'red_zone': 'red_zone',
-              'shift_cap': 'avoid', 'span_v_req': 'avoid'}
+              'shift_cap': 'avoid', 'span_v_req': 'avoid', 'virtual_cap': 'avoid'}
 
 
 class Runner:
