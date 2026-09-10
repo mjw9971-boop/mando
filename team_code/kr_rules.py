@@ -651,6 +651,14 @@ class KrRules:
         # 의 관찰(obj_static_s)을 기다리지 않는다. false = 이전 동작.
         self.lm_static_on_pick = bool(
             _lm.get('lane_map_static_on_pick_enable', False))
+        # span 끝이 정지선(=`_next_stopzone_s`)을 넘지 못하게 자른다. 재타겟
+        # 합집합이 게이트를 다시 안 보는 구멍을 막는다. false = 이전 동작.
+        self.lm_span_zone_clamp = bool(
+            _lm.get('lane_map_span_zone_clamp_enable', False))
+        # 다음 교차로 유효 진입 차로를 route.pkl 에 없을 때 **지도에서** 유도한다.
+        # false = 이전 동작 (route.pkl 의 valid_entry_lanes 만 본다).
+        self.lm_valid_by_map = bool(
+            _lm.get('lane_map_valid_by_map_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -3469,6 +3477,62 @@ class KrRules:
         print(f'[kr_rules] 회피 span 연장 — {side} 끝 {b}→{b2} (id={chain["ids"]}, '
               f'예상 최소 이격 {c:.2f} m, {self.span_extend_n}회)', flush=True)
 
+    def _lm_valid_by_map(self, planner, lg, ego_lane):
+        """다음 교차로 **유효 진입 차로**를 지도에서 유도한다 — 없으면 None.
+
+        route.pkl 의 `valid_entry_lanes` 는 `target='pair'` 세그먼트만 채운다.
+        마지막(`target='finish'`) 세그먼트는 **빈 리스트**라 데드라인이 아예 안
+        생기고(`_lm_deadline_s` → None), 그래서 `no_return` 도 죽는다
+        (실측 2026-09-10 run_20260910_135646, seg 2:
+         {'target':'finish','turn':None,'lanes':[],'chosen':(2756,0,5)}).
+
+        정의는 build_route 와 같다: **경로가 쓰는 진출 도로로 이어지는 연결로가
+        있는 진입 차로 전부**. laneLink 는 이미 레인그래프 `next` 에 들어 있으므로
+        새 재료가 필요 없다 — 경로 차로의 진출 도로를 구한 뒤, 자차 도로·섹션의
+        같은 방향 차로 중 그 도로로 이어지는 것을 모은다.
+
+        실측: road 2756 sec 0 의 lane 2·3·4·5 가 전부 junction 82 를 직진 통과해
+        같은 진출 도로(2806)로 간다 — 경로 차로 5 만이 아니라 넷 다 유효하다.
+        """
+        if lg is None or ego_lane is None:
+            return None
+        route = getattr(planner, 'route', None) or {}
+        lanes = route.get('lanes') or []
+        try:
+            i = int(planner.route_index)
+            ppm = float(getattr(planner, 'points_per_meter', 10))
+            rs = float(planner.route_s[i])
+        except Exception:                                  # noqa: BLE001
+            return None
+        # 경로에서 자차 도로 다음에 오는 **다른 도로** = 진출 도로
+        road = ego_lane[0]
+        exit_road = None
+        seen_self = False
+        for k in lanes:
+            if k[0] == road:
+                seen_self = True
+            elif seen_self:
+                exit_road = k[0]
+                break
+        if exit_road is None:
+            return None
+
+        def reaches(k, depth=3):
+            for nx in (lg.lanes.get(k, {}).get('next') or []):
+                if nx not in lg.lanes:
+                    continue
+                if nx[0] == exit_road:
+                    return True
+                if depth > 0 and lg.lanes[nx]['junction'] != -1 and reaches(nx, depth - 1):
+                    return True
+            return False
+
+        d0 = lg.lanes[ego_lane]['dir']
+        out = {k for k in lg.lanes
+               if k[0] == ego_lane[0] and k[1] == ego_lane[1]
+               and lg.lanes[k]['dir'] == d0 and reaches(k)}
+        return out or None
+
     def _lm_deadline_s(self, planner, ap, ego_speed: float) -> float | None:
         """**언제까지** 유효 차로로 돌아와 있어야 하나 — 절대 route_s. 없으면 None.
 
@@ -3499,6 +3563,30 @@ class KrRules:
             need = (max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
                     + self.ns_turn_margin_m)
             return max(route_s, float(s1) - need)
+        # route.pkl 이 이 세그먼트를 안 채웠다 (`target='finish'` 는 lanes=[]).
+        # 그렇다고 "제약 없음" 이 아니다 — 교차로는 여전히 앞에 있고, 복귀 램프가
+        # 그 안으로 들어가면 안 된다. 지도에서 유효 차로를 유도해 데드라인을 만든다.
+        if self.lm_valid_by_map:
+            lg = getattr(planner, 'lg', None)
+            ego_lane = self._tick_ego_lane or self._ego_lane(lg, ap)
+            valid = self._lm_valid_by_map(planner, lg, ego_lane)
+            if valid:
+                for e in vel:
+                    seg = int(e.get('seg', -1))
+                    if seg < 0 or seg + 1 >= len(wps):
+                        continue
+                    s0, s1 = float(wps[seg]), float(wps[seg + 1])
+                    if not (s0 <= route_s < s1):
+                        continue
+                    # 자차가 **이미 유효 차로에 있으면** 돌아올 이유가 없다 —
+                    # 데드라인은 세그먼트 끝이다 (no_return 이 복귀를 거기까지
+                    # 미룬다). 아니면 램프 길이만큼 앞당긴다.
+                    if ego_lane in valid:
+                        return float(s1)
+                    need = (max(self.ot_trans_m,
+                                self.shift_k_s * max(ego_speed, 0.1))
+                            + self.ns_turn_margin_m)
+                    return max(route_s, float(s1) - need)
         return None
 
     def _lm_no_return_m(self, planner, ap, ego_speed: float,
@@ -4265,6 +4353,27 @@ class KrRules:
             # 원복은 original_route_points 에서 통째로 되돌리므로 합집합이 맞다.
             span = (min(self.ot_span[0], span[0]), max(self.ot_span[1], span[1]))
             self.lm_retarget_n += 1
+        # span 끝이 정지선을 넘지 못하게 자른다.
+        #
+        # `_next_stopzone_s` 는 "시프트 span 이 넘으면 안 되는 route_s" 다.
+        # 생성 시에는 `span_into_zone` 게이트가 그걸 보지만, **재타겟의 합집합은
+        # 다시 보지 않는다**. 실측 2026-09-10 run_20260910_135646:
+        #   t 47.4  span 생성 [453.5, 567.3]  (blocker 3)
+        #   t 53.4  RETARGET 합집합 [453.5, **581.9**]  (blocker 4 = 정지선 대기차)
+        #   정지선 route_s 578.5 · 종료선 577.5
+        # 복귀 램프의 끝이 정지선 4.4 m·종료선 3.4 m **뒤**에 놓여, 자차가
+        # d_stop 6.7 → 5.5 m 에서 차로를 넘고 교차로 안에서 복귀를 마쳤다.
+        # 교차로 안 차로변경은 되돌릴 방법이 없다 — 게이트의 원래 취지 그대로다.
+        # false = 이전 동작 (합집합을 그대로 둔다).
+        if self.lm_span_zone_clamp:
+            _lim = self._next_stopzone_s(planner)
+            if _lim is not None:
+                _i = int(float(_lim) * ppm)
+                if _i > span[0] and _i < span[1]:
+                    self.last_avoid = dict(self.last_avoid or {},
+                                           span_clamped=[int(span[1]), _i],
+                                           span_clamp_s=round(float(_lim), 1))
+                    span = (span[0], _i)
         self.ot_span = span
         self.ot_target = target                            # 지금 향하는 차로 (재타겟 판정)
         # 시프트가 **떠나온** 차로 = span 끝에서 복귀할 차로. 트리거가 이것도

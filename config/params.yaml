@@ -2547,6 +2547,23 @@ avoid_map:
   # 범위는 on_pick 한 줄뿐 — `_static_ok` 자체는 standoff·큐·보행자가 같이
   # 쓰므로 건드리지 않는다. false = 이전 동작.
   lane_map_static_on_pick_enable: false
+  # span 끝이 정지선(`_next_stopzone_s` = 다음 정지선 − zone_gate_margin_m)을
+  # 넘지 못하게 자른다. 생성 시에는 `span_into_zone` 게이트가 보지만 **재타겟의
+  # 합집합은 다시 보지 않는다**. 실측 run_20260910_135646:
+  #   t 47.4  span 생성   [453.5, 567.3]  (blocker 3)
+  #   t 53.4  RETARGET 합집합 [453.5, 581.9]  (blocker 4 = 정지선 대기차)
+  #   정지선 578.5 · 종료선 577.5 → 복귀 램프 끝이 정지선 4.4 m 뒤
+  # 그래서 자차가 d_stop 6.7 → 5.5 m 에서 차로를 넘고 교차로 안에서 복귀를
+  # 마쳤다. false = 이전 동작.
+  lane_map_span_zone_clamp_enable: false
+  # 다음 교차로 **유효 진입 차로**를 route.pkl 에 없을 때 지도에서 유도한다.
+  # route.pkl 의 valid_entry_lanes 는 `target='pair'` 세그먼트만 채우고 마지막
+  # `target='finish'` 세그먼트는 lanes=[] 라, 데드라인이 아예 안 생기고
+  # (`_lm_deadline_s` → None) `no_return` 도 같이 죽는다.
+  # 정의는 build_route 와 같다 — 경로가 쓰는 진출 도로로 이어지는 연결로가 있는
+  # 진입 차로 전부. laneLink 는 이미 레인그래프 `next` 에 있다.
+  # false = 이전 동작 (route.pkl 만 본다).
+  lane_map_valid_by_map_enable: false
   # 큐로 판정된 객체를 free_run 에서 **빼지 말고 표시만** 한다.
   # 큐 제외의 목적은 "신호 대기 줄을 **추월 후보로 삼지 않기**" 지 "장애물이
   # 없는 셈 치기" 가 아니다. 그런데 제외는 `_tick_corridor`(= **내 차로** 회랑)
