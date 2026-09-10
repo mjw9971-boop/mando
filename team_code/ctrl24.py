@@ -2011,7 +2011,15 @@ class Ctrl24:
                                and odo - self._esc_mark >= self.esc_release_m):
                 self._esc_engaged = False
                 self._esc_mark = None
+                self._esc_rearmed = []
                 self._esc_hist.clear()
+                return
+            # 걸려 있는 **동안 매 틱** 재무장한다 (2026-09-10). 래치가 서는 틱 1회로는
+            # 못 잡는다 — 실측: 18_연속교차로11 은 래치 29.8 s, 시프트 42.8 s, 그 뒤
+            # HANDLED 고착이라 걸릴 때는 요동 방지 집합이 비어 있었다.
+            got = self._escape_rearm()
+            if got:
+                self._esc_rearmed = sorted(set(self._esc_rearmed) | set(got))
             return
         if legit_alive:
             return
@@ -2021,7 +2029,6 @@ class Ctrl24:
             return
         self._esc_engaged = True
         self._esc_mark = float(odo)
-        self._esc_rearmed = self._escape_rearm()      # 래치가 서는 틱에 1회
 
     def _escape_floor(self, ap) -> float | None:
         """이번 틱에 깔 바닥 [m/s]. 안 걸렸거나 간격이 모자라면 None.
@@ -2038,7 +2045,11 @@ class Ctrl24:
         return self.esc_v
 
     def _escape_rearm(self) -> list:
-        """래치가 서는 틱에 회랑 전방 객체를 요동 방지 집합에서 뺀다 (별도 스위치)."""
+        """래치가 걸려 있는 동안 회랑 전방 객체를 요동 방지 집합에서 뺀다 (별도 스위치).
+
+        매 틱 본다 — 고착의 원인이 되는 HANDLED(이미 시프트한 객체라 재시도 안 함)는
+        래치가 선 **뒤에** 생기는 경우가 있다 (실측 2026-09-10, 4런 중 3런).
+        """
         if not self.esc_rearm or not self._shifted_for:
             return []
         ids = [int(a.id) for _s, _l, _h, a in (self._corridor or [])

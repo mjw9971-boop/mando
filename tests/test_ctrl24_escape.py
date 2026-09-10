@@ -216,6 +216,18 @@ def test_rearm_off_by_default_keeps_the_shifted_set():
     assert 'rearmed' not in (kr.last_escape or {})
 
 
+def test_rearm_fires_while_engaged_not_only_at_the_latch_tick():
+    """래치가 선 **뒤에** 시프트한 객체도 잡는다 (2026-09-10 트리거 이동)."""
+    kr, p, ap = avoid_rig(cfg=on_cfg(escape_rearm_shift_enable=True),
+                          actors=[car(2, 40.0)], left=False, right=False)
+    hold(kr, ap, p, int(C['escape_stuck_s'] * HZ) + 1, v=0.0, target=0.0)
+    assert kr._esc_engaged is True and not kr._shifted_for
+    kr._shifted_for.add(2)                                # 래치가 선 뒤에 생긴 HANDLED
+    apply(kr, ap, v=0.0, target=0.0)
+    assert 2 not in kr._shifted_for
+    assert kr.last_escape.get('rearmed') == [2]
+
+
 def test_rearm_on_clears_the_corridor_blocker_from_the_set():
     kr, p, ap = _stuck_with_handled_blocker(on_cfg(escape_rearm_shift_enable=True))
     hold(kr, ap, p, int(C['escape_stuck_s'] * HZ) + 1, v=0.0, target=0.0)
