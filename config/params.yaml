@@ -1984,14 +1984,14 @@ ctrl24:
   # 근거 (리플레이 40건 155,374틱, 2026-09-10): 정당하지 않은 정지 명령이 86구간
   # 3,892틱. 그중 10 s 이상이 5구간, 최장 32.4 s. 셋 다 자력으로 풀릴 경로가 코드에
   # 없었다 (_shifted_for 가 span 안에서는 안 비고, no_target 은 지도가 고정이라 불변).
-  escape_enable: false          # 기본 off — 켜면 이전 동작과 달라진다
+  escape_enable: true         # 기본 off — 켜면 이전 동작과 달라진다
   escape_stuck_s: 3.0           # 이 시간 동안
   escape_progress_m: 0.1        # 경로 진행이 이 미만이면 고착
-  escape_v: 1.0                 # 바닥 [m/s]
+  escape_v: 5.0            # 바닥 [m/s]
   escape_release_m: 5.0         # 걸린 뒤 이만큼 진행하면 푼다 (래치)
   # 바닥의 정의에 들어가는 물리 간격 [m] — 회랑 전방 최근접 객체까지 범퍼 간격이
   # 이 이하면 바닥은 0 이다 (원래 후보값 그대로). 붙어서 밀지 않는다.
-  escape_clear_m: 2.0
+  escape_clear_m: 0.0
   # 고착 래치가 서는 틱에 회랑 전방 객체를 요동 방지 집합(_shifted_for)에서 빼
   # 중첩 시프트가 재시도되게 한다. 바닥과 독립인 별도 스위치.
   escape_rearm_shift_enable: false
@@ -2007,9 +2007,9 @@ ctrl24:
   #   (3) 둘 다 아니면 시도하지 않는다 (벽·건물일 수 있다)
   # lane_graph 는 driving 차로만 노드로 담는다 (build_lane_graph.DRIVING) — 그래서
   # 우측 여유는 차로 조회가 아니라 sidewalk_right_m 프로파일로 잰다.
-  escape_virtual_shift_enable: false
-  escape_virtual_extra_m: 0.3   # D 의 고정 여유 (그 위에 percep.obstacle_clearance_m)
-  escape_virtual_v: 3.0         # 가상 시프트 span 안 속도 상한 [m/s]
+  escape_virtual_shift_enable: true
+  escape_virtual_extra_m: 0.5   # D 의 고정 여유 (그 위에 percep.obstacle_clearance_m)
+  escape_virtual_v: 5.0         # 가상 시프트 span 안 속도 상한 [m/s]
   # 좌(대향) 진입 전 대향 방향 이동 차량이 이 안에 있으면 바닥 0 (대기) [m].
   # 진입 뒤는 P2 가 이동 객체에 0 을 내므로 별도 장치를 두지 않는다.
   escape_oncoming_clear_m: 80.0
