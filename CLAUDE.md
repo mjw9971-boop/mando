@@ -76,6 +76,9 @@
   시프트 목표 이웃이 span 중간에서 끊기는 것도 기각하지 않는다 — K8 span_v_req
   (`ctrl24.span_v_req_enable`)이 장애물 지점에 목표가 없으면 반대편 side 로 넘기고,
   뒤가 끊기면 연속 창에 전이 2회가 들어가는 속도를 min() 후보로 낸다 (B-30).
+  무한정지 방지는 규칙 하나다 — K9 탈출 바닥 (`ctrl24.escape_enable`, 기본 off):
+  경로 진행이 멈추고 정당한 정지 원인(신호·보행자·정지선 홀드)이 없으면 정당하지
+  않은 후보에만 바닥을 깐다. 정당한 원인은 바닥을 안 받아 구조적으로 못 뚫는다.
 - `vtd_adapter/` — CARLA 표면을 흉내내는 어댑터 (플래너·월드·제어·로거).
 - `config/params.yaml` — VTD·차량·판정 상수의 단일 출처.
   판단(IDM·forecast·lateral) 상수는 `team_code/config.py` 가 단일 출처다.

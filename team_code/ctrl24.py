@@ -20,6 +20,10 @@ kr_rules 와의 차이 (설계 결정 2026-09-08, 사용자 승인):
   복원  K6 red_zone 붉은 구간 진입 전 감속 (2026-09-09 Q3 번복 — 근거는 _red_approach_profile)
         K7 shift_cap 시프트 전이 횡가속 상한 (2026-09-09 — geom 게이트 삭제의 대가를
         기각이 아니라 속도로 갚는다. 근거는 _shift_speed_cap)
+  추가  K9 escape 탈출 바닥 (2026-09-10, 기본 off) — **무한정지 방지 규칙 하나**.
+        경로 진행이 멈추고 정당한 정지 원인이 없으면 정당하지 않은 후보에만 바닥을 깐다.
+        정당한 원인(신호·보행자·정지선 홀드)은 바닥을 안 받아 구조적으로 못 뚫는다.
+        근거는 _escape_tick / _escape_floor.
   추가  K8 span_v_req 이웃 연속 창 (2026-09-09, B-30) — 시프트 목표 이웃이 span 중간에서
         끊기면 route.py 폴백이 경로에 계단을 만든다. **기각하지 않는다**: 장애물 지점에
         목표가 없으면 반대편 side 를 보고, 뒤가 끊기면 span 을 자르는 대신 창에 전이
@@ -38,6 +42,7 @@ overtake.a_lat_max·shift_cap_min_v·shift_latest_m 은 그 섹션을 읽는다.
 """
 from __future__ import annotations
 
+import collections
 import math as _math
 
 import numpy as np
@@ -171,6 +176,14 @@ class Ctrl24:
         # 교차로 관통 연장 — 상수는 overtake.* 를 그대로 읽는다 (kr_rules 와 같은 값).
         self.span_jx = bool(c['span_junction_extend_enable'])
         self.span_jump_m = float(c['span_target_jump_m'])
+        # ── K9 탈출 바닥 (무한정지 방지) ───────────────────────────────────
+        self.esc_on_cfg = bool(c['escape_enable'])
+        self.esc_win = max(1, int(round(float(c['escape_stuck_s']) * self.hz)))
+        self.esc_prog_m = float(c['escape_progress_m'])
+        self.esc_v = float(c['escape_v'])
+        self.esc_release_m = float(c['escape_release_m'])
+        self.esc_clear_m = float(c['escape_clear_m'])
+        self.esc_rearm = bool(c['escape_rearm_shift_enable'])
         self.jx_exit_m = float(ot.get('zone_exit_margin_m', 5.0))
         self.jx_gap_m = float(ot.get('zone_junction_gap_m', 5.0))
         self.jx_max_m = float(ot.get('zone_extend_max_m', 120.0))
@@ -252,6 +265,12 @@ class Ctrl24:
         self._shifted_for: set = set()                # 이미 시프트를 만든 객체 id (요동 방지)
         self.last_span_plan: tuple | None = None
         self.span_v_req: float | None = None      # K8 후보 (감속하면 담기는 속도)
+        # K9 — 진행 시계 하나와 래치 하나. 그 이상은 두지 않는다.
+        self._esc_hist: collections.deque = collections.deque(maxlen=self.esc_win + 1)
+        self._esc_engaged = False
+        self._esc_mark: float | None = None       # 걸린 시점 route_s (래치 해제 기준)
+        self.last_escape: dict | None = None      # 진단 (reasons.escape)
+        self._esc_rearmed: list = []              # 이번 걸림에서 재무장한 객체 id
         self._nb_cache: dict = {}                 # (side, n_steps) → 이웃 연속성 bool 배열
         self.last_overtake: str | None = None
         self._prepass_done = False
@@ -1801,6 +1820,10 @@ class Ctrl24:
         self._sig_go_tl = None
         self._sig_wait_ticks = 0
         self._rtor_reset()                            # RTOR 래치·정지 누적 (순간이동 = 새 접근)
+        self._esc_hist.clear()                        # K9 — 순간이동은 진행이 아니다
+        self._esc_engaged = False
+        self._esc_mark = None
+        self._esc_rearmed = []
 
     # ── 틱 ────────────────────────────────────────────────────────────────
     def _tick_head(self, ap, planner, ego_speed: float) -> None:
@@ -1909,6 +1932,98 @@ class Ctrl24:
             return self.rtor_go_v
         return None
 
+    # ── K9 탈출 바닥 (무한정지 방지, 2026-09-10) ──────────────────────────
+    #
+    # 규칙 하나:
+    #   경로 진행이 escape_stuck_s 동안 escape_progress_m 미만이고 정당한 정지 원인이
+    #   없으면, 전방 간격이 escape_clear_m 을 넘는 한 정당하지 않은 모든 min() 후보에
+    #   바닥 escape_v 를 깔고 escape_release_m 진행할 때까지 유지한다.
+    #
+    # 유한 시간 논증 — 걸린 뒤 매 틱 목표가 escape_v 이상이다(간격 조건이 서는 한).
+    # 고착의 정의상 정당한 원인이 없으므로 그것이 결과를 0 으로 되돌릴 수 없다.
+    # 래치는 escape_release_m 진행까지 유지되므로 매 걸림이 거리를 벌거나 계속 명령한다.
+    # 정당한 정지 불가침 논증 — 정당한 후보는 바닥을 **안 받는다**. 최종값은
+    # min(정당한 후보들, max(escape_v, 정당하지 않은 후보들)) 이라, 정당한 후보가
+    # escape_v 보다 낮으면 그대로 이긴다. 신호·보행자를 뚫는 경로가 구조적으로 없다.
+
+    LEGIT_KR = ('stop_profile', 'stop_hold', 'ped_intent', 'crosswalk')
+
+    def _pdm_legit(self, ap) -> bool:
+        """PDM 목표를 정한 것이 정당한 원인인가 (적신호·보행자·정지표지).
+
+        autopilot 원문이 그 셋 중 하나가 min 을 이겼을 때만 세우는 플래그다 —
+        후보값을 따로 받아올 필요가 없고, 조립이 무엇이든 있다.
+        """
+        return bool(getattr(ap, 'traffic_light_hazard', False)
+                    or getattr(ap, 'walker_hazard', False)
+                    or getattr(ap, 'stop_sign_hazard', False))
+
+    def _front_gap_m(self) -> float | None:
+        """회랑 전방 최근접 객체까지 **범퍼 간격** [m]. 없으면 None (막힌 것이 없다).
+
+        s_rel 은 자차 뒷축 → 객체 중심이므로 앞범퍼(front)와 객체 반길이를 뺀다.
+        """
+        best = None
+        for s_rel, _lat, _hw, act in (self._corridor or []):
+            bb = getattr(act, 'bounding_box', None)
+            ext = float(getattr(getattr(bb, 'extent', None), 'x', 0.0) or 0.0)
+            g = float(s_rel) - self.front - ext
+            if best is None or g < best:
+                best = g
+        return best
+
+    def _escape_tick(self, planner, route_s: float, legit_min: float | None) -> None:
+        """진행 시계 갱신 + 래치 판정. 틱당 1회, 후보 계산 뒤에 부른다."""
+        self.last_escape = None
+        if not self.esc_on_cfg:
+            self._esc_hist.clear()
+            self._esc_engaged = False
+            self._esc_mark = None
+            return
+        self._esc_hist.append(float(route_s))
+        # 정당한 원인이 바닥보다 낮게 잡고 있으면 그것은 정당한 정지다 — 고착이 아니다.
+        legit_alive = legit_min is not None and legit_min < self.esc_v
+        if self._esc_engaged:
+            if legit_alive or (self._esc_mark is not None
+                               and route_s - self._esc_mark >= self.esc_release_m):
+                self._esc_engaged = False
+                self._esc_mark = None
+                self._esc_hist.clear()
+            return
+        if legit_alive:
+            return
+        if len(self._esc_hist) < self._esc_hist.maxlen:
+            return
+        if route_s - self._esc_hist[0] >= self.esc_prog_m:
+            return
+        self._esc_engaged = True
+        self._esc_mark = float(route_s)
+        self._esc_rearmed = self._escape_rearm()      # 래치가 서는 틱에 1회
+
+    def _escape_floor(self, ap) -> float | None:
+        """이번 틱에 깔 바닥 [m/s]. 안 걸렸거나 간격이 모자라면 None.
+
+        간격 조건은 **바닥의 정의**다 (정당한 정지 집합이 아니다): 회랑 전방 최근접
+        객체까지 범퍼 간격이 escape_clear_m 이하면 바닥이 0 이라 원래 후보가 그대로다.
+        붙어서 밀지 않는다.
+        """
+        if not self._esc_engaged:
+            return None
+        gap = self._front_gap_m()
+        if gap is not None and gap <= self.esc_clear_m:
+            return None
+        return self.esc_v
+
+    def _escape_rearm(self) -> list:
+        """래치가 서는 틱에 회랑 전방 객체를 요동 방지 집합에서 뺀다 (별도 스위치)."""
+        if not self.esc_rearm or not self._shifted_for:
+            return []
+        ids = [int(a.id) for _s, _l, _h, a in (self._corridor or [])
+               if int(a.id) in self._shifted_for]
+        for i in ids:
+            self._shifted_for.discard(i)
+        return ids
+
     def apply(self, control, target_speed: float, ap):
         """(control, target_speed) → 규칙 반영 후 (control, target_speed).
         속도는 전부 min() 후보다. 후보가 PDM 목표보다 낮으면 종방향을 되감아 재계산."""
@@ -1923,8 +2038,47 @@ class Ctrl24:
 
         candidate, ped_bind, ped = self._candidates(ap, planner, ego_speed, target_speed)
 
+        # ── K9 탈출 바닥 ──────────────────────────────────────────────────
+        # 후보를 정당/정당하지 않음으로 가르고, **정당하지 않은 후보만** c → max(c, 바닥)
+        # 으로 바꾼 뒤 평소대로 min() 한다. 중재는 그대로 min() 이다.
+        # PDM 목표가 어느 쪽인지는 autopilot 원문의 hazard 플래그가 정한다.
+        kr = self.last_kr or {}
+        pdm_legit = self._pdm_legit(ap)
+        legit_vals = [float(v) for k, v in kr.items()
+                      if k in self.LEGIT_KR and v is not None]
+        other_vals = [float(v) for k, v in kr.items()
+                      if k not in self.LEGIT_KR and v is not None]
+        (legit_vals if pdm_legit else other_vals).append(float(target_speed))
+        legit_min = min(legit_vals) if legit_vals else None
+        other_min = min(other_vals) if other_vals else None
+        base_t = target_speed if candidate is None else min(target_speed, candidate)
+        self._escape_tick(planner, route_s, legit_min)
+        floor = self._escape_floor(ap)
+        esc_t = None
+        gap = self._front_gap_m() if self._esc_engaged else None
+        if floor is not None:
+            raised = floor if other_min is None else max(other_min, floor)
+            esc_t = raised if legit_min is None else min(legit_min, raised)
+            self.last_escape = {'state': 'FLOOR', 'v': round(float(floor), 2),
+                                'gap_m': None if gap is None else round(float(gap), 1),
+                                'before': round(float(base_t), 2),
+                                'after': round(float(esc_t), 2),
+                                'raised': bool(esc_t > base_t + 1e-9),
+                                'held_m': (None if self._esc_mark is None
+                                           else round(route_s - self._esc_mark, 1))}
+            if self._esc_rearmed:
+                self.last_escape['rearmed'] = list(self._esc_rearmed)
+        elif self._esc_engaged:
+            # 걸렸지만 전방 간격이 모자란다 — 바닥이 0 이다 (원래 후보 그대로).
+            self.last_escape = {'state': 'BLOCKED_GAP',
+                                'gap_m': None if gap is None else round(float(gap), 1),
+                                'before': round(float(base_t), 2),
+                                'raised': False,
+                                'held_m': (None if self._esc_mark is None
+                                           else round(route_s - self._esc_mark, 1))}
+
         # K4 보행자 비상 우회 — 보행자 후보가 최종 목표를 구속하는 틱 한정.
-        final_t = target_speed if candidate is None else min(target_speed, candidate)
+        final_t = base_t if esc_t is None else esc_t
         emg = bool(ped is not None and ped_bind and self.ped_emg_ratio > 0.0
                    and ped[1] > self.ped_emg_ratio * self.a_dec_max
                    and final_t <= ped[0] + 1e-9)
@@ -1933,16 +2087,30 @@ class Ctrl24:
             if self.last_ped is not None:
                 self.last_ped['emergency'] = True
 
-        if (candidate is not None and candidate < target_speed) or emg:
-            if candidate is not None and candidate < target_speed:
-                target_speed = candidate
+        # K4 비상은 바닥보다 먼저다 — 보행자 후보는 정당한 원인이라 바닥이 뚫지 못하고,
+        # 그 위에서 비상 감속까지 필요한 틱이면 비상이 이긴다.
+        if emg:
+            target_speed = float(final_t)
+            ap._longitudinal_controller.rewind_last()
+            accel, brake = ap._longitudinal_controller.emergency()
+            control.accel = accel
+            control.throttle = accel
+            control.brake = float(brake)
+        elif esc_t is not None and esc_t > base_t + 1e-9:
+            # 바닥이 올렸다 — 종방향을 되감아 새 목표로 다시 계산한다.
+            target_speed = float(esc_t)
+            ap._longitudinal_controller.rewind_last()
+            accel, brake = ap._longitudinal_controller.get_throttle_and_brake(
+                False, target_speed, ego_speed)
+            control.accel = accel
+            control.throttle = accel
+            control.brake = float(brake)
+        elif candidate is not None and candidate < target_speed:
+            target_speed = candidate
             hazard = target_speed < 1e-5
             ap._longitudinal_controller.rewind_last()
-            if emg:
-                accel, brake = ap._longitudinal_controller.emergency()
-            else:
-                accel, brake = ap._longitudinal_controller.get_throttle_and_brake(
-                    hazard, target_speed, ego_speed)
+            accel, brake = ap._longitudinal_controller.get_throttle_and_brake(
+                hazard, target_speed, ego_speed)
             control.accel = accel
             control.throttle = accel
             control.brake = float(brake)

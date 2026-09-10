@@ -385,7 +385,7 @@ class Runner:
         남는 키: initial / winner / leading / vehicle / red_light / sig_src / sig_lead_s /
         yellow / ped / avoid / speed_reduced_by / signal. 사라지는 키: bicycle / pedestrian
         (후보 자체가 없다) / route_end / red_zone. 새 키: kr = {stop_profile, stop_hold,
-        rtor_cap, ped_intent, crosswalk, red_zone, shift_cap, span_v_req} (없는 후보는 null) ·
+        rtor_cap, ped_intent, crosswalk, red_zone, shift_cap, span_v_req} (없는 후보는 null) · escape(K9 진단) ·
         prepass_ms. shift_cap 은 K7 (시프트 전이 횡가속 상한), span_v_req 는 K8 (이웃 연속 창에
         전이 2회가 들어가는 속도) — 둘 다 winner 어휘는 'avoid'.
         red_zone 은 kr_rules 의 reasons.red_zone 과 같은 후보다 (K6, 2026-09-09 복원);
@@ -411,9 +411,14 @@ class Runner:
                    'ped': self.kr.last_ped,
                    'avoid': self.kr.last_avoid,
                    'red_zone_detail': self.kr.last_red_zone,
+                   'escape': getattr(self.kr, 'last_escape', None),
                    'prepass_ms': self.kr.last_prepass_ms}
         if self.kr.last_signal is not None:
             reasons['signal'] = self.kr.last_signal
+        esc = reasons.get('escape')
+        if isinstance(esc, dict) and esc.get('raised'):
+            winner = 'escape'          # 바닥이 최종 목표를 올렸다 — 최저 후보가 아니다
+            reasons['winner'] = winner
         if reduced is not None and reduced[1] is not None:
             reasons['speed_reduced_by'] = {
                 'type': reduced[1], 'id': reduced[2],
