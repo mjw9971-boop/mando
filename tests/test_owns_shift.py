@@ -196,3 +196,87 @@ def test_from_hop_starts_cleared():
 
 def test_shift_ref_switch_default_is_off():
     assert CFG['avoid_map'].get('lane_map_shift_ref_enable') is False
+
+
+# ── (c) pick 즉시 시프트 / (e) 홀드 중 재타겟 ────────────────────────────
+#
+# 실측 2026-09-10 run_20260910_115526:
+#   pick   t 45.6 rs 428.2  s_rel 79.7  v 11.9
+#   시프트 t 49.7 rs 467.3  s_rel 38.5  → **39 m / 4.1 s 지연**
+#   그 사이 STANDOFF→WAIT→WAIT_EXPIRED, 속도 11.9 → 6.85
+#   대가: 두 번째 blocker 에서 avail_m 0.8 < need_m 18.2 (ramp_too_late)
+#
+# `armed` 는 대안이 못 된다 — lane_plan 이 램프를 v_cap(20 km/h)로 재는데 자차는
+# 43 km/h 라 start_s_rel 57.4 이고 armed 는 s_rel ≈ 22 에서야 참이 된다.
+def test_shift_on_pick_switch_default_is_off():
+    assert CFG['avoid_map'].get('lane_map_shift_on_pick_enable') is False
+
+
+def test_retarget_in_hold_switch_default_is_off():
+    assert CFG['avoid_map'].get('lane_map_retarget_in_hold_enable') is False
+
+
+def test_shift_on_pick_needs_owns_shift_and_a_pick():
+    """소유 조건이 없으면 즉시 시프트도 없다 — 옛 경로 그대로."""
+    k = kr(lane_map_shift_on_pick_enable=True)
+    k.last_lane_plan = {'pick': None}
+    assert k.lm_shift_on_pick is True
+    assert k._owns_shift() is False          # pick 이 없으면 소유하지 않는다
+
+
+def test_shift_on_pick_is_read_from_params():
+    assert kr(lane_map_shift_on_pick_enable=True).lm_shift_on_pick is True
+    assert kr(lane_map_shift_on_pick_enable=False).lm_shift_on_pick is False
+
+
+def test_retarget_in_hold_is_read_from_params():
+    assert kr(lane_map_retarget_in_hold_enable=True).lm_retarget_in_hold is True
+    assert kr(lane_map_retarget_in_hold_enable=False).lm_retarget_in_hold is False
+
+
+# ── 폴백은 **칸 수도** 따라가야 한다 ─────────────────────────────────────
+#
+# 안 따라가면 `_lm_hops` 가 폴백 side 에 None 을 돌려 n_hops = 1 이 되고,
+# 2칸짜리 차선책이 **한 칸 옆**에 떨어진다. 그 한 칸이 막힌 차로면 최악이다.
+# 실측 2026-09-10 run_20260910_115526 t 49.5: pick (2756,3,6)(우 1칸)이 기각돼
+# 차선책 (2756,3,3)(**좌 2칸**, free 80.0)으로 갔어야 하는데 좌 **1칸** =
+# (2756,3,4) 로 갔다. 그 차로는 id 2 가 38.5 m 앞에서 막고 있었고, 결국
+# 5.8 m 까지 기어들어가 ramp_too_late 로 갇혔다.
+HOPS2 = {'[2756, 3, 5]': 0, '[2756, 3, 4]': -1, '[2756, 3, 3]': -2,
+         '[2756, 3, 6]': 1}
+
+
+def rig_fb():
+    k = kr(lane_map_fallback_side_enable=True)
+    k.last_lane_map = {'hops': HOPS2}
+    k.last_lane_plan = {
+        'pick': '[2756, 3, 6]', 'side': 'right', 'hops': 1,
+        'ego_lane': [2756, 3, 5],
+        'cands': {'[2756, 3, 6]': {'free': 80.0, 'hops': 1},
+                  '[2756, 3, 3]': {'free': 80.0, 'hops': 2}}}
+    return k
+
+
+def test_fallback_carries_the_runner_up_hop_count():
+    """차선책이 좌 2칸이면 폴백도 **2칸**이어야 한다."""
+    k = rig_fb()
+    assert k._lm_second_side(k.last_lane_plan) == 'left'
+    assert k._lm_hops('left') == 2                  # 1 이 아니다
+    assert k._lm_hops('right') is None              # 계획한 쪽은 1칸이라 None
+
+
+def test_fallback_hops_none_without_the_switch():
+    """스위치가 꺼져 있으면 이전 동작 — 폴백 side 는 항상 None."""
+    k = rig_fb()
+    k.lm_fallback = False
+    k._lm_second_side(k.last_lane_plan)
+    assert k._lm_hops('left') is None
+
+
+def test_fallback_hops_none_when_runner_up_is_one_hop():
+    """차선책이 1칸이면 None (기존 관례 — n>1 일 때만 값을 준다)."""
+    k = rig_fb()
+    k.last_lane_plan['cands'] = {'[2756, 3, 6]': {'free': 80.0, 'hops': 1},
+                                 '[2756, 3, 4]': {'free': 60.0, 'hops': 1}}
+    assert k._lm_second_side(k.last_lane_plan) == 'left'
+    assert k._lm_hops('left') is None

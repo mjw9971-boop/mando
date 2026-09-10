@@ -634,11 +634,17 @@ class KrRules:
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
+        self._lm_fb_hops = None                    # 이번 틱 차선책 (side, 칸수)
         # 시프트 중 트리거가 **복귀할 차로**도 보게 할지. false = 이전 동작
         # (물리적으로 선 차로만 — 비켜 왔으니 늘 비어 보인다).
         self.lm_shift_ref = bool(_lm.get('lane_map_shift_ref_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
+        # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
+        self.lm_shift_on_pick = bool(_lm.get('lane_map_shift_on_pick_enable', False))
+        # (e) 적색 홀드 중에도 재타겟을 평가할지.
+        self.lm_retarget_in_hold = bool(
+            _lm.get('lane_map_retarget_in_hold_enable', False))
         # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
         self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
         # 활성 시프트 중에도 차로 지도가 다른 목표를 고르면 갈아탈지 (2026-09-09).
@@ -3071,6 +3077,15 @@ class KrRules:
         # 차로 중앙 복귀는 span 끝(위 원복)에서만 일어난다 — 녹색으로 바뀌어
         # 다시 달리기 시작하면 자연히 그 지점을 통과하며 복귀한다.
         if red_hold:
+            # (e) 적색 홀드 중에도 **목표 갱신은 한다**. 이 반환이
+            # `_lm_retarget`(아래 ot_span 블록)보다 먼저라, 홀드가 걸린 동안
+            # 재타겟이 한 번도 평가되지 않았다 — 실측 run_20260910_115526
+            # t 56.2~68: 내내 SHIFT_HOLD 였고 그 사이 pick 은 (2756,2,3)·
+            # (2756,1,3)(둘 다 free_run 80.0)로 옳은 목표를 가리키고 있었다.
+            # 원복이 아니라 **목표만 바꾸는 것**이라 "급조향 금지" 와 충돌하지
+            # 않는다 (램프는 현재 위치부터 이어 붙인다).
+            if self.lm_retarget_in_hold and self._lm_retarget(ap, planner, ego_speed):
+                return False
             self.last_avoid = {'state': 'SHIFT_HOLD', 'suppress': 'red_ahead',
                                'span': list(self.ot_span)}
             if self.hold_restore and self.span_active_standoff:
@@ -3188,7 +3203,23 @@ class KrRules:
             # (d − shift_latest_m)/v 인데, 지도는 램프 길이를 속도·칸수로
             # 직접 풀므로 두 벌을 유지할 이유가 없다. 게이트 10개는 그대로다.
             armed = self._owns_shift() and (self.last_lane_plan or {}).get('armed')
-            if (self._static_ok(cand) and t_left < budget) or latched or armed:
+            # (c) 지도가 목표를 고르면 **즉시** 만든다. 옛 시간 예산
+            # (t_left < wait_s − obj_s)은 관찰 시간을 거리로 사 먹는다 — 실측
+            # 2026-09-10 run_20260910_115526: pick 이 t 45.6 rs 428.2(s_rel 79.7,
+            # v 11.9)에 나왔는데 SHIFT_ACTIVE 는 t 49.7 rs 467.3(s_rel 38.5)로
+            # **39 m / 4.1 s** 늦었고, 그 사이 STANDOFF→WAIT→WAIT_EXPIRED 를 거치며
+            # 속도가 11.9 → 6.85 로 떨어졌다. 그 대가로 두 번째 blocker 에서
+            # avail_m 0.8 < need_m 18.2 (`ramp_too_late`)가 됐다.
+            #
+            # `armed` 는 대안이 못 된다: `lane_plan` 이 램프를 **v_cap**(20 km/h)로
+            # 재는데 자차는 43 km/h 라 `start_s_rel` 이 57.4 로 나오고, armed 는
+            # s_rel ≈ 22 에서야 참이 된다 — 옛 규칙(38.5)보다 **더 늦다**.
+            #
+            # 관찰의 알맹이(`_static_ok` = 그 객체가 obj_static_s 이상 정지)는
+            # 그대로 둔다. 없애는 것은 **시간 예산**뿐이다 — 그것이 거리를 먹는다.
+            on_pick = (self.lm_shift_on_pick and self._owns_shift()
+                       and self._static_ok(cand))
+            if (self._static_ok(cand) and t_left < budget) or latched or armed or on_pick:
                 actor, preempt = cand, True
                 self.last_avoid = dict(base, state='PREEMPT', latched=latched)
             elif obj_s >= self.wait_s:
@@ -3510,6 +3541,7 @@ class KrRules:
         cands = lp.get('cands') or {}
         pick = lp.get('pick')
         hops = (self.last_lane_map or {}).get('hops') or {}
+        self._lm_fb_hops = None
         if not cands or not hops:
             return None
         rest = [(float(v.get('free', 0.0)), k) for k, v in cands.items()
@@ -3517,7 +3549,18 @@ class KrRules:
         if not rest:
             return None
         rest.sort(reverse=True)
-        return 'left' if int(hops[rest[0][1]]) < 0 else 'right'
+        best = rest[0][1]
+        h = int(hops[best])
+        # **칸 수도 같이 넘긴다.** 넘기지 않으면 `_lm_hops` 가 폴백 side 에 대해
+        # None 을 돌려 n_hops 가 1 이 되고, 2칸짜리 차선책이 **한 칸 옆**에
+        #떨어진다 — 그 한 칸이 막힌 차로면 정확히 최악이다.
+        # 실측 2026-09-10 run_20260910_115526 t 49.5: pick (2756,3,6)(우 1칸)이
+        # 기각돼 차선책 (2756,3,3)(**좌 2칸**, free 80.0)으로 갔어야 하는데,
+        # 좌 **1칸** = (2756,3,4) 로 갔다. 그 차로는 id 2 가 38.5 m 앞에서 막고
+        # 있었고(blocked_by 에 그렇게 찍혀 있다), 결국 5.8 m 까지 기어들어가
+        # `ramp_too_late` 로 갇혔다.
+        self._lm_fb_hops = (('left' if h < 0 else 'right'), abs(h))
+        return self._lm_fb_hops[0]
 
     def _owns_shift(self) -> bool:
         """이번 틱 **차로 지도가 시프트를 소유하는가** ([3]).
@@ -3540,7 +3583,13 @@ class KrRules:
         if not self.lane_map_on:
             return None
         lp = self.last_lane_plan or {}
-        if not lp.get('pick') or lp.get('side') != side:
+        if not lp.get('pick'):
+            return None
+        if lp.get('side') != side:
+            # 폴백 side — 차선책의 칸 수를 쓴다 (없으면 옛 동작대로 None).
+            fb = getattr(self, '_lm_fb_hops', None)
+            if self.lm_fallback and fb is not None and fb[0] == side:
+                return fb[1] if fb[1] > 1 else None
             return None
         n = int(lp.get('hops') or 1)
         return n if n > 1 else None
