@@ -643,6 +643,10 @@ class KrRules:
         # (4) 복귀 차로는 트리거에만 쓰고, 램프 길이·v_cap 은 물리 차로 기준으로.
         # false = 이전 동작 (복귀 차로가 램프까지 정해 제자리 감속을 만든다).
         self.lm_ramp_phys = bool(_lm.get('lane_map_ramp_by_phys_lane_enable', False))
+        # (2) 후보 순위에서 **점선 쪽을 free 다음으로** 본다 (실선 후보를 빼지는
+        # 않는다 — 게이트 2바퀴가 유일한 길인 경우를 잃지 않기 위해).
+        # false = 이전 동작 (free → hop 수 → 유효차로 → 우측).
+        self.lm_prefer_dashed = bool(_lm.get('lane_map_prefer_dashed_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -1856,11 +1860,13 @@ class KrRules:
             L = self._ramp_len_m(n, lane_w, v_cap)
             need = L + self.shift_ahead_m
             if float(free.get(k, 0.0)) > need:
-                cands.append((float(free[k]), -n, k, n, L, need))
+                cands.append((float(free[k]), -n, k, n, L, need,
+                              self._lm_dashed(lg, ego_lane, h, local_s, need)))
         plan = {'trigger_free_m': round(mine, 1), 'ego_lane': lm['ego_lane'],
                 'lane_w': round(lane_w, 2), 'v_cap': round(v_cap, 2),
                 'cands': {c[2]: {'free': round(c[0], 1), 'hops': c[3],
-                                 'ramp_m': round(c[4], 1)} for c in cands}}
+                                 'ramp_m': round(c[4], 1), 'dashed': c[6]}
+                          for c in cands}}
         if not cands:
             plan['pick'] = None
             plan['why'] = 'no_candidate'                   # → standoff → never_stall
@@ -1871,14 +1877,24 @@ class KrRules:
         # 양쪽 free_run 이 80.0 동률이라 방향이 사실상 무작위였다.
         #   ① 다음 교차로 유효 차로가 있는 쪽 (돌아올 필요가 없다)
         #   ② 오른쪽 (우측통행 — 추월이 아니라 회피이므로 갓길 쪽이 기본)
+        # (2) **넘어도 되는 선인지를 free 다음에 본다.** `passable` 은 표시를
+        # 아예 안 본다 (존재 ∧ 같은 방향 ∧ 폭 ∧ 교차로 아님) — 그래서 실선으로
+        # 갈린 차로가 후보에 들어오고, 게이트가 `right:solid` 로 기각한 뒤에야
+        # 반대쪽으로 폴백한다. 실측 2026-09-10 run_20260910_121651 t 53.0:
+        #   (2756,3,6) free 80.0 1칸 ← pick. 게이트에서 solid 기각.
+        #   (2756,3,3) free 80.0 2칸 ← 점선. 결국 여기로 갔다 (2.9 s 뒤).
+        # 후보를 **빼지는 않는다** — 게이트의 2바퀴(solid 완화)가 유일한 길인
+        # 경우를 잃지 않기 위해서다. 순위만 점선 쪽으로 올린다.
+        # false = 이전 동작 (free → hop 수 → 유효차로 → 우측).
         vel_side = self._lm_valid_side(planner, hops, key)
         def _tie(c):
             side = 'left' if hops[c[2]] < 0 else 'right'
-            return (c[0], -abs(int(hops[c[2]])),
+            return (c[0], 1 if (self.lm_prefer_dashed and c[6]) else 0,
+                    -abs(int(hops[c[2]])),
                     1 if (vel_side is not None and side == vel_side) else 0,
                     1 if side == 'right' else 0)
         cands.sort(key=_tie, reverse=True)
-        _f, _nh, pick, n_hops, ramp_m, need = cands[0]
+        _f, _nh, pick, n_hops, ramp_m, need, _dash = cands[0]
         # 램프 시작 s — 목표 차로 첫 장애물과 내 차로 장애물 중 **먼저 걸리는 쪽**
         #
         # (4) 복귀 차로는 **트리거**에만 쓴다. 램프 길이는 자차가 실제로 달리는
@@ -3590,6 +3606,24 @@ class KrRules:
         """
         return bool(self.lm_owns and self.lane_map_on
                     and (self.last_lane_plan or {}).get('pick'))
+
+    def _lm_dashed(self, lg, ego_lane, hop: int, local_s: float,
+                   need_m: float) -> bool:
+        """(2) 이 후보로 가는 선이 **점선인가** — 게이트와 같은 잣대로 미리 본다.
+
+        `_side_pass` 의 solid 게이트가 쓰는 `_dashed_ahead_m` 과 `dash_slack_m`
+        을 그대로 쓴다 (기준을 두 벌 만들지 않는다). 게이트는 시프트 span 전체를
+        재지만 여기서는 아직 span 이 없으므로 **램프 + 여유**(need)를 잰다 —
+        같은 방향의 보수적 근사다.
+        """
+        if not self.lm_prefer_dashed or lg is None or ego_lane is None:
+            return False
+        side = 'left' if int(hop) < 0 else 'right'
+        try:
+            cover = self._dashed_ahead_m(lg, ego_lane, side, local_s, need_m)
+        except Exception:                                  # noqa: BLE001
+            return False
+        return bool(cover >= need_m - self.ot_dash_slack_m)
 
     def _lm_hops(self, side: str) -> int | None:
         """이번 틱 차로 지도가 이 side 로 **몇 칸** 가라고 하는가. 아니면 None.
