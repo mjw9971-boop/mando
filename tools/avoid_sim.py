@@ -419,6 +419,36 @@ def cfg_with(base, on: bool, axis: str = 'lane_map'):
         c['avoid_map']['lane_map_avoid_enable'] = True
         c['avoid_map']['lane_map_no_return_enable'] = True
         c['overtake']['side_clear_by_map_enable'] = on
+    elif axis == 'ramp_phys':
+        # (4) 복귀 차로 참조가 램프·v_cap 까지 정하는 것을 끊는다. 이 축은
+        # **밤에 켠 13개를 양쪽 다 켜 둔 위에서** 비교해야 의미가 있다 —
+        # shift_ref 가 꺼져 있으면 mine 이 애초에 물리 차로라 차이가 0 이다.
+        for k in ('lane_map_avoid_enable', 'lane_map_no_return_enable',
+                  'lane_map_retarget_enable', 'lane_map_owns_shift_enable',
+                  'lane_map_shift_ref_enable', 'lane_map_fallback_side_enable',
+                  'lane_map_queue_mark_enable', 'lane_map_shift_on_pick_enable',
+                  'lane_map_retarget_in_hold_enable'):
+            c['avoid_map'][k] = True
+        for k in ('standoff_creep_end_narrow_enable',
+                  'standoff_creep_delay_pause_enable',
+                  'queue_close_gap_enable', 'side_clear_by_map_enable'):
+            c['overtake'][k] = True
+        c['avoid_map']['lane_map_ramp_by_phys_lane_enable'] = on
+    elif axis == 'prefer_dashed':
+        # (2) 후보 순위에서 점선 쪽을 free 다음으로. ramp_phys 와 같은 바탕
+        # (밤에 켠 13개 + (4) 수정) 위에서 이 스위치만 가른다.
+        for k in ('lane_map_avoid_enable', 'lane_map_no_return_enable',
+                  'lane_map_retarget_enable', 'lane_map_owns_shift_enable',
+                  'lane_map_shift_ref_enable', 'lane_map_fallback_side_enable',
+                  'lane_map_queue_mark_enable', 'lane_map_shift_on_pick_enable',
+                  'lane_map_retarget_in_hold_enable',
+                  'lane_map_ramp_by_phys_lane_enable'):
+            c['avoid_map'][k] = True
+        for k in ('standoff_creep_end_narrow_enable',
+                  'standoff_creep_delay_pause_enable',
+                  'queue_close_gap_enable', 'side_clear_by_map_enable'):
+            c['overtake'][k] = True
+        c['avoid_map']['lane_map_prefer_dashed_enable'] = on
     elif axis == 'creep_fix':
         # [1] 두 조각을 같이 켠다 — 종점 배제 폭(route_end)과 지연 시계 누적.
         # 둘 중 하나만으로는 안 풀린다 (앞의 것을 풀면 뒤의 것이 이어받는다).
@@ -441,7 +471,7 @@ def main():
                          '보려면 늘린다 (12번).')
     ap.add_argument('--axis', default='lane_map',
                     choices=('lane_map', 'creep_end', 'creep_fix', 'side_clear',
-                             'geom_b'),
+                             'geom_b', 'ramp_phys', 'prefer_dashed'),
                     help='off/on 으로 비교할 스위치 축')
     a = ap.parse_args()
 
@@ -458,6 +488,10 @@ def main():
            f"{'on 충돌':>7} {'|t_off|':>7} {'포화':>4} {'시프트':>6} {'차로':>12} "
            f"{'최저v':>6} {'정지s':>6}")
     print(hdr); print('─' * len(hdr))
+    # 케이스 setup 이 무대(LaneGraph)를 덮어쓰므로 원본 마킹을 떠 둔다.
+    _mark0 = {k: (list(lg.lanes[k].get('left_mark') or []),
+                  list(lg.lanes[k].get('right_mark') or []))
+              for k in lg.lanes}
     for no, name, lane, objs, expect, setup in cases(lg):
         if want and no not in want:
             continue
@@ -465,6 +499,14 @@ def main():
         for lm in (False, True):
             objs2 = [make_obj(o.id, o.x, o.y, o.yaw_deg, o.speed, o.length, o.width)
                      for o in objs]
+            # **무대를 매 케이스 처음 상태로 되돌린다.** 케이스 7 의 setup 이
+            # `lg.lanes[k]['left_mark']` 를 실선으로 **영구히** 덮어써서, 한 번
+            # 돌고 나면 8~12 가 전부 실선 무대에서 돌았다 (2026-09-10 발견:
+            # 12 를 단독으로 돌리면 1p1 · 정지 0.0 s 인데 전 케이스 sweep 에서는
+            # 1p2! · 180.4 s 로 나온다 — 같은 설정·같은 코드인데 순서 때문이다).
+            for _k, _rec in _mark0.items():
+                lg.lanes[_k]['left_mark'] = list(_rec[0])
+                lg.lanes[_k]['right_mark'] = list(_rec[1])
             try:
                 # 12 는 신호 주기(적 13 s + 녹 13 s)를 **여러 번** 넘겨야
                 # 차이가 드러난다 — 기본 900틱(45 s)은 한 주기가 채 안 돼
