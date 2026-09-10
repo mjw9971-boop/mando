@@ -268,7 +268,9 @@ class Ctrl24:
         # K9 — 진행 시계 하나와 래치 하나. 그 이상은 두지 않는다.
         self._esc_hist: collections.deque = collections.deque(maxlen=self.esc_win + 1)
         self._esc_engaged = False
-        self._esc_mark: float | None = None       # 걸린 시점 route_s (래치 해제 기준)
+        self._esc_mark: float | None = None       # 걸린 시점 주행거리 (래치 해제 기준)
+        self._esc_odo = 0.0                       # 자차 이동거리 누적 [m]
+        self._esc_xy: tuple | None = None         # 직전 틱 위치 (누적용)
         self.last_escape: dict | None = None      # 진단 (reasons.escape)
         self._esc_rearmed: list = []              # 이번 걸림에서 재무장한 객체 id
         self._nb_cache: dict = {}                 # (side, n_steps) → 이웃 연속성 bool 배열
@@ -1823,6 +1825,7 @@ class Ctrl24:
         self._esc_hist.clear()                        # K9 — 순간이동은 진행이 아니다
         self._esc_engaged = False
         self._esc_mark = None
+        self._esc_xy = None                           # 순간이동 변위를 누적하지 않는다
         self._esc_rearmed = []
 
     # ── 틱 ────────────────────────────────────────────────────────────────
@@ -1972,20 +1975,40 @@ class Ctrl24:
                 best = g
         return best
 
-    def _escape_tick(self, planner, route_s: float, legit_min: float | None) -> None:
+    def _escape_odo(self, ap) -> float:
+        """자차 **이동거리** 누적 [m] — 틱 간 위치 변위의 합.
+
+        route_s 로 재지 않는 이유 (2026-09-10): 종점 패드에서는 route_s 가 더 늘지
+        않고, courseRespawn 은 route_s 를 튀게 한다. 둘 다 "진행이 없다" 로 오독된다.
+        리스폰은 on_reset 이 직전 위치를 지워 순간이동 거리가 안 섞인다.
+        """
+        try:
+            loc = ap._vehicle.get_location()
+            xy = (float(loc.x), float(loc.y))
+        except Exception:                                  # noqa: BLE001 — 목 조립
+            return self._esc_odo
+        if self._esc_xy is not None:
+            d = _math.hypot(xy[0] - self._esc_xy[0], xy[1] - self._esc_xy[1])
+            if d < 10.0:                                   # 한 틱 10 m 이상은 순간이동
+                self._esc_odo += d
+        self._esc_xy = xy
+        return self._esc_odo
+
+    def _escape_tick(self, ap, legit_min: float | None) -> None:
         """진행 시계 갱신 + 래치 판정. 틱당 1회, 후보 계산 뒤에 부른다."""
         self.last_escape = None
+        odo = self._escape_odo(ap)
         if not self.esc_on_cfg:
             self._esc_hist.clear()
             self._esc_engaged = False
             self._esc_mark = None
             return
-        self._esc_hist.append(float(route_s))
+        self._esc_hist.append(float(odo))
         # 정당한 원인이 바닥보다 낮게 잡고 있으면 그것은 정당한 정지다 — 고착이 아니다.
         legit_alive = legit_min is not None and legit_min < self.esc_v
         if self._esc_engaged:
             if legit_alive or (self._esc_mark is not None
-                               and route_s - self._esc_mark >= self.esc_release_m):
+                               and odo - self._esc_mark >= self.esc_release_m):
                 self._esc_engaged = False
                 self._esc_mark = None
                 self._esc_hist.clear()
@@ -1994,10 +2017,10 @@ class Ctrl24:
             return
         if len(self._esc_hist) < self._esc_hist.maxlen:
             return
-        if route_s - self._esc_hist[0] >= self.esc_prog_m:
+        if odo - self._esc_hist[0] >= self.esc_prog_m:
             return
         self._esc_engaged = True
-        self._esc_mark = float(route_s)
+        self._esc_mark = float(odo)
         self._esc_rearmed = self._escape_rearm()      # 래치가 서는 틱에 1회
 
     def _escape_floor(self, ap) -> float | None:
@@ -2052,7 +2075,7 @@ class Ctrl24:
         legit_min = min(legit_vals) if legit_vals else None
         other_min = min(other_vals) if other_vals else None
         base_t = target_speed if candidate is None else min(target_speed, candidate)
-        self._escape_tick(planner, route_s, legit_min)
+        self._escape_tick(ap, legit_min)
         floor = self._escape_floor(ap)
         esc_t = None
         gap = self._front_gap_m() if self._esc_engaged else None
@@ -2065,7 +2088,7 @@ class Ctrl24:
                                 'after': round(float(esc_t), 2),
                                 'raised': bool(esc_t > base_t + 1e-9),
                                 'held_m': (None if self._esc_mark is None
-                                           else round(route_s - self._esc_mark, 1))}
+                                           else round(self._esc_odo - self._esc_mark, 1))}
             if self._esc_rearmed:
                 self.last_escape['rearmed'] = list(self._esc_rearmed)
         elif self._esc_engaged:
@@ -2075,7 +2098,7 @@ class Ctrl24:
                                 'before': round(float(base_t), 2),
                                 'raised': False,
                                 'held_m': (None if self._esc_mark is None
-                                           else round(route_s - self._esc_mark, 1))}
+                                           else round(self._esc_odo - self._esc_mark, 1))}
 
         # K4 보행자 비상 우회 — 보행자 후보가 최종 목표를 구속하는 틱 한정.
         final_t = base_t if esc_t is None else esc_t

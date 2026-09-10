@@ -44,14 +44,20 @@ def on_cfg(**kw):
     return c
 
 
+def move(ap, p, m):
+    """자차를 경로를 따라 m 미터 앞으로 — 고착 판정은 **자차 이동거리**로 잰다."""
+    ap._vehicle._x += float(m)
+    p.route_index = min(len(p.route_s) - 1,
+                        p.route_index + int(round(m * p.points_per_meter)))
+
+
 def hold(kr, ap, p, n, v=0.0, target=12.5, advance=0.0):
     """n 틱 동안 같은 자리에서(또는 advance m/틱 진행하며) 돌린다."""
     out = None
     for _ in range(n):
         out = apply(kr, ap, v=v, target=target)
         if advance:
-            p.route_index = min(len(p.route_s) - 1,
-                                p.route_index + int(round(advance * p.points_per_meter)))
+            move(ap, p, advance)
     return out
 
 
@@ -99,12 +105,34 @@ def test_latch_holds_until_release_distance():
     kr, p, ap = avoid_rig(cfg=on_cfg(), actors=[car(2, 40.0)])
     hold(kr, ap, p, int(C['escape_stuck_s'] * HZ) + 1, v=0.0, target=0.0)
     assert kr._esc_engaged is True
-    p.route_index += int((C['escape_release_m'] - 1.0) * p.points_per_meter)
+    move(ap, p, C['escape_release_m'] - 1.0)
     apply(kr, ap, v=1.0, target=0.0)
     assert kr._esc_engaged is True                        # 아직 5 m 를 못 갔다
-    p.route_index += int(1.5 * p.points_per_meter)
+    move(ap, p, 1.5)
     apply(kr, ap, v=1.0, target=0.0)
     assert kr._esc_engaged is False and kr.last_escape is None
+
+
+def test_progress_is_measured_by_travelled_distance_not_route_s():
+    """route_s 가 멈춰도(종점 패드) 자차가 움직이면 고착이 아니다."""
+    kr, p, ap = avoid_rig(cfg=on_cfg(), actors=[car(2, 40.0)])
+    p.route_index = len(p.route_s) - 1                    # route_s 가 더 안 는다
+    for _ in range(int(10 * HZ)):
+        apply(kr, ap, v=1.0, target=0.0)
+        ap._vehicle._x += 0.2                             # 자차는 계속 간다
+    assert kr._esc_engaged is False and kr.last_escape is None
+    assert kr._esc_odo == pytest.approx(0.2 * 10 * HZ, rel=0.02)
+
+
+def test_teleport_is_not_counted_as_progress():
+    """courseRespawn — on_reset 이 직전 위치를 지워 순간이동 거리가 안 섞인다."""
+    kr, p, ap = avoid_rig(cfg=on_cfg(), actors=[car(2, 40.0)])
+    hold(kr, ap, p, 5, v=0.0, target=0.0)
+    before = kr._esc_odo
+    kr.on_reset()
+    ap._vehicle._x += 500.0
+    apply(kr, ap, v=0.0, target=0.0)
+    assert kr._esc_odo == pytest.approx(before)           # 500 m 가 안 실린다
 
 
 # ── 정당한 정지 원인은 못 뚫는다 ──────────────────────────────────────────
