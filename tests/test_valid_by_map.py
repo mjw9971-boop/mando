@@ -86,14 +86,21 @@ def test_defaults_are_previous_behaviour():
 
 
 def test_route_pkl_last_segment_is_empty(route):
-    """전제 — 사용자 가설('경로 차로 하나만')이 아니라 **빈 리스트**다."""
+    """전제 — 사용자 가설('경로 차로 하나만')이 아니라 **빈 리스트**다.
+
+    경로가 다시 빌드되면 차로 키는 바뀌므로 **성질만** 고정한다
+    (`chosen` 을 박아 두었다가 2026-09-10 경로 재빌드에서 깨졌다:
+     (2756,0,5) → (3024,0,-3)). 지키려는 것은 "finish 세그먼트는 lanes 가
+    비어 있고, pair 세그먼트는 여러 차로를 담는다" 이지 특정 차로가 아니다.
+    """
     segs = {e['seg']: e for e in route['valid_entry_lanes']}
     last = segs[max(segs)]
     assert last['target'] == 'finish'
-    assert last['lanes'] == []
-    assert last['chosen'] == (2756, 0, 5)
-    first = segs[min(segs)]
-    assert first['target'] == 'pair' and len(first['lanes']) == 4
+    assert last['lanes'] == [], '이 커밋의 전제가 깨졌다 — build_route 가 채우기 시작했나'
+    assert last['chosen'] is not None
+    pair = [e for e in route['valid_entry_lanes'] if e['target'] == 'pair']
+    if pair:
+        assert len(pair[0]['lanes']) > 1, 'pair 세그먼트는 여러 차로를 담는다'
 
 
 def test_map_derives_all_four_straight_lanes(lg, route):

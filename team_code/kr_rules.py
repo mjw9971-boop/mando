@@ -56,6 +56,7 @@ turn signal — 방향지시등:
 """
 from __future__ import annotations
 
+import json as _json
 import math as _math
 
 import numpy as np
@@ -670,6 +671,10 @@ class KrRules:
         # (5) 폴백 side 가 큐 차로면 버린다. false = 이전 동작.
         self.lm_fallback_no_queue = bool(
             _lm.get('lane_map_fallback_no_queue_enable', False))
+        # (3) 동률 1순위(다음 짝 회전 방향)를 **섹션 빼고** 맞춘다.
+        # false = 이전 동작 (전체 키 비교 — 교집합이 늘 비어 규칙이 안 돈다).
+        self.lm_valid_side_by_id = bool(
+            _lm.get('lane_map_valid_side_by_id_enable', False))
         # 큐 객체를 free_run 에서 **빼지 말고 표시만** 할지. false = 이전 동작(뺀다).
         self.queue_mark = bool(_lm.get('lane_map_queue_mark_enable', False))
         # (c) 지도가 목표를 고르면 즉시 시프트 (옛 시간 예산 우회).
@@ -1980,11 +1985,35 @@ class KrRules:
                 continue
             if not (float(wps[seg]) <= route_s < float(wps[seg + 1])):
                 continue
-            want = {str(list(k)) for k in e['lanes']}
-            sides = {('left' if h < 0 else 'right')
-                     for k, h in hops.items() if k in want and k != ego_key}
+            if self.lm_valid_side_by_id:
+                # **섹션을 빼고 (도로, 차로id) 로 맞춘다.**
+                # `valid_entry_lanes` 는 교차로 **직전 섹션**의 차로 키를 담는다
+                # (실측: seg0 = [(2533,0,3)…(2533,0,6)]). 그런데 자차는 그
+                # 한참 위 섹션에 있다 — run_20260910_144656 t 12.1 은
+                # (2533,**5**,3) 이고 지도 hops 키도 전부 섹션 5 다.
+                # 그래서 교집합이 **항상 비고**, 이 규칙(동률 1순위 = 다음 짝
+                # 회전 방향)이 사실상 한 번도 돌지 않았다. `ot_from_hop`(3940047)·
+                # `_lane_hops` 섹션 분할과 같은 부류의 버그다.
+                # 차로 id 는 도로 안에서 섹션이 달라도 같은 차로를 가리킨다.
+                want_id = {(k[0], k[2]) for k in e['lanes']}
+                sides = {('left' if h < 0 else 'right')
+                         for k, h in hops.items()
+                         if k != ego_key and self._key_road_lane(k) in want_id}
+            else:
+                want = {str(list(k)) for k in e['lanes']}
+                sides = {('left' if h < 0 else 'right')
+                         for k, h in hops.items() if k in want and k != ego_key}
             return sides.pop() if len(sides) == 1 else None
         return None
+
+    @staticmethod
+    def _key_road_lane(k):
+        """지도 hops 의 문자열 키 '[road, sec, id]' → (road, id). 섹션은 버린다."""
+        try:
+            v = _json.loads(k) if isinstance(k, str) else list(k)
+            return (int(v[0]), int(v[2]))
+        except Exception:                                  # noqa: BLE001
+            return None
 
     def _stopline_d(self, planner) -> float | None:
         """다음 정지선까지 뒷축 거리 — 신호 정지선 우선, 없으면 무신호 정지선 최근접."""
