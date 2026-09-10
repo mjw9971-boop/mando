@@ -402,6 +402,8 @@ def cfg_with(base, on: bool, axis: str = 'lane_map'):
     `creep_end` — [1] `standoff_creep_end_narrow_enable` 만 켠다. 크립 게이트의
     종점 배제 폭을 never_stall 과 같은 축(unlatch_m 30)으로 좁힌다.
     `creep_fix` — 위에 `standoff_creep_delay_pause_enable` 까지 같이 켠다.
+    `geom_b` — 전이 길이를 속도로 재계산 (조향 바닥 포함). **채택하지 않았다** —
+    조향 바닥을 제대로 넣으면 geom 기각의 2 % 만 풀린다 (아래 커밋 메시지 참조).
     `side_clear` — (3) `side_clear_by_map_enable`. 지도는 양쪽 다 켜 둔다
     (지도가 꺼져 있으면 이 스위치가 아무 일도 안 하므로 대조가 성립하지 않는다).
     """
@@ -409,6 +411,9 @@ def cfg_with(base, on: bool, axis: str = 'lane_map'):
     c = copy.deepcopy(base)
     if axis == 'creep_end':
         c['overtake']['standoff_creep_end_narrow_enable'] = on
+    elif axis == 'geom_b':
+        # 전이 길이를 속도로 (조향 바닥 포함). 채택하지 않은 축이지만 대조용으로 남긴다.
+        c['overtake']['trans_m_by_speed_enable'] = on
     elif axis == 'side_clear':
         # (3) 목표 차로 점유 판정을 free_run 으로. 지도가 켜져 있어야 의미가 있다.
         c['avoid_map']['lane_map_avoid_enable'] = True
@@ -435,7 +440,8 @@ def main():
                     help='케이스당 최대 틱 (기본 900 = 45 s). 신호 주기를 여러 번 '
                          '보려면 늘린다 (12번).')
     ap.add_argument('--axis', default='lane_map',
-                    choices=('lane_map', 'creep_end', 'creep_fix', 'side_clear'),
+                    choices=('lane_map', 'creep_end', 'creep_fix', 'side_clear',
+                             'geom_b'),
                     help='off/on 으로 비교할 스위치 축')
     a = ap.parse_args()
 

@@ -404,6 +404,10 @@ class KrRules:
         # 목표 차로 후방 감시 창 [m] — 이 안에 자차보다 빠른 차가 있으면 기각
         # (채점 항목 14). 0 = 후방을 안 본다.
         self.rear_clear_m = float(ot.get('rear_clear_m', 30.0))
+        # (c) 전이 길이를 속도·a_lat_max 로 다시 계산할지. false = 이전 동작
+        # (max(transition_m, shift_k_s·v) — 정지 상태에서도 12 m).
+        self.trans_by_speed = bool(ot.get('trans_m_by_speed_enable', False))
+        self.trans_min_m = float(ot.get('trans_min_m', 4.0))
         self.q_hold_ticks = int(round(float(ot.get('queue_hold_s', 15.0)) * self.hz))
         # 억제 단일화 (C). 'queue_only' = 억제는 _is_queue 하나, 적색·정지선·교차로는
         # 일시정지/게이트 입력. 'legacy' = 이전 3중 억제(_red_ahead·_signal_zone·_is_queue)
@@ -2845,6 +2849,56 @@ class KrRules:
                 return False
         return True
 
+    def _trans_need_m(self, lg, ego_lane, local_s, ego_speed: float,
+                      n_hops: int = 1) -> float:
+        """이 속도에서 **실제로 필요한 전이 길이** [m] (c).
+
+        옛 식은 `max(transition_m(12), shift_k_s·v)` 라 **정지 상태에서도 12 m** 를
+        요구한다. 그 12 는 주행 중 전이를 기준으로 잡은 상수라, 재출발 시프트에는
+        과하다 — 그리고 그것이 `geom` 자기잠금의 분모다 (need = 12+1+2 = 15 m 인데
+        standoff·크립으로 s_rel 이 7.7 m 까지 내려가면 영영 못 넘는다).
+
+        옳은 축은 이미 저장소에 있다: `_ramp_len_m` 이 시프트 형상과 `a_lat_max`
+        에서 L ≥ v·π·√(Y/(2a)) 를 유도한다. 같은 식을 그대로 쓴다 — 상수를 새로
+        만들지 않는다. 5 km/h·한 칸·3.2 m 폭이면 약 4.5 m 다.
+
+        바닥은 상수가 아니라 **조향 한계**에서 유도한다. `_ramp_len_m` 은 횡가속
+        (`a_lat_max`)만 보므로 v→0 에서 0 으로 수렴하는데, 실제로는 **조향각**이
+        먼저 막힌다. 같은 raised-cosine 형상에서
+            |y''|max = Y·π²/(2L²) ≤ κ_max = tan(max_steer)/wheelbase
+            ⇒ L ≥ π·√(Y / (2·κ_max))
+        이 차량(휠베이스 2.94 m, max_steer 0.480 rad)은 한 칸 3.2 m 에 **9.4 m** 다.
+        고정값 4.0 을 쓰면 램프가 조향 한계를 넘어 포화한다 — 실측 avoid_sim
+        케이스 11 에서 조향 포화가 0 → 27틱으로 늘었다 (2026-09-10).
+        `trans_min_m` 은 그 위에 얹는 하한일 뿐이다.
+
+        스위치가 꺼지면 옛 식 그대로.
+        """
+        old = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
+        if not self.trans_by_speed:
+            return old
+        try:
+            w = self._lane_width_at(lg, ego_lane, local_s)
+        except Exception:                                  # noqa: BLE001
+            w = 3.2
+        hops = max(1, int(n_hops))
+        need = self._ramp_len_m(hops, w, max(0.0, float(ego_speed)))
+        floor = max(self.trans_min_m, self._steer_min_trans_m(hops, w))
+        # 주행 중에는 옛 값보다 커지지 않게 min 을 씌운다 — 이 스위치의 목적은
+        # **저속에서 과한 요구를 줄이는 것**이지 고속에서 늘리는 것이 아니다.
+        return max(floor, min(old, need))
+
+    def _steer_min_trans_m(self, hops: int, lane_w: float) -> float:
+        """조향각 한계가 정하는 최소 전이 길이 [m]. 상수를 새로 만들지 않는다 —
+        `vehicle.wheelbase` · `vehicle.max_steer` 를 그대로 읽는다."""
+        L = float(self.cfg['vehicle']['wheelbase'])
+        ms = float(self.cfg['vehicle']['max_steer'])
+        k = _math.tan(ms) / L if L > 0.0 else 0.0
+        Y = max(0.0, float(hops)) * max(0.1, float(lane_w))
+        if k <= 0.0 or Y <= 0.0:
+            return 0.0
+        return _math.pi * _math.sqrt(Y / (2.0 * k))
+
     def _side_clear_by_map(self, lg, planner, ap, target, n_hops: int):
         """목표 차로가 비었는가를 **차로 지도의 free_run 으로** 판정한다 (3).
 
@@ -3787,7 +3841,7 @@ class KrRules:
             # span 전체**가 점선인지 본다. dashed_corridor_m 은 '점선 조각의
             # 길이' 라 이미 지나온 조각도 통과시킨다 (실측: 앞 점선 5 m 인데
             # 76.4 반환 → span 84.1 m 가 전 구간 실선 위에 얹혔다).
-            trans_m = max(self.ot_trans_m, self.shift_k_s * max(ego_speed, 0.1))
+            trans_m = self._trans_need_m(lg, ego_lane, local_s, ego_speed, n_hops)
             span_m = (2.0 * trans_m + self.ot_before_m + self.ot_after_m
                       + chain['extent_m'])                 # 연쇄면 첫~끝 객체 길이만큼
             # 전이 시작 여유 — L3 이상은 shift_ahead_l3_m (B-2). 정지 상태에서
