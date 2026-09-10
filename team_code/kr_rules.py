@@ -381,6 +381,7 @@ class KrRules:
         self.span_lost_restore = bool(ot.get('span_lost_restore_enable', False))
         self.ot_ids: list = []                     # 이 시프트를 만든 객체 id
         self.ot_target = None                      # 지금 향하는 차로 (재타겟 판정)
+        self.ot_from_lane = None                   # 시프트가 떠나온 차로 (복귀 대상)
         self.lm_hop_n = 0                          # 이번 시프트의 칸 수 (커밋 B)
         self.lm_retarget_n = 0                     # 재타겟 횟수
         self.shift_k_s = float(ot.get('shift_k_s', 3.0))
@@ -403,7 +404,6 @@ class KrRules:
         # 목표 차로 후방 감시 창 [m] — 이 안에 자차보다 빠른 차가 있으면 기각
         # (채점 항목 14). 0 = 후방을 안 본다.
         self.rear_clear_m = float(ot.get('rear_clear_m', 30.0))
-
         self.q_hold_ticks = int(round(float(ot.get('queue_hold_s', 15.0)) * self.hz))
         # 억제 단일화 (C). 'queue_only' = 억제는 _is_queue 하나, 적색·정지선·교차로는
         # 일시정지/게이트 입력. 'legacy' = 이전 3중 억제(_red_ahead·_signal_zone·_is_queue)
@@ -630,6 +630,9 @@ class KrRules:
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
+        # 시프트 중 트리거가 **복귀할 차로**도 보게 할지. false = 이전 동작
+        # (물리적으로 선 차로만 — 비켜 왔으니 늘 비어 보인다).
+        self.lm_shift_ref = bool(_lm.get('lane_map_shift_ref_enable', False))
         # 커밋 C — 복귀 없음. 복귀 전이를 장애물 직후가 아니라 **데드라인**에 둔다.
         self.lm_no_return = bool(_lm.get('lane_map_no_return_enable', False))
         # 활성 시프트 중에도 차로 지도가 다른 목표를 고르면 갈아탈지 (2026-09-09).
@@ -1782,6 +1785,17 @@ class KrRules:
         key = str(list(ego_lane))
         free = lm['free_run']
         mine = float(free.get(key, self.lane_map_ahead_m))
+        # 시프트 중에는 **복귀할 차로**도 같이 본다. 밀린 경로 위에 있으면 자차가
+        # 물리적으로 선 차로는 (비켜 왔으니) 비어 보이고, 그래서 트리거가 영영
+        # 안 걸린다 — 실측 07 rs 2802~2841 의 248틱이 그 꼴이다:
+        #   물리 차로 (2076,3,4) free_run 80.0  → mine = 80 ≥ decide_m → None
+        #   복귀 차로 (2076,3,3) free_run  7.5  → 콘 5·6·7·9 가 그 차로에 있다
+        # 회랑은 복귀 전이 뒤의 콘 9 를 78.3 m 앞으로 보고 있었다. 둘 다 맞고
+        # 재는 대상이 달랐을 뿐이라, **둘 중 나쁜 쪽**을 트리거로 쓴다.
+        if self.lm_shift_ref and self.ot_span is not None and self.ot_from_lane:
+            back = free.get(str(list(self.ot_from_lane)))
+            if back is not None:
+                mine = min(mine, float(back))
         if mine >= self.lm_decide_m:
             return None                                    # 트리거 아님
         hops = {k: h for k, h in lm['hops'].items()}
@@ -3486,6 +3500,7 @@ class KrRules:
         self.ot_side = None
         self.ot_ids = []
         self.ot_target = None
+        self.ot_from_lane = None
         self.lm_hop_n = 0
         self.lm_retarget_n = 0
         self.span_extend_n = 0
@@ -4031,6 +4046,9 @@ class KrRules:
             self.lm_retarget_n += 1
         self.ot_span = span
         self.ot_target = target                            # 지금 향하는 차로 (재타겟 판정)
+        # 시프트가 **떠나온** 차로 = span 끝에서 복귀할 차로. 시프트 중 차로 지도의
+        # 트리거가 이 차로도 같이 봐야 한다 (아래 lane_plan 참조).
+        self.ot_from_lane = ego_lane
         self.lm_hop_n = int(n_steps or 1)                  # 몇 칸짜리 시프트였나
         self.ot_ids = list(chain['ids'])                   # 대상 상실 판정의 기준
         self.ot_side = side                                # 연장이 같은 방향을 쓴다
@@ -4255,6 +4273,8 @@ class KrRules:
         self.ot_span = None
         self.ot_side = None
         self.ot_ids = []
+        self.ot_target = None
+        self.ot_from_lane = None
         self.lm_hop_n = 0
         self.span_extend_n = 0
         self.ot_blocked_ticks = 0
