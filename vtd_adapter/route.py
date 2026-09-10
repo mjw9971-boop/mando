@@ -738,6 +738,53 @@ class VtdRoutePlanner:
                     self.route_points[idx][:2] - self.original_route_points[idx][:2]))
                 self.lat_shift[idx] = self._lat_build[idx] + (d if shift_to_left_lane else -d)
 
+    def restore_route_smoothly(self, start_index, end_index, transition_length=0.0):
+        """[start_index, end_index) 를 원 경로로 되돌린다 — 앞 `transition_length`
+        점만큼은 **현재 경로에서 코사인으로 섞는다**.
+
+        `shift_route_smoothly` 의 역방향이다. 목표가 이웃 차로 waypoint 가 아니라
+        `original_route_points` 라는 것만 다르고, 전이 계수는 같은
+        `_smooth_transition` 을 쓴다 (같은 형상이라야 만들 때와 풀 때의 요구
+        횡가속을 같은 식으로 잴 수 있다).
+
+        **왜 필요한가**: 종전 원복(`kr_rules._restore_span`)은 span 전체를 한 틱에
+        원 경로로 덮었다. 자차가 span 안(평지)에 있으면 발밑과 바로 앞의 경로가
+        차로폭만큼 **계단**으로 옮겨 붙어 조향이 다음 틱에 곧바로 풀락이 된다 —
+        실측 2026-09-10 `20260910_202706/실전주행_교통류_02_직진11` rs 2380.1:
+        span [22586, 24201](ppm 10 → rs 2258.6~2420.1) **안**의 rs 2380.5 에서
+        `targets_lost` 원복이 걸렸고, 다음 틱 조향 −0.480 포화가 11틱,
+        heading_err −0.609 rad, 차로 −1 → −2 를 가로질러 진폭 4.4 m S자가 났다.
+        시프트를 **만들 때** 전이를 두는 것과 같은 이유로 풀 때도 전이가 필요하다.
+
+        `commands` 는 전이가 **끝난** 점에서만 원본으로 되돌린다 — 전이 구간은
+        아직 차로를 옮기는 중이라 원본 커맨드가 아니다.
+        `lat_shift` 는 남아 있던 변위의 **부호를 유지**한 채 크기만 다시 잰다
+        (`shift_route_smoothly` 와 같은 규약: +좌 / −우).
+        """
+        n = len(self.original_route_points)
+        i0 = max(0, int(start_index))
+        i1 = min(n, int(end_index))
+        L = max(0.0, float(transition_length))
+        has_lat = (getattr(self, 'lat_shift', None) is not None
+                   and getattr(self, '_lat_build', None) is not None)
+        for idx in range(i0, i1):
+            f = 1.0
+            if L > 0.0 and (idx - i0) < L:
+                f = float(self._smooth_transition(float(idx - i0) / L))
+            # 부호는 **덮기 전에** 읽는다 (아래에서 lat_shift[idx] 를 갈아 끼운다).
+            sgn = 1.0
+            if has_lat and idx < len(self.lat_shift):
+                sgn = 1.0 if (float(self.lat_shift[idx])
+                              - float(self._lat_build[idx])) >= 0.0 else -1.0
+            self.route_points[idx] = (f * self.original_route_points[idx]
+                                      + (1.0 - f) * self.route_points[idx])
+            if f > 1.0 - 1e-9:
+                self.commands[idx] = self.commands_orig[idx]
+            if has_lat and idx < len(self.lat_shift):
+                d = float(np.linalg.norm(
+                    self.route_points[idx][:2] - self.original_route_points[idx][:2]))
+                self.lat_shift[idx] = self._lat_build[idx] + sgn * d
+
     def plan_shift_span(self, first_actor, last_actor=None,
                         obstacle_direction='right', transition_length=120.0,
                         extra_length_before=0.0, extra_length_after=0.0,

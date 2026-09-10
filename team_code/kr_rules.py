@@ -380,6 +380,12 @@ class KrRules:
         # 사라졌을 때**만 푼다 (게이트로 빠졌거나 월드에서 없어졌거나).
         # false = 이전 동작.
         self.span_lost_restore = bool(ot.get('span_lost_restore_enable', False))
+        # 시프트 원복을 **전이로** 푼다 (2026-09-10 실주행 [1]). 자차가 span 안일
+        # 때만 산다 — `_restore_span` 참고. false = 이전 동작(전체 하드 원복).
+        self.restore_ramp = bool(ot.get('span_restore_ramp_enable', False))
+        # 이보다 작은 잔여 변위는 계단이 안 되므로 그냥 하드 원복한다 [m].
+        self.restore_ramp_min_m = float(ot.get('span_restore_min_lat_m', 0.3))
+        self._restore_diag = None                  # 마지막 원복 전이 진단
         self.ot_ids: list = []                     # 이 시프트를 만든 객체 id
         self.ot_target = None                      # 지금 향하는 차로 (재타겟 판정)
         self.ot_from_hop = 0                       # 떠나온 차로의 hop 오프셋 (복귀 대상)
@@ -2758,7 +2764,7 @@ class KrRules:
         if turn is not None and self.ns_turn_ticks < self.ns_turn_hold_ticks:
             self.ns_turn_ticks += 1
             if self.ot_span is not None:
-                self._restore_span(planner)         # 계획 경로가 회전 차로로 데려간다
+                self._restore_span(planner, ego_speed)   # 계획 경로가 회전 차로로 데려간다
             self.ns_level = 0
             self.ns_info = dict(turn, state='TURN_LANE_RETURN',
                                 hold_s=round(self.ns_turn_ticks / self.hz, 1),
@@ -3301,7 +3307,7 @@ class KrRules:
         # 스위치가 꺼지면 옛 순서(홀드 먼저) 그대로.
         if (self.ot_span is not None and planner.route_index > self.ot_span[1]
                 and (self.hold_restore or not red_hold)):
-            self._restore_span(planner)
+            self._restore_span(planner, ego_speed)
             return False
 
         # 시프트 진행 중 억제 구역에 걸렸다면 — **원복하지 않는다**.
@@ -3333,7 +3339,7 @@ class KrRules:
             return False
 
         if self.ot_span is not None and planner.route_index > self.ot_span[1]:
-            self._restore_span(planner)                    # (E-6 꺼짐 + 적색 아님)
+            self._restore_span(planner, ego_speed)         # (E-6 꺼짐 + 적색 아님)
             return False
         if not self.ot_enabled:
             return False
@@ -3343,8 +3349,10 @@ class KrRules:
             # standoff 가 25 m 앞에 세운다. 적색이면 위 SHIFT_HOLD 가 먼저 반환한다.
             # false 면 이전 동작(아무것도 안 봄).
             if self.span_lost_restore and self._span_targets_lost(ap, planner):
-                self._restore_span(planner)
-                self.last_avoid = {'state': 'RESTORE', 'why': 'targets_lost'}
+                self._restore_span(planner, ego_speed)
+                self.last_avoid = {'state': 'RESTORE', 'why': 'targets_lost',
+                                   **({'ramp': self._restore_diag}
+                                      if self._restore_diag else {})}
                 return False
             # 차로 지도가 **다른 목표 차로**를 고르면 목표만 갈아 끼운다 (재타겟).
             # 차로 지도는 매 틱 목표를 다시 고르므로 "활성 중엔 생성 금지" 가
@@ -3960,12 +3968,37 @@ class KrRules:
             return False
         return True
 
-    def _restore_span(self, planner) -> None:
-        """지나간 시프트 span 원복 (다음 장애물용) — E-6 으로 호출처가 둘이 됐다."""
+    def _restore_span(self, planner, ego_speed: float | None = None,
+                      hard: bool = False) -> None:
+        """지나간 시프트 span 원복 (다음 장애물용) — E-6 으로 호출처가 둘이 됐다.
+
+        **자차가 span 안에 있으면 계단이 된다** (2026-09-10 실주행 [1]).
+        호출처 5곳 중 둘(`targets_lost` 원복 · 회전 차로 복귀)은 자차가 span
+        평지 한복판일 때 걸린다. [a,b) 를 한 번에 덮으면 발밑과 바로 앞의 경로가
+        차로폭만큼 옮겨 붙어 다음 틱에 조향이 풀락이 된다 — 실측
+        `20260910_202706/실전주행_교통류_02_직진11`: span [22586,24201] 안
+        rs 2380.5 에서 `targets_lost` 원복 → 조향 −0.480 이 11틱 포화,
+        heading_err −0.609 rad, 차로 −1 → −2 를 가로지른 진폭 4.4 m S자.
+        (그 구간 `avoid.state` 는 원복 뒤 끝까지 None 이다 — 회피 시프트도
+        계획 차선변경도 아니고 **원복 자체**가 만든 궤적이다.)
+
+        그래서 자차가 span 안이면 `_restore_span_ramped` 가 **전이로** 푼다.
+        자차가 span 을 지난 뒤(호출처 3304)나 순간이동 리셋(4817)은 계단이
+        생길 자리가 없으므로 그대로 하드 원복이다 — 전자는 인덱스 조건이,
+        후자는 `hard=True` 가 거른다.
+
+        `overtake.span_restore_ramp_enable` = false 면 이전 동작(전체 하드 원복).
+        """
+        self._restore_diag = None
         a, b = self.ot_span
-        planner.route_points[a:b] = planner.original_route_points[a:b]
-        planner.commands[a:b] = planner.commands_orig[a:b]
-        planner.lat_shift[a:b] = planner._lat_build[a:b]
+        i0 = int(getattr(planner, 'route_index', 0) or 0)
+        done = False
+        if self.restore_ramp and not hard and a <= i0 < b:
+            done = self._restore_span_ramped(planner, a, b, i0, ego_speed)
+        if not done:
+            planner.route_points[a:b] = planner.original_route_points[a:b]
+            planner.commands[a:b] = planner.commands_orig[a:b]
+            planner.lat_shift[a:b] = planner._lat_build[a:b]
         planner._kd = _cKDTree(planner.route_points[:, :2])
         self.ot_span = None
         self.ot_side = None
@@ -3976,6 +4009,48 @@ class KrRules:
         self.lm_retarget_n = 0
         self.span_extend_n = 0
         self.last_overtake = 'restored'
+
+    def _restore_span_ramped(self, planner, a: int, b: int, i0: int,
+                             ego_speed: float | None) -> bool:
+        """자차가 밟고 있는 span 을 **전이로** 원복한다. 못 하면 False (하드 폴백).
+
+        형상·잣대는 **만들 때와 같은 축**이다:
+          · 시작   자차 앞 `shift_ahead_m` — 뒤에서 시작하면 발밑이 옆으로 튄다
+                   (`shift_route_around_actors` 의 `min_start_ahead` 와 같은 사고).
+          · 길이   `_ramp_len_m(1, lat, v)` — Y 를 칸 수가 아니라 **남아 있는 실제
+                   변위 lat** 로 넣는다. 반 칸만 밀려 있으면 반 칸짜리 램프면 된다.
+          · 속도   `max(ego_speed, lm_avoid_v)` — 생성부(4545행)와 같은 식.
+        [a, s0) 는 자차가 이미 밟고 있어 건드리지 않는다. 그 구간이 밀린 채
+        남지만 **자차 뒤라 다시 밟지 않는다**. `route_points` 가 원본과 다르다는
+        사실 자체는 `_shift_target_steps` 가 이미 다루는 상태다 (그 함수가 세는
+        k 가 1 이 되어 "지금 있는 차로에서 한 칸" 이 그대로 성립한다).
+
+        잔여 span 이 램프보다 짧으면 램프를 그만큼 **압축**한다 — 요구 횡가속이
+        올라가지만 계단(무한대)보다는 언제나 낫다. 생성부가 `late` 에서
+        램프를 되푸는 것과 같은 처리다.
+        """
+        try:
+            lat = abs(float(planner.lat_shift[i0]) - float(planner._lat_build[i0]))
+        except Exception:                                  # noqa: BLE001
+            return False                                   # 배열 없음/불일치 → 이전 동작
+        if lat < self.restore_ramp_min_m:
+            return False                                   # 변위가 없다 = 계단도 없다
+        ppm = int(getattr(planner, 'points_per_meter', 10) or 10)
+        v = max(float(ego_speed or 0.0), self.lm_avoid_v)
+        s0 = i0 + int(round(self.shift_ahead_m * ppm))
+        if s0 >= b:
+            return False                                   # 전이 여유조차 없다
+        n_tr = min(int(round(self._ramp_len_m(1, lat, v) * ppm)), b - s0)
+        if n_tr <= 0:
+            return False
+        try:
+            planner.restore_route_smoothly(s0, b, transition_length=n_tr)
+        except AttributeError:                             # 목 플래너 (구 서명)
+            return False
+        self._restore_diag = {'lat_m': round(lat, 2), 'ramp_m': round(n_tr / ppm, 1),
+                              'ahead_m': round(self.shift_ahead_m, 1),
+                              'v': round(v, 2), 'kept': [int(a), int(s0)]}
+        return True
 
     def _standoff_target(self, ap, planner, corridor) -> None:
         """standoff(관찰 감속) 대상 선정 (B-5) — 매 틱 apply 머리에서 None 으로
@@ -4814,7 +4889,7 @@ class KrRules:
         # ── 회피 시프트 ── span 은 경로점 인덱스라 **먼저 원복**하고 버린다.
         if self.ot_span is not None:
             try:
-                self._restore_span(planner)
+                self._restore_span(planner, hard=True)
             except Exception:                         # noqa: BLE001
                 pass                                  # planner 없음·배열 불일치
         self.ot_span = None
