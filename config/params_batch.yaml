@@ -1,0 +1,62 @@
+# 배치 실행용 params 오버레이 — config/params.yaml 의 키만 **덮어쓴다**.
+#
+# 왜 별도 파일인가 (2026-09-10):
+#   실험 스위치를 params.yaml 에서 켜 두면 "기본값이 꺼져 있는지" 보는 검사가
+#   통째로 깨진다. 2026-09-07 에 한 번 정리했던 바로 그 드리프트가 다시 났고
+#   (`pytest` 35 failed, 전부 `*_default_is_off` 계열), 그 상태로는 회귀 판정이
+#   불가능하다 — 무엇이 새 실패인지 구분이 안 된다.
+#   그래서 **커밋본 params.yaml 은 전부 false** 로 두고, 배치에서 켤 것만
+#   여기에 모은다. pytest 는 이 파일을 보지 않는다 (환경변수 미설정).
+#
+# 쓰는 법 — 환경변수 하나면 배치와 run_agent 서브프로세스가 같이 본다:
+#
+#     MANDO_PARAMS_OVERLAY=1 python3 tools/batch_run.py ...
+#     MANDO_PARAMS_OVERLAY=1 python3 run_agent.py --route ...
+#
+#   `1` 대신 다른 경로를 주면 그 파일을 쓴다 (실험 세트를 여러 벌 두는 용도).
+#   미설정 · `0` 이면 오버레이가 없다 = 커밋본 그대로.
+#
+# 규칙:
+#   · **없는 키는 KeyError 로 죽는다.** 오타난 스위치를 조용히 새 키로 만들면
+#     켠 줄 알았는데 아무 일도 안 일어난다.
+#   · 여기 있는 값이 검증을 통과하면 params.yaml 기본값으로 **옮기고** 여기서
+#     지운다. 이 파일은 "아직 기본값이 아닌 것" 의 목록이지 두 번째 정본이 아니다.
+#   · 런 첫 줄 스위치 스냅샷(log.enabled)에 그대로 반영되므로, 어떤 설정으로
+#     돈 배치인지는 로그만 봐도 남는다.
+#
+# 아래 23개는 2026-09-10 배치(20260910_202706)가 실제로 쓰던 값이다.
+
+avoid_map:
+  # 차로 지도 회피 일체 (커밋 A~C 계열). lane_map_avoid_enable 이 대장 스위치고
+  # 나머지는 그 안의 세부 규칙이라 따로 켜도 lane_map_avoid_enable 없이는 죽는다.
+  lane_map_avoid_enable: true
+  lane_map_fallback_no_queue_enable: true
+  lane_map_fallback_side_enable: true
+  lane_map_no_return_enable: true
+  lane_map_owns_shift_enable: true
+  lane_map_prefer_dashed_enable: true
+  lane_map_queue_mark_enable: true
+  lane_map_ramp_by_phys_lane_enable: true
+  lane_map_retarget_enable: true
+  lane_map_retarget_in_hold_enable: true
+  lane_map_shift_on_pick_enable: true
+  lane_map_shift_ref_enable: true
+  lane_map_span_zone_clamp_enable: true
+  lane_map_static_on_pick_enable: true
+  lane_map_valid_by_map_enable: true
+  lane_map_valid_side_by_id_enable: true
+  shift_hold_red_bounded_enable: true
+
+overtake:
+  queue_close_gap_enable: true
+  side_clear_by_map_enable: true
+  standoff_creep_delay_pause_enable: true
+  standoff_creep_end_narrow_enable: true
+
+percep:
+  # 자차 차로 판정에서 경로 인덱스를 몇 칸까지 보나. 1 = 이전 동작.
+  route_index_hops: 2
+
+speed:
+  # 붉은 구간 진입 전 감속의 하한 [km/h]. 0 = 이전 동작(하한 없음).
+  red_approach_min_kph: 10.0

@@ -9,15 +9,71 @@ config/params.yaml 로더.
 """
 from __future__ import annotations
 
+import os
 import pathlib
+import sys
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_PARAMS = ROOT / 'config' / 'params.yaml'
+DEFAULT_OVERLAY = ROOT / 'config' / 'params_batch.yaml'
+OVERLAY_ENV = 'MANDO_PARAMS_OVERLAY'
 
 
-def load_params_yaml(path: str | None = None) -> dict[str, Any]:
-    """config/params.yaml → 중첩 dict. 파일이 없으면 FileNotFoundError 를 그대로 낸다."""
+def _resolve_overlay(overlay: str | None) -> pathlib.Path | None:
+    """어떤 오버레이를 얹을지 — 인자 > 환경변수 > 없음.
+
+    환경변수 `MANDO_PARAMS_OVERLAY` 는 두 가지를 받는다:
+      · `1` / `true` / `yes` → `config/params_batch.yaml` (기본 배치 오버레이)
+      · 그 밖의 값           → 그 경로의 파일
+    빈 값 · `0` · `false` · 미설정이면 오버레이가 없다.
+
+    **기본이 "없음" 인 것이 핵심이다.** pytest 는 환경변수를 안 걸므로 항상
+    커밋본(전부 false)을 본다 — 배치용 스위치를 켜 두면 `*_default_is_off`
+    검사가 통째로 깨지던 드리프트가 이 경계에서 끝난다 (2026-09-10, 35건).
+    """
+    if overlay is not None:
+        return pathlib.Path(overlay) if overlay else None
+    raw = (os.environ.get(OVERLAY_ENV) or '').strip()
+    if not raw or raw.lower() in ('0', 'false', 'no', 'off'):
+        return None
+    if raw.lower() in ('1', 'true', 'yes', 'on'):
+        return DEFAULT_OVERLAY
+    return pathlib.Path(raw)
+
+
+def _merge_overlay(doc: dict, over: dict, path: str = '') -> list[str]:
+    """오버레이를 제자리 병합한다. 바뀐 키의 점표기 목록을 돌려준다.
+
+    **없는 키는 만들지 않고 KeyError 로 죽는다.** 오버레이는 "기본값을 덮는"
+    파일이라, 오타난 스위치를 조용히 새 키로 만들어 두면 켠 줄 알았는데
+    아무 일도 안 일어난다 — 이 저장소가 DEFAULTS dict 이중화를 폐지한 것과
+    같은 이유다 (설정 두 벌이 어긋나는 사고를 조용히 넘기지 않는다).
+    """
+    changed: list[str] = []
+    for k, v in over.items():
+        dotted = f'{path}{k}'
+        if k not in doc:
+            raise KeyError(f'params 오버레이에 없는 키: {dotted}')
+        if isinstance(v, dict) and isinstance(doc[k], dict):
+            changed += _merge_overlay(doc[k], v, dotted + '.')
+        elif doc[k] != v:
+            doc[k] = v
+            changed.append(dotted)
+    return changed
+
+
+def load_params_yaml(path: str | None = None,
+                     overlay: str | None = None) -> dict[str, Any]:
+    """config/params.yaml → 중첩 dict. 파일이 없으면 FileNotFoundError 를 그대로 낸다.
+
+    `overlay` (또는 환경변수 `MANDO_PARAMS_OVERLAY`) 가 있으면 그 파일의 키만
+    덮어쓴다 — 배치 실행에서 켜는 실험 스위치를 커밋본과 **분리**하는 통로다.
+    `tools/batch_run.py` 는 손대지 않는다: 환경변수는 서브프로세스로 그대로
+    상속되므로 배치·run_agent 가 같은 오버레이를 본다.
+
+        MANDO_PARAMS_OVERLAY=1 python3 tools/batch_run.py ...
+    """
     import yaml
 
     p = pathlib.Path(path) if path else DEFAULT_PARAMS
@@ -34,7 +90,16 @@ def load_params_yaml(path: str | None = None) -> dict[str, Any]:
             for q in parts[:-1]:
                 cur = cur.setdefault(q, {})
             cur[parts[-1]] = v
-        return out
+        doc = out
+
+    ov = _resolve_overlay(overlay)
+    if ov is not None:
+        with open(ov, 'r', encoding='utf-8') as f:
+            over = yaml.safe_load(f) or {}
+        changed = _merge_overlay(doc, over)
+        print(f'[config] params 오버레이 {ov.name}: {len(changed)}개 키 덮어씀'
+              + (f' — {", ".join(changed)}' if changed else ''),
+              file=sys.stderr, flush=True)
     return doc
 
 
