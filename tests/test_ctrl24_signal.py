@@ -119,7 +119,14 @@ def test_timeout_go_clock_is_zero_with_stopped_lead_in_corridor():
 
 
 # ── RTOR ────────────────────────────────────────────────────────────────
-def _rtor_rig(cfg=CFG, actors=()):
+# K2 홀드는 params 기본값이 2026-09-10 부터 0.0 (비활성) 이다. RTOR 과 K2 잔여의
+# 틱 단위 상호작용은 원래 값을 사본에 주입해 계속 검증한다 (B-25 관례).
+K2_CFG = dict(stopline_hold_s=1.0, stopline_hold_min_s=0.5)
+
+
+def _rtor_rig(cfg=None, actors=()):
+    if cfg is None:
+        cfg = cfg_with(**K2_CFG)
     d = FRONT + 1.0                                     # 앞범퍼가 정지선 1.0 m 앞 = 구역 안
     ev = [{'kind': 'turn_right', 's': d + 0.2, 'junction': 3}]
     return rig(cfg, actors=actors, d_tl=d, state=TrafficLightState.Red, events=ev)
@@ -148,7 +155,7 @@ def test_rtor_latches_after_half_second_stop_and_caps_speed():
 
 def test_rtor_k2_residual_when_min_hold_longer_than_rtor_hold():
     """rtor 0.5 < stopline_hold_min 이면 그 차이만큼 K2 가 남는다 (틱 단위)."""
-    kr, p, ap = _rtor_rig(cfg_with(stopline_hold_min_s=0.8))
+    kr, p, ap = _rtor_rig(cfg_with(stopline_hold_s=1.0, stopline_hold_min_s=0.8))
     for _ in range(9):
         apply(kr, ap, v=0.0)
     _c, t = apply(kr, ap, v=0.0)                        # 래치 틱 (정지 10틱째)
@@ -164,7 +171,7 @@ def test_rtor_k2_residual_when_min_hold_longer_than_rtor_hold():
 
 def test_rtor_hold_zero_means_no_stop_at_all():
     """정지 0 s 의 근거: hold 0 이면 조건 1~4·6 만으로 첫 틱에 래치 → 정지 후보 소멸."""
-    kr, p, ap = _rtor_rig(cfg_with(rtor_stop_hold_s=0.0))
+    kr, p, ap = _rtor_rig(cfg_with(rtor_stop_hold_s=0.0, **K2_CFG))
     _c, t = apply(kr, ap, v=6.0)                        # 6 m/s 로 접근 중 (정지 없음)
     assert kr._rtor_go is True and kr.last_signal['rtor']['reason'] == 'latch'
     assert kr.last_kr['stop_profile'] is None and kr.last_kr['stop_hold'] is None

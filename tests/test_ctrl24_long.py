@@ -124,10 +124,29 @@ def test_k1_uses_pdm_injected_s0():
 
 
 # ── K2 ───────────────────────────────────────────────────────────────────
-def test_k2_arms_once_per_stop_and_releases_on_green_with_min():
+# params 기본값은 2026-09-10 부터 0.0 / 0.0 (비활성) 이다. 기능 자체는 원래 값을 사본에
+# 주입해 계속 검증한다 (B-25 관례: params 가 정본, off 경로는 사본에서 명시적으로).
+K2_CFG = dict(stopline_hold_s=1.0, stopline_hold_min_s=0.5)
+
+
+def test_k2_disabled_by_default_yields_no_candidate():
+    """기본값 0.0 — 후보 키는 남고 값은 항상 None. 정지선 앞 정지는 K1·PDM 이 세운다."""
+    assert C['stopline_hold_s'] == 0.0 and C['stopline_hold_min_s'] == 0.0
     kr, p, ap = rig(d_tl=FRONT + 1.5, state=TrafficLightState.Red)
-    hold = int(C['stopline_hold_s'] * HZ)
-    mn = int(C['stopline_hold_min_s'] * HZ)
+    for _ in range(int(2.0 * HZ)):
+        _c, t = apply(kr, ap, v=0.0)
+        assert 'stop_hold' in kr.last_kr and kr.last_kr['stop_hold'] is None
+        assert kr.sl_hold_left == 0
+    set_signal(p, TrafficLightState.Green, FRONT + 1.5)
+    _c, t = apply(kr, ap, v=0.0)
+    assert t == 12.5                                    # 홀드 잔여 없이 즉시 출발
+
+
+def test_k2_arms_once_per_stop_and_releases_on_green_with_min():
+    cfg = cfg_with(**K2_CFG)
+    kr, p, ap = rig(cfg, d_tl=FRONT + 1.5, state=TrafficLightState.Red)
+    hold = int(K2_CFG['stopline_hold_s'] * HZ)
+    mn = int(K2_CFG['stopline_hold_min_s'] * HZ)
     for _ in range(5):
         _c, t = apply(kr, ap, v=0.0)
         assert t == 0.0
@@ -143,8 +162,9 @@ def test_k2_arms_once_per_stop_and_releases_on_green_with_min():
 
 
 def test_k2_does_not_rearm_while_still_stopped():
-    kr, p, ap = rig(d_tl=FRONT + 3.0, state=TrafficLightState.Red)   # 계획 정지점 1.5 m 앞
-    for _ in range(int(C['stopline_hold_s'] * HZ) + 5):
+    cfg = cfg_with(**K2_CFG)
+    kr, p, ap = rig(cfg, d_tl=FRONT + 3.0, state=TrafficLightState.Red)   # 계획 정지점 1.5 m 앞
+    for _ in range(int(K2_CFG['stopline_hold_s'] * HZ) + 5):
         apply(kr, ap, v=0.0)
     assert kr.sl_hold_left == 0
     _c, t = apply(kr, ap, v=0.0)
