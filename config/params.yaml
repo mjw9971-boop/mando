@@ -1924,6 +1924,21 @@ ctrl24:
   prepass_obb_reach_k: 1.5
   prepass_obb_reach_extra_m: 10.0
   prepass_obb_lat_m: 8.0
+  # ── 이웃 차로 스캔 + side 선택 (2026-09-10) ──────────────────────────
+  # 시프트 side 를 좌측 first-fit 으로 고르면, 옆 차로에 정지차가 있거나 그쪽 빈 길이가
+  # 전이보다 짧아도 그쪽을 만들어 절반만 옮긴 채 굳는다. 양쪽 목표 차로에서 자차 앞
+  # 첫 정지객체까지 빈 길이(free)를 재고, need = trans + shift_ahead_m + extra_before_m
+  # 보다 짧은 side 는 후보에서 빼며(nb_short), 남은 쪽을 free 내림차순으로 시도한다.
+  # 동률(0.5 m 이내)은 좌측 우선 = 기존 순서. 스캔 폭·정지 판정은 _corridor_blockers 와
+  # 같은 축(half_ego + 객체반폭 + percep.obstacle_clearance_m · blocker_speed_max).
+  # side 선택에만 쓴다 — 기존 게이트(span_too_far·_span_fit)는 그대로 뒤에서 돈다.
+  # 실측 2026-09-10 (174328·174657·145230·161652 시프트 17건): 좌측을 골랐는데 반대쪽
+  # 이 더 길었던 것 3건. need 는 스캔 길이 하한(20 m)과 겹치므로 shift_ahead·extra_before
+  # 를 키우면 빈 차로도 nb_short 가 된다 — 이 네 값은 함께 본다.
+  neighbor_scan_enable: false     # 킬스위치, 기본 off. off 면 스캔을 아예 안 부르고 ('left','right') 순서 그대로
+  neighbor_scan_k: 10.0            # 스캔 길이 = k · v [s]. 전이 trans_k 3.24 보다 길게 잡아 여유
+  neighbor_scan_min_m: 80.0       # 저속·정지에서의 하한 [m]
+  neighbor_scan_max_m: 80.0       # detect_max_m 상한 (GT 범위) [m]
   # ── K7 시프트 전이 횡가속 상한 (2026-09-09) ────────────────────────────
   # geom 게이트(전이 + shift_ahead + 여유가 장애물까지 거리에 들어가는가)를 삭제한
   # 대가로, 공간이 부족한 채 만들어진 시프트가 남는다 — 리플레이 40건 실측
@@ -1991,7 +2006,7 @@ ctrl24:
   escape_release_m: 5.0         # 걸린 뒤 이만큼 진행하면 푼다 (래치)
   # 바닥의 정의에 들어가는 물리 간격 [m] — 회랑 전방 최근접 객체까지 범퍼 간격이
   # 이 이하면 바닥은 0 이다 (원래 후보값 그대로). 붙어서 밀지 않는다.
-  escape_clear_m: -4.0
+  escape_clear_m: -5.0
   # 고착 래치가 서는 틱에 회랑 전방 객체를 요동 방지 집합(_shifted_for)에서 빼
   # 중첩 시프트가 재시도되게 한다. 바닥과 독립인 별도 스위치.
   escape_rearm_shift_enable: true

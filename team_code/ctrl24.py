@@ -160,6 +160,11 @@ class Ctrl24:
         self.obb_reach_k = float(c['prepass_obb_reach_k'])
         self.obb_reach_extra_m = float(c['prepass_obb_reach_extra_m'])
         self.obb_lat_m = float(c['prepass_obb_lat_m'])
+        # ── 이웃 차로 스캔 + side 선택 (2026-09-10) ──────────────────────
+        self.nb_scan = bool(c['neighbor_scan_enable'])
+        self.nb_k = float(c['neighbor_scan_k'])
+        self.nb_min_m = float(c['neighbor_scan_min_m'])
+        self.nb_max_m = float(c['neighbor_scan_max_m'])
         # ── K7 시프트 전이 횡가속 상한 ─────────────────────────────────────
         # 상수는 overtake.* 를 그대로 읽는다 (K6 이 speed.* 를 읽는 것과 같은 규칙).
         # ctrl24 는 켜고 끄는 스위치 하나(ctrl24.shift_cap_enable)만 자기 섹션에 둔다.
@@ -1512,14 +1517,75 @@ class Ctrl24:
                            'blocker': actor.id, 's_rel': round(s_rel, 1), 'lat': round(lat, 2),
                            'trigger': trig.get(actor.id, 'corridor'), 'nested': self.nested}
         chain = self._chain(corridor, actor)
-        if self._try_shift(planner, ego_speed, chain):
+        if self._try_shift(planner, ego_speed, chain, ap=ap):
             return
         # 정상 시프트가 불가능하다고 확정됐다 — 고착 래치가 서 있으면 가상 차로로.
         # 탈출 규칙의 한 갈래다 (새 상태기가 아니다).
         if self._esc_engaged and self.esc_virt:
             self._try_virtual_shift(planner, ap, ego_speed)
 
-    def _try_shift(self, planner, ego_speed: float, chain: dict) -> bool:
+    def _neighbor_free_m(self, planner, left: bool, ego_speed: float, ap=None):
+        """목표 이웃 차로에서 자차 앞 첫 정지객체까지의 빈 길이 [m]. 목표가 없으면 None.
+
+        · 목표 차로 = `_shift_target_wp` 가 쓰는 것과 **같은** 이웃 (n_steps = _shift_target_steps).
+          자차 앞 0~scan_len 의 경로 인덱스를 1 m 간격으로 따라가며 목표 웨이포인트를 모은다.
+          하나도 없으면 None (기존 no_target 과 같은 의미).
+        · 스캔 폭 = half_ego + 객체반폭 + percep.obstacle_clearance_m — _corridor_blockers 와 같은 축.
+        · 스캔 길이 = clip(neighbor_scan_k · v, neighbor_scan_min_m, neighbor_scan_max_m).
+        · 정지 판정 blocker_speed_max, walker 제외.
+        · 반환 = 첫 정지객체까지 종거리. 없으면 scan_len (그만큼은 비었다).
+        """
+        ap = ap if ap is not None else self._ap
+        f = getattr(planner, '_shift_target_wp', None)
+        if f is None or ap is None:
+            return None
+        ppm = int(getattr(planner, 'points_per_meter', 10))
+        i0 = int(planner.route_index)
+        n = len(planner.route_points)
+        scan = min(self.nb_max_m, max(self.nb_min_m, self.nb_k * max(float(ego_speed), 0.0)))
+        steps = self._target_steps(planner, left, i0)
+        pts = []; idxs = []
+        for idx in range(i0, min(n, i0 + int(scan * ppm) + 1), max(1, ppm)):
+            try:
+                wp = f(idx, left, steps)
+            except Exception:                              # noqa: BLE001 — 목 플래너
+                return None
+            if wp is None:
+                continue
+            loc = getattr(getattr(wp, 'transform', None), 'location', None)
+            if loc is None:
+                return None
+            pts.append((float(loc.x), float(loc.y))); idxs.append(idx)
+        if len(pts) < 2:
+            return None
+        P = np.asarray(pts, dtype=float)
+        try:
+            actors = list(ap._world.get_actors()); ego_id = ap._vehicle.id
+        except Exception:                                  # noqa: BLE001
+            return scan
+        best = scan
+        for a in actors:
+            if a.id == ego_id or self._is_walker(a):
+                continue
+            if float(getattr(a, 'speed', 0.0)) >= self.v_static:
+                continue
+            loc = a.get_location(); q = np.array([float(loc.x), float(loc.y)])
+            d = np.hypot(P[:, 0] - q[0], P[:, 1] - q[1]); j = int(d.argmin())
+            j2 = j + 1 if j + 1 < len(P) else j - 1
+            tan = (P[j2] - P[j]) if j2 > j else (P[j] - P[j2])
+            nrm = float(np.hypot(*tan))
+            if nrm < 1e-9:
+                continue
+            tan = tan / nrm; dv = q - P[j]
+            along = float(dv @ tan); lat = float(tan[0] * dv[1] - tan[1] * dv[0])
+            dist = (idxs[j] - i0) / float(ppm) + along
+            bb = getattr(a, 'bounding_box', None)
+            hw = float(bb.extent.y) if bb is not None else 0.9
+            if 0.0 < dist <= scan and abs(lat) < self.half_ego + hw + self.clr:
+                best = min(best, dist)
+        return float(best)
+
+    def _try_shift(self, planner, ego_speed: float, chain: dict, ap=None) -> bool:
         """좌측 우선, 좌측이 변위 0(이웃 없음 — route.py 폴백)이면 우측. 게이트는 span_too_far
         하나. 변위 < noop_disp_m 인 시프트는 성공이 아니다(NOOP): 되돌리고 span 을 세우지 않는다."""
         actor, last = chain['first'], chain['last']
@@ -1547,7 +1613,26 @@ class Ctrl24:
                 last_i = i0 + int(round(pb[0] * ppm))
         except Exception:                                  # noqa: BLE001 — 목 조립
             obs_i = last_i = None
-        for side in ('left', 'right'):
+        # 이웃 차로 스캔 — side 선택에만 쓴다 (2026-09-10). off 면 스캔을 안 부르고 원래 순서.
+        sides = ('left', 'right')
+        if self.nb_scan:
+            need = trans + self.shift_ahead_m + self.ot_before_m
+            free = {sd: self._neighbor_free_m(planner, sd == 'left', ego_speed, ap=ap)
+                    for sd in ('left', 'right')}
+            kept = []
+            for sd in ('left', 'right'):
+                if free[sd] is None:
+                    rejects.append(f'{sd}:no_target')
+                elif free[sd] < need:
+                    rejects.append(f'{sd}:nb_short({free[sd]:.1f}/{need:.1f})')
+                else:
+                    kept.append(sd)
+            if len(kept) == 2 and free['right'] > free['left'] + 0.5:
+                kept = ['right', 'left']                   # 동률(0.5 m 이내)은 좌측 우선
+            sides = tuple(kept)
+            self.last_avoid['nb_free'] = {'left': free['left'], 'right': free['right'],
+                                          'need': round(need, 1), 'order': list(sides)}
+        for side in sides:
             left = side == 'left'
             try:
                 a, b, _l = planner.plan_shift_span(
@@ -1659,6 +1744,7 @@ class Ctrl24:
         self.span_v_req = max(v_reqs) if v_reqs else None
         noop = bool(rejects) and all(
             r.endswith((':noop', ':no_target', ':span_no_room', ':span_no_fit'))
+            or ':nb_short(' in r
             for r in rejects)
         state = ('SPAN_WAIT_V' if v_reqs else
                  ('NOOP' if noop else self.last_avoid['state']))
