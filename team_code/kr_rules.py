@@ -661,6 +661,11 @@ class KrRules:
         # 재타겟 판정을 **자차 물리 차로 기준 잔여 칸수**로 (2026-09-11 [2]).
         # false = 이전 동작(`ot_target` 의도 비교). `_lm_retarget` 주석 참고.
         self.retarget_by_hops = bool(_lm.get('retarget_by_hops_enable', False))
+        # 목표는 있는데 못 가고 있는 상태의 시한 [s] ([3]). 0 이면 이전 동작.
+        self.span_stale_max_ticks = int(round(
+            float(_lm.get('span_stale_max_s', 0.0)) * self.hz))
+        self._span_stale_ticks = 0                 # 잔여 칸수가 안 줄어든 틱
+        self._span_stale_ref = None                # 마지막으로 본 잔여 칸수
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
@@ -3388,6 +3393,21 @@ class KrRules:
                                    **({'ramp': self._restore_diag}
                                       if self._restore_diag else {})}
                 return False
+            # **목표는 있는데 못 가고 있는 시간**에 시한을 둔다 (2026-09-11 [3]).
+            # `never_stall` 과 축이 다르다 — 그쪽은 `route_s` 가 `bo_progress_m`
+            # 만큼 나아가면 시계를 되돌리므로 **달리는 중에는 원리적으로 안
+            # 걸린다**. 실측 run_20260911_001250 t 130~150 이 정확히 그 사각이다:
+            # v 3~5.5 m/s 로 계속 달리면서 목표 −1 까지 **한 칸도 줄이지 못한 채**
+            # 25 s 를 썼고, 그 사이 여유가 69.5 → 20.8 m 로 사라졌다.
+            # 여기 시계는 **잔여 칸수**로 잰다: 줄면 되돌리고, 안 줄면 센다.
+            if self._span_stale_tick():
+                self._restore_span(planner, ego_speed)
+                self.last_avoid = {'state': 'RESTORE', 'why': 'span_stale',
+                                   'stale_s': round(self.span_stale_max_ticks
+                                                    / self.hz, 1),
+                                   **({'ramp': self._restore_diag}
+                                      if self._restore_diag else {})}
+                return False
             # 차로 지도가 **다른 목표 차로**를 고르면 목표만 갈아 끼운다 (재타겟).
             # 차로 지도는 매 틱 목표를 다시 고르므로 "활성 중엔 생성 금지" 가
             # 필요 없다 — 필요한 것은 램프를 새로 만드는 것이 아니라 **이어 붙이는**
@@ -4057,6 +4077,44 @@ class KrRules:
             return None
         n = int(lp.get('hops') or 1)
         return n if n > 1 else None
+
+    def _span_stale_tick(self) -> bool:
+        """시프트가 **목표에 다가가지 못한 채** 얼마나 살아 있었나 — 시한 초과면 참.
+
+        재는 것은 시간이 아니라 **잔여 칸수의 진전**이다. `lane_map.hops[pick]` 은
+        자차가 지금 밟고 있는 차로 기준 오프셋이므로, 절댓값이 줄면 시프트가 제
+        일을 하고 있는 것이고 안 줄면 아무 일도 안 일어나고 있는 것이다.
+
+        `never_stall` 과 **겹치지 않는다**: 그쪽 시계는 `route_s` 가
+        `bo_progress_m` 만큼 나아가면 리셋되므로 달리는 동안에는 안 선다.
+        여기는 종방향으로는 잘 가면서 **횡방향으로만** 막힌 경우를 잡는다.
+
+        시한을 넘기면 호출처가 span 을 버린다. 버리면 다음 틱에 `ot_span` 이
+        None 이라 평소 생성 경로가 **현재 물리 차로에서** 새로 만든다 —
+        의도를 쥔 채 굳어 있던 것이 풀린다.
+
+        자기제한적이다: 새 span 이 서면 `ot_target` 대입에서 시계가 0 이 되므로
+        최소 주기가 `span_stale_max_s` 다. 0 이면 이전 동작(시한 없음).
+        """
+        if self.span_stale_max_ticks <= 0:
+            self._span_stale_ticks = 0
+            return False
+        pick = (self.last_lane_plan or {}).get('pick')
+        hops = (self.last_lane_map or {}).get('hops') or {}
+        n = hops.get(str(pick)) if pick else None
+        if n is None:
+            return False                                   # 잴 수 없다 — 세지 않는다
+        n = abs(int(n))
+        if n == 0:                                         # 도착 — 시프트가 제 일을 했다
+            self._span_stale_ticks = 0
+            self._span_stale_ref = None
+            return False
+        if self._span_stale_ref is None or n < self._span_stale_ref:
+            self._span_stale_ref = n                       # 한 칸 줄었다 — 시계를 새로
+            self._span_stale_ticks = 0
+            return False
+        self._span_stale_ticks += 1
+        return self._span_stale_ticks >= self.span_stale_max_ticks
 
     def _span_targets_lost(self, ap, planner) -> bool:
         """이 시프트를 만든 객체가 **전부 사라졌나** ([1] span 상실 원복).
@@ -4783,6 +4841,8 @@ class KrRules:
         # 목표를 **정한 순간부터** 최소 유지 시간이 흐른다 (2026-09-10 [1]) —
         # 재타겟 직후만이 아니라 최초 시프트도 같다. 0 이면 이전 동작.
         self._retarget_lock = self.retarget_hold_ticks
+        self._span_stale_ticks = 0                         # 새 목표 = 새 시계 ([3])
+        self._span_stale_ref = None
         # 시프트가 **떠나온** 차로 = span 끝에서 복귀할 차로. 트리거가 이것도
         # 같이 봐야 한다 (아래 lane_plan).
         # **차로 키가 아니라 hop 오프셋으로 기억한다.** 키로 두면 자차가 섹션을

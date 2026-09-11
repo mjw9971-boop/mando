@@ -39,6 +39,10 @@ avoid_map:
   # 같은 로그 재생: t 130~150 의 25 s 무실행이 풀려 재타겟이 t 144.0·147.0·150.6
   # 에 3회 발화한다 (전 0회).
   retarget_by_hops_enable: true
+  # 2026-09-11 [3] — "목표는 있는데 못 가고 있는" 상태의 시한. never_stall 은
+  # route_s 가 나아가면 리셋되므로 달리는 중에는 안 걸린다(축이 다르다).
+  # 같은 로그 재생: 6회 발동, 그중 t 140.4 가 죽었던 25 s 구간 한복판이다.
+  span_stale_max_s: 8.0
   lane_map_fallback_no_queue_enable: true
   lane_map_fallback_side_enable: true
   lane_map_no_return_enable: true
