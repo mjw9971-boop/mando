@@ -201,7 +201,11 @@ _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
 # GREEN_EXEMPT_WINNERS·CROSSING_WINNERS 판정이 그대로 맞는다 (K1/K2 = light 는 면책 아님).
 _KR24_NAME = {'stop_profile': 'light', 'stop_hold': 'light', 'ped_intent': 'walker',
               'crosswalk': 'walker', 'rtor_cap': 'rtor', 'red_zone': 'red_zone',
-              'shift_cap': 'avoid', 'span_v_req': 'avoid', 'virtual_cap': 'avoid'}
+              'shift_cap': 'avoid', 'span_v_req': 'avoid', 'virtual_cap': 'avoid',
+              # K10 경로 곡률 감속 — 새 어휘. score.GREEN_EXEMPT_WINNERS 와
+              # batch_run.CROSSING_WINNERS 어디에도 넣지 않는다 (정당한 정차
+              # 원인이 아니고, 애초에 정지를 만들지 않는다).
+              'curvature': 'curvature'}
 
 
 class Runner:
@@ -411,6 +415,8 @@ class Runner:
                    'ped': self.kr.last_ped,
                    'avoid': self.kr.last_avoid,
                    'red_zone_detail': self.kr.last_red_zone,
+                   # K10 진단 (구속 지점 R·남은거리·차로). 후보값 자체는 kr.curvature.
+                   'curvature_detail': getattr(self.kr, 'last_curvature', None),
                    'escape': getattr(self.kr, 'last_escape', None),
                    'prepass_ms': self.kr.last_prepass_ms}
         if self.kr.last_signal is not None:

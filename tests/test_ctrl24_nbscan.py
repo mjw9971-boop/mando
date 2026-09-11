@@ -167,5 +167,7 @@ def test_no_target_side_is_labelled_and_other_side_used():
 def test_scan_does_not_add_a_candidate():
     kr, p, ap = rig(on_cfg(), actors=[car(2, 60.0), car(3, 10.0, LANE)])
     apply(kr, ap, v=8.0)
+    # 2026-09-11 K10 curvature 추가로 후보 키가 9 → 10 개 (값은 여기서 null).
     assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
-                               'crosswalk', 'red_zone', 'shift_cap', 'span_v_req', 'virtual_cap'}
+                               'crosswalk', 'red_zone', 'shift_cap', 'span_v_req',
+                               'virtual_cap', 'curvature'}
