@@ -1946,7 +1946,7 @@ ctrl24:
   # 판정은 전방 정지선 tl 의 controller_ids 중 하나라도 원시 state 가 6 인지로
   # 한다 — 지도 id 를 박지 않는다. 거리·감속도는 K1 값(stop_profile_a·s0)을
   # 그대로 읽어 새 임계를 만들지 않는다. 같은 정지선에서 1회만 선다.
-  flash_stop_enable: true      # 2026-09-12 활성 (off 면 state 6 판정조차 하지 않는다)
+  flash_stop_enable: false      # 2026-09-12 활성 (off 면 state 6 판정조차 하지 않는다)
   flash_stop_hold_s: 1.0       # 정지 후 유지 [s]. 채점 요구 0.5 s 의 두 배
   a_yellow: 4.0                # 황색 원샷 판정 감속 [m/s²]. 0 = 판정 없음(PDM 원문)
   yellow_guard_max_m: 60.0     # 교차로 통과 가드 상한 [m]
