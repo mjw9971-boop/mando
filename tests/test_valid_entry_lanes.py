@@ -193,7 +193,18 @@ def test_empty_pair_set_means_banned_connector(lg, field_on):
     csv = 'tests/fixtures/waypoints_pair_banned.csv'
     if not (ROOT / csv).exists():
         pytest.skip('없음')
-    rt = _build(lg, csv)
+    # 2026-09-11: route.banned_r_min_m 가 5.65(= 기하 최소회전반경 × margin)
+    # 에서 3.0(지도 결함 안전망)으로 완화되면서 R 5.43 / 4.52 는 더 이상 금지가
+    # 아니다 — 그러면 이 CSV 에도 빈 집합이 안 생겨 **전제가 사라진다**.
+    # 이 검사가 보는 것은 임계값이 아니라 "금지 연결로뿐이면 빈 집합이 된다"는
+    # 규칙이므로, 임계를 옛 기하 기준으로 **명시적으로 고정**해서 본다
+    # (기본값이 또 바뀌어도 안 깨진다 — 2026-09-07 드리프트 원칙).
+    mp = pytest.MonkeyPatch()
+    mp.setattr(BR, 'banned_r_min_m', lambda: BR.tight_turn_r_m())
+    try:
+        rt = _build(lg, csv)
+    finally:
+        mp.undo()
     empty = [e for e in rt['valid_entry_lanes'] if e['target'] == 'pair' and not e['lanes']]
     forced = {tuple(k) for _wi, k, _r in rt.get('infeasible_forced') or []}
     assert empty, '이 CSV 에 빈 집합이 있어야 이 테스트가 유효하다'

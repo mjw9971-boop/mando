@@ -175,7 +175,9 @@ def test_retry_params_present():
 def test_wide_radius_covers_road_lanes(lg):
     """도로 1926 섹션 0 은 5차로·첫↔끝 12.87 m — 넓힌 반경이 그걸 덮는다."""
     pts = wps(WIDE_CSV)
-    r = BR.dp_wide_radius(lg, pts, 1, 8.0, 16.0)
+    # 2026-09-11: 반환이 float → WideR(radius, allow, near) 로 바뀌었다
+    # (연결로에서 접근 도로를 보려면 허용 차로 집합을 같이 돌려줘야 한다).
+    r = BR.dp_wide_radius(lg, pts, 1, 8.0, 16.0).radius
     assert 12.87 < r <= 16.0
     c8, _ = BR.dp_point_candidates(lg, pts, 1, 8.0, None)
     cw, _ = BR.dp_point_candidates(lg, pts, 1, r, None)

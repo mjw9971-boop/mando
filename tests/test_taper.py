@@ -32,8 +32,13 @@ def lg():
     return LaneGraph(str(GRAPH), cfg=CFG)
 
 
-def test_params_present_default_off():
-    assert CFG['route']['taper_penalty_enable'] is False
+def test_params_present():
+    # taper_penalty_enable 은 2026-09-09 (경로 파트 실측, 경로 34건 중 4건이
+    # 끝 폭 0.00 m 차로를 피하고 대가는 +1.2 m) 로 **true 가 정본**이다.
+    # 기본값을 읽어 "꺼져 있는지" 보는 검사는 그때 드리프트가 됐다 —
+    # 2026-09-07 원칙대로 키의 **존재와 타입**만 보고, off 동작은 아래
+    # _dij(penalty=0) 처럼 사본에서 명시적으로 꺼서 본다.
+    assert isinstance(CFG['route']['taper_penalty_enable'], bool)
     assert float(CFG['route']['taper_penalty_m']) > 0
     assert float(CFG['scoring']['lane_departure_taper_handover_m']) == 0.0
 

@@ -71,7 +71,11 @@ def test_default_is_on():
 def test_dpcfg_still_builds_from_eleven_positional_args():
     """밖에서 11개 위치인자로 DPCfg 를 짓는 자리가 있다 (test_global_dp)."""
     c = BR.DPCfg(True, 8.0, 3.0, 400.0, 10.0, 1.0, 45.0, True, False, 16.0, 1.0)
-    assert c.finish_lock is True and len(c) == 12
+    # 2026-09-11: 필드가 12 → 14 로 늘었다 (retry_ratio · retry_junction 추가).
+    # 이 검사의 요점은 개수가 아니라 **11개 위치인자 호출이 아직 되는가** 와
+    # 뒤에 붙은 필드가 전부 기본값을 갖는가 다.
+    assert c.finish_lock is True and len(c) == 14
+    assert c.retry_ratio == 0.0 and c.retry_junction is False
 
 
 # ── 실제 경로 ────────────────────────────────────────────────────────────
