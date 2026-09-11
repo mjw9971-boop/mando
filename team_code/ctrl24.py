@@ -140,6 +140,21 @@ class Ctrl24:
         self.red_a = float(sp['approach_decel_mps2'])
         self.red_look_m = float(sp['red_lookahead_m'])
         self.red_v_zone = float(sp['red_zone_target_kph']) / 3.6
+        # ── K10 경로 곡률 감속 (2026-09-11) ───────────────────────────────
+        # 급커브 연결로에 빠른 속도로 들어가면 조향이 포화해도 호를 못 따라가고
+        # 밖으로 밀린다 (mjw 실측: R 6.5 m 에 25 km/h 진입 → steer −0.480 포화
+        # 9 m, 차로이탈 1.31 m, 탈출 시 +0.22 되튐). 기존 후보 9개 중 **경로
+        # 곡률을 보는 것이 없다** — K7 shift_cap 은 회피 시프트의 전이 곡률이지
+        # 지도 경로의 곡률이 아니다.
+        # 감속도는 K6 와 같은 speed.approach_decel_mps2 를 읽는다 (값을 두 곳에
+        # 적지 않는다 — 둘 다 "무언가에 닿기 전에 그 속도가 되어 있어야 한다" 는
+        # 같은 축이다).
+        self.curv_on = bool(c['curvature_cap_enable'])
+        self.curv_look_m = float(c['curvature_lookahead_m'])
+        self.curv_a_lat = float(c['curvature_a_lat_max'])
+        self.curv_min_kappa = float(c['curvature_min_kappa'])
+        self.curv_kappa: np.ndarray | None = None     # 경로당 1회 캐시 (지도 κ)
+        self.last_curvature: dict | None = None       # K10 진단
         self.a_emergency = float(cfg['speed']['a_emergency'])
         self.a_dec_max = abs(float(cfg['control']['a_dec_max']))
         self.detect_max_m = float(c['detect_max_m'])
@@ -175,6 +190,10 @@ class Ctrl24:
         # 미리보기 창의 바닥 [m] — 전이에 **닿기 전에** 감속이 시작돼야 한다.
         # 창의 속도항은 ctrl24 자신의 전이 계수(trans_k)를 쓴다 (전이 길이와 같은 축).
         self.shift_cap_look_m = float(ot.get('shift_latest_m', 25.0))
+        # K7-P 거리 프로파일 (2026-09-11). K10 _curvature_profile 의 식·상수를
+        # 그대로 재사용한다 — 감속도는 speed.approach_decel_mps2(self.red_a),
+        # 창의 제동거리 항도 v²/(2a) 로 같다. 새 상수는 이 스위치 하나뿐이다.
+        self.shift_cap_profile = bool(c['shift_cap_profile_enable'])
         # ── K8 span 이웃 연속성 (B-30) ─────────────────────────────────────
         self.span_cont = bool(c['span_v_req_enable'])
         self.span_v_min = float(c['span_v_req_min'])
@@ -1856,6 +1875,122 @@ class Ctrl24:
                               'entry_s': round(nxt, 1)}
         return v
 
+    # ── K10 경로 곡률 감속 (2026-09-11) ──────────────────────────────────────
+    def _curv_kappa(self, planner):
+        """경로점별 **지도** 곡률 |κ| [1/m] — 경로당 1회 캐시.
+
+        **기하 미분이 아니라 지도 값을 쓴다.** route_points 를 2차차분하면 지도가
+        직선인 구간에서도 κ 가 남는다 — 실측(data/route.pkl 1367.6 m, 스텐실을
+        0.5/1/2/3 m 로 바꿔 가며): 지도 κ < 0.005 인 구간에서 기하 κ 가 각각
+        0.0768 / 0.0292 / 0.0181 / 0.0177 이고 **스텐실을 넓혀도 안 사라진다**
+        (= 리샘플 잡음이 아니라 차선변경 램프·테이퍼 블렌드의 실제 횡곡률이다).
+        그대로 쓰면 v_cap 이 5.7~11.9 m/s 로 직선에서 걸려 "완만 구간 v_target
+        변화 0" 이 깨진다. 지도 κ 는 build_lane_graph 가 중앙값 필터를 먹인
+        값이라 직선에서 정확히 0 이고, build_route 리포트의 R_min 과 **같은 어휘**다.
+
+        나눠 가진 몫이 분명하다 — 회피 시프트 곡률은 K7(shift_cap)이, 계획
+        차선변경 램프는 이미 검증된 기하(lc_move_s)라 아무도 세지 않는다.
+        """
+        if self.curv_kappa is not None:
+            return self.curv_kappa
+        wps = getattr(planner, 'route_waypoints', None)
+        if not wps:
+            return None
+        lg = self._tick_lg or getattr(planner, 'lg', None)
+        if lg is None or not getattr(lg, 'lanes', None):
+            return None
+        out = np.zeros(len(wps), dtype=float)
+        i = 0
+        while i < len(wps):                       # 같은 차로 구간을 묶어 한 번에 보간
+            key = wps[i].key
+            j = i
+            while j < len(wps) and wps[j].key == key:
+                j += 1
+            rec = lg.lanes.get(key)
+            cv = None if rec is None else np.asarray(rec.get('curv'))
+            if cv is not None and cv.size:
+                sv = np.asarray(rec['s'], dtype=float)
+                ss = np.fromiter((wps[k].s for k in range(i, j)), dtype=float, count=j - i)
+                out[i:j] = np.abs(np.interp(ss, sv, cv))
+            i = j
+        self.curv_kappa = out
+        return out
+
+    def _curvature_profile(self, planner, ego_speed: float) -> float | None:
+        """K10: 앞 경로 곡률에서 나오는 **속도 상한** — min() 후보.
+
+            점별 상한  v_pt = √(curvature_a_lat_max / κ)
+            거리 반영  v_allow = min_j √(v_pt(j)² + 2·a·d_j)      d_j = 그 점까지 남은 거리
+
+        **계단이 아니라 거리 프로파일이다.** 종방향은 목표 미달분을 err/dt
+        (dt 0.05 → ×20) 로 실행하므로, 계단 목표는 0.2 m/s 만 모자라도 즉시
+        a_dec_max(−4.0) 로 포화한다 (실측 run_20260911_130348: 계단형인 K8
+        span_v_req 는 이긴 47틱 **전건**이 그 조건, 28틱이 −4.00). K1·K6 와
+        같은 √(v² + 2ad) 형태로 내면 매 틱 err ≈ a·dt = 0.1 m/s → −2.0 로
+        유지돼 포화하지 않는다.
+
+        **탐색 창은 제동거리로 정한다** (지시 (c)). 고정 15 m 는 45 km/h 에서
+        모자란다 — R 5 로 줄이는 데 36 m, 정지까지 48 m 가 필요하다.
+        창을 `curvature_lookahead_m + v²/(2a)` 로 두면 **증명적으로 충분**하다:
+        d > v²/(2a) 인 점은 v_pt 가 0 이어도 √(2ad) > v 라 구속할 수 없다.
+        앞의 상수항은 커브 자체의 길이를 덮는 바닥이다 (지도 급커브 구간 실측
+        3.3~15.3 m).
+
+        · 직선이면 κ < curvature_min_kappa 라 후보가 없다 → None (영향 0).
+        · 하한 상수를 두지 않는다 — 지도 전체 κ max 0.5699 (R 1.75 m, 차로
+          (1666,0,-3)) 라 v_cap 최솟값이 2.09 m/s 다. 정지는 만들 수 없다.
+          그래도 고착이 나면 'curvature' 는 LEGIT_KR 이 아니므로 K9 탈출
+          바닥이 들어 올린다.
+        """
+        if not self.curv_on or self.curv_a_lat <= 0.0:
+            return None
+        kap = self._curv_kappa(planner)
+        if kap is None or not len(kap):
+            return None
+        rs = getattr(planner, 'route_s', None)
+        if rs is None or not len(rs):
+            return None
+        i = int(getattr(planner, 'route_index', 0))
+        if i >= len(kap):
+            return None
+        a = self.red_a                                # speed.approach_decel_mps2
+        v = max(0.0, float(ego_speed))
+        look = self.curv_look_m + (v * v / (2.0 * a) if a > 0.0 else 0.0)
+        j1 = int(np.searchsorted(rs, rs[i] + look, side='right'))
+        j1 = min(j1, len(kap))
+        if j1 <= i:
+            return None
+        seg = kap[i:j1]
+        m = seg >= self.curv_min_kappa
+        if not m.any():
+            return None                               # 직선·완만 — 후보 없음
+        v_pt = np.sqrt(self.curv_a_lat / seg[m])
+        d = rs[i:j1][m] - rs[i]
+        allow = np.sqrt(v_pt * v_pt + 2.0 * a * np.maximum(0.0, d))
+        b = int(np.argmin(allow))
+        raw = float(allow[b])
+        # ── 상한형 바닥: 이 후보가 요구하는 감속을 a 로 묶는다 ────────────────
+        # 프로파일은 **차가 그 위에 올라타 있을 때만** 감속이 a 다. 위에 있으면
+        # 시간당 하강률이 a·v/v_allow 로 a 를 넘고, 종방향이 그 차이를 err/dt
+        # (×20)로 실행해 0.2 m/s 만 모자라도 a_dec_max(−4.0)에 포화한다.
+        # 그 뒤가 더 나쁘다 — jerk 이 내려갈 때 3배(jerk_dec_mult)라 −4.0 에서
+        # 복귀하는 데 3 s 가 걸리고, 그 사이 계속 제동해 **목표 아래로 넘어간다**.
+        # 실측 2026-09-11 폐루프(mock_vtd, route_s 805~830, R 7.60): 이 바닥이
+        # 없을 때 v 5.35 → **0.05 m/s 정지** (off 는 같은 자리 최저 4.78).
+        # 바닥을 깔면 이 후보가 낼 수 있는 감속이 정확히 a 라 포화가 구조적으로
+        # 안 난다. 창이 제동거리를 덮으므로(위 참조) 정상 접근에서는 프로파일이
+        # 이미 바닥보다 높아 이 max 가 아무것도 안 바꾼다 — 늦게 걸린 틱에서만 산다.
+        v_allow = max(raw, v - self.red_a / self.hz)
+        idx = int(np.flatnonzero(m)[b])
+        self.last_curvature = {'v_allow': round(v_allow, 2),
+                               'raw': round(raw, 2),
+                               'floored': bool(v_allow > raw + 1e-9),
+                               'd': round(float(d[b]), 1),
+                               'r_m': round(1.0 / float(seg[m][b]), 2),
+                               'v_pt': round(float(v_pt[b]), 2),
+                               'lane': list(planner.route_waypoints[i + idx].key)}
+        return v_allow
+
     # ── K7 시프트 전이 횡가속 상한 (kr_rules._shift_speed_cap 원문 이식) ──────
     def _shift_speed_cap(self, planner, ego_speed: float) -> float | None:
         """진행 중인 회피 시프트의 전이 곡률에서 나오는 **속도 상한** — min() 후보.
@@ -1896,6 +2031,13 @@ class Ctrl24:
         i = int(getattr(planner, 'route_index', 0))
         ppm = float(getattr(planner, 'points_per_meter', 10))
         look = max(self.shift_cap_look_m, self.trans_k * max(ego_speed, 0.1))
+        if self.shift_cap_profile and self.red_a > 0.0:
+            # 창에 제동거리를 더한다 (K10 과 같은 항). 창이 span[0] 에 못 닿으면
+            # cap 이 아예 안 나오고, 닿는 순간 **계단**으로 선다 — 실측
+            # run_20260911_185104: 그렇게 None 인 틱 152개, 구간 0 은 None →
+            # 9.69 한 틱에 v 11.41 위로 떨어졌다.
+            v_l = max(float(ego_speed), 0.0)
+            look += v_l * v_l / (2.0 * self.red_a)
         h = max(1, int(round(0.5 * ppm)))                   # 0.5 m 스텐실 (위 참조)
         j0 = max(i, int(self.ot_span[0]), h)
         j1 = min(len(arr) - 1 - h, int(self.ot_span[1]), i + int(look * ppm))
@@ -1906,7 +2048,24 @@ class Ctrl24:
         kappa = float(d2.max()) / (hs * hs)
         if kappa <= 1e-6:
             return None
-        return max(self.shift_cap_min_v, _math.sqrt(self.a_lat_max / kappa))
+        cap = _math.sqrt(self.a_lat_max / kappa)
+        if self.shift_cap_profile and self.red_a > 0.0:
+            # 거리 프로파일 — K1·K6·K10 과 같은 √(v² + 2ad) 형태.
+            #     v_allow = √(cap² + 2·a·d)      d = span[0] 까지 남은 거리
+            # cap 값 자체(a_lat_max)는 안 건드린다. 계단이 램프가 될 뿐이다.
+            # span 안이면 d = 0 이라 cap 그대로 — 전이 구간의 상한은 불변이다.
+            d_span = max(0.0, (int(self.ot_span[0]) - i) / ppm)
+            cap = _math.sqrt(cap * cap + 2.0 * self.red_a * d_span)
+            # 상한형 바닥 — K10 _curvature_profile 과 같은 한 줄이다.
+            # 프로파일은 **차가 그 위에 올라타 있을 때만** 감속이 a 다. 위에 있으면
+            # 시간당 하강률이 a·v/cap 으로 a 를 넘고, 종방향이 그 차이를 err/dt
+            # (dt = 1/send_hz → ×20)로 실행해 **0.2 m/s 만 모자라도** a_dec_max
+            # (−4.0)에 포화한다. 실측 2026-09-11 리플레이 8런: 이 줄이 없으면
+            # accel ≤ −3.99 가 1293 → 1431 틱(+138)이고 그중 157틱의 argmin 이
+            # kr:shift_cap 이었다 (예: v 9.66 · cap 9.445 → err −0.215 → −4.0).
+            # 이 바닥이 있으면 이 후보가 요구할 수 있는 감속이 정확히 a 다.
+            cap = max(cap, float(ego_speed) - self.red_a / self.hz)
+        return max(self.shift_cap_min_v, cap)
 
     # ── 리셋 ──────────────────────────────────────────────────────────────
     def on_reset(self) -> None:
@@ -1980,6 +2139,7 @@ class Ctrl24:
         self.last_kr = {}
         self.last_kr_winner = None
         self.last_red_zone = None
+        self.last_curvature = None
         self.ped_emergency = False
         if not self._prepass_done:
             # pre_pass 가 이미 이 틱의 회피 진단을 만들었으면 지우지 않는다 (2026-09-08
@@ -2020,6 +2180,8 @@ class Ctrl24:
         self.last_stop_profile = prof
         add('stop_profile', prof)
         add('red_zone', self._red_approach_profile(planner))
+        # K10 — 앞 경로 곡률 상한. 직선이면 None 이라 영향이 없다.
+        add('curvature', self._curvature_profile(planner, ego_speed))
         # K7 — 진행 중인 회피 시프트에서만 산다. 게이트가 아니라 상한이라,
         # 신호·보행자가 더 낮으면 그쪽이 이긴다.
         cap = self._shift_speed_cap(planner, ego_speed)

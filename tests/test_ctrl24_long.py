@@ -98,9 +98,11 @@ def test_apply_without_candidates_keeps_pdm_target():
     ctrl, t = apply(kr, ap, v=5.0, target=12.5)
     assert t == 12.5 and ctrl.accel == 1.0             # 되감지 않았다 (본류 값 그대로)
     assert kr.last_kr_winner is None
+    # 후보가 하나도 안 나도 **키는 전부 있다** (로거 관례: 안 난 후보는 null).
+    # 2026-09-11 K10 curvature 추가로 9 → 10 개.
     assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
                                'crosswalk', 'red_zone', 'shift_cap',
-                               'span_v_req', 'virtual_cap'}
+                               'span_v_req', 'virtual_cap', 'curvature'}
 
 
 # ── K1 ───────────────────────────────────────────────────────────────────

@@ -81,7 +81,10 @@ def test_off_falls_back_on_2152(lg):
         rt, err = build(lg, wps(), FORCED_SEGS)
     assert len(rt['pair_fallbacks']) == 1
     assert rt['pair_fallbacks'][0]['roads_in'] == [2152, 2190]
-    assert rt['total_length'] > 2000                # 220 m 자리에 먼 길
+    # 220 m 자리에 먼 길. 임계는 "먼 길로 갔다"만 보면 되는 느슨한 경계다 —
+    # 2026-09-11 build_route 교체로 폴백이 고르는 우회가 2081 → 1934 m 로
+    # 짧아졌다 (여전히 220 m 의 9배). 값이 아니라 축을 지킨다.
+    assert rt['total_length'] > 1500
     assert '짝이 없다' in err
 
 

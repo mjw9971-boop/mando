@@ -52,10 +52,17 @@ def lg():
     return LaneGraph(str(GRAPH))
 
 
-def _on(monkeypatch, hint=True, cap=400.0, thr=25.0):
+def _on(monkeypatch, hint=True, cap=400.0, thr=25.0, bias=0.0):
     monkeypatch.setattr(BR, '_CAND_CFG', (True, 5000))
     monkeypatch.setattr(BR, '_START_OVERRIDE', True)
     monkeypatch.setattr(BR, '_PAIR_CFG', (hint, cap, thr))
+    # 이 파일이 보는 축은 **짝 해석 스위치** 하나다. route.turn_lane_bias_m
+    # (2026-09-09 도입, 현재 기본 60) 은 진입 차로 선택에 따로 개입해 그 축을
+    # 가린다 — hint on/off 두 경로를 0.34 m 차이로 수렴시켜 아래
+    # test_switch_off_is_previous_behaviour 의 "재료가 있는 CSV" 전제를 없앤다.
+    # 그래서 여기서는 **명시적으로 0 으로 고정**한다 (기본값이 또 바뀌어도
+    # 안 깨진다 — 2026-09-07 드리프트 원칙). bias 자체의 검사는 별건이다.
+    monkeypatch.setattr(BR, '_TURN_BIAS', bias)
 
 
 def _build(lg, path):

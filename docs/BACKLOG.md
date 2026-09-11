@@ -1180,3 +1180,57 @@ VTD 실주행에서 같은 자리가 재현되는지부터 본 뒤 판단한다.
 2. **정상 시프트가 활성이면 가상 시프트를 안 만든다** (`ot_span is not None` 가드).
    06_좌회전(25.4 s)이 그래서 407 래치 틱 내내 NOOP 이었다. 중첩 가상 시프트를 허용할지는
    미결.
+
+## B-34. mjw `build_route.py` 이식 — 남은 판단거리 둘 (won1, 2026-09-11)
+
+**상태**: 이식 완료·경로 검증 완료. 아래 둘만 사람 판단 대기.
+
+won1 은 origin/won_24 에 mjw 의 `tools/build_route.py`(+351/−41) 만 덮은 브랜치다.
+없던 `route.*` 키 5개를 mjw 값·주석과 함께 넣었다
+(`banned_r_min_m` 3.0 · `dp_retry_junction_enable` true · `dp_retry_ratio` 2.0 ·
+`turn_lane_bias_m` 60.0 · `turn_lane_constraint_enable` false), `taper_penalty_enable`
+은 false → true 로 맞췄다.
+
+### (1) `banned_r_min_m: 3.0` 의 전제가 이 브랜치엔 없다
+
+mjw 주석의 완화 근거는 "`speed.curvature_cap_enable` 이 R 에 맞춰
+v ≤ √(a_lat·R) 로 눌러 주므로 옛 임계 5.65 m 는 과보수" 다.
+**이 브랜치 제어기(ctrl24)에는 커브 감속이 없다** (`speed.curvature_*` 키 자체가
+없고 소비처도 없다 — `vtd_adapter/logger.py:29` 의 `'curvature'` 후보명만 유물로
+남아 있다).
+
+관측된 결과: 루트 `waypoints.csv` 가 rc=1 → rc=0 이 됐다. R 3.07 m 연결로
+(1174,0,-1) 가 "회전 불가 기하 [오류]" 에서 "급회전 [경고]" 로 내려갔다.
+경로 자체는 안 바뀐다 — 옛 코드도 대안이 없어 "금지 해제" 로 그 연결로를 탔다.
+바뀐 것은 **게이트**다: `run_agent --csv` 는 rc=1 이면 멈추고
+`batch_run` 은 rc≠0 을 빌드 실패로 친다. 즉 전에는 사람이 한 번 보게 돼 있던
+자리를 이제 그냥 지나간다.
+
+리포트의 `v ≤ 2.77 m/s` 는 `speed.curvature_a_lat_max` **기본값 2.5** 를 가정한
+참고값이지 실제 상한이 아니다.
+
+선택지: (a) 그대로 둔다 — 우회가 이탈 감점보다 나쁘다는 규정 판단을 따른다.
+(b) `banned_r_min_m: 5.65` 로 옛 동작 복귀 — 게이트가 다시 선다.
+(c) 커브 감속을 제어기에 들인다 (**제어기 파트 소관**).
+
+### (2) DP 폴리라인 연속성 안전망이 좋은 경로를 버리는 자리
+
+mjw 코드에 DP 결과를 재샘플해 폴리라인 계단을 보는 안전망이 붙었다. 임계를
+넘으면 **짝 해석 경로로 폴백**한다. `tests/fixtures/dp/dp_01_drop_point.csv`
+(9점, 홀수)에 짝 구간을 강제로 물리면 그 폴백이 더 나쁜 경로를 고른다:
+
+|  | DP 채택 | 총거리 | 차로 |
+|---|---|---|---|
+| won_24 코드 | 예 | 749.3 m | 25 |
+| mjw 코드 | **아니오** (불연속 2.08 m > 0.3) | **1500.0 m** | 53 |
+
+`tests/test_global_dp.py::test_form_variants_agree_with_each_other` 가 이것을
+잡는다 (현재 유일하게 남은 신규 실패).
+
+**실동작에는 안 나타난다.** 빌더 CLI 의 자동 판정 경로에서는 같은 픽스처 셋 3개가
+전부 동일한 793.1 m / 26차로로 나오고, `gen_scenarios` 는 홀수 경유점 CSV 를
+호출 전에 거절한다 (`_build_from_rows`). 강제 짝 경로를 쓰는 곳은 그 테스트와
+`tools/perturb_route_test.py` 뿐이다.
+
+판단거리: 안전망 임계(0.3 m)를 올릴지, 폴백 대신 "DP 유지 + WARN" 으로 바꿀지,
+아니면 테스트 쪽 전제를 짝 강제에서 자동 판정으로 옮길지.
