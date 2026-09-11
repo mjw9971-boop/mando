@@ -35,6 +35,10 @@ avoid_map:
   lane_map_obb_yaw_vtd_enable: true
   # 2026-09-10 [1] — 목표 최소 유지 3 s. 마진은 섹션 구멍 때문에 무효였다.
   retarget_min_hold_s: 3.0
+  # 2026-09-11 [2] — 재타겟 판정을 자차 물리 차로 기준 잔여 칸수로.
+  # 같은 로그 재생: t 130~150 의 25 s 무실행이 풀려 재타겟이 t 144.0·147.0·150.6
+  # 에 3회 발화한다 (전 0회).
+  retarget_by_hops_enable: true
   lane_map_fallback_no_queue_enable: true
   lane_map_fallback_side_enable: true
   lane_map_no_return_enable: true

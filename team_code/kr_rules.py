@@ -658,6 +658,9 @@ class KrRules:
             float(_lm.get('retarget_min_hold_s', 0.0)) * self.hz))
         self._retarget_lock = 0                    # 남은 잠금 틱
         self._retarget_why = None                  # 이번 틱 재타겟 차단 사유 (진단)
+        # 재타겟 판정을 **자차 물리 차로 기준 잔여 칸수**로 (2026-09-11 [2]).
+        # false = 이전 동작(`ot_target` 의도 비교). `_lm_retarget` 주석 참고.
+        self.retarget_by_hops = bool(_lm.get('retarget_by_hops_enable', False))
         # (4) owns_shift 에서 계획한 쪽이 기각되면 차선책·반대쪽으로 폴백할지.
         # false = 이전 동작 (계획한 쪽 하나만 보고 그 틱은 포기).
         self.lm_fallback = bool(_lm.get('lane_map_fallback_side_enable', False))
@@ -3882,7 +3885,29 @@ class KrRules:
         if not pick:
             self._retarget_why = 'no_pick'
             return False
-        if self.ot_target is not None and str(list(self.ot_target)) == str(pick):
+        # 판정 축은 **자차 물리 차로 기준 잔여 칸수**다 (2026-09-11 [2]).
+        #
+        # 예전에는 `ot_target`(시프트를 만들 때 적어 둔 **의도**)과 `pick` 을 비교해
+        # "이미 그리로 가는 중" 이면 끝냈다. 그런데 의도와 기하가 어긋날 수 있다:
+        # 시프트는 그때 연 **칸 수만큼만** 움직이고, 도중에 차로가 생기거나 없어지면
+        # 같은 횡변위가 다른 차로에 떨어진다.
+        # 실측 run_20260911_001250: t 129.9 재타겟이 `ot_target = (2011,0,-1)` 로
+        # 한 칸을 열었는데, 그 사이 road 2011 이 sec0/1 `[-3,-2,-1]` → sec2
+        # `[-4,-3,-2,-1]` → sec5 `[-5,-4,-3,-2,-1]` 로 **안쪽에 차로가 생겨**
+        # 번호가 밀렸다. 한 칸은 새로 생긴 차로에 떨어졌고 −1 은 여전히 한 칸 밖인데,
+        # 게이트는 `pick == ot_target` 이라 t 130~150 의 **25 s 를 전부 막았다**
+        # (`retarget_why` 가 그 구간 내내 `margin:+0.0`). 그동안 여유가
+        # 69.5 → 20.8 m 로 줄어 결국 `ramp_too_late` 로 끝났다.
+        #
+        # `lane_map.hops` 는 **자차가 지금 밟고 있는 차로 기준** 오프셋이라
+        # 의도도 섹션 번호도 타지 않는다. 0 이면 도착한 것이고, 그 밖이면
+        # 아직 그만큼 남은 것이다. false = 이전 동작(`ot_target` 비교).
+        if self.retarget_by_hops:
+            _h = ((self.last_lane_map or {}).get('hops') or {}).get(str(pick))
+            if _h is not None and int(_h) == 0:
+                self._retarget_why = 'arrived'
+                return False                               # 이미 그 차로에 있다
+        elif self.ot_target is not None and str(list(self.ot_target)) == str(pick):
             self._retarget_why = 'same_target'
             return False                                   # 이미 그리로 가는 중
         # 최소 유지 시간 — 한 번 정했으면 그동안은 안 바꾼다 (2026-09-10 [1]).
@@ -3898,17 +3923,29 @@ class KrRules:
             return False
         # 최소 이득 — 새 목표가 지금 목표보다 lane_switch_margin_m 만큼은 더
         # 뚫려 있어야 갈아탄다. 매 틱 목표가 흔들리면 램프를 계속 다시 그린다.
-        if self.lm_switch_margin > 0.0 and self.ot_target is not None:
+        # 최소 이득 — 옛 기준은 "지금 **목표** 대비" 였다. 목표가 같은 차로면
+        # 이득이 언제나 0 이라 게이트가 자기 자신을 막는다 (위 실측의 25 s).
+        # hop 축에서는 "지금 **밟고 있는 차로** 대비" 가 맞는 질문이다 —
+        # 흔들림 억제는 `retarget_min_hold_s`(시간 축)가 맡는다.
+        if self.lm_switch_margin > 0.0:
             free = ((self.last_lane_map or {}).get('free_run') or {})
-            new_f = self._free_of(free, pick)
-            cur_f = self._free_of(free, self.ot_target)
-            if (new_f is not None and cur_f is not None
-                    and float(new_f) - float(cur_f) < self.lm_switch_margin):
-                self._retarget_why = 'margin:%+.1f' % (float(new_f) - float(cur_f))
-                return False
+            ref = (str((self.last_lane_map or {}).get('ego_lane'))
+                   if self.retarget_by_hops else self.ot_target)
+            if ref is not None:
+                new_f = self._free_of(free, pick)
+                cur_f = self._free_of(free, ref)
+                if (new_f is not None and cur_f is not None
+                        and float(new_f) - float(cur_f) < self.lm_switch_margin):
+                    self._retarget_why = 'margin:%+.1f' % (float(new_f) - float(cur_f))
+                    return False
         corridor = self._corridor_blockers(ap, planner)
         new = [c for c in corridor if c[3].id not in set(self.ot_ids)]
-        if not new:
+        # hop 축에서는 **이미 아는 장애물도 사유가 된다**. 여기까지 온 것은
+        # "아직 칸이 남았다(0 이 아니다) ∧ 목표 차로가 지금 차로보다 낫다" 는
+        # 뜻이고, 그때 필요한 것은 새 장애물이 아니라 **한 칸을 더 여는 것**이다.
+        # 옛 조건(새 장애물 필수)은 목표가 바뀌는 경우만 상정한 것이다.
+        pool = new if new else (corridor if self.retarget_by_hops else [])
+        if not pool:
             self._retarget_why = 'no_new_blocker:%d' % len(corridor)
             return False                                   # 새 장애물이 없다
         lg = getattr(planner, 'lg', None)
@@ -3916,11 +3953,13 @@ class KrRules:
         if lg is None or ego_lane is None:
             self._retarget_why = 'no_lane'
             return False
-        chain = self._chain(corridor, new[0][3])
+        chain = self._chain(corridor, pool[0][3])
         side = lp.get('side')
         n_pass = 1
         self.last_avoid = {'state': 'RETARGET', 'from': list(self.ot_target or ()),
-                           'to': pick, 'new_blocker': int(new[0][3].id),
+                           'to': pick, 'new_blocker': int(pool[0][3].id),
+                           'hops_left': ((self.last_lane_map or {}).get('hops')
+                                         or {}).get(str(pick)),
                            'span_before': list(self.ot_span)}
         ok = self._side_pass(ap, planner, ego_speed, chain, False,
                              lg, ego_lane, self._ego_local_s(lg, ap), n_pass)
