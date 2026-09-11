@@ -190,6 +190,10 @@ class Ctrl24:
         # 미리보기 창의 바닥 [m] — 전이에 **닿기 전에** 감속이 시작돼야 한다.
         # 창의 속도항은 ctrl24 자신의 전이 계수(trans_k)를 쓴다 (전이 길이와 같은 축).
         self.shift_cap_look_m = float(ot.get('shift_latest_m', 25.0))
+        # K7-P 거리 프로파일 (2026-09-11). K10 _curvature_profile 의 식·상수를
+        # 그대로 재사용한다 — 감속도는 speed.approach_decel_mps2(self.red_a),
+        # 창의 제동거리 항도 v²/(2a) 로 같다. 새 상수는 이 스위치 하나뿐이다.
+        self.shift_cap_profile = bool(c['shift_cap_profile_enable'])
         # ── K8 span 이웃 연속성 (B-30) ─────────────────────────────────────
         self.span_cont = bool(c['span_v_req_enable'])
         self.span_v_min = float(c['span_v_req_min'])
@@ -2021,6 +2025,13 @@ class Ctrl24:
         i = int(getattr(planner, 'route_index', 0))
         ppm = float(getattr(planner, 'points_per_meter', 10))
         look = max(self.shift_cap_look_m, self.trans_k * max(ego_speed, 0.1))
+        if self.shift_cap_profile and self.red_a > 0.0:
+            # 창에 제동거리를 더한다 (K10 과 같은 항). 창이 span[0] 에 못 닿으면
+            # cap 이 아예 안 나오고, 닿는 순간 **계단**으로 선다 — 실측
+            # run_20260911_185104: 그렇게 None 인 틱 152개, 구간 0 은 None →
+            # 9.69 한 틱에 v 11.41 위로 떨어졌다.
+            v_l = max(float(ego_speed), 0.0)
+            look += v_l * v_l / (2.0 * self.red_a)
         h = max(1, int(round(0.5 * ppm)))                   # 0.5 m 스텐실 (위 참조)
         j0 = max(i, int(self.ot_span[0]), h)
         j1 = min(len(arr) - 1 - h, int(self.ot_span[1]), i + int(look * ppm))
@@ -2031,7 +2042,24 @@ class Ctrl24:
         kappa = float(d2.max()) / (hs * hs)
         if kappa <= 1e-6:
             return None
-        return max(self.shift_cap_min_v, _math.sqrt(self.a_lat_max / kappa))
+        cap = _math.sqrt(self.a_lat_max / kappa)
+        if self.shift_cap_profile and self.red_a > 0.0:
+            # 거리 프로파일 — K1·K6·K10 과 같은 √(v² + 2ad) 형태.
+            #     v_allow = √(cap² + 2·a·d)      d = span[0] 까지 남은 거리
+            # cap 값 자체(a_lat_max)는 안 건드린다. 계단이 램프가 될 뿐이다.
+            # span 안이면 d = 0 이라 cap 그대로 — 전이 구간의 상한은 불변이다.
+            d_span = max(0.0, (int(self.ot_span[0]) - i) / ppm)
+            cap = _math.sqrt(cap * cap + 2.0 * self.red_a * d_span)
+            # 상한형 바닥 — K10 _curvature_profile 과 같은 한 줄이다.
+            # 프로파일은 **차가 그 위에 올라타 있을 때만** 감속이 a 다. 위에 있으면
+            # 시간당 하강률이 a·v/cap 으로 a 를 넘고, 종방향이 그 차이를 err/dt
+            # (dt = 1/send_hz → ×20)로 실행해 **0.2 m/s 만 모자라도** a_dec_max
+            # (−4.0)에 포화한다. 실측 2026-09-11 리플레이 8런: 이 줄이 없으면
+            # accel ≤ −3.99 가 1293 → 1431 틱(+138)이고 그중 157틱의 argmin 이
+            # kr:shift_cap 이었다 (예: v 9.66 · cap 9.445 → err −0.215 → −4.0).
+            # 이 바닥이 있으면 이 후보가 요구할 수 있는 감속이 정확히 a 다.
+            cap = max(cap, float(ego_speed) - self.red_a / self.hz)
+        return max(self.shift_cap_min_v, cap)
 
     # ── 리셋 ──────────────────────────────────────────────────────────────
     def on_reset(self) -> None:
