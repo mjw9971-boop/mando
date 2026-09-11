@@ -129,7 +129,7 @@ red_zone:
 speed:
   # 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
   # (phase3: VtdRoutePlanner 가 speed_limits 에 반영)
-  margin_kph: 3.0
+  margin_kph: 6.0
   # 붉은 구간(감속 구간)을 **차로 s 로** 판정할지 (lanegraph.speed_limit_at).
   # true = red_spans 안이면 red_zone.limit_kph, 붉은 차로인데 구간 밖이면
   #        호환값(speed_src='red_compat')을 무시하고 None → carry.
