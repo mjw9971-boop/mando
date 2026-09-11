@@ -165,7 +165,7 @@ speed:
   red_zone_target_kph: 27.0
   # 진입 감속에 쓸 감속도 [m/s²]. speed.a_min(-6.0) 보다 훨씬 완만하다 — 미리
   # 눌러 두는 천장이지 제동이 아니다.
-  approach_decel_mps2: 1.5
+  approach_decel_mps2: 1.2
   # 진입점 탐색 거리 [m]. 45 km/h → 27 km/h 에 25 m 이므로 60 이면 충분하다.
   red_lookahead_m: 60.0
   # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
