@@ -621,6 +621,11 @@ class KrRules:
         # 순수 제한속도(아무도 안 줄인 틱)도 상한으로 실행할지 (실주행 2차 [1]).
         # false = 이전 동작 (곡률·LC·붉은구간 접근만 상한 축).
         self.cap_limit = bool(cfg['control'].get('cap_limit_target_enable', False))
+        # 시프트 전이 상한(`shift_cap`)·gap_fit 속도 연동을 **상한 축**으로 옮긴다.
+        # 둘 다 "이 속도를 넘지 마라" 인데 err/dt 축에 실려 있었다 — `_apply` 의
+        # 후보표 주석 참고. false = 이전 동작.
+        self.cap_axis_shift = bool(
+            cfg['control'].get('cap_axis_shift_enable', False))
         # ── 차로 지도 (커밋 A, 읽기 전용) ────────────────────────────────
         _lm = cfg.get('avoid_map') or {}
         self.lane_map_on = bool(_lm.get('lane_map_avoid_enable', False))
@@ -6566,14 +6571,26 @@ class KrRules:
         add('no_accel_red', self._no_accel_red_cap(planner, ap, ego_speed), 'cap')
 
         # 시프트 전이 횡가속 상한 (P1) — 진행 중인 회피 시프트에서만 산다.
+        #
+        # **상한형이다** (2026-09-11 [1]). `_shift_speed_cap` 은 v ≤ √(a_lat_max/κ)
+        # 를 내는 정상상태 상한이지 "1틱 뒤에 이 속도가 되어라" 가 아니다.
+        # 그런데 `'cap'` 표시 없이 등록돼 IDM err/dt 축(20배 증폭)에 실려 있었다 —
+        # 바로 옆의 curvature·lc_cap·lane_map 은 전부 'cap' 이다.
+        # 실측 run_20260911_001250 t 136.2: v 4.44, 목표 3.74 (초과 **0.70 m/s**)
+        # 인데 accel **−4.00**(바닥) → v 4.44 → 0.00 을 1.5 s 에 완주하고 정지,
+        # 그 뒤 jerk 램프로 다시 가속. 여유가 36 m 있는데 선 것이다.
+        # 그 정지 때문에 램프가 진행을 못 해 앞선 시프트가 안 끝나고, 새 목표를
+        # 못 만들어 거리를 다 쓰는 연쇄로 이어졌다 (총 정지 60 s).
+        # CLAUDE.md 「확정 사실」의 `_raw_accel` err/dt 항목 그대로다.
+        _ax = 'cap' if self.cap_axis_shift else 'stop'
         cap = self._shift_speed_cap(planner, ego_speed)
-        add('shift_cap', cap)
+        add('shift_cap', cap, _ax)
         if cap is not None:
             self.last_avoid = dict(self.last_avoid or {}, shift_cap=round(cap, 2))
         # gap_fit 속도 연동 — 짧은 전이를 만들려면 v ≤ trans / shift_k_s 여야 한다.
         # `_shift_speed_cap` 과 **같은 자리·같은 방식**의 min() 후보다. 오버라이드가
         # 아니라 상한이라, 신호·보행자·standoff 가 더 낮으면 그쪽이 이긴다.
-        add('gap_fit', self.gap_v_req)
+        add('gap_fit', self.gap_v_req, _ax)
 
         # BREAKOUT 크립 — 훅이 PDM 후보를 무효화한 뒤, 상한은 여전히 min() 이다.
         if self.breakout_creep():

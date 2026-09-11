@@ -66,3 +66,9 @@ percep:
 speed:
   # 붉은 구간 진입 전 감속의 하한 [km/h]. 0 = 이전 동작(하한 없음).
   red_approach_min_kph: 10.0
+
+control:
+  # 2026-09-11 [1] — shift_cap·gap_fit 을 상한 축으로. 실측 run_20260911_001250
+  # 재생: shift_cap 이 이긴 810틱에서 −4.0 포화 **46틱 → 0**, 그 축 최소
+  # accel −4.00 → −1.50. 전 주행 min accel 은 −8.00 그대로(정지 축 불변).
+  cap_axis_shift_enable: true
