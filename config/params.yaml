@@ -2056,7 +2056,7 @@ ctrl24:
   shift_ahead_m: 0.5           # 전이 시작을 자차 앞 이만큼 [m] (정지 상태 조향 풀락 방지)
   extra_before_m: 1.0          # 장애물 앞뒤 여유 [m]
   extra_after_m: 1.0
-  chain_gap_m: 10            # 연쇄 병합 [m] = extra_after + trans_min
+  chain_gap_m: 30            # 연쇄 병합 [m] = extra_after + trans_min
   # 유일한 side 게이트 — 시프트 시작점이 자차보다 이만큼 앞이면 기각 (순환 코스 안전망)
   span_gate_max_m: 100.0
   # 이 미만의 횡변위는 시프트가 아니다 (이웃 없음 → route.py 폴백이 원 경로 유지).
