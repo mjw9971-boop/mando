@@ -193,6 +193,12 @@ class Ctrl24:
         self.esc_red_defer = bool(c['escape_red_defer_enable'])
         self.esc_red_m = float(c['escape_red_defer_stopline_m'])
         self.esc_red_ticks = int(round(float(c['escape_red_defer_s']) * self.hz))
+        # 리스폰 뒤 시프트 상태 원복 (2026-09-11). 순간이동은 '상태를 처음으로' 인데
+        # 밀린 route_points 와 ot_* 가 남아 자차가 원 차로 중심에 놓인 채 플래너만
+        # 2.6 m 옆을 가리켰다 — 조향이 -0.480 으로 포화하고, 밀린 경로에 붙으면 VTD 가
+        # 다시 리스폰해 4.2 s 주기로 돌았다 (실측 2026-09-11,
+        # logs/적색신호,대기중 차량 문제 t=59.65→63.85, 리셋 후 125틱 중 96틱 포화).
+        self.reset_restore = bool(c['reset_restore_span_enable'])
         self.esc_virt = bool(c['escape_virtual_shift_enable'])
         self.esc_virt_extra = float(c['escape_virtual_extra_m'])
         self.esc_virt_v = float(c['escape_virtual_v'])
@@ -1932,6 +1938,37 @@ class Ctrl24:
         self._esc_defer_ticks = 0                     # 적색 유예 (순간이동 = 새 접근)
         self._esc_deferring = False
         self._esc_rearmed = []
+        self._reset_shift_state()
+
+    def _reset_shift_state(self) -> None:
+        """리스폰 뒤 시프트 상태를 처음으로 — 밀린 경로 원복 + 시프트 래치 비움.
+
+        순간이동은 진행이 아니라 '되돌림' 이다. 밀린 route_points 를 그대로 두면
+        자차는 원 차로 중심에 놓이는데 플래너만 옆 차로를 가리켜 횡오차가 시프트
+        변위(2.6 m)만큼 벌어지고, 횡제어가 최대 조향으로 밀린 경로를 쫓다가 거기
+        붙으면 VTD 가 다시 리스폰한다 (4.2 s 주기).
+
+        원복은 전이 도중이어도 안전하다 — 시프트는 route_points[a:b] 안에서만 쓰고
+        ot_span 은 겹친 span 의 합집합이라, 그 구간을 original_route_points 로
+        덮으면 바뀐 인덱스가 전부 되돌아간다. 구간 밖은 애초에 원본이므로 경계에
+        계단이 생기지 않는다. 킬스위치가 꺼져 있으면 아무것도 하지 않는다.
+        """
+        if not self.reset_restore:
+            return
+        planner = getattr(self._ap, '_waypoint_planner', None)
+        if planner is not None and self.ot_span is not None:
+            try:
+                self._restore_span(planner)               # ot_* · nested · _shifted_for 도 비운다
+            except Exception:                             # noqa: BLE001 — 목 플래너
+                pass
+        self.ot_span = None
+        self.ot_side = None
+        self.nested = 0
+        self._shifted_for.clear()
+        self._virt_span = None                            # 가상 시프트도 시프트 상태다
+        self._virt_wait = 0
+        self.last_span_plan = None
+        self.span_v_req = None
 
     # ── 틱 ────────────────────────────────────────────────────────────────
     def _tick_head(self, ap, planner, ego_speed: float) -> None:
