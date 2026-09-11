@@ -212,6 +212,7 @@ class Ctrl24:
         self.esc_red_defer = bool(c['escape_red_defer_enable'])
         self.esc_red_m = float(c['escape_red_defer_stopline_m'])
         self.esc_red_ticks = int(round(float(c['escape_red_defer_s']) * self.hz))
+        self.esc_defer_rearm = bool(c['escape_defer_release_rearm_enable'])
         # 리스폰 뒤 시프트 상태 원복 (2026-09-11). 순간이동은 '상태를 처음으로' 인데
         # 밀린 route_points 와 ot_* 가 남아 자차가 원 차로 중심에 놓인 채 플래너만
         # 2.6 m 옆을 가리켰다 — 조향이 -0.480 으로 포화하고, 밀린 경로에 붙으면 VTD 가
@@ -313,6 +314,7 @@ class Ctrl24:
         self._esc_rearmed: list = []              # 이번 걸림에서 재무장한 객체 id
         self._esc_defer_ticks = 0                 # 적색 정지선 앞 유예 누적 (조건 깨지면 0)
         self._esc_deferring = False               # 이번 틱 유예 여부 (틱당 1회 계산)
+        self._esc_prev_c = False                  # 직전 틱 C (전이 검출용 — 상태는 이것뿐)
         self._virt_span: tuple | None = None      # 가상 시프트 구간 (속도 상한용)
         self._virt_wait = 0                       # 대향 대기 틱 (진단)
         self._nb_cache: dict = {}                 # (side, n_steps) → 이웃 연속성 bool 배열
@@ -2356,6 +2358,20 @@ class Ctrl24:
         nxt = self._next_stopline(planner)
         ok = (nxt is not None and nxt[1] == 'Red'
               and nxt[0] is not None and float(nxt[0]) <= self.esc_red_m)
+        if self.esc_defer_rearm:
+            # C 가 **참 → 거짓으로 바뀌는 그 틱**에만. 거짓→거짓은 아무것도 하지 않는다
+            # (매 틱 리셋 금지). 적색 대기 동안 _esc_hist 는 계속 찼고 legit_alive 로만
+            # 억제됐으므로, 해제 틱에 그대로 두면 곧바로 고착으로 판정된다 —
+            # 실측 8런 43전이 중 전이 틱에 바닥이 깔린 23건의 20건이 그 경우다.
+            # 여기서 푸는 집합은 on_reset 의 K9 네 줄과 **같다** (같이 고칠 것).
+            # _escape_tick 이 이 함수보다 먼저 돌므로, 그 틱에 막 선 래치도 여기서
+            # 풀리고 _escape_floor 가 뒤에 돌아 바닥이 안 깔린다.
+            if self._esc_prev_c and not ok:
+                self._esc_hist.clear()
+                self._esc_engaged = False
+                self._esc_mark = None
+                self._esc_xy = None
+            self._esc_prev_c = ok
         if not (ok and self._esc_engaged):
             self._esc_defer_ticks = 0
             return False
