@@ -165,7 +165,7 @@ speed:
   red_zone_target_kph: 27.0
   # 진입 감속에 쓸 감속도 [m/s²]. speed.a_min(-6.0) 보다 훨씬 완만하다 — 미리
   # 눌러 두는 천장이지 제동이 아니다.
-  approach_decel_mps2: 2.0
+  approach_decel_mps2: 1.5
   # 진입점 탐색 거리 [m]. 45 km/h → 27 km/h 에 25 m 이므로 60 이면 충분하다.
   red_lookahead_m: 60.0
   # 종방향 명령 한계 (phase3 VtdLongitudinalController 가 사용)
@@ -1158,7 +1158,7 @@ overtake:
   # 경로를 다시 밀지 않고(급조향 금지 원칙) **속도 상한**을 min() 후보로 덧댄다:
   #   κ = |d²(lat_shift)/ds²|,  v_cap = √(a_lat_max / κ)
   # 0 이면 비활성 = 이전 동작.
-  a_lat_max: 1.5
+  a_lat_max: 1.0
   # 위 상한의 하한 [m/s] — 전이 곡률이 아무리 커도 이 밑으로는 안 내린다
   # (전이 한복판에서 완전 정지하면 빠져나올 수 없다).
   shift_cap_min_v: 1.0
