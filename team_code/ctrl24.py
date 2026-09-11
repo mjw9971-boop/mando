@@ -106,9 +106,6 @@ class Ctrl24:
         self.sl_hold_ticks = int(round(float(c['stopline_hold_s']) * self.hz))
         self.sl_min_ticks = int(round(float(c['stopline_hold_min_s']) * self.hz))
         self.sl_near_m = float(c['stopline_hold_near_m'])
-        # K11 — 적색 점멸 일시정지 (항목 9, 2026-09-12). 상수는 K1 것을 읽는다.
-        self.flash_on = bool(c['flash_stop_enable'])
-        self.flash_hold_ticks = int(round(float(c['flash_stop_hold_s']) * self.hz))
         # ap.config 를 못 읽는 환경(목)에서만 쓰는 폴백 — 정상 경로는 PDM 주입값
         self.stop_gap_sl_fallback = float(cfg['speed']['stop_gap_stopline_m']) + self.front
         # 황색 원샷 판정·교차로 통과 가드
@@ -275,10 +272,6 @@ class Ctrl24:
         self.sl_hold_left = 0
         self.sl_stopped = False
         self.sl_stop_ticks = 0
-        # K11 적색 점멸 — 전용 상태 셋. 기존 변수를 재사용하지 않는다.
-        self._raw_light: dict = {}                # 9910 원시 state (controller id → state)
-        self._flash_hold = 0                      # 남은 유지 틱
-        self._flash_done: set = set()             # 이미 선 점멸 정지선 (1회 제한)
         # 황색 래치 / 가드
         self.y_decision: str | None = None
         self.y_ctrl: int | None = None
@@ -505,61 +498,6 @@ class Ctrl24:
         if a_eff <= 0.0:
             return None
         return _math.sqrt(2.0 * a_eff * max(0.0, d_line - self._s0(ap)))
-
-    def _flash_stop(self, planner, ap) -> float | None:
-        """K11: 적색 점멸 정지선 앞 일시정지 (채점 항목 9). min() 후보.
-
-        점멸 판정은 전방 정지선 tl 의 controller_ids 중 하나라도 9910 **원시**
-        state 가 6 인지로 한다 — 지도 id 를 박지 않는다. LIGHT_STATE_MAP 이 6 을
-        Green 으로 뭉개 _stop_target_raw 가 못 보는 것을, 여기서만 원시값으로
-        되살린다 (매핑도 기존 색 해석도 건드리지 않는다).
-
-        거리·감속도는 K1 이 쓰는 값(stop_profile_a · _s0)을 그대로 읽는다 — 새
-        임계가 없다. 프로파일이 0 이 되는 지점은 뒷축 d = s0 이고 앞범퍼 여유가
-        speed.stop_gap_stopline_m(2.0 m) 다. 채점 항목 9 의 stop_ok_m 과 같은 값이라
-        선을 넘기 전에 선다. 정지 판정 0.5 m/s 는 K2 _stopline_hold 와 같은 값이고,
-        무장 창은 K2 의 stopline_hold_near_m 를 그대로 쓴다.
-
-        같은 정지선에서 1회만 선다 — 유지가 끝나면 그 정지선을 _flash_done 에
-        넣어 재접근해도 다시 서지 않는다 (통과 후 뒤돌아 서는 것을 막는다).
-        """
-        if not self.flash_on:
-            return None                                # off — state 6 판정조차 않는다
-        tls = getattr(planner, 'next_traffic_lights', None)
-        dists = getattr(planner, 'distances_to_next_traffic_lights', None)
-        if tls is None or dists is None:
-            return None
-        tl = tls[planner.route_index]
-        if tl is None:
-            return None                                # 정지선 매핑 없음
-        cids = [int(c) for c in (getattr(tl, 'controller_ids', None)
-                                 or [getattr(tl, 'id', -1)])]
-        if not any(self._raw_light.get(c) == 6 for c in cids):
-            return None                                # 점멸이 아니다 (6 = 점멸)
-        key = (int(getattr(tl, 'id', -1)), round(float(getattr(tl, 'route_s', 0.0)), 1))
-        if key in self._flash_done:
-            return None                                # 이 정지선은 이미 섰다
-        if self._flash_hold > 0:                       # 정지 유지 중
-            self._flash_hold -= 1
-            if self._flash_hold <= 0:
-                self._flash_done.add(key)
-            return 0.0
-        d_line = float(dists[planner.route_index])
-        if d_line - self.front <= 0.0:
-            # 앞범퍼가 이미 선을 넘었다 — 지금 서면 교차로 안이고 항목 9 도 인정되지
-            # 않는다 (채점은 front_m ≤ 0 구간의 정지만 센다). 기회가 끝났으니 이
-            # 정지선을 닫는다. 9910 이 신호 보고를 멈춰도 캐시가 남아 다시 서는 것을
-            # 여기서 함께 막는다 (실측 2026-09-12: 보고 중단 다음 틱에 0 을 냈다).
-            self._flash_done.add(key)
-            return None
-        try:
-            ego_speed = float(ap._vehicle.get_velocity().length())
-        except Exception:                              # noqa: BLE001 — 목 조립
-            ego_speed = 0.0
-        if ego_speed < 0.5 and (d_line - self.front) < self.sl_near_m:
-            self._flash_hold = self.flash_hold_ticks   # 무장 (K2 와 같은 근접 창)
-            return 0.0
-        return _math.sqrt(2.0 * self.stop_profile_a * max(0.0, d_line - self._s0(ap)))
 
     def _stopline_hold(self, planner, ego_speed: float) -> float | None:
         """K2: 정지선 6 m 안 정지 시 1회 무장 stopline_hold_s. 녹색 전환·래치 해제 시
@@ -877,9 +815,8 @@ class Ctrl24:
     def observe_lights(self, lights) -> None:
         """9910 lights [(id, state)] — 보고 시각만 센다 (state 는 플래너가 갱신)."""
         self._obs_tick += 1
-        for lid, state in lights or []:
+        for lid, _state in lights or []:
             self._light_seen[int(lid)] = self._obs_tick
-            self._raw_light[int(lid)] = int(state)     # K11 — 점멸(6)은 매핑에서 사라진다
 
     def _signal_stale(self, planner) -> dict | None:
         """다음 정지선 controller 의 미보고 판정 → 진단 dict. 관측이 없거나 대상 없음 → None."""
@@ -2142,9 +2079,6 @@ class Ctrl24:
         self.sl_hold_left = 0
         self.sl_stopped = False
         self.sl_stop_ticks = 0
-        self._raw_light.clear()                       # K11 — 순간이동 = 새 접근
-        self._flash_hold = 0
-        self._flash_done.clear()
         self.ped_lat.clear()
         self.ped_intent.clear()
         self.ped_clear.clear()
@@ -2264,7 +2198,6 @@ class Ctrl24:
                                    shift_cap=round(float(cap), 2))
         add('stop_hold', self._stopline_hold(planner, ego_speed))
         add('rtor_cap', self._rtor_cap())
-        add('flash_stop', self._flash_stop(planner, ap))      # K11 적색 점멸 (항목 9)
         ped = self._ped_intent(planner, ap, ego_speed)
         ped_bind = False
         if ped is not None:

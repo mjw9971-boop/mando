@@ -129,7 +129,7 @@ red_zone:
 speed:
   # 제한속도에서 항상 빼고 달릴 여유. 감점이 시간보다 비싸다.
   # (phase3: VtdRoutePlanner 가 speed_limits 에 반영)
-  margin_kph: 5.0
+  margin_kph: 3.0
   # 붉은 구간(감속 구간)을 **차로 s 로** 판정할지 (lanegraph.speed_limit_at).
   # true = red_spans 안이면 red_zone.limit_kph, 붉은 차로인데 구간 밖이면
   #        호환값(speed_src='red_compat')을 무시하고 None → carry.
@@ -1938,16 +1938,6 @@ ctrl24:
   stopline_hold_s: 0.0         # K2 정지선 6 m 안 정지 시 유지 [s]. 0 = 비활성
   stopline_hold_min_s: 0.0     # 녹색 전환·래치 해제 시 남기는 최소 정지 [s]. 0 = 비활성
   stopline_hold_near_m: 6.0    # 홀드를 무장하는 정지선 근접 창 [m, 앞범퍼]
-  # ── K11 적색 점멸 일시정지 (채점 항목 9, 2026-09-12) ───────────────────
-  # LIGHT_STATE_MAP 이 9910 state 6(점멸)을 Green 으로 뭉개 _stop_target_raw 가
-  # 못 본다 → K1·K2·P3 어느 것도 안 뜨고 무정차 통과한다. 실측(logs/적색점멸 3런):
-  # 정지선 최근접 앞범퍼 +0.11 / -0.01 / +0.09 m 를 24.2~24.7 km/h 로 지났고,
-  # 선을 넘기 전 v<0.5 가 한 틱도 없어 항목 9 가 3런 모두 1건 -6 이다.
-  # 판정은 전방 정지선 tl 의 controller_ids 중 하나라도 원시 state 가 6 인지로
-  # 한다 — 지도 id 를 박지 않는다. 거리·감속도는 K1 값(stop_profile_a·s0)을
-  # 그대로 읽어 새 임계를 만들지 않는다. 같은 정지선에서 1회만 선다.
-  flash_stop_enable: false      # 2026-09-12 활성 (off 면 state 6 판정조차 하지 않는다)
-  flash_stop_hold_s: 1.0       # 정지 후 유지 [s]. 채점 요구 0.5 s 의 두 배
   a_yellow: 4.0                # 황색 원샷 판정 감속 [m/s²]. 0 = 판정 없음(PDM 원문)
   yellow_guard_max_m: 60.0     # 교차로 통과 가드 상한 [m]
   # ── K3·K4·K5 보행자 ────────────────────────────────────────────────────
