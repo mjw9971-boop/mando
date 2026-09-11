@@ -200,6 +200,9 @@ _HAZARD_NAME = {'pedestrian': 'walker', 'red_light': 'light', 'leading': 'lead',
 # ctrl24 kr 후보(reasons.kr) → winner 어휘. 기존 어휘를 유지해 score/batch_run 의
 # GREEN_EXEMPT_WINNERS·CROSSING_WINNERS 판정이 그대로 맞는다 (K1/K2 = light 는 면책 아님).
 _KR24_NAME = {'stop_profile': 'light', 'stop_hold': 'light', 'ped_intent': 'walker',
+              # K11 적색 점멸 일시정지 — 신호가 만든 정지라 K1·K2 와 같은 'light'.
+              # 이 매핑이 없으면 후보가 이기는 틱에 _KR24_NAME[...] 가 KeyError 다.
+              'flash_stop': 'light',
               'crosswalk': 'walker', 'rtor_cap': 'rtor', 'red_zone': 'red_zone',
               'shift_cap': 'avoid', 'span_v_req': 'avoid', 'virtual_cap': 'avoid',
               # K10 경로 곡률 감속 — 새 어휘. score.GREEN_EXEMPT_WINNERS 와

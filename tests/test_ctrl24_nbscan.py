@@ -168,6 +168,7 @@ def test_scan_does_not_add_a_candidate():
     kr, p, ap = rig(on_cfg(), actors=[car(2, 60.0), car(3, 10.0, LANE)])
     apply(kr, ap, v=8.0)
     # 2026-09-11 K10 curvature 추가로 후보 키가 9 → 10 개 (값은 여기서 null).
+    # 2026-09-12 K11 flash_stop 자리 — 적색 점멸(항목 9)로 10 → 11 개.
     assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
                                'crosswalk', 'red_zone', 'shift_cap', 'span_v_req',
-                               'virtual_cap', 'curvature'}
+                               'virtual_cap', 'curvature', 'flash_stop'}

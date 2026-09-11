@@ -100,9 +100,10 @@ def test_apply_without_candidates_keeps_pdm_target():
     assert kr.last_kr_winner is None
     # 후보가 하나도 안 나도 **키는 전부 있다** (로거 관례: 안 난 후보는 null).
     # 2026-09-11 K10 curvature 추가로 9 → 10 개.
+    # 2026-09-12 K11 flash_stop(적색 점멸, 항목 9) 추가로 10 → 11 개.
     assert set(kr.last_kr) == {'stop_profile', 'stop_hold', 'rtor_cap', 'ped_intent',
                                'crosswalk', 'red_zone', 'shift_cap',
-                               'span_v_req', 'virtual_cap', 'curvature'}
+                               'span_v_req', 'virtual_cap', 'curvature', 'flash_stop'}
 
 
 # ── K1 ───────────────────────────────────────────────────────────────────
