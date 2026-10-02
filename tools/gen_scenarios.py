@@ -109,7 +109,11 @@ class EventUnfeasible(GenError):
     resolve_events 가 위치를 옮겨 재시도하고, 그래도 안 되면 (min_keep 가 있는
     주제에서) **그 이벤트만** 버린다. 시나리오째 죽이지 않는다 — 성립 안 하는
     이벤트를 억지로 넣는 것보다 하나 적게 넣는 편이 낫다 (2026-08-30 결정).
+
+    avoid_cond: gen_placement.avoid_geom 조건(A/D/E/F)이 후보를 전부 걸러서 난
+    실패면 그 조건 문자. --coverage-report 의 조건별 폐기 수가 이것으로 센다.
     """
+    avoid_cond = None
 
 
 def fnum(v: float) -> str:
@@ -987,7 +991,7 @@ class RoutePool:
         self.used_roads: dict = {}      # 같은 실행 내 방문 road 이력 ('any' 출구 가중)
 
     def get(self, name: str, variant: int = 1, salt: str = '',
-            min_length_m: float | None = None) -> Route:
+            min_length_m: float | None = None, allow_warnings: bool = False) -> Route:
         """min_length_m: 주제 지정 경로 최소 길이 — 우선순위는 주제 > routes
         개별(spec) > gen_coverage 기본 (synth_walk 이 해석). 캐시 키에 포함해
         같은 경로 이름이라도 주제 목표 길이가 다르면 따로 만든다."""
@@ -996,7 +1000,7 @@ class RoutePool:
         d = self.defs[name]
         if 'csv' in d:
             variant, salt, min_length_m = 1, '', None   # csv 는 파일에 고정
-        key = (name, variant, salt, min_length_m)
+        key = (name, variant, salt, min_length_m) + (('warn-ok',) if allow_warnings else ())
         if key in self.cache:
             cached = self.cache[key]
             if isinstance(cached, BaseException):   # GenError 는 SystemExit 계열이다
@@ -1008,12 +1012,21 @@ class RoutePool:
             # csv 는 재시도할 다른 시작점이 없다 — 경고가 있으면 경로째 탈락시키고
             # 이 경로를 쓰는 변형 전부를 사유와 함께 제외한다 (조용히 포함 금지)
             warns, first = route_check(self.lg, r.rt)
+            if warns and allow_warnings:
+                # 실경로(대회·현장 CSV)는 주어진 경로다 — 경고가 있어도 그대로 쓴다
+                # (--from-csv 와 같은 취급. 테마의 real_route: true).
+                print(f'  ⚠ 경로 {name}({d["csv"]}): build_route 경고 {warns}건 — {first} (실경로라 그대로 쓴다)')
+                self.cache[key] = r
+                return r
             if warns:
                 err = GenError(f'경로 {name}({d["csv"]}): build_route 경고 {warns}건 — {first}')
                 self.cache[key] = err
                 raise err
             why = (spawn_gate(self.lg, r.rt, self.gen_cfg)
                    or polyline_gate(self.lg, r.rt, self.gen_cfg))
+            if why and allow_warnings:  # 실경로 — --from-csv 처럼 게이트를 우회하고 알리기만 한다
+                print(f'  ⚠ 경로 {name}({d["csv"]}): 게이트 우회 — {why}')
+                why = None
             if why:                     # csv 는 재시도할 다른 시작점이 없다 — 경로째 탈락
                 GATE_STATS['reject'] += 1
                 err = GenError(f'경로 {name}({d["csv"]}): 경로 게이트 탈락 — {why}')
@@ -1248,6 +1261,21 @@ class XmlDoc:
                 raise GenError(f'SignalController {ctrl_id}: Phase({typ}) 치환 실패')
         self.text = self.text.replace(block, new, 1)
 
+    def set_signal_phases(self, ctrl_id: int, phases: list):
+        """위상의 **순서와 길이**를 통째로 바꾼다. phases = [(type, duration), …].
+
+        set_signal 은 길이만 바꾸고 템플릿의 순서(대개 go 먼저)를 따른다. 신호 대기 줄처럼
+        적색으로 시작해야 하는 시나리오는 순서를 지정해야 한다 (템플릿에도 stop 으로 시작하는
+        제어기가 있다 — Id 3)."""
+        m = re.search(rf'(<SignalController Id="{ctrl_id}" [^>]*>)(.*?)(\s*</SignalController>)',
+                      self.text, flags=re.S)
+        if not m:
+            raise GenError(f'SignalController Id={ctrl_id} 가 템플릿에 없다')
+        indent = re.search(r'\n(\s*)<Phase ', m.group(2))
+        pad = indent.group(1) if indent else '            '
+        body = ''.join(f'\n{pad}<Phase Duration="{dur:.1f}" Type="{typ}"/>' for typ, dur in phases)
+        self.text = self.text.replace(m.group(0), m.group(1) + body + m.group(3), 1)
+
     def final(self, name: str) -> str:
         try:
             ET.fromstring(self.text)
@@ -1411,6 +1439,13 @@ class Ctx:
     occupied: list = field(default_factory=list)
     shape_seq: int = 0
     player_seq: int = 0
+    # gen_placement.avoid_geom 전용 — 스위치가 전부 꺼져 있으면 셋 다 빈 채로 남는다.
+    statics: list = field(default_factory=list)      # 정지 물체 (x, y, 반길이, 반폭, 이름)
+    avoid_evs: list = field(default_factory=list)    # 회피 이벤트의 side 별 창 (F 역방향)
+    avoid_recs: list = field(default_factory=list)   # 판정 기록 (정의 옆 .placement.json)
+    # 자차 경로 차로 위에 놓은 물체 (이름, x, y, 차로 키) — route_gates 의 빌더 검사가 본다.
+    # XML 에는 영향이 없다.
+    route_objs: list = field(default_factory=list)
 
     def claim(self, s0, s1, what):
         for a, b in self.occupied:
@@ -1754,24 +1789,455 @@ def _multi_lane_spans(ctx, min_w: float, min_span: float, step: float = 2.0,
     return out
 
 
+# ── 회피 성립 조건 A·D·E·F (gen_placement.avoid_geom, 2026-10-01) ─────────
+# 정적 장애물을 "회피가 기하적으로 성립하는 자리" 에만 놓는다. 근거·실측·각
+# 스위치의 뜻은 params gen_placement.avoid_geom 주석이 단일 출처다.
+# 판정 순서 = 폐기 귀속 순서: 후보 표본을 E → A → D → F 로 걸러 가다가 후보가
+# 0 이 되면, 마지막으로 표본을 지운 조건이 그 폐기의 원인으로 기록된다.
+AVOID_CONDS = ('E', 'A', 'D', 'F')
+# S = 그 이벤트가 요구하는 **차로 구조**가 아니다 (예: 나란히는 자차가 가운데 차로여야 한다).
+# 스위치가 아니라 이벤트 정의의 일부라 avoid_geom 이 꺼져 있어도 본다. 판정은 S 가 먼저다.
+CAND_CONDS = ('S',) + AVOID_CONDS
+_AVOID_KEYS = {'A': 'neighbor_run_enable', 'D': 'chain_free_lane_enable',
+               'E': 'start_clear_enable', 'F': 'window_overlap_enable'}
+_AVOID_WHY = {'A': '이웃 차로가 회피 창(진입 전이 + 장애물 + 복귀 전이) 전체에 이어지지 않는다',
+              'D': '체인 전 구간에서 주행 회랑만큼 비어 있는 동방향 차로가 없다',
+              'E': '출발점에서 탐지 거리 + 가속 거리 안이다',
+              'F': '회피 창의 이웃 차로에 다른 이벤트의 정지 물체가 있다',
+              'S': '이 이벤트가 요구하는 차로 구조(차로 수·열린 쪽·이웃 길이)가 아니다'}
+AVOID_DROPS: collections.Counter = collections.Counter()   # min_keep 로 버린 이벤트 (조건별)
+_AVOID_REC_CAP_M = 300.0     # 판정 기록에 남길 이웃 연속 길이의 측정 상한 [m] (판정과 무관)
+
+
+def avoid_cfg() -> dict:
+    """gen_placement.avoid_geom 스위치 + 거기서 파생되는 길이들.
+
+    상수를 새로 두지 않는다 — 전이·여유·탐지 거리는 ctrl24.*, 가속 한계는
+    speed.a_max, 회랑 여유는 percep.obstacle_clearance_m, 이웃 폭 임계는
+    gen_placement.static_vehicle.min_neighbor_width_m 을 그대로 읽는다.
+    블록이 없거나 전부 false 면 {'any': False} 만 돌려준다 (이전 동작).
+    """
+    g = plc_cfg().get('avoid_geom') or {}
+    on = {c: bool(g.get(key, False)) for c, key in _AVOID_KEYS.items()}
+    out = {'on': on, 'any': any(on.values())}
+    if not out['any']:
+        return out
+    full = full_cfg()
+    c24 = full['ctrl24']
+    v_ref = float(c24['span_v_req_min'])
+    out.update(
+        v_ref=v_ref,
+        trans=max(float(c24['trans_min_m']), float(c24['trans_k']) * v_ref),
+        xb=float(c24['extra_before_m']), xa=float(c24['extra_after_m']),
+        min_w=float(plc_cfg()['static_vehicle']['min_neighbor_width_m']),
+        corr=float(full['vehicle']['width']) + 2.0 * float(full['percep']['obstacle_clearance_m']),
+        start_min=float(c24['detect_max_m']) + v_ref * v_ref / (2.0 * float(full['speed']['a_max'])))
+    return out
+
+
+def _nb_at(lg, k, sl: float, side: str, min_w: float):
+    """차로 k 의 sl 지점에서 side 쪽 동방향 주행 이웃 (폭 ≥ min_w). 없으면 None."""
+    nb = lg.neighbor(k, side)
+    if nb is None:
+        return None
+    o, me = lg.lanes[nb], lg.lanes[k]
+    if o['type'] != 'driving' or o['dir'] != me['dir']:
+        return None
+    if lg.width_at(nb, min(sl, o['length'])) < min_w:
+        return None
+    return nb
+
+
+def _nb_run(lg, k, sl: float, side: str, sgn: int, need: float, min_w: float,
+            step: float = 0.5):
+    """(k, sl) 에서 sgn 방향으로 **장애물 차로의 계보**(prev/next)를 따라가며 side
+    이웃이 끊김 없이 이어지는 길이 [m] 와 그 이웃 구간 [(이웃 차로, s0, s1)].
+
+    경로 차로가 아니라 장애물이 선 차로의 계보를 따른다 — 경로가 계획 차선변경으로
+    차로를 바꾸는 구간에서도 물리적으로 옆 차로가 이어지면 회피는 성립한다
+    (실측 2026-10-01: 경로 차로 기준이면 실주행 성공 7건 중 2건이 걸린다).
+    need 에 닿으면 멈춘다. 교차로 차로에는 들어가지 않는다 (연결로에는 이웃이 없다).
+    갈래가 여럿이면 가장 길게 이어지는 쪽을 택한다. (k, sl) 에 이웃이 있다고 가정한다.
+    """
+    nb = lg.neighbor(k, side)
+    run, a, b = 0.0, sl, sl
+    length = lg.length(k)
+    while run < need - 1e-9:
+        s2 = sl + sgn * step
+        if 0.0 <= s2 <= length:
+            if _nb_at(lg, k, s2, side, min_w) is None:
+                break
+            sl = s2
+            run += step
+            a, b = min(a, sl), max(b, sl)
+            continue
+        # 차로 끝 — 남은 토막을 더하고 계보의 다음 차로로 넘어간다.
+        end = length if sgn > 0 else 0.0
+        if _nb_at(lg, k, end, side, min_w) is None:
+            break
+        tail = abs(end - sl)
+        a, b = min(a, end), max(b, end)
+        best = None
+        for n in (lg.successors(k) if sgn > 0 else lg.predecessors(k)):
+            if lg.lanes[n]['junction'] != -1:
+                continue
+            s_in = 0.0 if sgn > 0 else lg.length(n)
+            if _nb_at(lg, n, s_in, side, min_w) is None:
+                continue
+            r, sg = _nb_run(lg, n, s_in, side, sgn, need - run - tail, min_w, step)
+            if best is None or r > best[0]:
+                best = (r, sg)
+        if best is None:
+            return run + tail, [(nb, a, b)]
+        return run + tail + best[0], [(nb, a, b)] + best[1]
+    return run, [(nb, a, b)]
+
+
+def _lane_fwd(lg, k, sl: float, dist: float):
+    """(k, sl) 에서 계보를 따라 dist [m] 앞의 (차로, s). 교차로·차로 끝이면 None."""
+    while sl + dist > lg.length(k):
+        dist -= lg.length(k) - sl
+        nxt = [n for n in lg.successors(k) if lg.lanes[n]['junction'] == -1]
+        if not nxt:
+            return None
+        k, sl = max(nxt, key=lambda n: lg.width_at(n, 0.0)), 0.0
+    return k, sl + dist
+
+
+def _in_segs(lg, segs, x: float, y: float, hl: float, hw: float) -> bool:
+    """정지 물체(중심 x,y · 반길이 hl · 반폭 hw)가 이웃 구간들에 걸치는가."""
+    for nb, a, b in segs:
+        s, t, dist, _ = lg.project(nb, x, y)
+        reach = lg.width_at(nb, s) / 2.0 + hw
+        # dist 는 차로 끝 클램프를 막는다 — 끝점 너머 물체는 종거리 부족분이 dist 에 실린다.
+        if a - hl <= s <= b + hl and abs(t) < reach and dist < reach + hl:
+            return True
+    return False
+
+
+def _chain_free_lane(lg, k, sl: float, stations, offs):
+    """체인 전 구간에서 **직선 회랑**이 가장 넓게 남는 동방향 차로 → (폭 [m], 차로).
+
+    엇갈린 체인은 자차로 안에서 좌우 빈 쪽이 번갈아 바뀐다 — 각 지점의 빈 폭이
+    아니라 전 지점에 **공통으로** 비어 있는 횡구간(차로 중심 기준)을 잰다.
+    stations: [(x, y, 반폭)], offs: 첫 장애물 기준 종거리 [m].
+    """
+    me = lg.lanes[k]
+    bases = [k]
+    for side in ('left', 'right'):
+        cur = k
+        for _ in range(6):
+            nb = lg.neighbor(cur, side)
+            if nb is None or lg.lanes[nb]['type'] != 'driving' or lg.lanes[nb]['dir'] != me['dir']:
+                break
+            bases.append(nb)
+            cur = nb
+    best = (0.0, None)
+    for base in bases:
+        pieces = None
+        for (x, y, hw), d in zip(stations, offs):
+            pos = _lane_fwd(lg, base, min(sl, lg.length(base)), d)
+            if pos is None:
+                pieces = []
+                break
+            kb, sb = pos
+            half = lg.width_at(kb, sb) / 2.0
+            t = lg.project(kb, x, y, tangent_ends=True)[1]
+            free = [(lo, hi) for lo, hi in ((-half, min(half, t - hw)), (max(-half, t + hw), half))
+                    if hi > lo]
+            pieces = free if pieces is None else [
+                (max(a0, b0), min(a1, b1)) for a0, a1 in pieces for b0, b1 in free
+                if min(a1, b1) > max(a0, b0)]
+        width = max((hi - lo for lo, hi in pieces or []), default=0.0)
+        if width > best[0]:
+            best = (width, base)
+    return best
+
+
+def _avoid_eval(lg, av, k, sl: float, s0: float, reach: float, half_len: float,
+                stations, bodies, cap: float | None = None) -> dict:
+    """한 배치 후보의 A·D·E·F 판정. lg 만 읽는 순수 함수다 (로그 표본 대조에도 쓴다).
+
+    k, sl   : 첫 장애물이 놓이는 차로와 차로 안 s.   s0: 그 route_s.
+    reach   : 첫 장애물 → 마지막 장애물 [m] (단일이면 0).
+    half_len: 장애물 종방향 반길이 [m].
+    stations: 이 이벤트의 장애물 [(x, y, 반폭)] — D 는 2개 이상일 때만 본다.
+    bodies  : 다른 이벤트의 정지 물체 [(x, y, 반길이, 반폭, 이름)] — F.
+    cap     : 기록용으로 이웃 연속 길이를 이만큼까지 더 잰다 (None = 필요 길이까지만).
+    """
+    need = {-1: half_len + av['xb'] + av['trans'],
+            +1: reach + half_len + av['xa'] + av['trans']}
+    sides = {}
+    for side in ('left', 'right'):
+        if lg.lanes[k]['junction'] != -1 or _nb_at(lg, k, sl, side, av['min_w']) is None:
+            sides[side] = {'present': False, 'ok': False, 'back': None, 'front': None,
+                           'segs': [], 'hits': []}
+            continue
+        run, segs = {}, []
+        for sgn in (-1, +1):
+            run[sgn], sg = _nb_run(lg, k, sl, side, sgn, need[sgn], av['min_w'])
+            segs += sg
+        ok = all(run[sgn] >= need[sgn] - 1e-6 for sgn in (-1, +1))
+        if cap is not None:             # 기록용 — 판정(ok)과 F 의 창(segs)은 위 값 그대로
+            run = {sgn: _nb_run(lg, k, sl, side, sgn, max(cap, need[sgn]), av['min_w'])[0]
+                   for sgn in (-1, +1)}
+        hits = [b[4] for b in bodies if _in_segs(lg, segs, b[0], b[1], b[2], b[3])]
+        sides[side] = {'present': True, 'ok': ok, 'back': run[-1], 'front': run[+1],
+                       'segs': segs, 'hits': hits}
+    # F 가 볼 side: A 가 켜져 있으면 A 를 통과한 쪽, 꺼져 있으면 이웃이 있는 쪽.
+    cand = [sd for sd, r in sides.items() if (r['ok'] if av['on']['A'] else r['present'])]
+    free_sides = [sd for sd in cand if not sides[sd]['hits']]
+    passed = {'A': any(r['ok'] for r in sides.values()),
+              'E': s0 - half_len >= av['start_min'],
+              'F': not cand or bool(free_sides), 'D': True}
+    d_free = None
+    if len(stations) >= 2:
+        d_free = _chain_free_lane(lg, k, sl, stations,
+                                  [reach * i / (len(stations) - 1) for i in range(len(stations))])
+        passed['D'] = d_free[0] >= av['corr'] - 1e-6
+    fail = next((c for c in AVOID_CONDS if av['on'][c] and not passed[c]), None)
+    return {'sides': sides, 'need': need, 'passed': passed, 'fail': fail,
+            'free_sides': free_sides, 'd_free': d_free, 'near_s': s0 - half_len}
+
+
+def _avoid_reverse(ctx, new_bodies):
+    """새 정지 물체가 **이미 놓인** 회피 이벤트의 창을 막는가 → (통과 여부, 갱신된 avoid_evs).
+
+    F 는 대칭이어야 한다: 나중에 놓이는 물체가 먼저 놓인 이벤트의 이웃 차로를 막아도
+    그 이벤트의 회피가 깨진다. 남은 side 가 하나라도 있으면 통과다.
+    """
+    out = []
+    for e in ctx.avoid_evs:
+        left = {sd: segs for sd, segs in e['sides'].items()
+                if not any(_in_segs(ctx.lg, segs, b[0], b[1], b[2], b[3]) for b in new_bodies)}
+        if e['sides'] and not left:
+            return False, ctx.avoid_evs
+        out.append(dict(e, sides=left))
+    return True, out
+
+
+def _avoid_at(ctx, av, s0: float, reach: float, half_len: float, stations_fn,
+              cap: float | None = None, skip=(), need_side: str | None = None) -> dict:
+    """route_s = s0 에 놓았을 때의 판정 (정방향 _avoid_eval + F 역방향).
+
+    skip: 이 이벤트에는 걸지 않는 조건 (근접 정지 출발은 E 를 건너뛴다).
+    need_side: 회피가 **그쪽으로** 성립해야 한다 (나란히·지그재그 — 열린 쪽이 정해져 있다).
+    """
+    _, k, sl = lane_at(ctx.route.rt, s0)
+    stations = stations_fn(s0)
+    res = _avoid_eval(ctx.lg, av, k, sl, s0, reach, half_len, stations, ctx.statics, cap=cap)
+    res['lane'] = k
+    res['reverse_ok'] = True
+    if need_side is not None:
+        res['passed']['A'] = bool(res['sides'][need_side]['ok'])
+        res['free_sides'] = [sd for sd in res['free_sides'] if sd == need_side]
+    if skip or need_side is not None:
+        res['fail'] = next((c for c in AVOID_CONDS
+                            if av['on'][c] and not res['passed'][c] and c not in skip), None)
+    if av['on']['F'] and ctx.avoid_evs:
+        mine = [(x, y, half_len, hw, '') for x, y, hw in stations]
+        res['reverse_ok'] = _avoid_reverse(ctx, mine)[0]
+        if not res['reverse_ok']:
+            res['passed']['F'] = False
+            if res['fail'] is None:
+                res['fail'] = 'F'
+    return res
+
+
+def _cand_fail(ctx, av, s0, reach, half_len, stations_fn, skip=(), need_side=None, extra=None):
+    """후보 s0 의 첫 탈락 조건 (없으면 None). 구조(S) → avoid_geom 순."""
+    if extra is not None and extra(s0):
+        return 'S'
+    if not av['any']:
+        return None
+    return _avoid_at(ctx, av, s0, reach, half_len, stations_fn, skip=skip, need_side=need_side)['fail']
+
+
+def _avoid_spans(ctx, av, base_spans, reach: float, half_len: float, stations_fn,
+                 step: float = 2.0, **kw):
+    """base_spans 안에서 조건을 통과하는 **시작점** 부분구간들 + 조건별 탈락 표본 수.
+
+    표본 간격은 _multi_lane_spans 와 같다 (이 맵의 최단 차로 섹션 1.6~1.8 m).
+    돌려주는 구간은 이미 reach 를 뺀 시작점 범위다 — _place_in_one_span 에는
+    reach=0 으로 넘긴다.
+    """
+    out, tally, n = [], collections.Counter(), 0
+    for a, b in base_spans:
+        hi = b - reach
+        if hi < a:
+            continue
+        lo = prev = None
+        u = a
+        while True:
+            uu = min(u, hi)
+            n += 1
+            fail = _cand_fail(ctx, av, uu, reach, half_len, stations_fn, **kw)
+            if fail is None:
+                lo = uu if lo is None else lo
+                prev = uu
+            else:
+                tally[fail] += 1
+                if lo is not None:
+                    out.append((lo, prev))
+                lo = prev = None
+            if uu >= hi:
+                break
+            u += step
+        if lo is not None:
+            out.append((lo, prev))
+    return out, tally, n
+
+
+def _avoid_refit(ctx, av, s, base_spans, reach: float, half_len: float, stations_fn,
+                 frac, need: float, claim, what: str, **kw):
+    """스위치가 꺼져 있었다면 놓였을 자리 s 를 조건에 대 보고, 걸릴 때만 옮긴다
+    → (s, info). 자리가 없으면 s = None.
+
+    통과하면 그 자리 그대로다 — 조건이 건드리지 않는 시나리오는 스위치를 켜도
+    XML 이 같다. 걸리면 그 점유를 물리고 base_spans 안에서 조건을 통과하는 가장
+    가까운 자리로 옮긴다. s 가 None(종전 로직이 자리를 못 찾음)이면 처음부터 찾는다.
+
+    info: moved  원래 자리가 걸린 조건 (안 옮겼으면 None, 원래 자리가 없었으면 '-')
+          from_s 원래 자리,  tally/samples 후보 표본의 조건별 탈락 수/표본 수,
+          emptied 조건이 후보를 전부 지웠으면 그 조건 (폐기 귀속), 아니면 None.
+    """
+    info = {'moved': None, 'from_s': None, 'tally': None, 'samples': 0, 'emptied': None}
+    if s is not None:
+        fail = _cand_fail(ctx, av, s, reach, half_len, stations_fn, **kw)
+        if fail is None:
+            return s, info
+        ctx.occupied = ctx.occupied[:-1]        # _place_in_one_span / claim 이 방금 넣은 점유
+        info.update(moved=fail, from_s=round(s, 2))
+    else:
+        info['moved'] = '-'
+    cand, tally, n = _avoid_spans(ctx, av, base_spans, reach, half_len, stations_fn, **kw)
+    info.update(tally=tally, samples=n)
+    if not cand:
+        # 후보를 0 으로 만든 조건 = 판정 순서상 마지막으로 표본을 지운 조건.
+        info['emptied'] = next((c for c in reversed(CAND_CONDS) if tally.get(c)), None)
+        return None, info
+    # cand 는 이미 reach 를 뺀 시작점 범위다 — reach 를 다시 빼지 않는다.
+    s2 = _place_in_one_span(ctx, frac, reach=0.0, need=need, claim=claim, what=what,
+                            spans=cand, near=s)
+    return s2, info
+
+
+def _avoid_unfeasible(what: str, cond: str) -> EventUnfeasible:
+    key = f' (gen_placement.avoid_geom.{_AVOID_KEYS[cond]})' if cond in _AVOID_KEYS else ''
+    e = EventUnfeasible(f'{what}: 배치 조건 {cond} — {_AVOID_WHY[cond]}{key}')
+    e.avoid_cond = cond
+    return e
+
+
+def _avoid_commit(ctx, av, kind: str, name, s0: float, res: dict | None, bodies,
+                  info: dict | None = None):
+    """배치 확정 — 정지 물체·회피 창을 등록하고 판정 기록을 남긴다.
+
+    res 가 None 이면 회피 대상이 아닌 정지 물체다 (옆 차로 정차차·narrow): 물체만
+    등록한다. 그 물체가 먼저 놓인 이벤트의 창을 막으면 F 로 버린다.
+    """
+    if res is not None and res['fail'] is not None:     # 표본 사이(< 2 m)에서 조건이 깨졌다
+        raise _avoid_unfeasible(kind, res['fail'])
+    if av['on']['F'] and ctx.avoid_evs:
+        ok, evs = _avoid_reverse(ctx, bodies)
+        if not ok:
+            raise _avoid_unfeasible(kind, 'F')
+        ctx.avoid_evs = evs
+    ctx.statics = ctx.statics + list(bodies)
+    rec = {'kind': kind, 'name': name, 'route_s': round(s0, 2), 'applies': res is not None}
+    if res is not None:
+        ctx.avoid_evs = ctx.avoid_evs + [
+            {'name': name, 'sides': {sd: res['sides'][sd]['segs'] for sd in res['free_sides']}}]
+        rnd = lambda x: None if x is None else round(x, 2)      # noqa: E731
+        sides = res['sides']
+        rec.update({
+            'lane': list(res['lane']),
+            'A': {'enabled': av['on']['A'], 'pass': res['passed']['A'],
+                  'need_back_m': rnd(res['need'][-1]), 'need_front_m': rnd(res['need'][+1]),
+                  **{sd: {'ok': sides[sd]['ok'], 'back_m': rnd(sides[sd]['back']),
+                          'front_m': rnd(sides[sd]['front'])} for sd in ('left', 'right')}},
+            'D': ({'enabled': av['on']['D'], 'applies': False} if res['d_free'] is None else
+                  {'enabled': av['on']['D'], 'applies': True, 'pass': res['passed']['D'],
+                   'free_m': rnd(res['d_free'][0]), 'need_m': rnd(av['corr']),
+                   'free_lane': None if res['d_free'][1] is None else list(res['d_free'][1])}),
+            'E': {'enabled': av['on']['E'], 'pass': res['passed']['E'],
+                  'near_edge_s_m': rnd(res['near_s']), 'need_m': rnd(av['start_min'])},
+            'F': {'enabled': av['on']['F'], 'pass': res['passed']['F'],
+                  'free_sides': list(res['free_sides']),
+                  **{f'{sd}_hits': list(sides[sd]['hits']) for sd in ('left', 'right')}},
+            # moved: 꺼져 있었다면 놓였을 자리(from_s)가 이 조건에 걸려 옮겼다
+            # (null = 그 자리 그대로, '-' = 종전 로직으로는 자리가 없었다).
+            'candidates': {'moved': (info or {}).get('moved'),
+                           'from_s': (info or {}).get('from_s'),
+                           'samples': (info or {}).get('samples', 0),
+                           'rejected': {c: int(((info or {}).get('tally') or {}).get(c, 0))
+                                        for c in CAND_CONDS
+                                        if c != 'S' or ((info or {}).get('tally') or {}).get('S')}}})
+    ctx.avoid_recs = ctx.avoid_recs + [rec]
+
+
 def ev_static_vehicle(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
     cfg = plc_cfg()['static_vehicle']
     gate = bool(cfg['require_multi_lane'])
     min_w = float(cfg['min_neighbor_width_m'])
+    # 회피 성립 조건 (gen_placement.avoid_geom). 옆 차로 정차차('좌측차로')는
+    # 자차로를 막지 않아 회피 대상이 아니다 — 후보를 거르지 않고 물체만 등록한다.
+    av = avoid_cfg()
+    filt = av['any'] and v.get('차선') != '좌측차로'
+    info = None
+
+    def station(s0):                    # 자차로 정중앙 정차차 (아래 t = 0 배치와 같은 점)
+        x0, y0, _z, _h = route_pt(lg, rt, s0, 0.0)
+        return [(x0, y0, CAR_W / 2.0)]
+
+    if v.get('배치') == '근접정지':
+        return _ev_near_stop(ctx, v, station)
+    # 배치: 회전직후 — 회전 출구 뒤 가까운 구간으로 후보를 좁힌다 (없으면 None = 제한 없음).
+    turn_win = _after_turn_windows(ctx) if v.get('배치') == '회전직후' else None
+
     if gate:
         # 자차로를 막는 정차 차량은 옆 차로가 있어야 회피가 성립한다 —
         # 근거는 params gen_placement.static_vehicle 주석.
         mspans = _multi_lane_spans(ctx, min_w, float(cfg['min_span_m']),
                                    check_self=bool(cfg['require_self_lane_width']))
-        if not mspans:
+        # avoid_geom A 가 켜지면 min_span_m(30 고정) 대신 A 의 회피 창 길이가
+        # "옆 차로가 얼마나 이어져야 하는가" 를 정한다 — 후보는 길이 제한 없는 구간이다.
+        base = mspans
+        if filt and av['on']['A']:
+            base = _multi_lane_spans(ctx, min_w, 0.0,
+                                     check_self=bool(cfg['require_self_lane_width']))
+        if not base:
             raise EventUnfeasible('static_vehicle: 동일 방향 주행차로가 2개 이상인 '
                                   '가용구간이 없다 — 자차로를 막으면 회피가 원천 불가다')
+        if turn_win is not None:
+            mspans, base = _clip_spans(mspans, turn_win), _clip_spans(base, turn_win)
+            if not base:
+                raise _avoid_unfeasible('static_vehicle', 'S')
         s = _place_in_one_span(ctx, v['위치'], reach=0.0, need=30.0,
                                claim=(-40.0, 40.0), what='static_vehicle',
                                spans=mspans)
+        if filt:
+            s, info = _avoid_refit(
+                ctx, av, s, base, 0.0, CAR_LEN / 2.0, station, v['위치'], 30.0,
+                (-40.0, 40.0), 'static_vehicle')
         if s is None:
+            if info and info['emptied']:
+                raise _avoid_unfeasible('static_vehicle', info['emptied'])
             raise EventUnfeasible('static_vehicle: 2차로 이상 구간이 전부 다른 이벤트에 막혔다')
+    elif filt:
+        try:                            # 꺼져 있었다면 놓였을 자리
+            s = pick_s(ctx.spans, v['위치'], need=30.0)
+            ctx.claim(s - 40, s + 40, 'static_vehicle')
+        except GenError:
+            s = None
+        s, info = _avoid_refit(
+            ctx, av, s, ctx.spans, 0.0, CAR_LEN / 2.0, station, v['위치'], 30.0,
+            (-40.0, 40.0), 'static_vehicle')
+        if s is None:
+            if info['emptied']:
+                raise _avoid_unfeasible('static_vehicle', info['emptied'])
+            raise GenError('static_vehicle: 이벤트를 놓을 구간이 부족하다 (회피 성립 구간 없음)')
     else:
         s = pick_s(ctx.spans, v['위치'], need=30.0)
         ctx.claim(s - 40, s + 40, 'static_vehicle')
@@ -1797,8 +2263,20 @@ def ev_static_vehicle(ctx, v):
     ctx.players.append(blk_vehicle_posabs(name, CAR, x, y, z, h))
     ctx.actions.append(blk_stay_action(name, x, y))
     ctx.checks.append((x, y, lane_tag))
+    if lane_tag == 'ego_lane':
+        ctx.route_objs.append((name, x, y, k))
+    if av['any']:
+        res = None
+        if lane_tag == 'ego_lane':      # 확정 지점에서 다시 잰다 (기록용으로 이웃 길이는 끝까지)
+            res = _avoid_at(ctx, av, s, 0.0, CAR_LEN / 2.0, station, cap=_AVOID_REC_CAP_M)
+        _avoid_commit(ctx, av, 'static_vehicle', name, s, res,
+                      [(x, y, CAR_LEN / 2.0, CAR_W / 2.0, name)], info)
     out = {'kind': 'static_vehicle', 'name': name, 'route_s': round(s, 2),
            'lane': v.get('차선', '자차로')}
+    if turn_win is not None:
+        out['placement'] = '회전직후'
+        out['after_turn_m'] = round(min(s - w0 + _AFTER_TURN_LO for w0, _w1 in turn_win
+                                        if w0 <= s <= _w1), 1)
     if v.get('대향차') == '있음':
         out['oncoming'] = ev_oncoming(ctx, {'위치': None, '개수': 2, '속도': 40, '_anchor': s})
     return out
@@ -1968,7 +2446,7 @@ def ev_signal(ctx, v):
     return {'kind': 'signal', 'timing': timing, 'approaches': out}
 
 
-def _place_in_one_span(ctx, frac, reach, need, claim, what, spans=None):
+def _place_in_one_span(ctx, frac, reach, need, claim, what, spans=None, near=None):
     """s 부터 s+reach 까지가 **한 가용구간 안에** 들어가는 시작 route_s. 없으면 None.
 
     왜 한 구간이어야 하는가 (2026-09-02 실측): pick_s 는 구간들을 이어붙인
@@ -1991,10 +2469,12 @@ def _place_in_one_span(ctx, frac, reach, need, claim, what, spans=None):
     spans: 후보 구간을 ctx.spans 가 아닌 다른 목록으로 좁힌다 (기본 ctx.spans).
     이벤트별 성립 조건으로 미리 걸러 낸 부분구간을 넘기는 용도다 — 예:
     static_vehicle 의 '동일 방향 주행차로 2개 이상' (_multi_lane_spans).
+    near: 요청 위치를 frac 대신 route_s 로 직접 준다 (avoid_geom 이 "꺼져 있었다면
+    놓였을 자리" 에서 가장 가까운 통과 지점을 찾을 때). None 이면 종전대로 frac.
     """
     spans = ctx.spans if spans is None else spans
     try:
-        want = pick_s(spans, frac, need=need)
+        want = pick_s(spans, frac, need=need) if near is None else near
     except GenError:
         want = None                     # 가용축 전체가 짧다 — 구간만 보고 고른다
     cands = [(a, b) for a, b in spans if b - a >= reach]
@@ -2048,7 +2528,8 @@ def _nearest_free(lo, hi, target, occupied, claim):
 def ev_obstacle_chain(ctx, v):
     lg, rt = ctx.lg, ctx.route.rt
     cfg = plc_cfg()
-    spans = None
+    av = avoid_cfg()
+    spans = base = None                 # base: avoid_geom 이 후보를 찾을 구간 (None = ctx.spans)
     if bool(cfg['obstacle_chain']['require_multi_lane']):
         # 1차로 구간의 체인은 슬라럼이 아니라 차단이다 — 실측(2026-09-02,
         # logs/batch/20260902_231132 정적회피집중_01_좌회전0): 1차로 (2818,6,-1)
@@ -2060,37 +2541,440 @@ def ev_obstacle_chain(ctx, v):
         spans = _multi_lane_spans(ctx, float(sv['min_neighbor_width_m']),
                                   float(sv['min_span_m']),
                                   check_self=bool(sv['require_self_lane_width']))
-        if not spans:
+        # avoid_geom A 가 켜지면 min_span_m 대신 A 의 회피 창 길이가 기준이다
+        # (ev_static_vehicle 과 같은 대체) — 후보는 길이 제한 없는 구간이다.
+        base = spans
+        if av['any'] and av['on']['A']:
+            base = _multi_lane_spans(ctx, float(sv['min_neighbor_width_m']), 0.0,
+                                     check_self=bool(sv['require_self_lane_width']))
+        if not base:
             raise EventUnfeasible('obstacle_chain: 동일 방향 주행차로가 2개 이상인 '
                                   '가용구간이 없다 — 1차로의 체인은 회피가 원천 불가다')
     n0 = n = int(v.get('개수', 4))
     spacing = 18.0
+    half = 0.0                          # 장애물 반치수 [m] — avoid_geom 이 켜졌을 때만 읽는다
+    if av['any']:
+        half = float(cfg['obstacle_chain']['object_extent_m']) / 2.0
+
+    def points(s_start, count):         # 체인 장애물의 (route_s, x, y, z) — 배치·판정 공용
+        pts = []
+        for i in range(count):
+            s = s_start + i * spacing
+            _, k, sl = lane_at(rt, s)
+            w = lg.width_at(k, sl)
+            t = (w / 2.0 - 0.7) * (1 if i % 2 == 0 else -1)
+            x, y, z, _ = route_pt(lg, rt, s, t)
+            pts.append((s, x, y, z))
+        return pts
+
     s0 = None
+    info = None
     while n >= 2:
         s0 = _place_in_one_span(ctx, v['위치'], reach=(n - 1) * spacing,
                                 need=n * spacing + 20.0,
                                 claim=(-20.0, n * spacing + 20.0),
                                 what='obstacle_chain', spans=spans)
+        if av['any']:
+            # need 는 시작점 범위 기준이라 reach 만큼 줄인다 (n·spacing+20 − reach).
+            s0, info = _avoid_refit(
+                ctx, av, s0, ctx.spans if base is None else base, (n - 1) * spacing, half,
+                lambda u, c=n: [(x, y, half) for _s, x, y, _z in points(u, c)],
+                v['위치'], spacing + 20.0, (-20.0, n * spacing + 20.0), 'obstacle_chain')
         if s0 is not None:
             break
         n -= 1                          # 어느 구간에도 안 들어간다 — 개수를 줄인다
     if s0 is None:
+        if info and info['emptied']:
+            raise _avoid_unfeasible('obstacle_chain', info['emptied'])
         raise GenError('obstacle_chain: 장애물 2개도 놓을 구간이 부족하다')
     shrunk = n != n0
     placed = []
-    for i in range(n):
-        s = s0 + i * spacing
-        _, k, sl = lane_at(rt, s)
-        w = lg.width_at(k, sl)
-        t = (w / 2.0 - 0.7) * (1 if i % 2 == 0 else -1)
-        x, y, z, _ = route_pt(lg, rt, s, t)
-        ctx.moving.append(blk_object(ctx.next_name('Obstacle'), x, y, z))
+    bodies = []
+    for s, x, y, z in points(s0, n):
+        oname = ctx.next_name('Obstacle')
+        ctx.moving.append(blk_object(oname, x, y, z))
         ctx.checks.append((x, y, 'ego_lane'))
         placed.append(round(s, 2))
+        bodies.append((x, y, half, half, oname))
+        ctx.route_objs.append((oname, x, y, lane_at(rt, s)[1]))
+    if av['any']:
+        res = _avoid_at(ctx, av, s0, (n - 1) * spacing, half,
+                        lambda _u: [(b[0], b[1], half) for b in bodies], cap=_AVOID_REC_CAP_M)
+        _avoid_commit(ctx, av, 'obstacle_chain', bodies[0][4], s0, res, bodies, info)
     out = {'kind': 'obstacle_chain', 'count': n, 'route_s': placed}
     if shrunk:
         out['note'] = f'구간 부족으로 개수 축소 ({v.get("개수", 4)}→{n})'
     return out
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 논문 실험용 이벤트 (2026-10-02) — 상수는 params gen_placement.paper_events
+# ════════════════════════════════════════════════════════════════════════
+# 전부 "자차로를 막는 정지 물체" 의 변형이다. 공통 규칙:
+#   · 자차 경로 차로 위의 물체는 ctx.route_objs 에 남긴다 (route_gates 의 빌더 검사).
+#   · avoid_geom(A·E) 이 켜져 있으면 static_vehicle 과 같은 길(_avoid_refit)로 자리를 잡고
+#     판정 기록을 남긴다. 이벤트가 요구하는 차로 구조는 스위치와 무관하게 본다 (조건 S).
+#   · 정의(yaml)에는 `objects` (지나가야 할 물체 이름 전부)를 남긴다 — 집계기가 조우 단위로 쓴다.
+
+_AFTER_TURN_LO = 25.0       # usable_spans 의 junction_margin — 회전 출구 뒤 가용구간이 여기서 시작한다
+
+
+def pe_cfg() -> dict:
+    return plc_cfg()['paper_events']
+
+
+def car_len() -> float:
+    """정차 차량(CAR)의 실제 길이 [m] — 범퍼 간 거리를 맞출 때 쓴다 (GT 실측)."""
+    return float(plc_cfg()['stopped_car']['length_m'])
+
+
+def _clip_spans(spans, wins):
+    out = []
+    for a, b in spans:
+        for w0, w1 in wins:
+            lo, hi = max(a, w0), min(b, w1)
+            if hi >= lo:
+                out.append((lo, hi))
+    return sorted(out)
+
+
+def _after_turn_windows(ctx) -> list:
+    """회전(진행 방향 변화 ≥ after_turn_min_deg) 교차로 출구 뒤 [25, after_turn_max_m] m 구간들."""
+    lg, rt = ctx.lg, ctx.route.rt
+    cfg = plc_cfg()['static_vehicle']
+    lanes, cum, lens = rt['lanes'], rt['cum_s'], rt['lengths']
+    out, i = [], 0
+    while i < len(lanes):
+        if lg.lanes[lanes[i]]['junction'] == -1:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(lanes) and lg.lanes[lanes[j + 1]]['junction'] != -1:
+            j += 1
+        h0 = lg.point_at(lanes[i], 0.0)[3]
+        h1 = lg.point_at(lanes[j], lens[j])[3]
+        if abs(math.degrees(wrap(h1 - h0))) >= float(cfg['after_turn_min_deg']):
+            exit_s = cum[j] + lens[j]
+            out.append((exit_s + _AFTER_TURN_LO, exit_s + float(cfg['after_turn_max_m'])))
+        i = j + 1
+    return out
+
+
+def _valid_nb(lg, k, sl, side):
+    return _nb_at(lg, k, sl, side, float(plc_cfg()['static_vehicle']['min_neighbor_width_m']))
+
+
+def _side_t(lg, k, sl, side) -> float:
+    """자차로 중심 → side 이웃 차로 중심의 횡오프셋 (좌 +)."""
+    nb = lg.neighbor(k, side)
+    w = (lg.width_at(k, sl) + lg.width_at(nb, min(sl, lg.length(nb)))) / 2.0
+    return w if side == 'left' else -w
+
+
+def _park(ctx, base: str, s: float, t: float = 0.0, on_route: bool = True):
+    """정차 차량 1대 (StoppedCar 와 같은 블록) → (이름, 정지 물체 튜플)."""
+    lg, rt = ctx.lg, ctx.route.rt
+    x, y, z, h = route_pt(lg, rt, s, t)
+    name = ctx.next_name(base)
+    ctx.players.append(blk_vehicle_posabs(name, CAR, x, y, z, h))
+    ctx.actions.append(blk_stay_action(name, x, y))
+    ctx.checks.append((x, y, 'ego_lane' if on_route else 'side_lane'))
+    if on_route:
+        ctx.route_objs.append((name, x, y, lane_at(rt, s)[1]))
+    return name, (x, y, CAR_LEN / 2.0, CAR_W / 2.0, name)
+
+
+def _blocking_spans(ctx, av):
+    """(꺼져 있었다면 쓸 후보 구간, avoid_geom 이 찾을 후보 구간) — static_vehicle 과 같은 규칙."""
+    sv = plc_cfg()['static_vehicle']
+    args = dict(check_self=bool(sv['require_self_lane_width']))
+    orig = _multi_lane_spans(ctx, float(sv['min_neighbor_width_m']), float(sv['min_span_m']), **args)
+    base = orig
+    if av['any'] and av['on']['A']:
+        base = _multi_lane_spans(ctx, float(sv['min_neighbor_width_m']), 0.0, **args)
+    return orig, base
+
+
+def _place_blocking(ctx, av, v, what, reach, stations_fn, claim, **kw):
+    """자차로 차단 이벤트의 시작 route_s 를 잡는다 → (s0, info). 실패는 EventUnfeasible."""
+    orig, base = _blocking_spans(ctx, av)
+    if not base:
+        raise EventUnfeasible(f'{what}: 동일 방향 주행차로가 2개 이상인 가용구간이 없다')
+    s0 = _place_in_one_span(ctx, v['위치'], reach=reach, need=reach + 30.0, claim=claim,
+                            what=what, spans=orig)
+    info = None
+    if av['any'] or kw.get('extra') is not None:
+        s0, info = _avoid_refit(ctx, av, s0, base, reach, CAR_LEN / 2.0, stations_fn,
+                                v['위치'], 30.0, claim, what, **kw)
+    if s0 is None:
+        if info and info['emptied']:
+            raise _avoid_unfeasible(what, info['emptied'])
+        raise EventUnfeasible(f'{what}: 성립 구간이 전부 다른 이벤트에 막혔다')
+    return s0, info
+
+
+def _commit_blocking(ctx, av, kind, name, s0, reach, stations_fn, bodies, info, **kw):
+    if av['any']:
+        res = _avoid_at(ctx, av, s0, reach, CAR_LEN / 2.0, stations_fn, cap=_AVOID_REC_CAP_M, **kw)
+        _avoid_commit(ctx, av, kind, name, s0, res, bodies, info)
+
+
+def _ev_near_stop(ctx, v, station):
+    """근접 정지 출발 — 자차가 정지 상태에서 시작하고 정차차가 앞범퍼 D [m] 앞에 있다.
+
+    거리 = 자차 앞범퍼 ~ 장애물 뒤끝. 경로의 route_s 0 이 자차 뒷축이므로
+    장애물 중심 = (축거 + 앞 오버행) + D + 차량 길이/2.  출발 여유(usable_spans 60 m)와
+    avoid_geom E(출발 거리)는 이 유형의 정의상 적용하지 않는다 — A 는 그대로 건다.
+    """
+    lg, rt = ctx.lg, ctx.route.rt
+    av = avoid_cfg()
+    veh = full_cfg()['vehicle']
+    dist = float(v['거리'])
+    s = float(veh['wheelbase']) + float(veh['front_overhang_m']) + dist + car_len() / 2.0
+    sv = plc_cfg()['static_vehicle']
+    i, k, sl = lane_at(rt, s)
+    if any(lg.lanes[kk]['junction'] != -1 for kk in rt['lanes'][:i + 1]) or \
+            _same_dir_lane_count(lg, k, sl, float(sv['min_neighbor_width_m']), True) < 2:
+        raise _avoid_unfeasible('static_vehicle(근접정지)', 'S')
+    res = None
+    if av['any']:
+        res = _avoid_at(ctx, av, s, 0.0, CAR_LEN / 2.0, station, cap=_AVOID_REC_CAP_M, skip=('E',))
+        if res['fail'] is not None:
+            raise _avoid_unfeasible('static_vehicle(근접정지)', res['fail'])
+    ctx.claim(0.0, s + 40.0, 'static_vehicle')
+    name, body = _park(ctx, 'StoppedCar', s)
+    if av['any']:
+        _avoid_commit(ctx, av, 'static_vehicle', name, s, res, [body], None)
+        rec = dict(ctx.avoid_recs[-1])  # E 는 이 유형에 걸지 않았다 — 기록에도 그렇게 남긴다
+        rec['E'] = dict(rec['E'], enabled=False, note='근접 정지 출발 — 적용 제외')
+        ctx.avoid_recs = ctx.avoid_recs[:-1] + [rec]
+    return {'kind': 'static_vehicle', 'name': name, 'route_s': round(s, 2), 'lane': '자차로',
+            'placement': '근접정지', 'bumper_gap_m': dist, 'objects': [name]}
+
+
+def ev_parked_row(ctx, v):
+    """앞뒤 연속 — 정차 차량 n 대가 같은 차로에 일렬. 간격 = 앞차 뒤끝 ~ 뒤차 앞끝 [m]."""
+    lg, rt = ctx.lg, ctx.route.rt
+    av = avoid_cfg()
+    n, gap = int(v.get('대수', 2)), float(v['간격'])
+    pitch = gap + car_len()
+    reach = (n - 1) * pitch
+
+    def stations(s0):
+        return [route_pt(lg, rt, s0 + i * pitch, 0.0)[:2] + (CAR_W / 2.0,) for i in range(n)]
+
+    def extra(s0):                      # 구조: 전부 **같은 차로**(첫 차 차로의 계보) 위여야 한다 —
+        _, k, sl = lane_at(rt, s0)      # 경로가 그 사이에 계획 차선변경을 하면 줄이 두 차로로 갈린다
+        for i in range(1, n):
+            pos = _lane_fwd(lg, k, sl, i * pitch)
+            if pos is None or tuple(pos[0]) != tuple(lane_at(rt, s0 + i * pitch)[1]):
+                return True
+        return False
+
+    claim = (-40.0, reach + 40.0)
+    s0, info = _place_blocking(ctx, av, v, 'parked_row', reach, stations, claim, extra=extra)
+    names, bodies = [], []
+    for i in range(n):
+        nm, body = _park(ctx, 'RowCar', s0 + i * pitch)
+        names.append(nm); bodies.append(body)
+    _commit_blocking(ctx, av, 'parked_row', names[0], s0, reach, stations, bodies, info)
+    return {'kind': 'parked_row', 'count': n, 'gap_m': gap,
+            'route_s': [round(s0 + i * pitch, 2) for i in range(n)], 'objects': names}
+
+
+def ev_side_by_side(ctx, v):
+    """나란히 — 자차가 가운데 차로이고, 자차로와 한쪽 옆 차로를 같은 위치에서 막는다.
+    열린쪽(좌/우) 옆 차로 하나만 남는다."""
+    lg, rt = ctx.lg, ctx.route.rt
+    av = avoid_cfg()
+    open_side = {'좌': 'left', '우': 'right'}[v['열린쪽']]
+    block_side = 'right' if open_side == 'left' else 'left'
+
+    def extra(s0):                      # 구조: 양쪽에 동방향 이웃이 있어야 한다 (자차 = 가운데)
+        _, k, sl = lane_at(rt, s0)
+        return _valid_nb(lg, k, sl, 'left') is None or _valid_nb(lg, k, sl, 'right') is None
+
+    def stations(s0):                   # 회피 창은 자차로 정차차 기준 (옆 차는 창 밖의 '막힌 쪽')
+        return [route_pt(lg, rt, s0, 0.0)[:2] + (CAR_W / 2.0,)]
+
+    s0, info = _place_blocking(ctx, av, v, 'side_by_side', 0.0, stations, (-40.0, 40.0),
+                               extra=extra, need_side=open_side)
+    _, k, sl = lane_at(rt, s0)
+    n1, b1 = _park(ctx, 'SideCar', s0)
+    n2, b2 = _park(ctx, 'SideCar', s0, _side_t(lg, k, sl, block_side), on_route=False)
+    _commit_blocking(ctx, av, 'side_by_side', n1, s0, 0.0, stations, [b1, b2], info,
+                     need_side=open_side)
+    return {'kind': 'side_by_side', 'open': v['열린쪽'], 'route_s': round(s0, 2),
+            'ego_lane': n1, 'side_lane': n2, 'objects': [n1, n2]}
+
+
+def ev_zigzag(ctx, v):
+    """지그재그 — 자차로 정차차, 그 앞 간격 [m] 뒤에 **비켜 간 쪽 옆 차로**의 정차차.
+    옆 차로로 비킨 뒤 다시 자차로로 돌아와야 지나간다. 간격 = 앞뒤 차의 끝과 끝."""
+    lg, rt = ctx.lg, ctx.route.rt
+    av = avoid_cfg()
+    gap = float(v['간격'])
+    reach = gap + car_len()
+
+    def side_at(s0):                    # 두 지점 모두에 이웃이 있는 쪽 (좌 우선)
+        _, k, sl = lane_at(rt, s0)
+        _, k2, sl2 = lane_at(rt, s0 + reach)
+        # 두 번째 지점의 경로 차로가 첫 차 차로의 계보여야 한다 — 경로가 그 사이에 계획
+        # 차선변경을 하면 '옆 차로' 가 첫 차의 차로가 되어 지그재그가 아니라 일렬이 된다.
+        pos = _lane_fwd(lg, k, sl, reach)
+        if pos is None or tuple(pos[0]) != tuple(k2):
+            return None
+        return next((sd for sd in ('left', 'right')
+                     if _valid_nb(lg, k, sl, sd) is not None
+                     and _valid_nb(lg, k2, sl2, sd) is not None), None)
+
+    def stations(s0):
+        return [route_pt(lg, rt, s0, 0.0)[:2] + (CAR_W / 2.0,)]
+
+    claim = (-40.0, reach + 40.0)
+    s0, info = _place_blocking(ctx, av, v, 'zigzag', reach, stations, claim,
+                               extra=lambda u: side_at(u) is None)
+    side = side_at(s0)
+    if av['any'] and av['on']['A']:     # 회피가 성립하는 쪽에 두 번째 차를 놓는다
+        res = _avoid_at(ctx, av, s0, reach, CAR_LEN / 2.0, stations)
+        ok = [sd for sd in ('left', 'right') if res['sides'][sd]['ok']]
+        _, k2, sl2 = lane_at(rt, s0 + reach)
+        side = next((sd for sd in ok if _valid_nb(lg, k2, sl2, sd) is not None), None)
+        if side is None:
+            raise _avoid_unfeasible('zigzag', 'A')
+    _, k2, sl2 = lane_at(rt, s0 + reach)
+    n1, b1 = _park(ctx, 'ZigCar', s0)
+    n2, b2 = _park(ctx, 'ZigCar', s0 + reach, _side_t(lg, k2, sl2, side), on_route=False)
+    _commit_blocking(ctx, av, 'zigzag', n1, s0, reach, stations, [b1, b2], info, need_side=side)
+    return {'kind': 'zigzag', 'gap_m': gap, 'side': {'left': '좌', 'right': '우'}[side],
+            'route_s': [round(s0, 2), round(s0 + reach, 2)],
+            'ego_lane': n1, 'side_lane': n2, 'objects': [n1, n2]}
+
+
+def _lineage_pos(lg, k, sl: float, d: float):
+    """(k, sl) 에서 계보를 따라 d [m] (음수 = 뒤) 떨어진 (차로, s). 교차로·끝이면 None."""
+    if d >= 0.0:
+        return _lane_fwd(lg, k, sl, d)
+    d = -d
+    while d > sl:
+        d -= sl
+        prv = [n for n in lg.predecessors(k) if lg.lanes[n]['junction'] == -1]
+        if not prv:
+            return None
+        k = max(prv, key=lambda n: lg.width_at(n, lg.length(n)))
+        sl = lg.length(k)
+    return k, sl - d
+
+
+def ev_side_traffic(ctx, v):
+    """옆 차로 교통 — 자차로 정차차 + **유일한 옆 차로**에 저속으로 흐르는 차량 줄.
+
+    교통 차량은 옆 차로에만 둔다 (자차로·장애물 뒤에는 없다). 줄은 장애물 뒤쪽 옆 차로에
+    서 있다가 자차가 줄 꼬리 뒤 trigger_back_m 에 닿으면 traffic_kph 로 출발한다 — 자차가
+    장애물에 닿을 때 옆 차로에 차량이 차간 간격으로 지나가고 있게 맞춘 값이다.
+    차간 = 앞차 뒤끝 ~ 뒤차 앞끝 [m].
+    """
+    lg, rt = ctx.lg, ctx.route.rt
+    av = avoid_cfg()
+    pe = pe_cfg()
+    gap = float(v['차간'])
+    pitch = gap + car_len()
+    length, head = float(pe['traffic_length_m']), float(pe['traffic_head_offset_m'])
+    fwd, back_trig = float(pe['traffic_forward_m']), float(pe['traffic_trigger_back_m'])
+    n = int(length // pitch) + 1
+    tail = head + (n - 1) * pitch                       # 장애물 → 줄 꼬리 (뒤쪽)
+    min_w = float(plc_cfg()['static_vehicle']['min_neighbor_width_m'])
+
+    def only_side(s0):
+        _, k, sl = lane_at(rt, s0)
+        sides = [sd for sd in ('left', 'right') if _valid_nb(lg, k, sl, sd) is not None]
+        return (sides[0], k, sl) if len(sides) == 1 else (None, k, sl)
+
+    def extra(s0):                      # 구조: 옆 차로가 한쪽뿐이고, 그 차로가 줄 길이만큼 이어진다
+        side, k, sl = only_side(s0)
+        if side is None or s0 - tail - back_trig < float(pe['traffic_trigger_min_s_m']):
+            return True
+        return (_nb_run(lg, k, sl, side, -1, tail + 5.0, min_w, 1.0)[0] < tail + 5.0
+                or _nb_run(lg, k, sl, side, +1, fwd, min_w, 1.0)[0] < fwd)
+
+    def stations(s0):
+        return [route_pt(lg, rt, s0, 0.0)[:2] + (CAR_W / 2.0,)]
+
+    s0, info = _place_blocking(ctx, av, v, 'side_traffic', 0.0, stations, (-40.0, 40.0), extra=extra)
+    side, k, sl = only_side(s0)
+    car, body = _park(ctx, 'StoppedCar', s0)
+    _commit_blocking(ctx, av, 'side_traffic', car, s0, 0.0, stations, [body], info, need_side=side)
+    tx, ty, _, _ = route_pt(lg, rt, s0 - tail - back_trig)
+    vt = float(pe['traffic_kph']) / 3.6
+    names = []
+    for i in range(n):
+        pts = []
+        d = -(head + i * pitch)
+        while d <= fwd:
+            pos = _lineage_pos(lg, k, sl, d)
+            nb = None if pos is None else lg.neighbor(pos[0], side)
+            if nb is None:
+                break
+            x, y, z, h = lg.point_at(nb, min(pos[1], lg.length(nb)))
+            pts.append((x, y, z, h % (2 * math.pi)))
+            d += 4.0
+        plen = sum(math.hypot(pts[j + 1][0] - pts[j][0], pts[j + 1][1] - pts[j][1])
+                   for j in range(len(pts) - 1))
+        sid = ctx.next_shape()
+        name = ctx.next_name('Traffic')
+        ctx.moving.append(blk_pathshape(sid, f'{name}Path', pts))
+        ctx.players.append(blk_vehicle_pathshape(name, CAR, sid, 0.01, plen))
+        ctx.actions.append(blk_player_actions(
+            name, [_act('go', tx, ty, float(pe['traffic_trigger_radius_m']), 'Ego',
+                        _speed_change(2.0, vt))]))
+        ctx.checks.append((pts[0][0], pts[0][1], 'side_lane'))
+        names.append(name)
+    return {'kind': 'side_traffic', 'name': car, 'route_s': round(s0, 2), 'lane': '자차로',
+            'traffic_side': {'left': '좌', 'right': '우'}[side], 'traffic_gap_m': gap,
+            'traffic_count': n, 'traffic_kph': float(pe['traffic_kph']),
+            'traffic': names, 'objects': [car]}
+
+
+def ev_signal_queue(ctx, v):
+    """신호 대기 줄 — 적색 정지선 앞에 정차한 차량 1~3 대 뒤로 자차가 접근한다 (오탐 측정).
+
+    신호는 **적색으로 시작**해 green_at_s 에 녹색이 된다. 대기 차량은 그때까지 강제 정지
+    (StoppedCar 와 같은 stay)였다가 녹색 시각에 release_kph 로 풀린다 — VTD 운전자 모델이
+    신호를 지키는지에 기대지 않는다. 자차는 그동안 **피하지 않고 기다려야** 한다.
+    """
+    lg, rt = ctx.lg, ctx.route.rt
+    pe = pe_cfg()
+    appr = [a for a in route_signal_approaches(lg, rt, ctx.ctrl_map)
+            if float(pe['queue_min_stop_s_m']) <= a[1] <= rt['total_length'] - 25.0]
+    if not appr:
+        raise GenError('signal_queue: 경로에 신호화된 접근이 없다 (출발 뒤 queue_min_stop_s_m 이상)')
+    jid, stop_s, ctrls = appr[0]
+    n = int(v.get('대수', 2))
+    pitch = car_len() + float(pe['queue_car_gap_m'])
+    s_first = stop_s - float(pe['queue_head_gap_m']) - car_len() / 2.0
+    s_last = s_first - (n - 1) * pitch
+    if any(lg.lanes[lane_at(rt, s_first - i * pitch)[1]]['junction'] != -1 for i in range(n)):
+        raise GenError('signal_queue: 대기 줄이 교차로 차로에 걸린다 — 구간이 부족하다')
+    ctx.claim(s_last - 60.0, stop_s + 10.0, 'signal_queue')
+    green_at = stop_s / (float(pe['queue_approach_kph']) / 3.6) + float(pe['queue_wait_s'])
+    for c in ctrls:                     # 적색으로 시작 → green_at 에 녹색
+        ctx.signals[c] = ('stop_first', green_at, float(pe['queue_green_s']), 3.0)
+    names = []
+    for i in range(n):
+        x, y, z, h = route_pt(lg, rt, s_first - i * pitch)
+        name = ctx.next_name('QueueCar')
+        ctx.players.append(blk_vehicle_posabs(name, CAR, x, y, z, h))
+        ctx.actions.append(blk_player_actions(name, [
+            _act('stay', x, y, 20.0, name, _speed_change(10.0, 0.0)),
+            _act('release', x, y, 20.0, name,
+                 _speed_change(2.0, float(pe['queue_release_kph']) / 3.6,
+                               delay=green_at + float(pe['queue_release_stagger_s']) * i))]))
+        ctx.checks.append((x, y, 'ego_lane'))
+        ctx.route_objs.append((name, x, y, lane_at(rt, s_first - i * pitch)[1]))
+        names.append(name)
+    return {'kind': 'signal_queue', 'count': n, 'junction': jid, 'controllers': ctrls,
+            'stop_s': round(stop_s, 2), 'green_at_s': round(green_at, 1),
+            'route_s': [round(s_first - i * pitch, 2) for i in range(n)], 'queue': names}
 
 
 # 양측 정차 차량의 (종거리 오프셋, 좌우 부호) — 우측 먼저, 14 m 뒤 좌측.
@@ -2111,6 +2995,7 @@ def ev_narrow(ctx, v):
                        f'가용구간이 없다')
     intr = float(v.get('침범폭', 0.7))
     placed = []
+    bodies = []
     for ds, sgn in NARROW_OFFSETS:
         _, k, sl = lane_at(rt, s + ds)
         w = lg.width_at(k, sl)
@@ -2121,6 +3006,10 @@ def ev_narrow(ctx, v):
         ctx.actions.append(blk_stay_action(name, x, y))
         placed.append({'name': name, 'route_s': round(s + ds, 2), 'side': '우측' if sgn < 0 else '좌측'})
         ctx.checks.append((x, y, 'narrow'))
+        bodies.append((x, y, CAR_LEN / 2.0, CAR_W / 2.0, name))
+    av = avoid_cfg()
+    if av['any']:                       # 다른 이벤트의 회피 창(F)이 볼 정지 물체로 등록
+        _avoid_commit(ctx, av, 'narrow', placed[0]['name'], s, None, bodies)
     return {'kind': 'narrow', 'intrusion_m': intr, 'vehicles': placed}
 
 
@@ -2134,6 +3023,9 @@ EVENTS = {
     'static_vehicle': ev_static_vehicle, 'cut_in': ev_cut_in, 'oncoming': ev_oncoming,
     'signal': ev_signal, 'obstacle_chain': ev_obstacle_chain, 'narrow': ev_narrow,
     'none': ev_none,
+    # 논문 실험용 (2026-10-02)
+    'parked_row': ev_parked_row, 'side_by_side': ev_side_by_side, 'zigzag': ev_zigzag,
+    'side_traffic': ev_side_traffic, 'signal_queue': ev_signal_queue,
 }
 
 
@@ -2373,6 +3265,7 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
             snap = (len(ctx.players), len(ctx.actions), len(ctx.moving),
                     dict(ctx.signals), list(ctx.checks), list(ctx.occupied),
                     ctx.shape_seq, ctx.player_seq)
+            asnap = (ctx.statics, ctx.avoid_evs, ctx.avoid_recs)    # avoid_geom (교체식 갱신)
             vv = dict(v) if attempt == 0 else dict(v, 위치=frac, 발동거리=frac)
             try:
                 resolved.append(EVENTS[ev](ctx, vv))
@@ -2382,6 +3275,7 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
                 msg = str(e)
                 (np_, na, nm, ctx.signals, ctx.checks, ctx.occupied,
                  ctx.shape_seq, ctx.player_seq) = snap
+                ctx.statics, ctx.avoid_evs, ctx.avoid_recs = asnap
                 del ctx.players[np_:], ctx.actions[na:], ctx.moving[nm:]
                 if not isinstance(e, EventUnfeasible) and \
                         '겹친다' not in msg and '부족하다' not in msg:
@@ -2390,6 +3284,8 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
         if last is not None:
             if min_keep is not None:
                 dropped.append(ev)          # 이 이벤트만 포기하고 계속 (min_keep 가드)
+                if getattr(last, 'avoid_cond', None):
+                    AVOID_DROPS[last.avoid_cond] += 1
                 continue
             raise last
     if min_keep is not None and len(resolved) < min_keep:
@@ -2408,8 +3304,12 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
     for w in cone_warn:
         print(f'  ⚠ {name}: {w}', file=sys.stderr)
     doc.add_moving(ctx.moving + cone_blocks)
-    for cid, (go, att, stop) in sorted(ctx.signals.items()):
-        doc.set_signal(cid, go, att, stop)
+    for cid, ph in sorted(ctx.signals.items()):
+        if ph[0] == 'stop_first':       # (표식, 적색, 녹색, 황색) — 적색으로 시작
+            doc.set_signal_phases(cid, [('stop', ph[1]), ('go', ph[2]), ('attention', ph[3])])
+        else:
+            go, att, stop = ph
+            doc.set_signal(cid, go, att, stop)
     xml_text = doc.final(name)
     bad = lateral_check(lg, rt, ctx.checks)
     d = {'name': name, 'theme': None, 'seed_key': seed_key,
@@ -2443,6 +3343,22 @@ def build_scenario(lg, ctrl_map, route: Route, events: list, axes: dict,
             'reach_m': round(cone_gate['reach'], 3),
             'clear_m': [round(cone_gate['clear_left'], 3),
                         round(cone_gate['clear_right'], 3)]}
+    # 경로 게이트·도로 분산이 볼 것 (정의 yaml 에는 쓰지 않는다 — write_scenario 가 뺀다).
+    d['_route_objs'] = [{'name': n, 'x': round(x, 3), 'y': round(y, 3), 'lane': list(k)}
+                        for n, x, y, k in ctx.route_objs]
+    av = avoid_cfg()
+    if av['any']:
+        # 회피 성립 조건 판정 기록. 정의(yaml)에는 넣지 않는다 — write_scenario 가
+        # 꺼내 정의 옆 <이름>.placement.json 으로 쓴다 (스위치가 꺼져 있으면 키 자체가 없다).
+        d['_placement'] = {
+            'name': name,
+            'switches': dict(av['on']),
+            'consts': {'v_ref_mps': av['v_ref'], 'trans_m': round(av['trans'], 3),
+                       'extra_before_m': av['xb'], 'extra_after_m': av['xa'],
+                       'min_neighbor_width_m': av['min_w'],
+                       'corridor_m': round(av['corr'], 3),
+                       'start_min_m': round(av['start_min'], 3)},
+            'events': list(ctx.avoid_recs)}
     return xml_text, d, bad
 
 
@@ -2624,15 +3540,136 @@ def write_scenario(out_dir, theme, name, xml_text, sdef, rows):
     csv = 'seq,x,y\n' + ''.join(f'{r[0]},{r[1]:.3f},{r[2]:.3f}\n' for r in rows)
     (d / f'{name}.csv').write_text(csv, encoding='utf-8')
     sdef = dict(sdef, theme=theme)
+    placement = sdef.pop('_placement', None)
+    quality = sdef.pop('_route_quality', None)
+    for k in [k for k in sdef if k.startswith('_')]:        # 생성기 내부용 (예: _route_objs)
+        sdef.pop(k)
+    if quality is not None:
+        placement = dict(placement or {'name': name}, route_quality=quality)
+    if placement is not None:
+        # *.yaml 로 쓰지 않는다 — rebuild_batch_lists 가 <주제>/*.yaml 을 전부 시나리오
+        # 정의로 읽는다.
+        (d / f'{name}.placement.json').write_text(
+            json.dumps(placement, ensure_ascii=False, indent=1), encoding='utf-8')
+    else:                               # 스위치를 끄고 다시 만들면 옛 기록이 남지 않게
+        (d / f'{name}.placement.json').unlink(missing_ok=True)
     (d / f'{name}.yaml').write_text(
         '# tools/gen_scenarios.py --from-yaml <이 파일> 로 단건 재생성\n'
         + yaml.safe_dump(sdef, allow_unicode=True, sort_keys=False), encoding='utf-8')
 
 
+# ── 경로 품질 게이트 (gen_placement.route_gates, 2026-10-02) ──────────────
+# 폐기 사유 코드 (--coverage-report 의 열): T 꼬리 · R 급회전 · C 콘 · B 이 브랜치 빌더 ·
+# W 다른 브랜치 빌더. 근거는 params gen_placement.route_gates 주석.
+GATE_CODES = ('T', 'R', 'C', 'B', 'W')
+_GATE_WHY = {'T': '종료선 뒤 꼬리가 요구에 못 미친다', 'R': '기하 최소회전반경 미만의 연결로가 있다',
+             'C': '종료선 콘이 회피 회랑 안이다',
+             'B': 'build_route CLI 로 지은 경로가 장애물 차로를 지나지 않는다',
+             'W': '다른 브랜치 빌더로 지은 경로가 장애물 차로를 지나지 않는다'}
+_OTHER_BUILDER_DIR: dict = {}
+
+
+class RouteGateError(GenError):
+    """경로 품질 게이트 탈락 — gate 에 사유 코드."""
+    gate = None
+
+
+def other_builder_dir(ref: str) -> pathlib.Path:
+    """비교 대상 브랜치의 빌더를 임시 폴더에 푼다 (git archive — 읽기 전용, 작업 트리 불변)."""
+    if ref not in _OTHER_BUILDER_DIR:
+        import subprocess
+        import tempfile
+        d = pathlib.Path(tempfile.gettempdir()) / f'mando_builder_{ref[:12]}'
+        if not (d / 'tools' / 'build_route.py').exists():
+            d.mkdir(parents=True, exist_ok=True)
+            ar = subprocess.run(['git', '-C', str(ROOT), 'archive', ref, 'tools', 'vtd_adapter',
+                                 'config', 'data/lane_graph.pkl'], capture_output=True)
+            if ar.returncode != 0:
+                raise GenError(f'route_gates: git archive {ref} 실패 — {ar.stderr.decode()[:200]} '
+                               f'(그 커밋이 이 저장소에 없으면 other_builder_enable 을 끌 것)')
+            subprocess.run(['tar', '-x', '-C', str(d)], input=ar.stdout, check=True)
+        _OTHER_BUILDER_DIR[ref] = d
+    return _OTHER_BUILDER_DIR[ref]
+
+
+def _cli_route(root: pathlib.Path, csv_path: pathlib.Path):
+    """root 의 build_route.py CLI 로 경로를 짓는다 → (rc, 출력, route dict 또는 None).
+    batch_run 이 부르는 것과 같은 명령이다."""
+    import pickle
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        pkl = pathlib.Path(td) / 'r.pkl'
+        cp = subprocess.run([sys.executable, str(root / 'tools' / 'build_route.py'),
+                             str(root / 'data' / 'lane_graph.pkl'), str(csv_path), '-o', str(pkl)],
+                            capture_output=True, text=True, cwd=str(root))
+        rt = pickle.load(open(pkl, 'rb')) if pkl.exists() else None
+    return cp.returncode, cp.stdout + cp.stderr, rt
+
+
+def route_quality(sdef: dict, rows: list, enforce: bool) -> dict:
+    """경로 품질 검사 → 기록 dict. enforce 면 켜진 게이트에 걸릴 때 RouteGateError.
+
+    enforce=False (실경로 — 주어진 경로라 버릴 수 없다)는 기록만 한다.
+    """
+    import tempfile
+    g = plc_cfg().get('route_gates') or {}
+    q: dict = {}
+
+    def fail(code, detail):
+        if enforce and bool(g.get({'T': 'tail_enable', 'R': 'sharp_turn_enable', 'C': 'cone_enable',
+                                   'B': 'builder_enable', 'W': 'other_builder_enable'}[code], False)):
+            e = RouteGateError(f'경로 게이트 {code} — {_GATE_WHY[code]} ({detail})')
+            e.gate = code
+            raise e
+
+    cone = sdef.get('finish_cone')
+    if cone:
+        q['cone_clear_m'] = min(cone['clear_m'])
+        if q['cone_clear_m'] <= 0.0:    # 기록은 3자리 반올림 — 경고 임계(여유 < 0)의 -0.000 도 잡는다
+            fail('C', f'여유 {q["cone_clear_m"]:.3f} m')
+    objs = sdef.get('_route_objs') or []
+    with tempfile.TemporaryDirectory() as td:
+        csv_path = pathlib.Path(td) / 'route.csv'
+        csv_path.write_text('seq,x,y\n' + ''.join(f'{r[0]},{r[1]:.3f},{r[2]:.3f}\n' for r in rows),
+                            encoding='utf-8')
+        rc, out, rt = _cli_route(ROOT, csv_path)
+        q['builder_rc'] = rc
+        m = re.search(r'종료선 뒤 꼬리 ([0-9.]+) m < 요구 ([0-9.]+)', out)
+        q['tail_short_m'] = float(m.group(1)) if m else None
+        q['sharp_turn_r_m'] = sorted({float(r) for r in
+                                      re.findall(r'급회전 연결로 \([^)]*\) R ([0-9.]+) m', out)})
+        lanes = {tuple(k) for k in (rt or {}).get('lanes', [])}
+        q['builder_off_lane'] = [o['name'] for o in objs if tuple(o['lane']) not in lanes]
+        if rt is None:
+            fail('B', f'build_route rc={rc}')
+        if m:
+            fail('T', f'{m.group(1)} m < {m.group(2)} m')
+        if q['sharp_turn_r_m']:
+            fail('R', 'R ' + '·'.join(f'{r:g}' for r in q['sharp_turn_r_m']) + ' m')
+        if q['builder_off_lane']:
+            fail('B', ', '.join(q['builder_off_lane']))
+        if bool(g.get('other_builder_enable', False)) or not enforce:
+            name = str(g.get('other_builder_name', 'other'))
+            rc2, _out2, rt2 = _cli_route(other_builder_dir(str(g['other_builder_ref'])), csv_path)
+            lanes2 = [tuple(k) for k in (rt2 or {}).get('lanes', [])]
+            q['other_builder'] = {'name': name, 'ref': str(g['other_builder_ref'])[:12], 'rc': rc2,
+                                  'off_lane': [o['name'] for o in objs if tuple(o['lane']) not in set(lanes2)],
+                                  'same_lanes': lanes2 == [tuple(k) for k in (rt or {}).get('lanes', [])],
+                                  'length_m': None if rt2 is None else round(float(rt2['total_length']), 1)}
+            q['builder_length_m'] = None if rt is None else round(float(rt['total_length']), 1)
+            if rt2 is None:
+                fail('W', f'{name} build_route rc={rc2}')
+            if q['other_builder']['off_lane']:
+                fail('W', f'{name}: ' + ', '.join(q['other_builder']['off_lane']))
+    return q
+
+
 def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed, path_truncate=False):
     ml = cfg.get('min_length_m')
     route = pool.get(*variant['route'],
-                     min_length_m=None if ml is None else float(ml))
+                     min_length_m=None if ml is None else float(ml),
+                     **({'allow_warnings': True} if cfg.get('real_route') else {}))
     events = list(variant['event'])
     scale = bool(cfg.get('scale_events'))
     min_keep = None
@@ -2696,7 +3733,8 @@ def gen_one(lg, ctrl_map, pool, theme, cfg, variant, name, seed, path_truncate=F
     pulk = pulk_def(axes) if cfg.get('pulk') else None
     xml_text, sdef, bad = build_scenario(lg, ctrl_map, route, ev_list, axes,
                                          name, seed_key, min_keep=min_keep,
-                                         pulk=pulk, path_truncate=path_truncate)
+                                         pulk=pulk,
+                                         path_truncate=path_truncate or bool(cfg.get('real_route')))
     return route, xml_text, sdef, bad
 
 
@@ -2721,6 +3759,8 @@ def main(argv=None) -> int:
                     help='--from-csv 가 쓸 주제 (기본: 실전주행_교통류)')
     ap.add_argument('--rebuild-lists', action='store_true',
                     help='생성 없이 디스크(<주제>/*.yaml) 기준으로 batch 목록만 재생성')
+    ap.add_argument('--manifest', action='store_true',
+                    help='생성 뒤 <out-dir>/MANIFEST.sha256 를 쓴다 (목록·XML·CSV·정의·판정 기록의 해시)')
     ap.add_argument('--coverage-report', action='store_true',
                     help='이번 생성분이 밟은 road 커버리지 요약(유니크/%%/미방문) 출력')
     a = ap.parse_args(argv)
@@ -2830,47 +3870,53 @@ def main(argv=None) -> int:
         return pool.get(*route_key).rt['total_length']
 
     chosen = allocate(themes, combos, a.count, a.hours, route_len, a.seed)
+    if a.count is None and a.hours is None:
+        # 테마가 자기 개수를 정한 경우 (themes.yaml 의 count) — 명령 한 줄에 유형마다 다른
+        # 개수를 담기 위한 것이다. --count/--hours 를 주면 그쪽이 이긴다.
+        for th in a.themes:
+            if themes[th].get('count') is not None:
+                chosen[th] = allocate(themes, {th: combos[th]}, int(themes[th]['count']),
+                                      None, route_len, a.seed)[th]
 
     summary, warn_total = [], 0
     skipped = []
     walk_starts: set = set()            # 합성 경로 시작 도로들 — 실기 스폰 확인 항목
     cov_roads: collections.Counter = collections.Counter()   # 생성분이 밟은 road 빈도
+    # 배치 조건(gen_placement.avoid_geom)·경로 게이트(route_gates) 집계 — 주제별 시도·폐기·road.
+    AVOID_DROPS.clear()
+    plc_stats: dict = {}
+    targets: dict = {}
     for th in a.themes:
         cfg = themes[th]
+        st = plc_stats[th] = {'tries': 0, 'disc': collections.Counter(), 'other': 0,
+                              'moved': collections.Counter(), 'roads': set(),
+                              'obst_roads': set(), 'short': []}
         n_ok = 0
         est_total = 0.0
-        target = len(chosen[th])
-        # 실패한 변형은 선택되지 않은 나머지 조합으로 백필해 개수를 채운다.
-        # start: 자유 주제는 조합이 소진돼도 새 순번(=새 시작점의 walk)으로
-        # 이어서 백필한다 — 조합 수 == target 이면 실패 1건이 곧 개수 미달이던
-        # 문제(2026-08-28 실측: 다중이벤트 17/20) 방지. 상한 3×target.
-        picked = {id(c) for c in chosen[th]}
-        queue = list(chosen[th]) + [c for c in combos[th] if id(c) not in picked]
-        free_mode = bool(combos[th] and combos[th][0]['route'][2])
-        next_rv = max((c['route'][1] for c in combos[th]), default=0) + 1
-        extra_used, qi = 0, 0
-        while n_ok < target:
-            if qi < len(queue):
-                variant = queue[qi]
-                qi += 1
-            elif free_mode and extra_used < 3 * target:
-                base = combos[th][extra_used % len(combos[th])]
-                variant = dict(base)
-                variant['route'] = (base['route'][0], next_rv, base['route'][2])
-                next_rv += 1
-                extra_used += 1
-            else:
-                break
-            name = f'{th}_{n_ok + 1:02d}_{variant["route"][0]}'
-            if variant['route'][1] != 1 and 'walk' in route_defs.get(variant['route'][0], {}):
-                name += str(variant['route'][1])
+        gated = bool(cfg.get('route_gates'))
+
+        def attempt(variant, name, cond_roads=None):
+            """변형 하나를 만들어 본다 → 성공하면 정의 dict, 버리면 None (사유는 st·skipped 에)."""
+            nonlocal warn_total, est_total
+            st['tries'] += 1
+            desc = f'{variant["route"][0]} / {"+".join(variant["event"])}'
             try:
                 route, xml_text, sdef, bad = gen_one(lg, ctrl_map, pool, th, cfg,
                                                      variant, name, a.seed)
+                objs = sdef.get('_route_objs') or []
+                road = objs[0]['lane'][0] if objs else None
+                if cond_roads is not None and road is not None and road in cond_roads:
+                    raise GenError(f'같은 조건에 이미 쓴 도로다 (road {road}) — 조건마다 서로 다른 도로')
+                if gated or cfg.get('real_route'):
+                    sdef['_route_quality'] = route_quality(sdef, route.rows, enforce=gated)
             except (GenError, RouteError) as e:
-                desc = f'{variant["route"][0]} / {"+".join(variant["event"])}'
                 skipped.append((th, desc, str(e).splitlines()[0]))
-                continue
+                code = getattr(e, 'avoid_cond', None) or getattr(e, 'gate', None)
+                if code:
+                    st['disc'][code] += 1
+                else:
+                    st['other'] += 1
+                return None
             write_scenario(out_dir, th, xml_text=xml_text, name=name,
                            sdef=sdef, rows=route.rows)
             rs = sdef['route']
@@ -2881,11 +3927,84 @@ def main(argv=None) -> int:
             if 'walk' in route_defs.get(variant['route'][0], {}):
                 walk_starts.add(rs['start']['road'])
             cov_roads.update(rs['roads'])
+            st['roads'].update(rs['roads'])
+            if road is not None:
+                st['obst_roads'].add(road)
+                if cond_roads is not None:
+                    cond_roads.add(road)
+            for rec in (sdef.get('_placement') or {}).get('events', []):
+                mv = (rec.get('candidates') or {}).get('moved')
+                if mv:
+                    st['moved'][mv] += 1
+            q = sdef.get('_route_quality') or {}
+            ob = q.get('other_builder') or {}
+            if cfg.get('real_route') and ob and not ob.get('same_lanes'):
+                print(f'  ⚠ {name}: {ob.get("name")} 빌더가 다른 차로열을 만든다 '
+                      f'(길이 {q.get("builder_length_m")} m vs {ob.get("length_m")} m)')
             for _, x, y, dm in bad:
                 print(f'  ⚠ {name}: ego 차선 이벤트가 경로에서 {dm:.1f} m 벗어남 ({x:.1f},{y:.1f})')
                 warn_total += 1
-            n_ok += 1
             est_total += sdef['est_s']
+            return sdef
+
+        def name_of(variant):
+            nm = f'{th}_{n_ok + 1:02d}_{variant["route"][0]}'
+            if variant['route'][1] != 1 and 'walk' in route_defs.get(variant['route'][0], {}):
+                nm += str(variant['route'][1])
+            return nm
+
+        if cfg.get('conditions'):
+            # 조건별 균형 생성 (논문 세트): 조건마다 per_condition 곳, **서로 다른 도로**.
+            # 조건을 못 채우면 다른 조건으로 메우지 않고 부족분으로 남긴다.
+            # --count 를 주면 조건당 개수를 그 값으로 줄여 시험 생성할 수 있다 (예: 신호 대기 줄 1개).
+            per = int(cfg['per_condition']) if a.count is None else int(a.count)
+            targets[th] = per * len(cfg['conditions'])
+            events = list(cfg.get('event', ['none']))
+            rv = 0
+            for cond in cfg['conditions']:
+                cond = dict(cond)
+                routes_c = list(cond.pop('routes', cfg.get('routes', ['기본'])))
+                roads_used: set = set()
+                got = tries = 0
+                limit = per * int(cfg.get('max_tries_per_place', 30))
+                while got < per and tries < limit:
+                    variant = dict(cond)
+                    for ax, vals in (cfg.get('cycle') or {}).items():
+                        variant[ax] = vals[got % len(vals)]
+                    variant['route'] = (routes_c[tries % len(routes_c)], rv, th)
+                    variant['event'] = events
+                    rv += 1
+                    tries += 1
+                    if attempt(variant, name_of(variant), roads_used) is not None:
+                        got += 1
+                        n_ok += 1
+                if got < per:
+                    st['short'].append((cond, per - got))
+        else:
+            target = targets[th] = len(chosen[th])
+            # 실패한 변형은 선택되지 않은 나머지 조합으로 백필해 개수를 채운다.
+            # start: 자유 주제는 조합이 소진돼도 새 순번(=새 시작점의 walk)으로
+            # 이어서 백필한다 — 조합 수 == target 이면 실패 1건이 곧 개수 미달이던
+            # 문제(2026-08-28 실측: 다중이벤트 17/20) 방지. 상한 3×target.
+            picked = {id(c) for c in chosen[th]}
+            queue = list(chosen[th]) + [c for c in combos[th] if id(c) not in picked]
+            free_mode = bool(combos[th] and combos[th][0]['route'][2])
+            next_rv = max((c['route'][1] for c in combos[th]), default=0) + 1
+            extra_used, qi = 0, 0
+            while n_ok < target:
+                if qi < len(queue):
+                    variant = queue[qi]
+                    qi += 1
+                elif free_mode and extra_used < 3 * target:
+                    base = combos[th][extra_used % len(combos[th])]
+                    variant = dict(base)
+                    variant['route'] = (base['route'][0], next_rv, base['route'][2])
+                    next_rv += 1
+                    extra_used += 1
+                else:
+                    break
+                if attempt(variant, name_of(variant)) is not None:
+                    n_ok += 1
         unsup = sorted({UNSUPPORTED[e] for e in cfg.get('event', []) if e in UNSUPPORTED})
         summary.append((th, n_ok, est_total, '; '.join(unsup)))
 
@@ -2932,10 +4051,56 @@ def main(argv=None) -> int:
         print('  상위 빈도: ' + '  '.join(f'{r}×{n}' for r, n in cov_roads.most_common(20)))
         missing = sorted(all_roads - visited)
         print(f'  미방문 {len(missing)}개: ' + ' '.join(map(str, missing)))
+        # 배치 조건 집계 — 논문 실험 환경 문단에 그대로 들어가는 숫자다.
+        # 시도 = gen_one 호출 수(백필 포함), 폐기 = 그 조건이 후보를 전부 걸러 버린 시도,
+        # 기타 = 조건과 무관한 폐기(경로 게이트·차로 수·구간 부족 등), 최종 = 기록된 시나리오,
+        # 이동 = 꺼져 있었다면 놓였을 자리가 그 조건에 걸려 같은 경로 안에서 옮긴 이벤트 수
+        #        ('-' = 종전 로직으로는 자리가 없던 것을 조건 A 의 후보에서 찾았다).
+        av = avoid_cfg()
+        sw = ' '.join(f'{c}={"on" if av["on"][c] else "off"}' for c in 'ADEF')
+        rg = plc_cfg().get('route_gates') or {}
+        gk = {'T': 'tail_enable', 'R': 'sharp_turn_enable', 'C': 'cone_enable',
+              'B': 'builder_enable', 'W': 'other_builder_enable'}
+        gw = ' '.join(f'{c}={"on" if rg.get(k) else "off"}' for c, k in gk.items())
+        cols = 'SADEF' + ''.join(GATE_CODES)
+        print(f'\n[배치 조건] gen_placement.avoid_geom  {sw}   route_gates(테마가 켠 경우만)  {gw}')
+        print('  S 차로 구조 · A 이웃 연속 · D 엇갈림 · E 출발 거리 · F 창 겹침 | '
+              'T 꼬리 · R 급회전 · C 콘 · B 빌더 · W 다른 브랜치 빌더')
+        print(f'  {"주제":16s} {"시도":>4s} ' + ' '.join(f'{c:>3s}' for c in cols)
+              + f' {"기타":>4s} {"최종":>4s} {"목표":>4s} {"road":>5s} {"장애물road":>8s}  이동(A/D/E/F/-)')
+        tot = collections.Counter()
+        obst_all: set = set()
+        for (th, n, _t, _note) in summary:
+            st = plc_stats[th]
+            row = {'tries': st['tries'], 'other': st['other'], 'final': n,
+                   'target': targets[th], **{c: st['disc'][c] for c in cols},
+                   **{'m' + c: st['moved'][c] for c in 'ADEF-'}}
+            tot.update(row)
+            obst_all |= st['obst_roads']
+            print(f'  {th:16s} {row["tries"]:4d} ' + ' '.join(f'{row[c]:3d}' for c in cols)
+                  + f' {row["other"]:4d} {row["final"]:4d} {row["target"]:4d} {len(st["roads"]):5d} '
+                  f'{len(st["obst_roads"]):8d}  ' + '/'.join(str(row['m' + c]) for c in 'ADEF-'))
+        print(f'  {"합계":16s} {tot["tries"]:4d} ' + ' '.join(f'{tot[c]:3d}' for c in cols)
+              + f' {tot["other"]:4d} {tot["final"]:4d} {tot["target"]:4d} {len(visited):5d} '
+              f'{len(obst_all):8d}  ' + '/'.join(str(tot['m' + c]) for c in 'ADEF-'))
+        for (th, _n, _t, _note) in summary:
+            for cond, lack in plc_stats[th]['short']:
+                print(f'  [부족] {th} {cond}: {lack}곳 못 채움')
+        if any(AVOID_DROPS.values()):
+            print('  이벤트 단위 폐기(min_keep 주제 — 시나리오는 유지): '
+                  + ' '.join(f'{c}={AVOID_DROPS[c]}' for c in 'ADEF'))
     if walk_starts:
         print(f'\n[실기 1회 확인] 합성 경로 시작 도로 {sorted(walk_starts)} — '
               f'Ego PathRef/Path01 은 경로 기준으로 생성했지만, VTD 스폰이 실제로 '
               f'그 위치에 되는지는 새 시작점마다 실기에서 한 번 확인할 것')
+    if a.manifest:
+        import hashlib
+        files = sorted(p for pat in ('batch_*.json', '*/*.xml', '*/*.csv', '*/*.yaml', '*/*.placement.json')
+                       for p in out_dir.glob(pat))
+        (out_dir / 'MANIFEST.sha256').write_text(''.join(
+            f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out_dir).as_posix()}\n'
+            for p in files), encoding='utf-8')
+        print(f'\nMANIFEST.sha256: {len(files)}개 파일  (확인: cd {out_dir} && sha256sum -c MANIFEST.sha256 --quiet)')
     print(f'\nbatch_all.json: {n_all}개 (주제 {n_themes}개)  ({out_dir}/)')
     print(f'실행:  python3 tools/batch_run.py {out_dir / "batch_all.json"}')
     print('       (batch_run 은 목록 여러 개·glob 도 받는다 — 주제별 batch_<주제>.json 조합 가능)')

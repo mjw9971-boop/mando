@@ -29,6 +29,10 @@ SPACING = 18.0
 def gate_cfg(monkeypatch, enable):
     cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in gs.plc_cfg().items()}
     cfg['obstacle_chain']['require_multi_lane'] = enable
+    # 이 파일은 require_multi_lane 게이트만 본다. gen_placement.avoid_geom(2026-10-01,
+    # params 에서 A·E 켬 — params 값이 정본)은 배치를 옮기므로 사본에서 명시적으로 끈다
+    # (docs/BACKLOG.md B-35). avoid_geom 자체는 tests/test_avoid_geom.py 가 본다.
+    cfg['avoid_geom'] = dict.fromkeys(gs._AVOID_KEYS.values(), False)
     monkeypatch.setattr(gs, '_PLC_CFG', cfg)
 
 

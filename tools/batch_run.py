@@ -71,6 +71,32 @@ BASIS_MARGIN = ('로그 ego.route_s ≥ route_<name>.pkl 총길이 − {margin:.
                 '(stop_gap+앞범퍼+여유, params.yaml 연동) [폴백]')
 
 
+def git_state(root: pathlib.Path = _ROOT) -> dict:
+    """그 순간의 코드 상태 — 커밋 해시와 미커밋 변경 (`git status --short` 요약).
+
+    커밋 해시만으로는 돌린 코드를 특정하지 못한다 (2026-10-02: 논문 실험 도구 전체가
+    미커밋인 채 해시 70160e9 만 남고 있었다). dirty = **추적 파일**의 미커밋 변경 —
+    추적 안 된 파일은 untracked 에 따로 둔다 (colcon 의 build/·install/·log/ 가 늘
+    남아 있어, 합치면 dirty 가 항상 참이 된다). git 이 없거나 저장소가 아니면 전부 None.
+    """
+    def git(*args):
+        cp = subprocess.run(['git', *args], cwd=str(root), capture_output=True, text=True, timeout=10)
+        if cp.returncode:
+            raise RuntimeError(cp.stderr.strip())
+        return cp.stdout
+    try:
+        commit = git('rev-parse', 'HEAD').strip()
+        lines = [ln for ln in git('status', '--short').splitlines() if ln.strip()]
+        return {'commit': commit, 'commit_short': commit[:7],
+                'branch': git('rev-parse', '--abbrev-ref', 'HEAD').strip(),
+                'dirty': any(not ln.startswith('??') for ln in lines),
+                'modified': [ln for ln in lines if not ln.startswith('??')],
+                'untracked': [ln[3:] for ln in lines if ln.startswith('??')]}
+    except Exception:                                   # noqa: BLE001 — 기록용이라 배치를 막지 않는다
+        return {'commit': None, 'commit_short': None, 'branch': None, 'dirty': None,
+                'modified': None, 'untracked': None}
+
+
 def done_rule(margin: float, b: dict, basis: str | None = None) -> str:
     return DONE_RULE.format(
         basis=basis or BASIS_MARGIN.format(margin=margin),
@@ -673,9 +699,17 @@ class Runner:
         self.scp: ScpClient | None = None
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.out_dir = _ROOT / 'logs' / 'batch' / ts
+        if getattr(args, 'out_dir', None):
+            # 구현(arm)별·유형별로 결과를 갈라 담는다 (tools/paper_run.py). 미지정이면
+            # 종전대로 logs/batch/<시각>.
+            self.out_dir = pathlib.Path(args.out_dir)
         self.results: list[dict] = []
         # 종료 판정 값은 컨트롤러와 같은 params.yaml 에서 (하드코딩 금지)
-        self.cfg = cfg = load_cfg()
+        # --config 를 주면 **자기 판정(batch.*)과 run_agent 가 같은 파일**을 읽는다 —
+        # 구현별 설정 사본(config/arms/A?.yaml)으로 돌릴 때 판정값과 제어기 스위치가
+        # 서로 다른 파일에서 오지 않게 한다. 미지정(None)이면 종전대로 기본 params.yaml.
+        self.cfg_path = getattr(args, 'config', None)
+        self.cfg = cfg = load_cfg(self.cfg_path)
         self.margin = end_margin_m(cfg)
         self.batch_cfg = cfg['batch']       # 종료 판정 임계 전부 (EndJudge 가 읽는다)
         self.end_policy = 'no_timeout' if getattr(args, 'no_early', False) else 'default'
@@ -783,6 +817,8 @@ class Runner:
                       '--graph', str(_ROOT / 'data' / 'lane_graph.pkl'),
                       '--host', self.args.host,
                       '--log', str(agent_log)]
+        if self.cfg_path:
+            launch_cmd += ['--config', str(self.cfg_path)]
         if self.args.dry_run:
             print(f'\n[dry-run] {name}')
             print('  route :', ' '.join(build_cmd))
@@ -948,7 +984,7 @@ class Runner:
         # 위반 검출 (tools/score.py — 배점 없음, 건수만). 전문은 {name}.score.txt 로.
         try:
             import score as score_tool
-            rep = score_tool.analyze(res['log'], load_cfg(), lg, route)
+            rep = score_tool.analyze(res['log'], load_cfg(self.cfg_path), lg, route)
             (self.out_dir / f"{res['name']}.score.txt").write_text(
                 score_tool.render(rep), encoding='utf-8')
             res['n_violations'] = rep['n_violations']
@@ -961,7 +997,7 @@ class Runner:
             # 정지선 정지 지표 — report 에 실어 **로그가 지워져도 남긴다**
             # (위 ticks 는 raw 줄만 고른 것이라 다르다 — stop_metrics 는 전 틱이 필요)
             stop_ticks = score_tool.load_ticks(res['log'])
-            _sc = load_cfg().get('score') or {}
+            _sc = load_cfg(self.cfg_path).get('score') or {}
             res['stops'] = (score_tool.stop_metrics(
                 stop_ticks, stop_ticks[0]['t'],
                 accel_sign=bool(_sc.get('cmd_reversals_accel_sign', False)),
@@ -979,7 +1015,7 @@ class Runner:
             # lg·route 를 넘긴다 — 구 생성기 산출물(기대값 없는 yaml)도 지도에서
             # 다시 재서 판정하고, ego 가 못 간 이벤트도 미도달로 제대로 센다.
             ev = event_check.check_scenario(res['scenario_yaml'], res['log'],
-                                            load_cfg(), lg, route)
+                                            load_cfg(self.cfg_path), lg, route)
             (self.out_dir / f"{res['name']}.events.txt").write_text(
                 event_check.render(ev, res['name']), encoding='utf-8')
             res['events_ok'], res['events_total'] = ev['ok'], ev['total']
@@ -988,6 +1024,46 @@ class Runner:
         except Exception as e:                          # noqa: BLE001
             res['events_ok'] = res['events_total'] = res['events_unreached'] = None
             res['collect_error'] = res.get('collect_error', '') + f' events:{e}'
+
+    # ── 구현(arm) 기록 · 이어하기 (--config / --out-dir / --resume) ────────
+    # 실제 주행이 끝까지 간 결과만 '끝난 런' 이다. 기반 실패(SCP·VTD 무응답·launch 사망·
+    # no-data·route 실패·예외)는 제어기 결과가 아니므로 이어하기에서 다시 돌린다.
+    DONE_STATUS = ('완주', 'stall', 'blocked', 'no_progress', 'timeout')
+
+    def arm_info(self) -> dict:
+        """--config 로 돌린 런에 붙는 꼬리표 — 어떤 구현을 어떤 판정값으로 돌렸는가.
+
+        config/arms/A?.yaml 은 tools/make_arms.py 가 `arm:` (이름·overlay 키 전체)를
+        심어 둔다. 그 키가 없는 임의의 설정 파일이면 경로와 판정값만 남긴다.
+        코드 상태(`git`: 커밋 해시·미커밋 여부)는 여기가 아니라 런마다 따로 붙는다 (run()).
+        """
+        if not self.cfg_path:
+            return {}
+        b = self.batch_cfg
+        arm = self.cfg.get('arm') or {}
+        return {'config': str(self.cfg_path),
+                'arm': arm.get('name'),
+                'arm_label': arm.get('label_ko'),
+                'arm_overlay': arm.get('overlay'),
+                'arm_base_sha256': arm.get('base_sha256'),
+                'judge': {k: b.get(k) for k in ('stall_end_s', 'blocked_end_s',
+                                                 'no_progress_end_s', 'stall_excuse_queue',
+                                                 'stall_speed_mps', 'stall_intent_mps')}}
+
+    def load_done(self) -> dict:
+        """--resume: out_dir/report.json 에서 끝난 런을 읽는다 → {이름: 결과}."""
+        p = self.out_dir / 'report.json'
+        if not (getattr(self.args, 'resume', False) and p.exists()):
+            return {}
+        prev = json.loads(p.read_text(encoding='utf-8'))
+        return {r['name']: r for r in prev if r.get('status') in self.DONE_STATUS}
+
+    def save_partial(self) -> None:
+        """--out-dir 로 돌릴 때는 런마다 report.json 을 갱신한다 — 중간에 죽어도
+        끝난 런이 남아 --resume 이 건너뛸 수 있다. 미지정이면 종전대로 끝에 한 번만 쓴다."""
+        if getattr(self.args, 'out_dir', None) and not self.args.dry_run:
+            (self.out_dir / 'report.json').write_text(
+                json.dumps(self.results, ensure_ascii=False, indent=1), encoding='utf-8')
 
     # ── 정지 지표 (영구 기록) ──────────────────────────────────────────────
     STOP_RULE = ('정지선 정지 지표: slf = 앞범퍼→정지선 [m] (음수 = 선 앞). '
@@ -1037,6 +1113,12 @@ class Runner:
         5개 중 2개가 로드 실패(no-data)로 시간만 태웠다. 없으면 즉시 중단한다.
         """
         path = scenarios[0]['vtd_xml_path']
+        # 제어기·VTD 한 PC (2026-10-01): host 가 로컬이면 ssh 없이 파일 존재로 확인.
+        if self.args.host in ('127.0.0.1', 'localhost'):
+            if not os.path.exists(path):
+                raise SystemExit(f'[중단] 로컬에 {path} 가 없다 — --vtd-dir 경로 확인.')
+            print(f'VTD 경로 확인(로컬): {path} OK')
+            return
         user = path.split('/')[2] if path.startswith('/home/') else 'mjw'
         target = self.args.ssh or f'{user}@{self.args.host}'
         cp = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
@@ -1063,9 +1145,22 @@ class Runner:
         print(done_rule(self.margin, self.batch_cfg,
                         BASIS_FINISH if self.batch_cfg.get('finish_judge_use_finish_s', True)
                         else None))
+        done = self.load_done()
+        tag = self.arm_info()
+        if tag:
+            print(f'설정: {tag["config"]}  구현 {tag["arm"] or "(이름 없음)"}'
+                  + (f' — {tag["arm_label"]}' if tag.get('arm_label') else ''))
+        if done:
+            print(f'이어하기: 끝난 런 {len(done)}건은 건너뛴다 ({self.out_dir}/report.json)')
         try:
             for i, sc in enumerate(scenarios, 1):
                 print(f'\n[{i}/{len(scenarios)}] {sc["name"]}  (timeout {sc["timeout_s"]}s)')
+                if sc['name'] in done:
+                    self.results.append(done[sc['name']])
+                    print(f'  → 건너뜀 (이미 끝남: {done[sc["name"]]["status"]})')
+                    continue
+                # 코드 상태는 런을 띄우기 직전에 읽는다 — 배치 도중 트리가 바뀌면 런마다 다르다.
+                git = git_state() if tag else None
                 try:
                     res = self.run_one(sc)
                 except KeyboardInterrupt:
@@ -1073,9 +1168,13 @@ class Runner:
                 except Exception as e:                  # noqa: BLE001 — 실패해도 다음으로
                     res = {'name': sc['name'], 'status': f'예외: {type(e).__name__}: {e}', 'log': None}
                     self.cleanup()
+                res.update(tag)
+                if git is not None:
+                    res['git'] = git
                 self.results.append(res)
                 if not self.args.dry_run:
                     self.collect(res)
+                    self.save_partial()
                 print(f'  → {res["status"]}')
                 time.sleep(self.args.pause_s)
         except KeyboardInterrupt:
@@ -1112,11 +1211,12 @@ class Runner:
         return 0 if all(r['status'] in ('완주', 'dry-run') for r in self.results) else 1
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """인자 파서. tools/paper_run.py 가 기본값(settle·pause)을 읽어 예상 시간을 낸다."""
     ap = argparse.ArgumentParser(description='배치 회귀 실행기 (SCP 원격 제어)')
     ap.add_argument('scenarios', nargs='+',
                     help='시나리오 목록 json/yaml — 여러 개·glob 가능, 합쳐서 순차 실행')
-    ap.add_argument('--host', default='192.168.50.11', help='VTD 주소 (SCP 48179 + 9910)')
+    ap.add_argument('--host', default='127.0.0.1', help='VTD 주소 (SCP 48179 + 9910)')
     ap.add_argument('--ssh', default=None,
                     help='실행 전 시나리오 실존 확인용 ssh 대상 (기본: <vtd_xml_path 의 홈 사용자>@host)')
     ap.add_argument('--settle-s', type=float, default=3.0, help='SCP 명령 간 대기')
@@ -1135,7 +1235,22 @@ def main(argv=None) -> int:
     g.add_argument('--timeout', dest='no_early', action='store_false',
                    help='params 기본값으로 조기 종료 (기본)')
     ap.set_defaults(no_early=False)
-    a = ap.parse_args(argv)
+    # ── 구현별 실행 (2026-10-01, 논문 실험). 셋 다 미지정이면 종전 동작 그대로다.
+    ap.add_argument('--config', default=None,
+                    help='설정 파일 (기본: config/params.yaml). 종료 판정(batch.*)과 '
+                         'run_agent 가 **같은 파일**을 읽는다 — config/arms/A?.yaml')
+    ap.add_argument('--out-dir', default=None,
+                    help='결과 디렉터리 (기본: logs/batch/<시각>). 런마다 report.json 을 갱신한다')
+    ap.add_argument('--resume', action='store_true',
+                    help='--out-dir 의 report.json 에 끝난 런(완주·stall·blocked·no_progress·'
+                         'timeout)이 있으면 건너뛴다. 기반 실패는 다시 돌린다')
+    return ap
+
+
+def main(argv=None) -> int:
+    a = build_parser().parse_args(argv)
+    if a.resume and not a.out_dir:
+        raise SystemExit('--resume 은 --out-dir 와 함께 쓴다 (어느 배치를 이을지 알 수 없다)')
     return Runner(a).run()
 
 

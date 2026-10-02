@@ -1,0 +1,63 @@
+# 논문 Ⅳ장 실험 — 구현(arm) 정의와 실행 계획의 단일 출처 (2026-10-02).
+#
+#   python3 tools/make_arms.py            # params.yaml + overlay → config/arms/WON24.yaml
+#   python3 tools/paper_run.py --dry-run  # 계획(런 수·예상 시간)만 출력
+#   python3 tools/paper_run.py            # 실행 (끝난 런은 건너뛴다)
+#
+# **주행 파라미터는 아무것도 바꾸지 않는다.** won_24 는 대회 최종 버전이고 params.yaml 의
+# 주행 값(ctrl24.* · overtake.* · speed.* · pdm.* …)을 그대로 쓴다. 사본에서 바뀌는 것은
+# 배치 판정값뿐이다 — 60 s 무한 정지 판정이고 주행에는 영향이 없다.
+# overlay 가 건드릴 수 있는 섹션을 아래 allowed_sections 로 못박는다 (make_arms 가 검사한다).
+#
+#   common.overlay.yaml   판정값 — 다른 브랜치(won)에서도 똑같이 맞춰야 하는 값
+#   WON24.overlay.yaml    그 밖에 바뀌는 것 없음
+#   WON24.yaml            make_arms.py 가 만드는 전체 사본 — 손으로 고치지 말 것
+#
+# 비교 대상인 초기 구현(won 브랜치)은 그 브랜치에서 따로 돌리고, 집계 때
+# tools/paper_report.py --arm WON=<로그 폴더> 로 합친다 (docs/PAPER_EXPERIMENT.md).
+base: config/params.yaml
+common: common.overlay.yaml
+allowed_sections: [batch]
+arms:
+  WON24:
+    overlay: WON24.overlay.yaml
+    label_ko: 최종 구현(won_24)
+    label_en: Final implementation (won_24)
+# 실행 계획: 목록 파일(scenarios/ 기준) × 구현. 유형 이름 = batch_<유형>.json 의 <유형>.
+scenario_dir: scenarios
+out_dir: logs/paper            # logs/paper/<구현>/<유형>/
+host: 127.0.0.1
+plan:
+  - arms: [WON24]              # 논문 세트 전부 (유형 1~8). 개수는 목록 파일이 정한다.
+    lists: [batch_논문1_기본.json, batch_논문2_근접정지.json, batch_논문3_앞뒤연속.json,
+            batch_논문4_나란히.json, batch_논문5_지그재그.json, batch_논문6_옆차로교통.json,
+            batch_논문7_오탐_급정거.json, batch_논문7_오탐_신호줄.json, batch_논문8_일반주행.json]
+# 집계(tools/paper_report.py)가 읽는 것. 그림의 글자는 전부 영문이다 — 구현 이름은
+# label_en, 유형 이름은 type_labels_en (없으면 이름을 그대로 쓴다).
+report:
+  reference: WON24             # 짝 비교(McNemar)의 기준 구현 — 나머지 구현 각각과 짝을 짓는다
+  trace_arms: [WON]            # 기준 구현과 시간–속도 그래프를 그릴 상대 (로그가 있는 것만)
+  labels:                      # 여기서 돌리지 않는 구현의 이름 (다른 브랜치 로그를 합칠 때)
+    WON:
+      label_ko: 초기 구현(won)
+      label_en: Initial implementation (won)
+  type_labels_en:
+    논문1_기본: Single parked vehicle
+    논문2_근접정지: Start close behind obstacle
+    논문3_앞뒤연속: Vehicles in a row
+    논문4_나란히: Side-by-side blockage
+    논문5_지그재그: Zigzag
+    논문6_옆차로교통: Adjacent-lane traffic
+    논문7_오탐_급정거: Lead hard braking
+    논문7_오탐_신호줄: Queue at red light
+    논문8_일반주행: Regular driving
+  # 조건 축 값별 성공률 그림 (by_condition.csv 에서 뽑는다). 축 이름은 시나리오 정의의 axes 키.
+  condition_figures:
+    - name: fig_near_stop_distance
+      types: [논문2_근접정지]
+      axis: 거리
+      xlabel: 'Initial gap, front bumper to obstacle rear [m]'
+    - name: fig_gap_success
+      types: [논문3_앞뒤연속, 논문5_지그재그]
+      axis: 간격
+      xlabel: 'Gap between obstacles [m]'

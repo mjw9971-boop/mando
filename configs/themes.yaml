@@ -89,6 +89,15 @@ routes:
     walk: {turns: [right], require: signalized, tail_m: 100}
   좌회전신호:
     walk: {turns: [left], require: signalized, tail_m: 100}
+  # 실경로 (논문 유형 8 · 일반 주행). 대회·현장 CSV 를 그대로 쓴다 — 테마의 real_route: true 가
+  # 경고·게이트 탈락을 막는다 (주어진 경로라 버릴 수 없다). 원본 위치와 해시는
+  # docs/PAPER_EXPERIMENT.md.
+  실경로_01:
+    csv: data/paper_routes/실경로_01_PathShape03.csv
+  실경로_02:
+    csv: data/paper_routes/실경로_02_venue0903.csv
+  공식경로:
+    csv: data/official_route.csv
   
 
 
@@ -140,6 +149,148 @@ themes:
     routes: [우회전, 좌회전]
     vary: [위치, 차선]
     start: 자유
+
+  # ── 논문 실험용 (2026-10-01) ────────────────────────────────────────────
+  # 추월집중·추월회전에서 '차선' 축만 뺀 사본이다 — 정차차가 **항상 자차로를 막는다**.
+  # 원본은 '차선: 좌측차로' 변형(옆 차로 정차차)이 섞여 회피가 필요 없는 시나리오가
+  # 나온다: seed 0 · 15개 기준 추월집중 5/15, 추월회전 7/15 (docs/BACKLOG.md B-35).
+  # "유형별 N개" 를 회피 조우 수로 읽으려면 그 변형이 없어야 한다.
+  # 원본은 회귀 비교 기준이라 손대지 않는다. 나머지 값은 원본과 같게 유지할 것.
+  추월집중_논문:
+    min_length_m: 250
+    event: [static_vehicle]
+    routes: [직진]
+    vary: [위치, 대향차]
+    start: 자유
+
+  추월회전_논문:
+    min_length_m: 400
+    event: [static_vehicle]
+    routes: [우회전, 좌회전]
+    vary: [위치]
+    start: 자유
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 논문 Ⅳ장 실험 세트 (2026-10-02) — docs/PAPER_EXPERIMENT.md 의 한 줄 명령으로 전부 생성한다.
+  #   conditions × per_condition : 조건마다 그만큼의 **서로 다른 도로**에 만든다 (균형 생성).
+  #                                못 채우면 다른 조건으로 메우지 않고 부족분으로 보고한다.
+  #   cycle        : 곳마다 번갈아 쓰는 축 (조건이 아니라 곳의 변형)
+  #   route_gates  : 꼬리·급회전·콘·두 브랜치 빌더 검사 (params gen_placement.route_gates)
+  #   count        : 조건이 없는 테마의 개수 (--count 를 안 줄 때)
+  # 전부 정차차가 자차로를 막는다 ('차선: 좌측차로' 변형 없음). avoid_geom A·E 가 걸린다
+  # (근접 정지만 E 예외).
+  # ════════════════════════════════════════════════════════════════════════
+  논문1_기본:
+    # 단일 정차차 — 직진 구간 5곳 + 회전 출구 뒤 25~60 m 5곳
+    min_length_m: 300
+    event: [static_vehicle]
+    start: 자유
+    route_gates: true
+    per_condition: 5
+    conditions:
+      - {배치: 직진, routes: [직진]}
+      - {배치: 회전직후, routes: [우회전, 좌회전]}
+
+  논문2_근접정지:
+    # 자차가 정지 상태로 정차차 뒤에서 출발한다. 거리 = 자차 앞범퍼 ~ 장애물 뒤끝 [m].
+    # 8 m 는 초기 구현(won)의 회피 기각 기준(앞범퍼 기준 13.0 m, 완화 후 9.0 m)보다 짧고
+    # 최종 구현의 최소(5.7 m)보다 길다. 30 m 는 기준 위. 환산은 docs/PAPER_EXPERIMENT.md.
+    min_length_m: 300
+    event: [static_vehicle]
+    routes: [직진, 우회전, 좌회전]
+    start: 자유
+    route_gates: true
+    per_condition: 5
+    conditions:
+      - {배치: 근접정지, 거리: 8}
+      - {배치: 근접정지, 거리: 30}
+
+  논문3_앞뒤연속:
+    # 정차 차량 2~3대가 같은 차로에 일렬. 간격 = 앞차 뒤끝 ~ 뒤차 앞끝 [m].
+    min_length_m: 400
+    event: [parked_row]
+    routes: [직진, 우회전, 좌회전]
+    start: 자유
+    route_gates: true
+    per_condition: 3
+    cycle: {대수: [2, 3]}
+    conditions:
+      - {간격: 10}
+      - {간격: 20}
+      - {간격: 30}
+      - {간격: 45}
+
+  논문4_나란히:
+    # 같은 방향 3차로 이상 구간, 자차가 가운데 차로. 자차로와 한쪽 옆 차로를 같은 위치에서
+    # 막아 반대쪽 옆 차로 하나만 열린다. 경로가 가운데 차로를 지나야 해서 수율이 낮다.
+    min_length_m: 400
+    event: [side_by_side]
+    routes: [직진, 우회전, 좌회전]
+    start: 자유
+    route_gates: true
+    per_condition: 4
+    max_tries_per_place: 60
+    conditions:
+      - {열린쪽: 좌}
+      - {열린쪽: 우}
+
+  논문5_지그재그:
+    # 자차로 정차차 → 그 앞 간격 [m] 뒤 옆 차로(비켜 간 쪽) 정차차. 비켰다가 돌아와야 한다.
+    min_length_m: 400
+    event: [zigzag]
+    routes: [직진, 우회전, 좌회전]
+    start: 자유
+    route_gates: true
+    per_condition: 4
+    conditions:
+      - {간격: 30}
+      - {간격: 45}
+      - {간격: 60}
+
+  논문6_옆차로교통:
+    # 자차로 정차차 + 유일한 옆 차로에 저속으로 흐르는 차량 줄 (pulk 가 아니다 — 자차로와
+    # 장애물 뒤에는 교통 차량이 없다). 차간 = 앞차 뒤끝 ~ 뒤차 앞끝 [m].
+    min_length_m: 500
+    event: [side_traffic]
+    routes: [직진, 우회전, 좌회전]
+    start: 자유
+    route_gates: true
+    per_condition: 5
+    conditions:
+      - {차간: 20}
+      - {차간: 40}
+
+  논문7_오탐_급정거:
+    # 앞차가 급정거한다 — 피하지 않고 기다려야 한다 (시프트를 만들면 오탐).
+    min_length_m: 400
+    event: [lead_brake]
+    routes: [직진, 우회전, 좌회전]
+    vary: [감속강도, 발동거리, 재출발]
+    감속강도: [3.0, 5.0, 7.0]
+    start: 자유
+    route_gates: true
+    count: 10
+
+  논문7_오탐_신호줄:
+    # 적색 정지선 앞에 정차한 차량 1~3대 뒤로 접근한다 — 적색 동안 피하지 않고 기다려야 한다.
+    min_length_m: 300
+    event: [signal_queue]
+    routes: [직진신호, 우회전신호, 좌회전신호]
+    start: 자유
+    route_gates: true
+    per_condition: 10
+    cycle: {대수: [1, 2, 3]}
+    conditions:
+      - {}
+
+  논문8_일반주행:
+    # 장애물 없는 실경로 — 주어진 경로라 게이트로 버리지 않고 검사 결과만 기록한다.
+    # (route_example.csv 는 저장소에 없어 4개다.)
+    event: [none]
+    routes: [실경로_01, 실경로_02, 공식경로, 기본]
+    start: 고정
+    real_route: true
+    count: 4
 
   정적회피집중:
     # 정적 장애물 회피만 집중 연습 (2026-09-02). 추월집중과 무엇이 다른가:
