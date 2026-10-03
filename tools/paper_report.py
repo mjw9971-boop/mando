@@ -20,6 +20,8 @@
   by_type.csv              유형 × 구현
   paired.csv               같은 시나리오 짝 비교 (McNemar 정확 검정) — 기준 구현 vs 나머지
   collisions.csv           충돌 이벤트 전부 (상대 물체·최소 간격)
+  collisions_after_finish.csv  종료선 이후라 세지 않은 충돌 (--after-finish exclude, 기본)
+  causes.csv               실패 런 · 기반 실패 런의 원인 분류 (제어기 판단 / 오탐 / 시나리오 / 시뮬레이터)
   brake_fp.csv             앞차 급정거 유형에서 만든 시프트와 그 대상이 다시 움직였는가
   brake_fp_summary.csv
   figures/                 fig_*.png 과 원천 fig_*.csv (글자는 영문)
@@ -31,6 +33,9 @@
 정의:
   무한 정지 = 종료 사유 stall + blocked (적신호·보행자 면책 없이 판정 시간만큼 정지)
   timeout   = 시나리오 제한 시간까지 끝나지 않음 — 무한 정지와 따로 센다
+  집계 기준 (2026-10-03) = 지나감 횡거리 8 m (--pass-lat-m) · 종료선 이후 사건 제외
+              (--after-finish exclude). 6.0 / include 를 주면 이전 집계.
+  실패 원인 = failure_cause() — 로그에서 읽는 규칙 (meta.json definitions.cause_rules).
   충돌      = score.py 항목 11 (객체 외곽 간격 ≤ score.collision_dist_m). **이 저장소의
               검출기로 로그를 다시 센다** — 다른 브랜치 로그도 같은 자로 잰다. report.json 의
               값과 다르면 meta.json 의 warnings 에 남는다.
@@ -114,11 +119,20 @@ def parse_scenario(yaml_path: pathlib.Path) -> dict | None:
     xml = yaml_path.with_suffix('.xml')
     if xml.exists():
         root = ET.parse(xml).getroot()
+        # PathShape 로 시작하는 차량(옆 차로 교통 · 2026-10-03 부터 신호 대기 줄)은 첫 웨이포인트가 시작점
+        shapes = {}
+        for ps in root.iter('PathShape'):
+            wp = ps.find('Waypoint')
+            if wp is not None:
+                shapes[ps.get('ShapeId')] = (float(wp.get('X')), float(wp.get('Y')))
         for pl in root.iter('Player'):
             desc, init = pl.find('Description'), pl.find('Init')
             pa = init.find('PosAbsolute') if init is not None else None
+            psr = init.find('PathShapeRef') if init is not None else None
             if desc is not None and pa is not None:
                 pos[desc.get('Name')] = (float(pa.get('X')), float(pa.get('Y')))
+            elif desc is not None and psr is not None and psr.get('PathShapeId') in shapes:
+                pos[desc.get('Name')] = shapes[psr.get('PathShapeId')]
         for ob in root.iter('Object'):
             sp = ob.find('StartPosAbs')
             if sp is None:
@@ -156,14 +170,20 @@ def parse_scenario(yaml_path: pathlib.Path) -> dict | None:
     # 유형 분류는 이벤트에서 나온다 (테마 이름을 코드에 적지 않는다).
     cls = 'avoid' if encounters else 'brake' if lead else 'queue' if queue else 'plain'
     # 두 브랜치의 빌더가 같은 차로열을 만드는가 — 생성기가 정의 옆에 남긴 기록.
-    same = None
+    same, builders = None, None
     pj = yaml_path.with_name(yaml_path.stem + '.placement.json')
     if pj.exists():
-        ob = ((json.loads(pj.read_text(encoding='utf-8')).get('route_quality') or {})
-              .get('other_builder') or {})
+        rq = json.loads(pj.read_text(encoding='utf-8')).get('route_quality') or {}
+        ob = rq.get('other_builder') or {}
         same = ob.get('same_lanes')
+        if ob:
+            # 비교 제외 판단의 원자료 (판단은 main — builders_differ)
+            builders = {'other': ob.get('name'), 'other_rc': ob.get('rc'),
+                        'off_lane_this': rq.get('builder_off_lane') or [],
+                        'off_lane_other': ob.get('off_lane') or [],
+                        'len_this_m': rq.get('builder_length_m'), 'len_other_m': ob.get('length_m')}
     return {'name': d.get('name'), 'theme': d.get('theme'), 'kinds': kinds,
-            'class': cls, 'builders_same': same,
+            'class': cls, 'builders_same': same, 'builders': builders,
             'queue_objs': [(n, pos.get(n)) for e in queue for n in e.get('queue', [])],
             'encounters': encounters, 'cones': cones,
             'lead_brake': [e for e in (d.get('events') or []) if e.get('kind') == 'lead_brake'],
@@ -299,7 +319,8 @@ def match_objects(ticks: list, points: list, tol: float) -> dict:
 
 def analyze_run(run: dict, scen: dict | None, opt) -> dict:
     """런 하나의 파생값 — 충돌·조우·정지 검토·시프트. 로그가 없으면 빈 값."""
-    out = {'collisions': [], 'encounters': [], 'review': None, 'snapshot': None, 'shifts': [],
+    out = {'collisions': [], 'collisions_after_finish': [], 'finish': None, 'encounters': [],
+           'review': None, 'snapshot': None, 'shifts': [],
            'queue': None, 'n_ticks': 0, 'dur_s': None, 'warn': []}
     if run['log'] is None:
         out['warn'].append('로그 없음')
@@ -331,14 +352,34 @@ def analyze_run(run: dict, scen: dict | None, opt) -> dict:
     matched = match_objects(ticks, pts, opt.match_m)
     kind_of = {oid: owner[i] for i, (oid, _l, _w, _h) in matched.items()}
 
+    # ── 종료선 (2026-10-03 집계 기준: 종료선 이후 사건은 세지 않는다) ─────
+    # 완주 판정 뒤의 몇 초는 채점 대상 주행이 아니다 — 그 사이 스크립트 교통이 자차 쪽으로
+    # 꺾여 들어온 접촉(논문6_07)이 실패로 잡혔다. 기준은 report.json 의 finish_thr_m
+    # (batch_run 이 채점과 같은 규칙으로 쓴 종료선 route_s — won 브랜치도 같은 키를 쓴다).
+    fin = run['res'].get('finish_thr_m')
+    cut = len(ticks)
+    if opt.after_finish == 'exclude':
+        if fin is None:
+            out['warn'].append('report.json 에 finish_thr_m 이 없다 — 종료선 이후 사건을 거르지 못했다')
+        else:
+            cut = next((i for i, t in enumerate(ticks) if float(t['ego']['route_s']) >= float(fin)), len(ticks))
+    out['finish'] = {'finish_thr_m': fin, 'cut_t_s': round(ticks[cut]['t'] - t0, 1) if cut < len(ticks) else None}
+    out['collisions_after_finish'] = []
+
     # ── 충돌 (score.py 항목 11 과 같은 검출기·같은 구간) ───────────────
     tail = score.driving_span(ticks) if run['status'] == '완주' else ticks
     col, _near = score.detect_proximity(tail, t0, cfg)
+    col_thr = float(cfg['score']['collision_dist_m'])
     for ev in col:
         kind, k = kind_of.get(int(ev['obj_id']), ('other', None))
-        out['collisions'].append({'t': ev['t0'], 'route_s': ev['s0'], 'obj_id': int(ev['obj_id']),
-                                  'obj_cls': ev.get('obj_cls'), 'min_gap_m': ev['min_gap_m'],
-                                  'v_kph': ev.get('v_kph'), 'obj_kind': kind, 'encounter': k})
+        c = {'t': ev['t0'], 'route_s': ev['s0'], 'obj_id': int(ev['obj_id']),
+             'obj_cls': ev.get('obj_cls'), 'min_gap_m': ev['min_gap_m'],
+             'v_kph': ev.get('v_kph'), 'obj_kind': kind, 'encounter': k,
+             **contact_onset(tail[ev['i0']:ev['i1'] + 1], int(ev['obj_id']), veh, col_thr, t0)}
+        if ev['i0'] >= cut:
+            out['collisions_after_finish'].append(c)
+        else:
+            out['collisions'].append(c)
 
     # ── 조우별 성패 ─────────────────────────────────────────────────────
     detect = float((cfg.get('ctrl24') or {}).get('detect_max_m', opt.detect_m))
@@ -415,7 +456,7 @@ def analyze_run(run: dict, scen: dict | None, opt) -> dict:
         out['review'] = out['snapshot']
 
     # ── 시프트 생성 (오탐 판정) ─────────────────────────────────────────
-    out['shifts'] = shift_events(ticks, t0, cfg, kind_of)
+    out['shifts'] = shift_events(ticks, t0, cfg, kind_of, upto=cut)
 
     # ── 신호 대기 줄: 대기 차량이 풀린 시각 · 자차가 줄 뒤에 닿았는가 ────
     qids = {oid for oid, (kind, _k) in kind_of.items() if kind == 'queue'}
@@ -516,12 +557,45 @@ def stall_review(run, ticks, t0, cfg, enc, pts, kind_of, front, opt, matched=Non
         'queue_suspect': bool(red and veh_ahead)}
 
 
-def shift_events(ticks: list, t0: float, cfg: dict, kind_of: dict) -> list:
-    """회피 시프트를 **만든** 틱들 — 대상 객체가 그 뒤 다시 움직였는가를 붙인다."""
+def contact_onset(span: list, oid: int, veh: dict, thr: float, t0: float) -> dict:
+    """충돌 구간에서 처음 간격이 임계 이하가 된 틱의 상태 — 누가 누구에게 들어왔나.
+
+    자차 속도 · 상대 속도 · 상대 진행각(자차 기준)을 남긴다. 실패 원인 분류
+    (failure_cause) 가 "움직이는 스크립트 차량이 거의 선 자차로 꺾여 들어왔다" 를 가른다.
+    """
+    L, W = float(veh['length']), float(veh['width'])
+    c_off = L / 2.0 - (L - float(veh['wheelbase']) - float(veh['front_overhang_m']))
+    first = None
+    for t in span:
+        e = t['ego']
+        rect = score._corners(e['x'] + c_off * math.cos(e['yaw']), e['y'] + c_off * math.sin(e['yaw']),
+                              e['yaw'], L, W)
+        for o in t['raw']['objects']:
+            if int(o[0]) != oid:
+                continue
+            g = score._rect_gap(rect, score._corners(o[1], o[2], o[4], o[6] or 1.0, o[7] or 1.0))
+            if first is None or (g <= thr and first[0] > thr):
+                first = (g, t, o)
+        if first is not None and first[0] <= thr:
+            break
+    if first is None:
+        return {'onset_t': None, 'ego_v_mps': None, 'obj_v_mps': None, 'obj_dyaw_deg': None}
+    _g, t, o = first
+    dyaw = (float(o[4]) - float(t['ego']['yaw']) + math.pi) % (2 * math.pi) - math.pi
+    return {'onset_t': round(t['t'] - t0, 1), 'ego_v_mps': round(float(t['ego']['speed']), 2),
+            'obj_v_mps': round(abs(float(o[5])), 2), 'obj_dyaw_deg': round(math.degrees(dyaw), 1)}
+
+
+def shift_events(ticks: list, t0: float, cfg: dict, kind_of: dict, upto: int | None = None) -> list:
+    """회피 시프트를 **만든** 틱들 — 대상 객체가 그 뒤 다시 움직였는가를 붙인다.
+
+    upto: 이 틱 앞에서 만든 시프트만 센다 (종료선 이후 제외). 대상이 다시 움직였는지는
+    그 뒤 틱까지 본다.
+    """
     thr = float((cfg.get('ctrl24') or {}).get('blocker_speed_max',
                                               (cfg.get('percep') or {}).get('obstacle_speed_max', 0.5)))
     made, seen = [], set()
-    for i, t in enumerate(ticks):
+    for i, t in enumerate(ticks[:upto]):
         a = ((t.get('decision') or {}).get('reasons') or {}).get('avoid') or {}
         if a.get('shift') not in ('left', 'right') or a.get('blocker') is None:
             continue
@@ -609,6 +683,74 @@ def judge(run: dict) -> tuple:
             return False, f'inf_stop({st})'
         return True, 'ok'
     return (True, 'ok') if st == '완주' else (False, st)
+
+
+# 실패 원인 분류 (2026-10-03). 규칙은 로그에서만 읽는다 — 시나리오 이름을 적지 않는다.
+CAUSE_KO = {'controller': '제어기 판단', 'false_positive': '오탐', 'scenario': '시나리오',
+            'simulator': '시뮬레이터'}
+# "움직이는 스크립트 차량이 거의 선 자차로 꺾여 들어왔다" — 접촉 시작 틱에서 상대가 이 속도
+# 이상으로 이 각도 이상 틀어 움직이고, 자차는 이 속도 이하. VTD 스크립트 차량(대기 줄 · 옆 차로
+# 교통)은 자차에 반응하지 않으므로, 그 경로가 자차로를 지나는 것은 시나리오 쪽 문제다.
+# 실측 (WON24 2026-10-02): 신호줄 02·03·06 은 상대 3.7–7.4 m/s · 23–32° · 자차 0.4–1.2 m/s.
+# 자차가 옆 차로로 들어가 붙은 경우(논문6_03)는 상대 진행각 −5~−8° 라 걸리지 않는다.
+INTRUDE = {'obj_v_mps': 1.0, 'obj_dyaw_deg': 15.0, 'ego_v_mps': 1.5}
+
+
+def builders_differ(scen: dict | None, tol: float) -> str | None:
+    """두 브랜치 빌더의 경로가 다른 길인가 → 사유 문자열 (같으면 None, 기록이 없으면 None).
+
+    다른 길 = 장애물 차로를 어느 한쪽 경로가 지나지 않음 · 비교 빌더 실패 · 길이 차 ≥ tol (비율).
+    """
+    b = (scen or {}).get('builders')
+    if not b:
+        return None
+    if b['other_rc'] not in (0, None):
+        return f'{b["other"]} 빌더 실패 (rc={b["other_rc"]})'
+    if b['off_lane_this'] or b['off_lane_other']:
+        return f'장애물 차로를 지나지 않음 (이 브랜치 {b["off_lane_this"]}, {b["other"]} {b["off_lane_other"]})'
+    lt, lo = b['len_this_m'], b['len_other_m']
+    if lt and lo and abs(lo - lt) / lt >= tol:
+        return f'경로 길이 {lt:.1f} m vs {b["other"]} {lo:.1f} m ({100 * abs(lo - lt) / lt:.1f} %)'
+    return None
+
+
+def failure_cause(run: dict) -> tuple:
+    """실패 런 (success False) 또는 기반 실패 런 → (원인, 근거). 그 밖의 런은 (None, None).
+
+    순서대로 처음 맞는 것:
+      simulator       기반 실패 (SCP · VTD 무응답 · no-data … — 제어기가 돌지 않았다)
+      false_positive  오탐 시프트 (다시 움직일 대상 — 대기 줄 · 급정거 앞차 — 에 시프트)
+      scenario        충돌이 전부 종료선 콘이거나, 전부 '움직이는 차량이 거의 선 자차로 들어옴'
+      controller      나머지 (충돌 · 못 지나감 · 무한 정지)
+    """
+    st = run['status']
+    if st not in DONE:
+        return 'simulator', f'기반 실패: {st}'
+    if run['success'] is not False:
+        return None, None
+    an = run['an']
+    if run['why'] == 'false_positive_shift':
+        q = (an.get('queue') or {}).get('shifts_on_queue') or [s for s in an['shifts'] if s['false_positive']]
+        s = q[0] if q else {}
+        return 'false_positive', (f'다시 움직인 {s.get("blocker_kind")} 객체에 시프트 '
+                                  f'(t={s.get("t")} s, 앞 {s.get("s_rel_m")} m, 신호 {s.get("light_state")})')
+    cols = an['collisions']
+    if cols and all(c['obj_kind'] == 'finish_cone' for c in cols):
+        return 'scenario', '종료선 콘 접촉 (콘이 회피 회랑 안)'
+    if cols and all(c.get('obj_v_mps') is not None and c['obj_v_mps'] >= INTRUDE['obj_v_mps']
+                    and abs(c['obj_dyaw_deg']) >= INTRUDE['obj_dyaw_deg']
+                    and c['ego_v_mps'] <= INTRUDE['ego_v_mps'] for c in cols):
+        c = cols[0]
+        return 'scenario', (f'움직이는 {c["obj_kind"]} 차량({c["obj_v_mps"]} m/s, 진행각 {c["obj_dyaw_deg"]:+.0f}°)이 '
+                            f'거의 선 자차({c["ego_v_mps"]} m/s)로 들어옴')
+    if cols:
+        c = cols[0]
+        return 'controller', (f'{c["obj_kind"]} 와 충돌 (접촉 시 자차 {c["ego_v_mps"]} m/s, '
+                              f'상대 {c["obj_v_mps"]} m/s, 최소 간격 {c["min_gap_m"]} m)')
+    sn = an.get('snapshot') or {}
+    if run['why'].startswith('not_passed'):
+        return 'controller', f'장애물을 다 지나지 못함 (끝: {sn.get("stop_avoid_state")}/{sn.get("stop_avoid_reject")})'
+    return 'controller', f'{run["why"]} (정지 중 회피 {sn.get("stop_avoid_state")}/{sn.get("stop_avoid_reject")})'
 
 
 def success_row(runs: list) -> dict:
@@ -904,7 +1046,15 @@ def main(argv=None) -> int:
     # 분석 임계 — 결과 수치가 아니라 "무엇을 같은 물체·지나감으로 볼 것인가" 의 정의다. meta.json 에 남긴다.
     ap.add_argument('--match-m', type=float, default=1.5, help='시나리오 물체 ↔ 로그 객체 좌표 허용 오차 [m]')
     ap.add_argument('--pass-near-m', type=float, default=15.0, help='지나감 판정을 하는 거리 [m]')
-    ap.add_argument('--pass-lat-m', type=float, default=6.0, help='지나감 판정의 횡거리 한계 [m]')
+    # 2026-10-03: 6 → 8 m. 나란히 유형은 열린 쪽으로 지나가면 먼 쪽 차가 두 차로 건너
+    # (실측 6.2–6.6 m) 에 있어, 6 m 로는 실제로 지나간 런 4건이 "못 지나감" 으로 잡혔다.
+    # 8 m 는 세 차로 건너(≈ 9.6 m) · 다른 길의 물체는 여전히 뺀다. 6.0 을 주면 이전 집계.
+    ap.add_argument('--pass-lat-m', type=float, default=8.0, help='지나감 판정의 횡거리 한계 [m]')
+    ap.add_argument('--builder-len-tol', type=float, default=0.05,
+                    help='구현 2개 이상일 때 두 빌더 경로 길이 차가 이 비율 이상이면 비교에서 뺀다 (기본 0.05)')
+    ap.add_argument('--after-finish', choices=('exclude', 'include'), default='exclude',
+                    help='종료선(report.json finish_thr_m) 을 지난 뒤 시작한 충돌·시프트를 셀지. '
+                         '기본 exclude (2026-10-03 집계 기준). include = 이전 집계')
     ap.add_argument('--detect-m', type=float, default=80.0, help='조우 도달 거리 — 설정에 ctrl24.detect_max_m 가 없을 때만')
     ap.add_argument('--ahead-m', type=float, default=30.0, help='정지 검토: 앞 물체를 찾는 범퍼 앞 거리 [m]')
     ap.add_argument('--ahead-lat-m', type=float, default=2.0, help='정지 검토: 앞 물체의 횡거리 한계 [m]')
@@ -942,18 +1092,24 @@ def main(argv=None) -> int:
         if key not in scen_cache:
             scen_cache[key] = parse_scenario(r['yaml'])
         r['scen'] = scen_cache[key]
-    # 브랜치 비교(구현 2개 이상)에서는 두 빌더가 다른 차로열을 만드는 시나리오를 자동으로 뺀다 —
-    # 같은 길을 달리지 않으므로 비교가 성립하지 않는다 (생성기가 남긴 route_quality 기록 기준).
-    auto_excl = []
+    # 브랜치 비교(구현 2개 이상)에서는 두 빌더의 경로가 **다른 길**인 시나리오를 자동으로 뺀다
+    # (생성기가 남긴 route_quality 기록 기준, builders_differ). 2026-10-03 결정 — won 결과를 보기
+    # 전에 확정한 규칙: 장애물 차로를 어느 한쪽 빌더가 지나지 않거나, 경로 길이 차가 5 % 이상.
+    # 차로열이 조금 다른 것(길이 차 5–8 m, 장애물 차로는 같음)은 같은 조우를 달리므로 남긴다.
+    auto_excl, auto_why = [], {}
     if len({r['arm'] for r in runs}) >= 2:
-        auto_excl = sorted({r['name'] for r in runs
-                            if r['scen'] and r['scen']['builders_same'] is False} - set(excluded))
+        for r in runs:
+            why = builders_differ(r['scen'], a.builder_len_tol)
+            if why and r['name'] not in excluded:
+                auto_why[r['name']] = why
+        auto_excl = sorted(auto_why)
         excluded = sorted(set(excluded) | set(auto_excl))
     n_before = len(runs)
     runs = [r for r in runs if r['name'] not in excluded]
     for r in runs:
         r['an'] = analyze_run(r, r['scen'], a) if r['status'] in DONE else \
-            {'collisions': [], 'encounters': [], 'review': None, 'snapshot': None, 'shifts': [],
+            {'collisions': [], 'collisions_after_finish': [], 'finish': None, 'encounters': [],
+             'review': None, 'snapshot': None, 'shifts': [],
              'queue': None, 'n_ticks': 0, 'dur_s': None, 'warn': ['기반 실패 — 분석 제외']}
         # 충돌 수의 정본은 **로그를 이 저장소의 채점기로 다시 센 값**이다 — 다른 브랜치에서
         # 돌린 구현은 그 브랜치의 score.py·임계로 report.json 을 썼을 수 있어, 구현끼리
@@ -963,10 +1119,13 @@ def main(argv=None) -> int:
         r['n_col_report'] = None if vio is None else int(vio.get('collision') or 0)
         r['n_col'] = len(r['an']['collisions'])
         r['success'], r['why'] = judge(r)
-        if r['n_col_report'] is not None and r['n_col_report'] != len(r['an']['collisions']) \
+        r['cause'], r['cause_evidence'] = failure_cause(r)
+        # report.json 은 종료선 이후 접촉도 센다 — 대조는 뺀 것까지 더한 수로 한다.
+        n_all = len(r['an']['collisions']) + len(r['an'].get('collisions_after_finish') or [])
+        if r['n_col_report'] is not None and r['n_col_report'] != n_all \
                 and r['status'] in DONE and r['log'] is not None:
             r['an']['warn'].append(f'충돌 수 불일치: report {r["n_col_report"]} / '
-                                   f'로그 재계산 {len(r["an"]["collisions"])}')
+                                   f'로그 재계산 {n_all} (종료선 이후 포함)')
 
     # 유형 분류 — 시나리오 정의에서 (이름을 코드에 적지 않는다)
     types = list(dict.fromkeys(r['type'] for r in runs))
@@ -1104,8 +1263,24 @@ def main(argv=None) -> int:
                    'light_state': sn.get('light_state'), 'ahead_kind': sn.get('ahead_kind'),
                    'ahead_lon_m': sn.get('ahead_lon_m'), 'route_s': sn.get('route_s'),
                    'collision_obj_kind': c0.get('obj_kind'), 'collision_min_gap_m': c0.get('min_gap_m'),
-                   'collision_t_s': c0.get('t'), 'log': str(r['log'])})
+                   'collision_t_s': c0.get('t'), 'collision_ego_v_mps': c0.get('ego_v_mps'),
+                   'collision_obj_v_mps': c0.get('obj_v_mps'), 'collision_obj_dyaw_deg': c0.get('obj_dyaw_deg'),
+                   'cause': r['cause'], 'cause_ko': CAUSE_KO.get(r['cause']),
+                   'cause_evidence': r['cause_evidence'], 'log': str(r['log'])})
     write_csv(out / 'failures.csv', fl)
+
+    # ── causes (실패 런 + 기반 실패 런의 원인 분류 — 결과에서 빼지 않는다) ──
+    write_csv(out / 'causes.csv', [
+        {'arm': r['arm'], 'type': r['type'], 'scenario': r['name'], 'class': type_class.get(r['type']),
+         'status': r['status'], 'why': r['why'], 'cause': r['cause'], 'cause_ko': CAUSE_KO.get(r['cause']),
+         'evidence': r['cause_evidence']}
+        for r in runs if r['cause']],
+        ['arm', 'type', 'scenario', 'class', 'status', 'why', 'cause', 'cause_ko', 'evidence'])
+    # 종료선 이후라 세지 않은 충돌 — 무엇을 뺐는지 남긴다
+    write_csv(out / 'collisions_after_finish.csv', [
+        {'arm': r['arm'], 'type': r['type'], 'scenario': r['name'],
+         'finish_thr_m': (r['an'].get('finish') or {}).get('finish_thr_m'), **c}
+        for r in runs for c in r['an'].get('collisions_after_finish') or []])
 
     # ── queue_fp (신호 대기 줄: 적색 동안 대기 차량에 만든 시프트) ─────────
     qrows = []
@@ -1148,7 +1323,7 @@ def main(argv=None) -> int:
               [{'arm': r['arm'], 'type': r['type'], 'scenario': r['name'], 'status': r['status'], **c,
                 'log': str(r['log'])} for r in runs for c in r['an']['collisions']],
               ['arm', 'type', 'scenario', 'status', 't', 'route_s', 'obj_id', 'obj_cls', 'obj_kind',
-               'encounter', 'min_gap_m', 'v_kph', 'log'])
+               'encounter', 'min_gap_m', 'v_kph', 'onset_t', 'ego_v_mps', 'obj_v_mps', 'obj_dyaw_deg', 'log'])
 
     # ── stall_review ────────────────────────────────────────────────────
     sr = [{'arm': r['arm'], 'type': r['type'], 'scenario': r['name'], 'status': r['status'],
@@ -1327,10 +1502,20 @@ def main(argv=None) -> int:
             'avoid_types': avoid_types, 'brake_types': brake_types,
             'queue_types': queue_types, 'plain_types': plain_types,
             'auto_excluded_builders_differ': auto_excl,
+            'auto_excluded_why': auto_why,
+            'builder_rule': {'off_lane': '어느 한쪽 빌더의 경로가 장애물 차로를 지나지 않음 (또는 빌드 실패)',
+                             'len_tol': a.builder_len_tol},
             'definitions': {'inf_stop': list(INF_STOP), 'valid_status': list(DONE),
-                            'collision': 'score.detect_proximity (항목 11)'},
+                            'collision': 'score.detect_proximity (항목 11)',
+                            'after_finish': a.after_finish,
+                            'cause_rules': ['simulator: 기반 실패', 'false_positive: 오탐 시프트',
+                                            'scenario: 충돌이 전부 종료선 콘, 또는 전부 움직이는 차량이 거의 선 '
+                                            '자차로 들어옴', 'controller: 나머지'],
+                            'cause_intrude': INTRUDE},
             'thresholds': {k: getattr(a, k) for k in ('match_m', 'pass_near_m', 'pass_lat_m', 'detect_m',
-                                                      'ahead_m', 'ahead_lat_m')},
+                                                      'ahead_m', 'ahead_lat_m', 'after_finish')},
+            'collisions_after_finish_excluded': sum(len(r['an'].get('collisions_after_finish') or [])
+                                                    for r in runs),
             'judge': sorted({json.dumps(r['res'].get('judge'), sort_keys=True) for r in runs
                              if r['res'].get('judge')}),
             'coverage': cover, 'trace': trace_note, 'warnings': warns}

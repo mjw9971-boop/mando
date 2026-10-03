@@ -25,8 +25,31 @@ python3 tools/gen_scenarios.py 논문1_기본 논문2_근접정지 논문3_앞�
 
 - 출력은 `scenarios/` (비어 있어야 한다 — 남아 있는 `coverage_history.json` 이 경로 추첨을 바꾼다).
 - **86개** · 목록·XML·CSV·정의·판정 기록 354개 파일. 확인: `cd scenarios && sha256sum -c MANIFEST.sha256 --quiet`
-- `MANIFEST.sha256` 자체의 해시: `4ada8e2d6676d0e87f3020cbc8a18cf7724884ea8f6acfcd6de5e02a53673cdc`
-- 같은 명령을 다른 폴더에 다시 돌려 354개 파일이 전부 같음을 확인했다 (2026-10-02).
+- `MANIFEST.sha256` 자체의 해시: `56599fe567196379e938e8d135ae1ae325f266d520d6a8c5090c5f9dc38ec1b2`
+  (2026-10-03 신호줄 재생성 뒤). 이전 세트 `4ada8e2d…` 와는 **신호줄 10개와 `batch_all.json` 만
+  다르고**, 나머지 8개 유형의 파일·목록은 바이트 동일함을 확인했다.
+- 같은 명령을 다른 폴더에 다시 돌려 354개 파일이 전부 같음을 확인했다 (2026-10-02, 2026-10-03).
+
+### 2026-10-03 신호줄 재생성
+
+첫 본 실행에서 신호줄 10런 중 3런(02·03·06)이 시나리오 원인 접촉이었다 — 대기 줄이 경로의
+차로변경 창 안 출발 차로에 놓여 자차가 줄 옆에 섰고, 풀린 대기 차량이 VTD 운전자 모델대로
+목표 차로로 꺾여 들어왔다. 실패한 것만 고르지 않고 **생성 규칙을 고쳐 유형 전체를 다시 만들었다**:
+
+- 대기 줄(뒤끝 − `queue_lc_clear_m` 10 m ~ 정지선)이 경로의 차로변경 창과 겹치는 신호 접근은 쓰지
+  않는다 (`gen_placement.paper_events.queue_lc_clear_m`, null = 이전 동작).
+- 대기 차량은 자기 차로를 따라 교차로를 가장 곧게 지나는 PathShape 로 `queue_release_path_m` 80 m
+  간다 (0 = 이전 동작 — 경로 없이 속도만 풂).
+- 새 10개 모두 `build_route.py` CLI 경로 기준으로 차로변경 창과 겹치지 않고, 대기 차량이 경로 차로
+  위에 있음을 확인했다. 대수 분포(1대 4 · 2대 3 · 3대 3)는 이전과 같다.
+- 이전 신호줄 로그(WON24 10런)와 그 시나리오 파일은 지우지 않고
+  `logs/paper/archive/set_4ada8e2d_논문7_오탐_신호줄/` 로 옮겼다 (`WON24_논문7_오탐_신호줄/`,
+  `scenarios/` — 이전 MANIFEST 포함). 집계에는 들어가지 않는다.
+- **won 은 이 새 세트로 돌린다** (`MANIFEST.sha256` 해시 `56599fe5…`).
+- 생성기 상수 2개가 `config/params.yaml` 에 들어가 기준 params 해시가 바뀌었고 `config/arms/WON24.yaml` 을
+  다시 만들었다. 이전 사본과 다른 키는 `gen_placement.paper_events.queue_lc_clear_m` ·
+  `queue_release_path_m` · `arm.base_sha256` 뿐이다 (주행 키 동일). 그래서 재주행 런(신호줄 10 ·
+  일반주행 2)은 나머지 런과 커밋·기준 params 해시가 달라 집계에 `[재현]` 경고가 뜬다 — 예상된 것이다.
 - 개수·조건은 `configs/themes.yaml` 의 `논문*` 테마가, 상수는 `config/params.yaml` 의
   `gen_placement.{avoid_geom, route_gates, paper_events, stopped_car}` 가 정한다.
   **이 둘과 `data/lane_graph.pkl` · `origin/won`(9b05f1f) 이 바뀌면 세트가 달라진다.**
@@ -108,7 +131,7 @@ won 의 회피 기각식 (`kr_rules._try_overtake` 의 geom 게이트):
 | 논문8_일반주행_04_실경로_01 | 896.7 m | 896.7 m | 예 | 없음 | **−0.309 m** |
 
 - **`기본`(waypoints.csv) 은 두 빌더가 다른 경로를 만든다** — 브랜치 간 비교에서 뺀다
-  (`--exclude 논문8_일반주행_01_기본`).
+  (자동 — §4 비교 제외 규칙, 길이 차 164 %).
 - 콘 여유가 음수인 경로는 종료선 콘이 회피 회랑 안이다 — 콘을 장애물로 잡을 수 있다.
   일반 주행의 감점·주행 시간을 읽을 때 종료 직전 거동을 따로 볼 것.
 
@@ -272,8 +295,58 @@ python3 tools/paper_report.py --arm WON24=logs/paper/WON24 --arm WON=logs/paper/
 - **충돌 수는 두 구현 모두 이 저장소의 검출기로 로그를 다시 센다** (같은 자). 종료 사유는 각 브랜치의
   batch_run 이 그 자리에서 내린 판정 그대로다 — 그래서 판정값을 위 표대로 맞춰야 한다.
 - 구현이 둘 이상이면 **두 빌더의 경로가 다른 시나리오는 자동으로 빠진다** (생성기가 남긴
-  `route_quality.other_builder.same_lanes` 기준 — 지금은 `논문8_일반주행_01_기본` 하나).
-  `--exclude` 를 따로 줄 필요가 없다.
+  `route_quality` 기록 기준). `--exclude` 를 따로 줄 필요가 없다.
+
+### 비교 제외 규칙 (2026-10-03 확정 — won 결과를 보기 전에 정했고 양쪽에 똑같이 적용한다)
+
+구현이 둘 이상일 때 다음 중 하나면 그 시나리오를 **모든 구현에서** 뺀다 (`paper_report.builders_differ`):
+
+1. 장애물이 놓인 차로를 어느 한쪽 빌더의 경로가 지나지 않는다 (`builder_off_lane` · `other_builder.off_lane`),
+   또는 비교 빌더가 경로를 짓지 못했다.
+2. 두 빌더의 경로 길이 차가 **5 % 이상**이다 (`--builder-len-tol 0.05`).
+
+차로열이 조금 다른 것만으로는 빼지 않는다 — 장애물 차로가 같으면 같은 조우를 달린다.
+
+현재 세트(`56599fe5…`)에서 걸리는 것 — **1개**:
+
+| 시나리오 | 사유 |
+|---|---|
+| `논문8_일반주행_01_기본` | 경로 길이 2470.4 m vs won 6531.4 m (164.4 %) |
+
+빼지 않는 것 (차로열은 다르나 장애물 차로가 같고 길이 차 < 5 %): `논문3_앞뒤연속_03_좌회전5`
+(634.3 / 639.2 m) · `논문3_앞뒤연속_06_좌회전8` (602.5 / 607.3) · `논문4_나란히_04_직진9` (676.7 / 681.2) ·
+`논문7_오탐_급정거_04_좌회전3` (622.3 / 630.7). 집계할 때마다 `report/meta.json` 의
+`auto_excluded_why` 에 사유가 남는다.
+
+### 집계 기준 (2026-10-03)
+
+- **지나감 횡거리 8 m** (`--pass-lat-m`, 이전 6 m). 나란히 유형은 열린 쪽으로 지나가면 먼 쪽 차가
+  두 차로 건너(6.2–6.6 m)라 6 m 로는 실제로 지나간 런 4건이 "못 지나감" 으로 잡혔다.
+- **종료선 이후 사건 제외** (`--after-finish exclude`). 기준은 `report.json` 의 `finish_thr_m`
+  (won 의 batch_run 도 쓴다). 뺀 충돌은 `collisions_after_finish.csv` 에 남는다.
+- **실패 원인 분류** (`causes.csv` · `failures.csv` 의 `cause`) — 로그에서 읽는 규칙, 순서대로:
+  기반 실패 → 시뮬레이터 / 오탐 시프트 → 오탐 / 충돌이 전부 종료선 콘이거나 전부 "움직이는 차량
+  (≥ 1 m/s, 진행각 ≥ 15°)이 거의 선 자차(≤ 1.5 m/s)로 들어옴" → 시나리오 / 나머지 → 제어기 판단.
+  분류만 하고 결과에서 빼지 않는다.
+
+### 논문 판형 표·그림
+
+```
+python3 tools/paper_figs.py --arm WON24=logs/paper/WON24                              # 지금
+python3 tools/paper_figs.py --arm WON24=logs/paper/WON24 --arm WON=logs/paper/WON     # won 이 오면 같은 명령
+```
+
+출력 `logs/paper/paper_figs/`: `table2_paper.csv/.md` (표 2) · `fig_A_success_by_type` (유형별 회피
+성공률 + 95% 구간) · `fig_B_near_stop_trace` (근접 정지 대표 시나리오의 시간–속도 · 장애물까지 거리) ·
+`fig_C_failure_causes` (실패 원인) — 각각 `.png`(600 dpi) · `.pdf` · 원천 `.csv`, 한 단 폭 8.5 cm ·
+8 pt · 회색조+무늬 — 그리고 `IV2_draft.md` (Ⅳ.2 문장 초안과 출처), `report/` (집계 원자료 · meta.json).
+표 2 의 주 지표는 회피·일반 주행 유형이 성공률, **오탐 유형(앞차 급정거 · 신호 대기 줄)은 오탐 런 수**
+(다시 움직일 대상에 시프트를 만든 런, 95% Wilson 구간)이다 — 오탐 유형의 성공률은 참고 열에 둔다.
+그림 B 의 범례에는 구현마다 **로그로 잰 시작 간격**을, 아래 칸에는 시나리오의 조건값을 적는다
+(로그 기준점과 생성 기준점이 달라 0.5 m 쯤 다르다 — 첫 실행에서 조건 8 m, 실측 7.5 m).
+그림 B 의 시나리오는 `arms.yaml report.paper_figs` 의 규칙으로 고른다 (모든 구현이 끝까지 간 런 중
+기준 구현이 성공한 것, 시작 거리가 가장 짧은 것). PDF 글꼴은 Noto CJK(CFF)면 Type 3 으로 넣는다 —
+나눔고딕(`fonts-nanum`)을 깔면 Type 42(편집 가능한 글자)로 바뀐다.
 
 ### 유형별 성공 기준 (집계기가 시나리오 정의의 이벤트로 유형을 가른다)
 

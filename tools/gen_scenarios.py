@@ -2935,6 +2935,29 @@ def ev_side_traffic(ctx, v):
             'traffic': names, 'objects': [car]}
 
 
+def _own_lane_path(lg, k, sl: float, dist: float, step: float = 4.0) -> list:
+    """(k, sl) 에서 차로를 따라 dist [m] — 갈림(교차로 연결로 · 차로 분기)에서는 방향이 가장
+    덜 바뀌는 다음 차로. → [(x, y, z, yaw)] (PathShape 웨이포인트). 차로 끝이면 거기서 멈춘다."""
+    def turn(a, b):
+        return abs((b - a + math.pi) % (2 * math.pi) - math.pi)
+    pts, d = [], 0.0
+    while True:
+        L = lg.length(k)
+        while sl <= L + 1e-6 and d <= dist:
+            x, y, z, h = lg.point_at(k, min(sl, L))
+            pts.append((x, y, z, h % (2 * math.pi)))
+            sl += step
+            d += step
+        if d > dist:
+            return pts
+        nxt = lg.successors(k)
+        if not nxt:
+            return pts
+        h_end = lg.point_at(k, L)[3]
+        k = min(nxt, key=lambda n: (turn(h_end, lg.point_at(n, lg.length(n))[3]), n))
+        sl -= L
+
+
 def ev_signal_queue(ctx, v):
     """신호 대기 줄 — 적색 정지선 앞에 정차한 차량 1~3 대 뒤로 자차가 접근한다 (오탐 측정).
 
@@ -2948,22 +2971,46 @@ def ev_signal_queue(ctx, v):
             if float(pe['queue_min_stop_s_m']) <= a[1] <= rt['total_length'] - 25.0]
     if not appr:
         raise GenError('signal_queue: 경로에 신호화된 접근이 없다 (출발 뒤 queue_min_stop_s_m 이상)')
-    jid, stop_s, ctrls = appr[0]
     n = int(v.get('대수', 2))
     pitch = car_len() + float(pe['queue_car_gap_m'])
-    s_first = stop_s - float(pe['queue_head_gap_m']) - car_len() / 2.0
-    s_last = s_first - (n - 1) * pitch
-    if any(lg.lanes[lane_at(rt, s_first - i * pitch)[1]]['junction'] != -1 for i in range(n)):
-        raise GenError('signal_queue: 대기 줄이 교차로 차로에 걸린다 — 구간이 부족하다')
+    lc_clear = pe.get('queue_lc_clear_m')
+    windows = [(e['window_s0'], e['window_s1']) for e in rt.get('events') or []
+               if e['kind'].startswith('lane_change')]
+    skipped = []
+    for jid, stop_s, ctrls in appr:     # 경로 순서대로 — 처음 맞는 신호 접근
+        s_first = stop_s - float(pe['queue_head_gap_m']) - car_len() / 2.0
+        s_last = s_first - (n - 1) * pitch
+        if any(lg.lanes[lane_at(rt, s_first - i * pitch)[1]]['junction'] != -1 for i in range(n)):
+            skipped.append(f'j{jid}: 교차로 차로에 걸림')
+            continue
+        # 차로변경 창과 겹치면 줄이 자차로가 아니라 옆 차로(출발 차로)에 선다 — 쓰지 않는다
+        lo = s_last - car_len() / 2.0 - float(lc_clear or 0.0)
+        if lc_clear is not None and any(w0 < stop_s and w1 > lo for w0, w1 in windows):
+            skipped.append(f'j{jid}: 차로변경 창과 겹침')
+            continue
+        break
+    else:
+        raise GenError('signal_queue: 쓸 수 있는 신호 접근이 없다 (' + '; '.join(skipped) + ')')
     ctx.claim(s_last - 60.0, stop_s + 10.0, 'signal_queue')
     green_at = stop_s / (float(pe['queue_approach_kph']) / 3.6) + float(pe['queue_wait_s'])
     for c in ctrls:                     # 적색으로 시작 → green_at 에 녹색
         ctx.signals[c] = ('stop_first', green_at, float(pe['queue_green_s']), 3.0)
     names = []
+    path_m = float(pe.get('queue_release_path_m') or 0.0)
     for i in range(n):
         x, y, z, h = route_pt(lg, rt, s_first - i * pitch)
         name = ctx.next_name('QueueCar')
-        ctx.players.append(blk_vehicle_posabs(name, CAR, x, y, z, h))
+        if path_m > 0.0:
+            # 풀린 뒤 자기 차로로 직진 — VTD 운전자 모델의 차로 선택에 맡기지 않는다
+            _, k, sl = lane_at(rt, s_first - i * pitch)
+            pts = _own_lane_path(lg, k, sl, path_m + i * pitch)
+            plen = sum(math.hypot(pts[j + 1][0] - pts[j][0], pts[j + 1][1] - pts[j][1])
+                       for j in range(len(pts) - 1))
+            sid = ctx.next_shape()
+            ctx.moving.append(blk_pathshape(sid, f'{name}Path', pts))
+            ctx.players.append(blk_vehicle_pathshape(name, CAR, sid, 0.01, plen))
+        else:
+            ctx.players.append(blk_vehicle_posabs(name, CAR, x, y, z, h))
         ctx.actions.append(blk_player_actions(name, [
             _act('stay', x, y, 20.0, name, _speed_change(10.0, 0.0)),
             _act('release', x, y, 20.0, name,
@@ -2974,7 +3021,10 @@ def ev_signal_queue(ctx, v):
         names.append(name)
     return {'kind': 'signal_queue', 'count': n, 'junction': jid, 'controllers': ctrls,
             'stop_s': round(stop_s, 2), 'green_at_s': round(green_at, 1),
-            'route_s': [round(s_first - i * pitch, 2) for i in range(n)], 'queue': names}
+            'route_s': [round(s_first - i * pitch, 2) for i in range(n)], 'queue': names,
+            # 대기 줄 자리 검사의 근거 — 경로의 차로변경 창, 건너뛴 신호 접근과 사유
+            'lc_windows': [[round(w0, 1), round(w1, 1)] for w0, w1 in windows],
+            'skipped_approaches': skipped, 'release_path_m': path_m}
 
 
 # 양측 정차 차량의 (종거리 오프셋, 좌우 부호) — 우측 먼저, 14 m 뒤 좌측.

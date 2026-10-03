@@ -318,6 +318,8 @@ gen_placement:
     queue_green_s: 40.0
     queue_release_kph: 30.0
     queue_release_stagger_s: 1.5
+    queue_lc_clear_m: 10.0
+    queue_release_path_m: 80.0
   route_gates:
     tail_enable: true
     sharp_turn_enable: true
@@ -577,7 +579,7 @@ arm:
   label_ko: 최종 구현(won_24)
   label_en: Final implementation (won_24)
   base: config/params.yaml
-  base_sha256: cdbe6ee8f5826eba210bcb8696fb074d5a2ad8cc8e7ca9be26c85ed9477c2809
+  base_sha256: b6c9dc1be1245d3c3028ca407aeaf2c3819d36a0556d90764bd49052687114dd
   overlay_files:
   - common.overlay.yaml
   - WON24.overlay.yaml

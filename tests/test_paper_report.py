@@ -104,13 +104,17 @@ def _log_hit():
     return out
 
 
-def _write_arm(root, arm, typ, runs):
-    """runs: [(이름, status, ticks 또는 None, violations 또는 None)]"""
+def _write_arm(root, arm, typ, runs, finish_thr_m=1e6):
+    """runs: [(이름, status, ticks 또는 None, violations 또는 None)]
+
+    finish_thr_m: report.json 의 종료선 route_s (batch_run 이 쓴다). 기본은 멀리 — 종료선
+    이후 제외가 끼어들지 않게.
+    """
     d = root / arm / typ
     d.mkdir(parents=True, exist_ok=True)
     rep = []
     for name, status, ticks, vio in runs:
-        res = {'name': name, 'status': status, 'log': None}
+        res = {'name': name, 'status': status, 'log': None, 'finish_thr_m': finish_thr_m}
         if ticks is not None:
             p = d / f'{name}.jsonl'
             p.write_text(''.join(json.dumps(t) + '\n' for t in ticks), encoding='utf-8')
@@ -412,8 +416,11 @@ def report2(tmp_path_factory):
         _scenario(scen, '줄', n, q, _car_xml('QueueCar01', 120.0, 0.0))
     _scenario(scen, '주행', '주행_01', [{'kind': 'none'}], '')
     _scenario(scen, '주행', '주행_02', [{'kind': 'none'}], '')
+    # 2026-10-03 규칙: 길이 차 ≥ 5 % 면 뺀다 (실경로 01_기본 처럼 2470 vs 6531 m)
     (scen / '주행' / '주행_02.placement.json').write_text(json.dumps(
-        {'route_quality': {'other_builder': {'same_lanes': False}}}), encoding='utf-8')
+        {'route_quality': {'builder_length_m': 2470.4, 'builder_off_lane': [],
+                           'other_builder': {'name': 'won', 'rc': 0, 'same_lanes': False, 'off_lane': [],
+                                             'length_m': 6531.4}}}), encoding='utf-8')
     ev = [{'kind': 'static_vehicle', 'name': 'StoppedCar01', 'route_s': OBS_X, 'lane': '자차로'}]
     for n, gap in (('거리_01', 8), ('거리_02', 30)):
         _scenario(scen, '거리', n, ev, _car_xml('StoppedCar01', OBS_X, 0.0))
@@ -486,3 +493,18 @@ def test_by_condition_and_condition_figure(report2):
     p = {r['unit']: r for r in _rows(report2 / 'paired.csv') if r['other'] == 'Q'}
     assert p['scenario(성공, 회피)']['ref_only_success'] == '1'
     assert p['scenario(성공, 오탐·신호 대기 줄)']['n_pairs'] == '2'       # 줄_02 는 양쪽 다 판정 제외
+
+
+def test_builders_differ_rule():
+    """2026-10-03 결정: 장애물 차로를 한쪽이라도 안 지나거나 길이 차 ≥ 5 % 일 때만 비교에서 뺀다."""
+    def sc(off_this=(), off_other=(), lt=600.0, lo=605.0, rc=0):
+        return {'builders': {'other': 'won', 'other_rc': rc, 'off_lane_this': list(off_this),
+                             'off_lane_other': list(off_other), 'len_this_m': lt, 'len_other_m': lo}}
+    assert pr.builders_differ(sc(), 0.05) is None                    # 차로열이 조금 달라도 같은 길
+    assert pr.builders_differ(sc(lo=630.0), 0.05) is not None         # 5.0 %
+    assert pr.builders_differ(sc(lo=629.0), 0.05) is None
+    assert pr.builders_differ(sc(lt=2470.4, lo=6531.4), 0.05) is not None
+    assert pr.builders_differ(sc(off_other=[(1, 0, -1)]), 0.05) is not None
+    assert pr.builders_differ(sc(off_this=[(1, 0, -1)]), 0.05) is not None
+    assert pr.builders_differ(sc(rc=1), 0.05) is not None
+    assert pr.builders_differ({'builders': None}, 0.05) is None and pr.builders_differ(None, 0.05) is None

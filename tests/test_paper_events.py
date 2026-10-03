@@ -7,7 +7,8 @@
   · 나란히: 자차가 가운데 차로이고, 막힌 쪽은 열린 쪽의 반대다.
   · 지그재그: 두 번째 차는 첫 차 차로의 옆 차로다 (같은 차로가 아니다).
   · 옆 차로 교통: 교통 차량은 옆 차로에만 있다 (자차로에 없다).
-  · 신호 대기 줄: 신호가 적색으로 시작하고, 대기 차량은 녹색 시각에 풀린다.
+  · 신호 대기 줄: 신호가 적색으로 시작하고, 대기 차량은 녹색 시각에 풀린다. 줄은 경로의
+    차로변경 창과 겹치지 않고, 풀린 차량은 자기 차로로 직진한다 (2026-10-03).
   · 균형 생성: 조건마다 per_condition 곳, 한 조건 안에서는 서로 다른 도로.
   · 경로 품질 게이트: 꼬리·급회전·콘·두 빌더 — 켜져 있으면 폐기, 끄면 통과, 실경로는 기록만.
 
@@ -169,7 +170,7 @@ def test_side_traffic_only_in_the_neighbor_lane(out, lg):
         assert e['objects'] == [e['name']]                           # 지나가야 할 것은 정차차뿐
 
 
-def test_signal_queue_starts_red_and_releases_at_green(out):
+def test_signal_queue_starts_red_and_releases_at_green(out, lg):
     (d, pos, root, _rec, y), = _defs(out, '논문7_오탐_신호줄')
     e = d['events'][0]
     text = y.with_suffix('.xml').read_text(encoding='utf-8')
@@ -179,13 +180,43 @@ def test_signal_queue_starts_red_and_releases_at_green(out):
         assert [t for _d, t in ph] == ['stop', 'go', 'attention']    # 적색으로 시작
         assert float(ph[0][0]) == pytest.approx(e['green_at_s'], abs=0.06)
     assert len(e['queue']) == e['count']
+    # 2026-10-03: 대기 줄(뒤끝 − queue_lc_clear_m ~ 정지선)은 경로의 차로변경 창과 겹치지 않는다
+    pe = gs.pe_cfg()
+    lo = e['route_s'][-1] - gs.car_len() / 2.0 - float(pe['queue_lc_clear_m'])
+    assert not any(w0 < e['stop_s'] and w1 > lo for w0, w1 in e['lc_windows'])
+    shapes = {ps.get('Name'): [(float(w.get('X')), float(w.get('Y')), float(w.get('Yaw')))
+                               for w in ps.iter('Waypoint')] for ps in root.iter('PathShape')}
+    pitch = gs.car_len() + float(pe['queue_car_gap_m'])
     for i, name in enumerate(e['queue']):
-        assert name in pos
         m = re.search(rf'<PlayerActions Player="{name}">(.*?)</PlayerActions>', text, re.S)
         delays = [float(x) for x in re.findall(r'DelayTime="([0-9.]+)"', m.group(1))]
         targets = [float(x) for x in re.findall(r'Target="([0-9.]+)"', m.group(1))]
         assert targets[0] == 0.0 and targets[1] > 5.0                # 정지 → 출발
         assert delays[0] == 0.0 and delays[1] >= e['green_at_s'] - 0.01
+        # 풀린 뒤 자기 차로로 직진 — 경로가 차로 중심 위이고 옆으로 꺾이는 점이 없다
+        pts = shapes[name + 'Path']
+        plen = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+        assert plen == pytest.approx(e['release_path_m'] + i * pitch, abs=5.0)
+        for x, y_, _h in pts:
+            assert abs(lg.locate(x, y_).t) < 0.6
+        for a, b in zip(pts, pts[1:]):
+            assert abs((b[2] - a[2] + math.pi) % (2 * math.pi) - math.pi) < math.radians(25)
+
+
+def test_own_lane_path_takes_the_straightest_branch(lg):
+    """갈림(교차로 연결로)에서는 방향이 가장 덜 바뀌는 다음 차로를 탄다."""
+    def turn(a, b):
+        return abs((b - a + math.pi) % (2 * math.pi) - math.pi)
+    k = next(k for k, v in sorted(lg.lanes.items())
+             if v['type'] == 'driving' and v['junction'] == -1 and len(lg.successors(k)) >= 2
+             and len({round(turn(lg.point_at(k, lg.length(k))[3], lg.point_at(n, lg.length(n))[3]), 1)
+                      for n in lg.successors(k)}) >= 2)
+    L = lg.length(k)
+    h_end = lg.point_at(k, L)[3]
+    want = min(lg.successors(k), key=lambda n: (turn(h_end, lg.point_at(n, lg.length(n))[3]), n))
+    pts = gs._own_lane_path(lg, k, max(L - 6.0, 0.0), 6.0 + lg.length(want) / 2.0)
+    x, y, _z, _h = pts[-1]
+    assert tuple(lg.locate(x, y).lane) == tuple(want) or lg.locate(x, y).lane in lg.successors(want)
 
 
 def test_conditions_use_distinct_roads(tmp_path, monkeypatch):

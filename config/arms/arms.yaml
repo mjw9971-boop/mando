@@ -51,6 +51,22 @@ report:
     논문7_오탐_급정거: Lead hard braking
     논문7_오탐_신호줄: Queue at red light
     논문8_일반주행: Regular driving
+  # 논문 판형 표·그림 (tools/paper_figs.py). 그림 B 는 trace_type 유형에서 모든 구현이 끝까지 간
+  # 런 중 기준 구현이 성공한 것, 그중 trace_axis 값이 가장 작은 시나리오를 쓴다.
+  paper_figs:
+    trace_type: 논문2_근접정지
+    trace_axis: 거리
+    compare_arm: WON              # Ⅳ.2 초안에서 비교 칸을 채울 구현 (없으면 '—')
+  type_labels_ko:               # 표·그림의 짧은 유형 이름 (없으면 '논문N_' 을 뗀 이름)
+    논문1_기본: 기본
+    논문2_근접정지: 근접 정지
+    논문3_앞뒤연속: 앞뒤 연속
+    논문4_나란히: 나란히
+    논문5_지그재그: 지그재그
+    논문6_옆차로교통: 옆 차로 교통
+    논문7_오탐_급정거: 앞차 급정거
+    논문7_오탐_신호줄: 신호 대기 줄
+    논문8_일반주행: 일반 주행
   # 조건 축 값별 성공률 그림 (by_condition.csv 에서 뽑는다). 축 이름은 시나리오 정의의 axes 키.
   condition_figures:
     - name: fig_near_stop_distance
