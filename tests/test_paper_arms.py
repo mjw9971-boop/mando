@@ -54,20 +54,42 @@ def test_overlay_keys_exist_in_base_and_only_they_change(defs, built):
             assert base[k] == old and after[k] == new and arm['overlay'][k] == new
 
 
-def test_copies_change_judge_values_only(defs, built):
-    """2026-10-02 계획: 주행 파라미터는 사본에서도 바꾸지 않는다 — 바뀌는 것은 배치 판정값뿐."""
-    assert defs['allowed_sections'] == ['batch']
+A2_KEYS = {'ctrl24.enable', 'speed.margin_kph', 'speed.approach_decel_mps2', 'overtake.a_lat_max'}
+
+
+def test_copies_change_judge_values_and_a2_keys_only(defs, built):
+    """WON24 사본은 배치 판정값만 바뀐다 (주행 파라미터 그대로). A2(초기 구현, 2026-10-04)는
+    거기에 ctrl24.enable=false 와 won 의 주행 값 세 개뿐이다 — 그 밖의 키는 기준과 같다."""
+    assert defs['allowed_sections'] == ['batch'] and set(defs['allowed_keys']) == A2_KEYS
     base = load_params_yaml()
+    fb = ma.flatten(base)
     for name, (text, arm) in built.items():
         cfg = yaml.safe_load(text)
-        assert all(k.startswith('batch.') for k in arm['overlay']), name
-        for sec in base:
-            if sec != 'batch':
-                assert cfg[sec] == base[sec], f'{name}: {sec} 가 기준과 다르다'
+        cfg.pop('arm')
+        fc = ma.flatten(cfg)
+        changed = {k for k in fb if fb[k] != fc[k]}
+        allowed = {k for k in fb if k.startswith('batch.')} | (A2_KEYS if name == 'A2' else set())
+        assert changed <= allowed, f'{name}: {sorted(changed - allowed)}'
         assert cfg['batch']['stall_end_s'] == cfg['batch']['blocked_end_s'] == 60.0
         assert cfg['batch']['no_progress_end_s'] == base['batch']['no_progress_end_s']
-        assert arm['label_ko'] and arm['label_en']
+        assert arm['label_ko'] and arm['label_en'] and arm['builder'] == 'paper_exp'
     assert built['WON24'][1]['label_ko'] == '최종 구현(won_24)'
+    assert {k for k in built['WON24'][1]['overlay']} <= {k for k in fb if k.startswith('batch.')}
+    a2 = yaml.safe_load(built['A2'][0])
+    # won(origin/won 9b05f1f) 의 값 — kr 경로가 읽는 주행 키 세 개 (리플레이 근거: docs "A2")
+    assert a2['ctrl24']['enable'] is False and a2['speed']['margin_kph'] == 5.0
+    assert a2['speed']['approach_decel_mps2'] == 2.0 and a2['overtake']['a_lat_max'] == 1.5
+    assert built['A2'][1]['label_ko'] == '초기 구현(won)'
+
+
+def test_allowed_keys_open_single_keys_not_sections():
+    cfg = {'ctrl24': {'enable': True, 'avoid_enable': True}, 'batch': {'stall_end_s': 1.0}}
+    keys = ['ctrl24.enable']
+    ma.apply_overlay(cfg, {'ctrl24': {'enable': False}}, 'x', allowed=['batch'], allowed_keys=keys)
+    assert cfg['ctrl24']['enable'] is False
+    with pytest.raises(ma.ArmError):                             # 같은 섹션의 다른 키는 여전히 거부
+        ma.apply_overlay(cfg, {'ctrl24': {'avoid_enable': False}}, 'x', allowed=['batch'], allowed_keys=keys)
+    assert cfg['ctrl24']['avoid_enable'] is True
 
 
 def test_overlay_outside_allowed_sections_is_rejected():
@@ -219,17 +241,20 @@ def test_type_of():
 
 
 def test_plan_covers_every_list_with_one_arm(defs):
-    """계획 = 목록 파일 × WON24. 개수는 목록 파일이 정한다 (코드에 적지 않는다)."""
+    """계획 = 목록 파일 × (WON24, A2). 개수는 목록 파일이 정한다 (코드에 적지 않는다)."""
     sc = ROOT / defs['scenario_dir']
     lists = [ln for block in defs['plan'] for ln in block['lists']]
     if not all((sc / ln).exists() for ln in lists):
         pytest.skip('scenarios/ 생성물 없음')
     plan = pr.build_plan(defs)
-    assert [p['arm'] for p in plan] == ['WON24'] * len(lists)
-    assert [p['type'] for p in plan] == [pr.type_of(ln) for ln in lists]
-    for p, ln in zip(plan, lists):
+    arms = defs['plan'][0]['arms']
+    assert arms == ['WON24', 'A2']
+    assert [p['arm'] for p in plan] == [a for a in arms for _ in lists]
+    assert [p['type'] for p in plan] == [pr.type_of(ln) for _ in arms for ln in lists]
+    for p in plan:
+        ln = f'batch_{p["type"]}.json'
         assert len(p['items']) == len(json.loads((sc / ln).read_text(encoding='utf-8')))
-        assert p['out_dir'] == ROOT / defs['out_dir'] / 'WON24' / p['type']
-        assert p['config'] == ma.ARMS_DIR / 'WON24.yaml'
+        assert p['out_dir'] == ROOT / defs['out_dir'] / p['arm'] / p['type']
+        assert p['config'] == ma.ARMS_DIR / f'{p["arm"]}.yaml'
     only = pr.build_plan(defs, arms=['WON24'], types=[pr.type_of(lists[-1])])
     assert [(p['arm'], p['type']) for p in only] == [('WON24', pr.type_of(lists[-1]))]

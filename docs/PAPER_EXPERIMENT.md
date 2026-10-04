@@ -1,19 +1,21 @@
 # 논문 Ⅳ장 실험 — 시나리오 세트 · 실행 · 집계 · won 브랜치 체크리스트
 
-2026-10-02 기준. 비교 대상은 둘이다.
+2026-10-02 기준 (2026-10-04 A2 추가). 비교 대상은 둘이고, **둘 다 `paper_exp` 에서 돌린다**.
 
-| 구현 | 브랜치 | 이름 (표·그림 범례) |
+| 구현 | 무엇 | 이름 (표·그림 범례) |
 |---|---|---|
-| `WON24` | won_24 (실험은 `paper_exp` 에서 돌린다 — 아래) | 최종 구현(won_24) / Final implementation (won_24) |
-| `WON` | won (`origin/won`, 9b05f1f 2026-09-07) | 초기 구현(won) / Initial implementation (won) |
+| `WON24` | won_24 제어기 (ctrl24) — params 주행 값 그대로 | 최종 구현(won_24) / Final implementation (won_24) |
+| `A2` | won 제어기 — 같은 브랜치에서 `ctrl24.enable: false`(kr_rules) + won 의 주행 값 3개. **won 과 틱 단위 동일** (§2a) | 초기 구현(won) / Initial implementation (won) |
+| (`WON`) | won 브랜치(`origin/won` 9b05f1f)에서 직접 돌린 로그 — **A2 로 대체해 쓰지 않는다** (§3 은 참고로 남긴다) | 초기 구현(won 브랜치) |
 
 `paper_exp` = won_24 `70160e9` + 실험 도구(생성기 · 집계기 · `config/arms` · 이 문서 ·
 `data/paper_routes`). **제어기 파일(`team_code/` · `vtd_adapter/` · `run_agent.py`)은 won_24 와
 같다** (`git diff won_24 paper_exp -- team_code vtd_adapter run_agent.py` 가 비어 있다).
 won_24 브랜치 자체는 그대로 둔다.
 
-**주행 파라미터는 어느 쪽도 바꾸지 않는다.** 두 브랜치 모두 그 브랜치의 `config/params.yaml`
-주행 값을 그대로 쓴다. 맞추는 것은 배치 판정값뿐이다 (60 s 무한 정지 — 주행에 영향 없음).
+**최종 구현의 주행 파라미터는 바꾸지 않는다** (WON24 사본은 배치 판정값만 다르다). 초기 구현 A2 는
+won 의 주행 값 세 개를 overlay 로 되돌릴 뿐이고, 그 밖의 키는 `make_arms.py` 가 거부한다
+(`arms.yaml` 의 `allowed_sections: [batch]` + `allowed_keys` 네 개).
 
 ## 1. 시나리오 세트 — 한 줄로 재현
 
@@ -163,19 +165,72 @@ won 의 회피 기각식 (`kr_rules._try_overtake` 의 geom 게이트):
 - **근접 정지(유형 2)** 의 실제 범퍼 거리 (스폰 오차 ±0.5 m).
 - 유형 3·4·5 (앞뒤 연속 · 나란히 · 지그재그) 는 배치 좌표만 지도와 대조했다.
 
-## 2. won_24 에서 실행·집계
+## 2. paper_exp 에서 실행·집계
 
 ```
-python3 tools/make_arms.py            # params.yaml + overlay → config/arms/WON24.yaml
-python3 tools/paper_run.py --dry-run  # 계획: 9배치 86런
-python3 tools/paper_run.py            # 실행. logs/paper/WON24/<유형>/, 끝난 런은 건너뛴다
-python3 tools/paper_report.py --arm WON24=logs/paper/WON24          # → logs/paper/report/
+python3 tools/make_arms.py            # params.yaml + overlay → config/arms/WON24.yaml · A2.yaml
+python3 tools/paper_run.py --dry-run  # 계획: 9배치 × (WON24, A2)
+python3 tools/paper_run.py            # 실행. logs/paper/<구현>/<유형>/, 끝난 런은 건너뛴다
+python3 tools/paper_figs.py --arm WON24=logs/paper/WON24 --arm A2=logs/paper/A2   # 표·그림·초안
 ```
 
 - 사본 `config/arms/WON24.yaml` 이 params 와 다른 키는 `batch.stall_end_s` · `batch.blocked_end_s`
-  (99999 → 60.0) 둘뿐이다. `make_arms.py` 는 `batch` 밖의 섹션을 건드리는 overlay 를 거부한다.
+  (99999 → 60.0) 둘뿐이다. `A2.yaml` 은 거기에 아래 §2a 의 네 키가 더 다르다. `make_arms.py` 는
+  `batch` 밖에서는 `allowed_keys` 의 네 키만 허용하고 나머지는 거부한다.
 - **params.yaml 을 바꾸면 사본을 다시 만든다** (`paper_run` 이 낡은 사본을 잡아 중단한다).
 - `logs/paper/A1/` 은 계획 변경 전에 돌다 멈춘 것이다 (끝난 런 0건). 지우지 않고 두되 집계에 넣지 않는다.
+
+### 2a. A2 — 초기 구현을 이 브랜치에서 돌리는 근거 (2026-10-04)
+
+**코드.** `origin/won` 과 `paper_exp` 의 제어기 쪽 차이는 4개 파일이고, kr_rules 경로에서는 전부 동작이 같다.
+
+| 파일 | 차이 | kr 경로 (`ctrl24.enable: false`) |
+|---|---|---|
+| `team_code/kr_rules.py` · `config.py` · `vtd_adapter/`(route.py 제외) · `data/lane_graph.pkl` | 없음 | — |
+| `team_code/autopilot.py` | `pre_pass` 훅 8줄 | 건너뛴다 — `KrRules` 에 `pre_pass` 가 없다 |
+| `vtd_adapter/route.py` | 종점 패드 · 시프트 목표 · 가상 시프트 | 전부 `ctrl24.enable` 로 막히거나 기본 인자일 때 원문과 같다 |
+| `run_agent.py` | 리셋 때 `reset_index` 순서 · 로그용 결정 조립 순서 · 예외 메시지 | `KrRules.on_reset` 은 플래너를 안 건드린다 · 나머지는 로그 표기 |
+| `team_code/ctrl24.py` | 신규 | 불리지 않는다 |
+
+**params.** kr 경로가 읽는 키 중 won 과 값이 다른 것은 셋이다 — A2 overlay 가 won 값으로 되돌린다.
+
+| 키 | won → won_24 | 읽는 곳 |
+|---|---|---|
+| `speed.margin_kph` | 5.0 → 6.0 | `vtd_adapter/route.py` 목표 속도 = 제한속도 − 여유 |
+| `speed.approach_decel_mps2` | 2.0 → 1.5 | `kr_rules` 적신호 접근 감속도 |
+| `overtake.a_lat_max` | 1.5 → 1.0 | `kr_rules` 시프트 중 곡률 속도 상한 |
+
+그 밖의 차이(`ctrl24.*` 94 · `gen_placement.*` 33 · `batch.*` · `comm.host` · `route.*` 6)는 kr 경로가
+읽지 않는다. `route.*` 는 경로 빌더(`tools/build_route.py`)만 읽는다.
+
+**리플레이 (개루프, `run_agent.py --replay`).** WON24 로그 7개 — 기본_01 · 근접정지_01 · 나란히_03 ·
+옆차로교통_01 · 급정거_01 · 실경로_02 · 신호줄_01(이전 세트) — 를 같은 경로 pkl 로 돌려 틱마다
+`v_target` · `steering` · `accel` · winner · 지시등을 비교했다.
+
+| 비교 | 결과 |
+|---|---|
+| won 코드 vs paper_exp 코드 (같은 won params) | 7로그 차이 0 — 코드 동일 |
+| won vs paper_exp params + `ctrl24.enable: false` 만 | 7로그 전부 다름 (v_target 371–1237틱, steering 최대 243틱) |
+| won vs 위 + `margin_kph` · `approach_decel_mps2` 만 won 값 | 2로그 다름 (`a_lat_max` 미반영) |
+| won vs **`config/arms/A2.yaml`** | **7로그 · 12,007틱 차이 0** |
+
+(로그 사이에 끼는 `gc_pause` 같은 이벤트 줄은 틱이 아니라 비교에서 뺐다.)
+
+**경로.** 두 구현 모두 batch_run 이 이 브랜치의 `build_route.py` 로 경로를 짓는다 — 같은 시나리오면 같은
+경로다. won 빌더와 경로가 달라 빠지던 5개(`논문8_일반주행_01_기본` · `논문3_앞뒤연속_03·06` ·
+`논문4_나란히_04` · `논문7_오탐_급정거_04`)를 다시 지어 WON24 런의 경로와 차로열·길이가 같음을
+확인했다. 그래서 `arms.yaml` 에 구현별 `builder: paper_exp` 를 적고, `paper_report` 는 **구현끼리 빌더가
+다를 때만** 빌더 차이 제외를 한다 — WON24 · A2 비교에서는 86개 전부 남는다.
+
+**한계.** A2 는 "won 제어기 + 최종 경로 빌더" 다. won 브랜치를 통째로 돌린 것과는 경로 생성만 다르다
+(위 5개에서 차로열이 다르다). 비교는 제어기의 차이만 본다.
+
+**논문에 쓸 설명 (제안).**
+
+> 초기 구현은 최종 구현과 같은 코드베이스에서 회피 제어기를 끄고 초기 규칙 계층과 당시의 주행
+> 파라미터 세 개(목표 속도 여유 5 km/h, 적신호 접근 감속도 2.0 m/s², 시프트 횡가속 상한 1.5 m/s²)로
+> 실행하였다. 이 구성이 초기 구현 브랜치와 같은 명령을 내는지 개루프 리플레이 7개 로그(12,007틱)로
+> 확인하였으며 조향·가감속 명령이 모든 틱에서 일치하였다. 두 구현은 같은 경로 생성기로 만든 같은 경로를 주행한다.
 
 ### 재현 정보 — 어디에 무엇이 남는가
 
@@ -194,6 +249,8 @@ python3 tools/paper_report.py --arm WON24=logs/paper/WON24          # → logs/p
   으로 센다. won 쪽 커밋은 체크리스트(§3)대로 손으로 적는다.
 
 ## 3. won 브랜치에서 같은 실험을 돌릴 때 — 체크리스트
+
+> 2026-10-04 부터 초기 구현은 A2(§2a)로 돌린다. 아래는 won 브랜치를 직접 돌릴 일이 생길 때를 위한 참고다.
 
 won 의 `batch_run.py` 에는 `--config` · `--out-dir` · `--resume` 이 **없다** (2026-09-07 판).
 won 코드를 따로 풀어 확인한 것은 ✔ 로 표시했다.
@@ -288,16 +345,19 @@ python3 tools/paper_report.py --arm WON=logs/paper/WON --out /tmp/won_check
 ## 4. 합쳐서 집계
 
 ```
-python3 tools/paper_report.py --arm WON24=logs/paper/WON24 --arm WON=logs/paper/WON
+python3 tools/paper_report.py --arm WON24=logs/paper/WON24 --arm A2=logs/paper/A2
 ```
 
-- 구현 이름은 `config/arms/arms.yaml` 에서 온다 (`arms.WON24`, `report.labels.WON`).
+- 구현 이름과 빌더는 `config/arms/arms.yaml` 에서 온다 (`arms.WON24` · `arms.A2`, 다른 브랜치 로그면 `report.labels`).
 - **충돌 수는 두 구현 모두 이 저장소의 검출기로 로그를 다시 센다** (같은 자). 종료 사유는 각 브랜치의
   batch_run 이 그 자리에서 내린 판정 그대로다 — 그래서 판정값을 위 표대로 맞춰야 한다.
-- 구현이 둘 이상이면 **두 빌더의 경로가 다른 시나리오는 자동으로 빠진다** (생성기가 남긴
-  `route_quality` 기록 기준). `--exclude` 를 따로 줄 필요가 없다.
+- 구현이 둘 이상이고 **구현끼리 빌더가 다르면**(예: won 브랜치 로그) 두 빌더의 경로가 다른 시나리오가
+  자동으로 빠진다 (생성기가 남긴 `route_quality` 기록 기준). WON24 · A2 는 빌더가 같아 빠지는 것이 없다.
+  빌더를 모르는 구현이 끼면 다르다고 본다. `meta.json` 의 `arm_builders` · `builder_rule_applied` 에 남는다.
 
 ### 비교 제외 규칙 (2026-10-03 확정 — won 결과를 보기 전에 정했고 양쪽에 똑같이 적용한다)
+
+> 2026-10-04: 이 규칙은 **구현끼리 빌더가 다를 때만** 돈다. WON24 · A2 는 같은 빌더라 적용되지 않는다.
 
 구현이 둘 이상일 때 다음 중 하나면 그 시나리오를 **모든 구현에서** 뺀다 (`paper_report.builders_differ`):
 

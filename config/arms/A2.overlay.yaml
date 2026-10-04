@@ -1,0 +1,10 @@
+# A2 — 초기 구현(won). 이 브랜치의 kr_rules 경로(ctrl24.enable false)에 won 의 주행 값 세 개.
+# kr 경로 코드는 origin/won(9b05f1f)과 같다 — 다른 것은 params 값뿐이고, 그중 kr 경로가 읽는 것이
+# 아래 세 키다 (2026-10-04 리플레이: 이 넷을 맞추면 7로그·12,007틱 v_target·steering·accel 차이 0).
+ctrl24:
+  enable: false                 # Ctrl24 대신 KrRules + PDM 원문 조립 (run_agent.py)
+speed:
+  margin_kph: 5.0               # won 값 (won_24: 6.0) — 플래너 목표 속도 = 제한속도 − 여유
+  approach_decel_mps2: 2.0      # won 값 (won_24: 1.5) — kr_rules 적신호 접근 감속도
+overtake:
+  a_lat_max: 1.5                # won 값 (won_24: 1.0) — kr_rules 시프트 중 곡률 속도 상한

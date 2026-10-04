@@ -299,9 +299,9 @@ def test_nested_batches_are_merged_and_done_run_wins(tmp_path):
                     '--arms-yaml', str(ROOT / 'config' / 'arms' / 'arms.yaml')]) == 0
     t = _rows(out / 'table2.csv')[0]
     assert (t['arm'], t['label'], t['n_valid'], t['completed'], t['inf_stop']) == \
-        ('WON', '초기 구현(won)', '2', '1', '1')
+        ('WON', '초기 구현(won 브랜치)', '2', '1', '1')
     meta = json.loads((out / 'meta.json').read_text(encoding='utf-8'))
-    assert meta['warnings'] == [] and meta['arms']['WON']['label_en'] == 'Initial implementation (won)'
+    assert meta['warnings'] == [] and meta['arms']['WON']['label_en'] == 'Initial implementation (won branch)'
     # 꼬리표 없는 런(다른 브랜치에서 --config 없이 돈 결과)은 그렇다고 적힌다
     s = meta['arms']['WON']['settings']
     assert s['untagged_runs'] == 2 and s['runs_without_git'] == 2 and s['overlay'] == [] and s['code'] == []
@@ -446,7 +446,10 @@ def report2(tmp_path_factory):
         rp.write_text(json.dumps(rr, ensure_ascii=False), encoding='utf-8')
     out = root / 'out'
     cfgp = root / 'arms.yaml'
-    cfgp.write_text(yaml.safe_dump({'report': {'reference': 'P', 'condition_figures': [
+    cfgp.write_text(yaml.safe_dump({'report': {'reference': 'P',
+                                               # 구현별 빌더가 다르다 → 빌더 차이 제외 규칙이 돈다
+                                               'labels': {'P': {'builder': 'paper_exp'}, 'Q': {'builder': 'won'}},
+                                               'condition_figures': [
         {'name': 'fig_near_stop_distance', 'types': ['거리'], 'axis': '거리', 'xlabel': 'gap'}]}},
         allow_unicode=True), encoding='utf-8')
     assert pr.main(['--arm', f'P={root / "P"}', '--arm', f'Q={root / "Q"}', '--scenarios', str(scen),
@@ -468,6 +471,25 @@ def test_queue_success_false_positive_and_not_released(report2):
     assert (bt[('줄', 'P')]['success'], bt[('줄', 'P')]['n_judged'], bt[('줄', 'P')]['n_excluded']) == ('2', '2', '1')
     assert (bt[('줄', 'Q')]['success'], bt[('줄', 'Q')]['false_positive_runs']) == ('1', '1')
     assert 'queue_not_released=1' in bt[('줄', 'P')]['excluded_reasons']
+
+
+def test_builder_rule_only_when_arm_builders_differ(report2, tmp_path):
+    """2026-10-04: 같은 빌더를 쓰는 구현끼리(A2 를 이 브랜치에서 돌린 경우)는 경로가 같으므로 빼지 않는다."""
+    meta = json.loads((report2 / 'meta.json').read_text(encoding='utf-8'))
+    assert meta['arm_builders'] == {'P': 'paper_exp', 'Q': 'won'} and meta['builder_rule_applied'] is True
+    root = report2.parent
+    out = tmp_path / 'same'
+    assert pr.main(['--arm', f'P={root / "P"}', '--arm', f'Q={root / "Q"}', '--scenarios', str(root / 'scenarios'),
+                    '--out', str(out), '--arms-yaml', str(root / 'arms.yaml'), '--no-figures',
+                    '--builder', 'P=paper_exp', '--builder', 'Q=paper_exp']) == 0
+    m2 = json.loads((out / 'meta.json').read_text(encoding='utf-8'))
+    assert m2['builder_rule_applied'] is False and m2['auto_excluded_builders_differ'] == []
+    assert '주행_02' in {r['scenario'] for r in _rows(out / 'runs.csv')}
+    # 빌더를 모르는 구현이 있으면 다르다고 본다 (보수적으로 뺀다)
+    out3 = tmp_path / 'unknown'
+    assert pr.main(['--arm', f'P={root / "P"}', '--arm', f'Q={root / "Q"}', '--scenarios', str(root / 'scenarios'),
+                    '--out', str(out3), '--arms-yaml', str(tmp_path / 'none.yaml'), '--no-figures']) == 0
+    assert json.loads((out3 / 'meta.json').read_text(encoding='utf-8'))['auto_excluded_builders_differ'] == ['주행_02']
 
 
 def test_plain_driving_and_auto_exclusion(report2):

@@ -15,8 +15,8 @@
 batch_run.py 가 이걸 report.json 에 옮겨 적는다. 제어기는 모르는 최상위 키를 읽지 않는다.
 
 안전장치:
-  · arms.yaml 의 allowed_sections 밖의 섹션을 건드리는 overlay 는 거부한다 (현재 batch 만 —
-    주행 파라미터는 사본에서도 바꾸지 않는다).
+  · arms.yaml 의 allowed_sections 밖의 섹션을 건드리는 overlay 는 거부한다 (현재 batch 만).
+    섹션 밖에서는 allowed_keys 에 적은 개별 키만 허용한다 (현재 A2 의 네 키).
   · overlay 의 키는 **기준 params 에 이미 있는 키**여야 한다 (오타가 새 키로 조용히
     들어가면 스위치가 안 먹은 채 200런이 돈다).
   · 사본을 다시 읽었을 때 기준과 다른 키가 overlay 키와 정확히 같아야 한다.
@@ -69,19 +69,24 @@ def flatten(d: dict, prefix: str = '') -> dict:
     return out
 
 
-def apply_overlay(cfg: dict, overlay: dict, where: str, allowed=None) -> None:
+def apply_overlay(cfg: dict, overlay: dict, where: str, allowed=None, allowed_keys=None) -> None:
     """overlay 의 잎 키를 cfg 에 덮는다 (제자리). 기준에 없는 키면 죽는다.
 
     allowed: 건드려도 되는 최상위 섹션 목록 (arms.yaml allowed_sections). 주면 그 밖의
     섹션을 건드리는 overlay 를 거부한다 — 주행 파라미터를 실험 사본에서 바꾸지 않기 위한
     못이다 (2026-10-02: 사본에서 바뀌는 것은 배치 판정값뿐).
+    allowed_keys: 섹션 밖이어도 허용하는 **개별 키** (arms.yaml allowed_keys, 점 표기).
+    2026-10-04: 초기 구현 A2 를 이 브랜치에서 돌리려고 ctrl24.enable 과 won 의 주행 값
+    세 개만 연다 — 섹션 전체를 열지 않는다 (docs/PAPER_EXPERIMENT.md "A2").
     """
+    keys = set(allowed_keys or ())
     for dotted, val in flatten(overlay).items():
         cur = cfg
         parts = dotted.split('.')
-        if allowed is not None and parts[0] not in allowed:
-            raise ArmError(f'{where}: `{dotted}` — `{parts[0]}` 섹션은 사본에서 바꿀 수 없다 '
-                           f'(arms.yaml allowed_sections = {list(allowed)})')
+        if allowed is not None and parts[0] not in allowed and dotted not in keys:
+            raise ArmError(f'{where}: `{dotted}` — 사본에서 바꿀 수 없다 '
+                           f'(arms.yaml allowed_sections = {list(allowed)}, '
+                           f'allowed_keys = {sorted(keys)})')
         for q in parts[:-1]:
             if not isinstance(cur.get(q), dict):
                 raise ArmError(f'{where}: `{dotted}` — 기준 params 에 `{q}` 섹션이 없다')
@@ -104,11 +109,12 @@ def build(name: str, defs: dict, arms_dir: pathlib.Path = ARMS_DIR) -> tuple[str
     merged: dict = {}
     for fn in files:
         ov = load_yaml(arms_dir / fn)
-        apply_overlay(cfg, ov, fn, defs.get('allowed_sections'))
+        apply_overlay(cfg, ov, fn, defs.get('allowed_sections'), defs.get('allowed_keys'))
         merged.update(flatten(ov))
     before = flatten(base)
     changed = {k: [before[k], v] for k, v in merged.items() if before[k] != v}
     arm = {'name': name, 'label_ko': spec.get('label_ko'), 'label_en': spec.get('label_en'),
+           'builder': spec.get('builder'),
            'base': defs['base'], 'base_sha256': hashlib.sha256(base_bytes).hexdigest(),
            'overlay_files': files,
            # overlay 가 지정한 키 전체 (기준과 값이 같아도 남긴다 — "지정했다" 가 기록이다)

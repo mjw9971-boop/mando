@@ -1050,6 +1050,8 @@ def main(argv=None) -> int:
     # (실측 6.2–6.6 m) 에 있어, 6 m 로는 실제로 지나간 런 4건이 "못 지나감" 으로 잡혔다.
     # 8 m 는 세 차로 건너(≈ 9.6 m) · 다른 길의 물체는 여전히 뺀다. 6.0 을 주면 이전 집계.
     ap.add_argument('--pass-lat-m', type=float, default=8.0, help='지나감 판정의 횡거리 한계 [m]')
+    ap.add_argument('--builder', action='append', metavar='이름=빌더',
+                    help='구현의 경로 빌더 출처 (arms.yaml 에 없을 때). 구현끼리 빌더가 다를 때만 빌더 차이 제외를 한다')
     ap.add_argument('--builder-len-tol', type=float, default=0.05,
                     help='구현 2개 이상일 때 두 빌더 경로 길이 차가 이 비율 이상이면 비교에서 뺀다 (기본 0.05)')
     ap.add_argument('--after-finish', choices=('exclude', 'include'), default='exclude',
@@ -1073,6 +1075,9 @@ def main(argv=None) -> int:
     ko = {k: v.get('label_ko') for k, v in named.items()}
     en = {k: v.get('label_en') for k, v in named.items()}
     ko.update(_kv(a.label_ko, '--label-ko')); en.update(_kv(a.label_en, '--label-en'))
+    # 구현별 경로 빌더 (arms.yaml arms.<이름>.builder · report.labels.<이름>.builder, --builder 가 우선)
+    builder = {k: v.get('builder') for k, v in named.items()}
+    builder.update(_kv(a.builder, '--builder'))
     lab_ko = lambda n: ko.get(n) or n                     # noqa: E731
     lab_en = lambda n: en.get(n) or n                     # noqa: E731
     tlab = lambda t: (rep_cfg.get('type_labels_en') or {}).get(t, t)   # noqa: E731
@@ -1096,8 +1101,15 @@ def main(argv=None) -> int:
     # (생성기가 남긴 route_quality 기록 기준, builders_differ). 2026-10-03 결정 — won 결과를 보기
     # 전에 확정한 규칙: 장애물 차로를 어느 한쪽 빌더가 지나지 않거나, 경로 길이 차가 5 % 이상.
     # 차로열이 조금 다른 것(길이 차 5–8 m, 장애물 차로는 같음)은 같은 조우를 달리므로 남긴다.
+    # 2026-10-04: 구현끼리 **빌더가 다를 때만** 적용한다. A2(초기 구현)를 이 브랜치에서 돌리면 두
+    # 구현이 같은 빌더로 같은 경로를 받으므로 (5개 재빌드 확인) 뺄 이유가 없다. 빌더를 모르는
+    # 구현이 있으면 다르다고 본다 (보수적으로 뺀다).
     auto_excl, auto_why = [], {}
-    if len({r['arm'] for r in runs}) >= 2:
+    loaded = sorted({r['arm'] for r in runs})
+    arm_builders = {k: builder.get(k) for k in loaded}
+    builders_split = len(loaded) >= 2 and (None in arm_builders.values()
+                                           or len(set(arm_builders.values())) >= 2)
+    if builders_split:
         for r in runs:
             why = builders_differ(r['scen'], a.builder_len_tol)
             if why and r['name'] not in excluded:
@@ -1503,6 +1515,7 @@ def main(argv=None) -> int:
             'queue_types': queue_types, 'plain_types': plain_types,
             'auto_excluded_builders_differ': auto_excl,
             'auto_excluded_why': auto_why,
+            'arm_builders': arm_builders, 'builder_rule_applied': builders_split,
             'builder_rule': {'off_lane': '어느 한쪽 빌더의 경로가 장애물 차로를 지나지 않음 (또는 빌드 실패)',
                              'len_tol': a.builder_len_tol},
             'definitions': {'inf_stop': list(INF_STOP), 'valid_status': list(DONE),

@@ -578,6 +578,7 @@ arm:
   name: WON24
   label_ko: 최종 구현(won_24)
   label_en: Final implementation (won_24)
+  builder: paper_exp
   base: config/params.yaml
   base_sha256: b6c9dc1be1245d3c3028ca407aeaf2c3819d36a0556d90764bd49052687114dd
   overlay_files:

@@ -4,31 +4,42 @@
 #   python3 tools/paper_run.py --dry-run  # 계획(런 수·예상 시간)만 출력
 #   python3 tools/paper_run.py            # 실행 (끝난 런은 건너뛴다)
 #
-# **주행 파라미터는 아무것도 바꾸지 않는다.** won_24 는 대회 최종 버전이고 params.yaml 의
-# 주행 값(ctrl24.* · overtake.* · speed.* · pdm.* …)을 그대로 쓴다. 사본에서 바뀌는 것은
-# 배치 판정값뿐이다 — 60 s 무한 정지 판정이고 주행에는 영향이 없다.
-# overlay 가 건드릴 수 있는 섹션을 아래 allowed_sections 로 못박는다 (make_arms 가 검사한다).
+# **최종 구현(WON24)의 주행 파라미터는 아무것도 바꾸지 않는다.** won_24 는 대회 최종 버전이고
+# params.yaml 의 주행 값을 그대로 쓴다. WON24 사본에서 바뀌는 것은 배치 판정값뿐이다.
 #
-#   common.overlay.yaml   판정값 — 다른 브랜치(won)에서도 똑같이 맞춰야 하는 값
+# 초기 구현(A2, 2026-10-04)은 won 브랜치 대신 **이 브랜치에서** ctrl24.enable=false (kr_rules 경로)
+# 로 돌린다. kr 경로 코드는 origin/won 과 같고, won 과 값이 다른 주행 키 세 개를 won 값으로
+# 되돌리면 리플레이 7로그·12,007틱에서 won 과 차이 0 이다 (docs/PAPER_EXPERIMENT.md "A2").
+# overlay 가 건드릴 수 있는 것은 allowed_sections(섹션 전체)와 allowed_keys(개별 키)뿐이다.
+#
+#   common.overlay.yaml   판정값 — 모든 구현에 같게
 #   WON24.overlay.yaml    그 밖에 바뀌는 것 없음
-#   WON24.yaml            make_arms.py 가 만드는 전체 사본 — 손으로 고치지 말 것
+#   A2.overlay.yaml       ctrl24.enable false + won 의 주행 값 세 개
+#   WON24.yaml · A2.yaml  make_arms.py 가 만드는 전체 사본 — 손으로 고치지 말 것
 #
-# 비교 대상인 초기 구현(won 브랜치)은 그 브랜치에서 따로 돌리고, 집계 때
-# tools/paper_report.py --arm WON=<로그 폴더> 로 합친다 (docs/PAPER_EXPERIMENT.md).
+# builder: 그 구현의 런이 쓰는 경로 빌더(tools/build_route.py)의 출처. 같은 빌더를 쓰는 구현끼리는
+# 경로가 같으므로 paper_report 가 빌더 차이 제외 규칙을 적용하지 않는다.
 base: config/params.yaml
 common: common.overlay.yaml
 allowed_sections: [batch]
+allowed_keys: [ctrl24.enable, speed.margin_kph, speed.approach_decel_mps2, overtake.a_lat_max]
 arms:
   WON24:
     overlay: WON24.overlay.yaml
     label_ko: 최종 구현(won_24)
     label_en: Final implementation (won_24)
+    builder: paper_exp
+  A2:
+    overlay: A2.overlay.yaml
+    label_ko: 초기 구현(won)
+    label_en: Initial implementation (won)
+    builder: paper_exp
 # 실행 계획: 목록 파일(scenarios/ 기준) × 구현. 유형 이름 = batch_<유형>.json 의 <유형>.
 scenario_dir: scenarios
 out_dir: logs/paper            # logs/paper/<구현>/<유형>/
 host: 127.0.0.1
 plan:
-  - arms: [WON24]              # 논문 세트 전부 (유형 1~8). 개수는 목록 파일이 정한다.
+  - arms: [WON24, A2]          # 논문 세트 전부 (유형 1~8). 개수는 목록 파일이 정한다.
     lists: [batch_논문1_기본.json, batch_논문2_근접정지.json, batch_논문3_앞뒤연속.json,
             batch_논문4_나란히.json, batch_논문5_지그재그.json, batch_논문6_옆차로교통.json,
             batch_논문7_오탐_급정거.json, batch_논문7_오탐_신호줄.json, batch_논문8_일반주행.json]
@@ -36,11 +47,12 @@ plan:
 # label_en, 유형 이름은 type_labels_en (없으면 이름을 그대로 쓴다).
 report:
   reference: WON24             # 짝 비교(McNemar)의 기준 구현 — 나머지 구현 각각과 짝을 짓는다
-  trace_arms: [WON]            # 기준 구현과 시간–속도 그래프를 그릴 상대 (로그가 있는 것만)
+  trace_arms: [A2]             # 기준 구현과 시간–속도 그래프를 그릴 상대 (로그가 있는 것만)
   labels:                      # 여기서 돌리지 않는 구현의 이름 (다른 브랜치 로그를 합칠 때)
-    WON:
-      label_ko: 초기 구현(won)
-      label_en: Initial implementation (won)
+    WON:                       # won 브랜치에서 직접 돌린 로그 (A2 를 쓰면 필요 없다)
+      label_ko: 초기 구현(won 브랜치)
+      label_en: Initial implementation (won branch)
+      builder: won
   type_labels_en:
     논문1_기본: Single parked vehicle
     논문2_근접정지: Start close behind obstacle
@@ -56,7 +68,7 @@ report:
   paper_figs:
     trace_type: 논문2_근접정지
     trace_axis: 거리
-    compare_arm: WON              # Ⅳ.2 초안에서 비교 칸을 채울 구현 (없으면 '—')
+    compare_arm: A2               # Ⅳ.2 초안에서 비교 칸을 채울 구현 (없으면 '—')
   type_labels_ko:               # 표·그림의 짧은 유형 이름 (없으면 '논문N_' 을 뗀 이름)
     논문1_기본: 기본
     논문2_근접정지: 근접 정지
